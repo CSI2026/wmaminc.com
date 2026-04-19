@@ -1692,7 +1692,8 @@ function loadFromStorage(){
     var b = localStorage.getItem('wmam_brevo');
     if(b) BREVO_API_KEY = b;
     var agents = localStorage.getItem('wmam_agents');
-    if(agents){ DB.agents = JSON.parse(agents); }
+    if(agents){ DB.agents = JSON.parse(agents);
+    DB.agents.forEach(function(a){ if(typeof normalizeAgentSales==='function') normalizeAgentSales(a); }); }
     var nid = localStorage.getItem('wmam_nextId');
     if(nid){ DB.nextId = parseInt(nid)||7; }
     var teams = localStorage.getItem('wmam_teams');
@@ -2483,8 +2484,8 @@ function showReturningAgentForm(agent){
   overlay.id='returningAgentOverlay';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px';
   overlay.innerHTML='<div style="background:white;border-radius:12px;max-width:580px;width:100%;max-height:92vh;overflow-y:auto;padding:0">'
-    +'<div style="background:linear-gradient(135deg,var(--blue),var(--blue-dark));padding:24px 28px;border-radius:12px 12px 0 0">'
-    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:white;letter-spacing:3px">Welcome Back!</div>'
+    +'<div style="background:linear-gradient(135deg,var(--blue),var(--blue-dark));padding:24px 28px;border-radius:12px 12px 0 0;position:relative">'
+    +'<button onclick="var ol=document.getElementById(\'returningAgentOverlay\');if(ol)ol.remove();" style="position:absolute;top:12px;right:14px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-size:.9rem;width:28px;height:28px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1">✕</button>'+'<div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:white;letter-spacing:3px">Welcome Back!</div>'
     +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:rgba(255,255,255,.8);margin-top:4px">Please verify your information and complete all required steps below.</div>'
     +'</div>'
     +'<div style="padding:24px 28px">'
@@ -2831,7 +2832,10 @@ async function loadFromSupabase(){
           links: safeJSON(a.links, []),
           start: a.start_date||'',
           agentCodes: safeJSON(a.agent_codes, {}),
-          canHostCall: a.can_host_call===true
+          canHostCall: a.can_host_call===true,
+          profilePic:  a.profile_pic||'',
+          phone:       a.phone||'',
+          address:     a.address||''
         };
       });
       DB.nextId = Math.max.apply(null, DB.agents.map(function(a){return a.id;})) + 1;
@@ -2896,9 +2900,12 @@ async function loadFromSupabase(){
       if(lo){ var lop=JSON.parse(lo); lop.forEach(function(l){ var ex=LINKS.find(function(x){return x.id===l.id;}); if(ex) ex.url=l.url; else LINKS.push(l); }); }
     }catch(e){}
 
+    // Normalize all agents — backfill monthlySales from u.sales for legacy data
+    DB.agents.forEach(function(a){ normalizeAgentSales(a); });
     console.log('Loaded from Supabase: '+DB.agents.length+' agents');
     // Seed defaults if empty
-    if(DB.agents.length === 0){ await seedDefaultAgents(); }
+    if(DB.agents.length === 0){ await seedDefaultAgents();
+      DB.agents.forEach(function(a){ normalizeAgentSales(a); }); }
   } catch(e){
     console.warn('Supabase load failed, using local:', e);
     loadFromStorage();
@@ -2931,7 +2938,10 @@ async function saveAgentToSupabase(agent){
     links: JSON.stringify(agent.links||[]),
     start_date: agent.start||'',
     agent_codes: JSON.stringify(agent.agentCodes||{}),
-    can_host_call: agent.canHostCall===true
+    can_host_call: agent.canHostCall===true,
+    profile_pic:  agent.profilePic||'',
+    phone:        agent.phone||'',
+    address:      agent.address||''
   };
   await sbUpsert('agents', data);
 }
@@ -3093,6 +3103,7 @@ function panelDailyAudit(){
   h += '<div id="aud-error" style="display:none;margin-top:12px;color:var(--red);font-family:\'Barlow Condensed\',sans-serif;font-size:.8rem;letter-spacing:1px"></div>';
 
   h += '</div></div>';
+  h = panelHeader('📋 Daily Audit') + h;
   return h;
 }
 
@@ -3424,6 +3435,7 @@ function panelFormBuilder(){
   if(!form){ form = fbDefaultForms()[0]; registry.push(form); saveFBRegistry(registry); }
 
   var h = '';
+  h += panelHeader('📝 Form Builder');
 
   // ── Top bar: form selector + actions ──
   h += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px">';
@@ -4326,6 +4338,7 @@ function panelTeamPhotos() {
       +'</div>';
   }
   html += '</div></div>';
+  html = panelHeader('📸 Team Photos') + html;
   return html;
 }
 
@@ -4410,6 +4423,7 @@ function panelNotifications(){
 
   // Full-screen overlay for unread — force attention
   var h = '';
+  h += panelHeader('🔔 Notifications');
 
   // Unread banner
   if(unread.length){
@@ -4539,6 +4553,7 @@ function panelAlerts(){
     }
     h+='</div>';
   });
+  h = panelHeader('🚨 Alerts') + h;
   return h;
 }
 
@@ -4619,13 +4634,24 @@ function panelReports() {
     // Monthly history for this program
     const monthlyData = {};
     agents.forEach(function(a){
-      (a.monthlySales||[]).forEach(function(m){
+      // Use agentProgSales for consistent reading across legacy + new agents
+        // Also check if agent has any monthlySales entries at all
+        var aMS = a.monthlySales||[];
+        if(aMS.length===0 && (a.program===prog || ((a.programs||[]).indexOf(prog)>=0))){
+          // Legacy agent — attribute all u.sales to current month
+          var now = new Date();
+          var currM = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
+          if(!monthlyData[currM]) monthlyData[currM]={total:0,agents:[]};
+          monthlyData[currM].total += (a.sales||0);
+          monthlyData[currM].agents.push({name:a.name,sales:a.sales||0});
+        }
+        aMS.forEach(function(m){
         if(m.program===prog){
           if(!monthlyData[m.month]) monthlyData[m.month]={total:0,agents:[]};
           monthlyData[m.month].total += m.sales;
           monthlyData[m.month].agents.push({name:a.name,sales:m.sales});
         }
-      });
+        }); // end aMS.forEach
     });
     const months = Object.keys(monthlyData).sort().reverse().slice(0,3);
     if(months.length){
@@ -4669,6 +4695,7 @@ function panelReports() {
       +'</div></div>';
   }
 
+  html = panelHeader('📊 Reports') + html;
   return html;
 }
 
@@ -4821,6 +4848,7 @@ function panelOwnerControl(){
   if(!isOwner(u)&&u.role!=='admin') return '<div style="padding:40px;text-align:center;color:var(--muted)">Owner access only.</div>';
 
   var h = '';
+  h += panelHeader('🔑 Owner Control');
   h += '<div style="background:linear-gradient(135deg,#1a0a00,#3a1200);border-radius:10px;padding:20px 28px;margin-bottom:20px;color:white;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">';
   h += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:2rem;letter-spacing:4px">\uD83D\uDD11 Owner Control Panel</div>';
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;opacity:.7;margin-top:2px">Full system access \u2014 all changes save automatically to Supabase cloud</div></div>';
@@ -5459,8 +5487,12 @@ function ocpExportBackup(){
 }
 
 function panelSettings() {
+  var u = DB.current;
+  if(!u || (!isOwner(u) && u.role!=='admin')){
+    return panelAgentProfile();
+  }
   const hasLogo = !!COMPANY_LOGO;
-  return `
+  return panelHeader('⚙️ Settings') + `
     <!-- LOGO UPLOAD CARD -->
     <div class="bo-card" style="margin-bottom:20px">
       <div class="bo-card-head">
@@ -5641,7 +5673,8 @@ function panelTeamRoom(teamId) {
   const members = DB.agents.filter(a => team.members.includes(a.id));
   const leader  = team.leader ? DB.agents.find(a => a.id === team.leader) : null;
 
-  return `
+  var _ph = panelHeader('🏠 Team Room');
+  return _ph + `
     <div style="display:flex;gap:20px;align-items:flex-start">
 
       <!-- Main feed -->
@@ -5710,7 +5743,6 @@ function panelTeamRoom(teamId) {
       </div>
     </div>`;
 }
-
 function teamMsgHTML(m, team) {
   const u = DB.current;
   const canDelete = isOwner(u)||isOwner(u)||u.role==='admin' || m.from===u.name;
@@ -5783,7 +5815,8 @@ function panelLLTeams() {
       ${LIFELINE_TEAMS.map(team => {
         const members = DB.agents.filter(a => team.members.includes(a.id));
         const leader  = team.leader ? DB.agents.find(a => a.id === team.leader) : null;
-        return `<div class="bo-card" style="border-left:4px solid ${team.color}">
+        var _ph2 = panelHeader('👥 Lifeline Teams');
+  return _ph2 + `<div class="bo-card" style="border-left:4px solid ${team.color}">
           <div class="bo-card-head" style="background:${team.color}10">
             <div style="display:flex;align-items:center;gap:10px">
               <div style="width:32px;height:32px;border-radius:50%;background:${team.color};display:flex;align-items:center;justify-content:center;font-size:.9rem">📍</div>
@@ -5845,7 +5878,6 @@ function panelLLTeams() {
       }).join('')}
     </div>`;
 }
-
 function setTeamLeader(teamId, agentId) {
   const team = LIFELINE_TEAMS.find(t => t.id === teamId);
   if (team) {
@@ -6191,6 +6223,7 @@ function doLogin(){
   if(!found){ if(errEl) errEl.style.display='block'; return; }
   if(errEl) errEl.style.display='none';
   DB.current = found;
+    normalizeAgentSales(DB.current);
   try{ sessionStorage.setItem('wmam_session', found.id); }catch(e){}
   // First-login notification
   var loginKey = 'wmam_firstlogin_'+found.id;
@@ -6236,7 +6269,14 @@ function sendFirstLoginNotification(u){
 function launchBO(u){
   try{ sessionStorage.setItem('wmam_session', u.id); }catch(e){}
   var ava = document.getElementById('boAva');
-  if(ava) ava.textContent = u.name.split(' ').map(function(n){return n[0];}).join('').substring(0,2);
+  if(ava){
+    if(u.profilePic){
+      ava.innerHTML = '<img src="'+u.profilePic+'" style="width:100%;height:100%;object-fit:cover;border-radius:50%">';
+      ava.style.background = 'transparent';
+    } else {
+      ava.textContent = u.name.split(' ').map(function(n){return n[0];}).join('').substring(0,2);
+    }
+  }
   var nameEl = document.getElementById('boUserName');
   if(nameEl) nameEl.textContent = u.name;
   var roleEl = document.getElementById('boUserRole');
@@ -6247,13 +6287,15 @@ function launchBO(u){
   showPage('backoffice');
   buildNav(u);
   gotoPanel('bo');
+  setTimeout(function(){ checkInventoryExpiryAlerts(); }, 1500);
+  scheduleNationalCallReminders();
 }
 
 // ══════════════════════════════════════════════
 //  NAV BUILDER
 // ══════════════════════════════════════════════
 function buildNav(u){
-  var nav  = document.getElementById('boNavItems');
+  var nav  = document.getElementById('boNav');
   if(!nav) return;
   var isAdmin    = isOwner(u)||u.role==='admin';
   var isHRRole   = isHR(u);
@@ -6340,10 +6382,9 @@ function buildNav(u){
   // Personal nav
   if(!isHRRole&&!isInvRole){
     h += boNavBtn('links','🔗 My Links');
-    h += boNavBtn('subs','📝 My Submissions');
     if(isLdr||isAdmin) h += boNavBtn('myteam','👥 My Team');
     h += boNavBtn('lb','🏆 Leaderboard');
-    h += boNavBtn('daily-audit','📸 Daily Audit');
+    h += boNavBtn('daily-audit','📸 Daily Photo Audit');
     h += boNavBtn('meetings','📹 Meetings');
   }
 
@@ -6359,8 +6400,12 @@ function buildNav(u){
   }
 
   // Owner panel
-  h += boNavBtn('settings','⚙️ Settings');
-  if(isOwnerRole||isAdmin) h += boNavBtn('owner-control','🔑 Owner Control');
+  if(isAdmin||isOwnerRole){
+    h += boNavBtn('settings','⚙️ Settings');
+    h += boNavBtn('owner-control','🔑 Owner Control');
+  } else {
+    h += boNavBtn('agent-profile','👤 My Profile');
+  }
 
   nav.innerHTML = h;
 }
@@ -6382,17 +6427,662 @@ function closeAllBODD(){
   document.querySelectorAll('.bo-nav-dd').forEach(function(el){ el.style.display='none'; });
 }
 function toggleBONav(){
-  var n = document.getElementById('boNavItems');
+  var n = document.getElementById('boNav');
   if(n) n.style.display = n.style.display==='none'?'flex':'none';
 }
 function closeBONav(){
-  var n = document.getElementById('boNavItems');
+  var n = document.getElementById('boNav');
   if(n) n.style.display='none';
 }
 
 // ══════════════════════════════════════════════
 //  GOTO PANEL ROUTER
 // ══════════════════════════════════════════════
+
+// ══ AGENT SELF-SERVICE PROFILE ════════════════════════════════
+function panelAgentProfile(){
+  var u   = DB.current;
+  var pic = u.profilePic||'';
+  var ini = u.name.split(' ').map(function(n){return n[0]||'';}).join('').toUpperCase().slice(0,2);
+  var h   = panelHeader(u.name + ' — My Profile');
+  h += '<div style="max-width:600px;margin:0 auto">';
+
+  // ── Profile Picture ──
+  h += '<div class="bo-card" style="margin-bottom:20px">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">Profile Picture</div>'
+     + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">Shown in video calls when camera is off</div></div>';
+
+  // ── Professional photo policy notice ──
+  h += '<div style="background:rgba(0,53,148,.05);border-left:4px solid var(--blue);'
+     + 'margin:0 20px;padding:12px 16px;border-radius:0 6px 6px 0">'
+     + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;font-weight:700;'
+     + 'letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin-bottom:6px">Photo Requirements</div>'
+     + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5">'
+     + '\u2713 Professional headshot only &nbsp;\u2022&nbsp; \u2713 White or plain background<br>'
+     + '\u2717 No hats &nbsp;\u2022&nbsp; \u2717 No sunglasses or glasses &nbsp;\u2022&nbsp; \u2717 No filters<br>'
+     + '\u2717 No group photos &nbsp;\u2022&nbsp; \u2717 No casual selfies &nbsp;\u2022&nbsp; \u2717 No logos or text'
+     + '</div></div>';
+
+  h += '<div style="padding:24px;display:flex;align-items:flex-start;gap:24px;flex-wrap:wrap">';
+
+  // Avatar preview
+  h += '<div id="profilePicPreview" style="width:110px;height:110px;border-radius:50%;overflow:hidden;'
+     + 'background:var(--blue);display:flex;align-items:center;justify-content:center;flex-shrink:0;'
+     + 'border:3px solid var(--blue);box-shadow:0 4px 14px rgba(0,53,148,.25)">'
+     + (pic ? '<img src="'+pic+'" style="width:100%;height:100%;object-fit:cover">'
+            : '<span style="font-family:Bebas Neue,sans-serif;font-size:2.2rem;color:white;letter-spacing:2px">'+ini+'</span>')
+     + '</div>';
+
+  h += '<div style="flex:1;min-width:220px">';
+
+  // Upload button
+  h += '<div style="margin-bottom:14px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;font-weight:700;letter-spacing:2px;'
+     + 'text-transform:uppercase;color:var(--muted);margin-bottom:6px">Option 1 — Upload a Photo</div>';
+  h += '<label style="display:inline-flex;align-items:center;gap:8px;background:var(--blue);color:white;'
+     + 'font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;'
+     + 'padding:8px 16px;border-radius:5px;cursor:pointer;transition:background .15s" '
+     + '\U0001f4ce&nbsp; Choose File'
+     + '<input type="file" id="profilePicFile" accept="image/*" onchange="previewProfilePic(this)" style="display:none"></label>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:var(--muted);margin-top:5px">'
+     + 'JPG, PNG or GIF \u00b7 Max 2MB</div>';
+  h += '</div>';
+
+  // Selfie camera button
+  h += '<div style="margin-bottom:14px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;font-weight:700;letter-spacing:2px;'
+     + 'text-transform:uppercase;color:var(--muted);margin-bottom:6px">Option 2 — Take a Selfie</div>';
+  h += '<button onclick="openSelfieCamera()" style="display:inline-flex;align-items:center;gap:8px;'
+     + 'background:white;border:2px solid var(--blue);color:var(--blue);'
+     + 'font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;'
+     + 'padding:7px 16px;border-radius:5px;cursor:pointer;transition:all .15s" '
+     + '\U0001f4f7&nbsp; Open Camera</button>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:var(--muted);margin-top:5px">'
+     + 'Make sure you have a plain white wall behind you</div>';
+  h += '</div>';
+
+  if(pic){
+    h += '<button onclick="removeProfilePic()" style="background:none;border:1px solid var(--red);'
+       + 'color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;'
+       + 'text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer">Remove Photo</button>';
+  }
+  h += '</div></div>';
+
+  // ── Hidden selfie camera modal ──
+  h += '<div id="selfieCameraModal" style="display:none;position:fixed;inset:0;z-index:99998;'
+     + 'background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center">'
+     + '<div style="background:#111;border-radius:14px;padding:0;overflow:hidden;width:min(520px,95vw);'
+     + 'box-shadow:0 24px 60px rgba(0,0,0,.6)">'
+     // Header
+     + '<div style="background:#0a0a1a;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,.08)">'
+     + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:white;letter-spacing:3px">Take Professional Headshot</div>'
+     + '<button onclick="closeSelfieCamera()" style="background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);'
+     + 'color:white;font-size:.85rem;width:28px;height:28px;border-radius:50%;cursor:pointer">\u2715</button>'
+     + '</div>'
+     // Reminder
+     + '<div style="background:rgba(0,53,148,.15);border-bottom:1px solid rgba(0,53,148,.2);'
+     + 'padding:10px 20px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:rgba(255,255,255,.7);line-height:1.5">'
+     + '\u2139\ufe0f &nbsp;White/plain background \u00b7 Look directly at camera \u00b7 No hats, glasses or filters'
+     + '</div>'
+     // Video feed
+     + '<div style="position:relative;background:#000;aspect-ratio:1">'
+     + '<video id="selfieVideo" autoplay playsinline style="width:100%;height:100%;object-fit:cover;display:block"></video>'
+     + '<canvas id="selfieCanvas" style="display:none"></canvas>'
+     // Guide overlay
+     + '<div style="position:absolute;inset:0;pointer-events:none;display:flex;align-items:center;justify-content:center">'
+     + '<div style="width:65%;height:65%;border-radius:50%;border:2px dashed rgba(255,255,255,.35)"></div>'
+     + '</div>'
+     + '</div>'
+     // Controls
+     + '<div style="padding:16px 20px;display:flex;align-items:center;justify-content:center;gap:16px;background:#0a0a1a">'
+     + '<button onclick="takeSelfie()" style="width:60px;height:60px;border-radius:50%;'
+     + 'background:white;border:4px solid rgba(255,255,255,.3);cursor:pointer;'
+     + 'display:flex;align-items:center;justify-content:center;font-size:1.4rem" title="Take Photo">\U0001f4f7</button>'
+     + '<span style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:rgba(255,255,255,.4);letter-spacing:1px">Tap to capture</span>'
+     + '</div>'
+     + '</div></div>';
+
+  h += '</div>';
+
+  // ── Personal Info ──
+  h += '<div class="bo-card" style="margin-bottom:20px">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">Personal Information</div></div>';
+  h += '<div style="padding:20px 24px;display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+  h += '<div class="f-field"><label class="f-label">Full Name</label>'
+     + '<input type="text" class="f-input" id="profName" value="'+escHtml(u.name||'')+'"></div>';
+  h += '<div class="f-field"><label class="f-label">Email</label>'
+     + '<input type="email" class="f-input" id="profEmail" value="'+escHtml(u.email||'')+'"></div>';
+  h += '<div class="f-field"><label class="f-label">Phone</label>'
+     + '<input type="tel" class="f-input" id="profPhone" value="'+escHtml(u.phone||'')+'" placeholder="(555) 555-5555"></div>';
+  h += '<div class="f-field" style="grid-column:1/-1"><label class="f-label">Address</label>'
+     + '<input type="text" class="f-input" id="profAddress" value="'+escHtml(u.address||'')+'" placeholder="Street, City, State, ZIP"></div>';
+  h += '</div></div>';
+
+  // ── Credentials ──
+  h += '<div class="bo-card" style="margin-bottom:20px">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">Login Credentials</div></div>';
+  h += '<div style="padding:20px 24px;display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+  h += '<div class="f-field"><label class="f-label">Username</label>'
+     + '<input type="text" class="f-input" value="'+escHtml(u.username||'')+'" readonly style="background:var(--offwhite);color:var(--muted)"></div>';
+  h += '<div class="f-field"><label class="f-label">New Password <span style="color:var(--muted);font-size:.7em">(leave blank to keep)</span></label>'
+     + '<input type="password" class="f-input" id="profPass" placeholder="New password..."></div>';
+  h += '</div></div>';
+
+  // ── Account Info (read-only) ──
+  var progs = (Array.isArray(u.programs)&&u.programs.length) ? u.programs : (u.program?[u.program]:[]);
+  h += '<div class="bo-card" style="margin-bottom:20px">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">Account Details</div>'
+     + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">Managed by Admin</div></div>';
+  h += '<div style="padding:16px 24px;display:grid;grid-template-columns:1fr 1fr;gap:12px">';
+  h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Role</div>'
+     + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;font-weight:700;color:var(--brown)">'+u.role+'</div></div>';
+  h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Program(s)</div>'
+     + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;font-weight:700;color:var(--brown)">'+(progs.join(', ')||'\u2014')+'</div></div>';
+  if(u.carrier) h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Carrier</div>'
+     + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;font-weight:700;color:var(--brown)">'+u.carrier+'</div></div>';
+  h += '</div></div>';
+
+  // ── Save Button ──
+  h += '<div style="padding:8px 0 32px;text-align:center">';
+  h += '<button onclick="saveAgentProfile()" style="background:var(--blue);border:none;color:white;'
+     + 'font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:3px;padding:13px 48px;'
+     + 'border-radius:6px;cursor:pointer;box-shadow:0 4px 12px rgba(0,53,148,.3)">SAVE PROFILE</button>';
+  h += '</div></div>';
+  return h;
+}
+
+function previewProfilePic(input){
+  if(!input.files||!input.files[0]) return;
+  var file = input.files[0];
+  if(file.size > 2097152){ alert('Image must be under 2MB'); input.value=''; return; }
+  var reader = new FileReader();
+  reader.onload = function(e){
+    DB.current._pendingPic = e.target.result;
+    var p = document.getElementById('profilePicPreview');
+    if(p) p.innerHTML = '<img src="'+e.target.result+'" style="width:100%;height:100%;object-fit:cover">';
+  };
+  reader.readAsDataURL(file);
+}
+
+function removeProfilePic(){
+  DB.current.profilePic = '';
+  DB.current._pendingPic = null;
+  saveAgentToSupabase(DB.current);
+  saveToStorage();
+  gotoPanel('agent-profile');
+}
+
+// ══ SELFIE CAMERA ════════════════════════════════════════════
+var _selfieStream = null;
+
+function openSelfieCamera(){
+  var modal = document.getElementById('selfieCameraModal');
+  if(!modal) return;
+  modal.style.display = 'flex';
+  var video = document.getElementById('selfieVideo');
+  if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+    navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:640}}})
+      .then(function(stream){
+        _selfieStream = stream;
+        if(video) video.srcObject = stream;
+      })
+      .catch(function(err){
+        alert('Camera access denied or not available. Please upload a photo instead.');
+        closeSelfieCamera();
+      });
+  } else {
+    alert('Camera not supported in this browser. Please upload a photo instead.');
+    closeSelfieCamera();
+  }
+}
+
+function closeSelfieCamera(){
+  var modal = document.getElementById('selfieCameraModal');
+  if(modal) modal.style.display = 'none';
+  if(_selfieStream){
+    _selfieStream.getTracks().forEach(function(t){ t.stop(); });
+    _selfieStream = null;
+  }
+}
+
+function takeSelfie(){
+  var video  = document.getElementById('selfieVideo');
+  var canvas = document.getElementById('selfieCanvas');
+  if(!video || !canvas) return;
+  var size = Math.min(video.videoWidth, video.videoHeight) || 640;
+  canvas.width  = size;
+  canvas.height = size;
+  var ctx = canvas.getContext('2d');
+  // Center-crop to square
+  var sx = (video.videoWidth  - size) / 2;
+  var sy = (video.videoHeight - size) / 2;
+  ctx.save();
+  // Mirror the image (selfie camera flips naturally)
+  ctx.translate(size, 0); ctx.scale(-1, 1);
+  ctx.drawImage(video, sx, sy, size, size, 0, 0, size, size);
+  ctx.restore();
+  var dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  DB.current._pendingPic = dataUrl;
+  var preview = document.getElementById('profilePicPreview');
+  if(preview) preview.innerHTML = '<img src="'+dataUrl+'" style="width:100%;height:100%;object-fit:cover">';
+  closeSelfieCamera();
+  // Show confirmation
+  var btn = document.querySelector('[onclick="takeSelfie()"]');
+  if(btn) btn.textContent = '\u2713';
+  alert('\u2713 Photo captured! Scroll down and click SAVE PROFILE to keep it.');
+}
+
+function saveAgentProfile(){
+  var u = DB.current;
+  var g = function(id){ var el=document.getElementById(id); return el?el.value.trim():''; };
+  var name=g('profName'), email=g('profEmail'), phone=g('profPhone'),
+      address=g('profAddress'), pass=g('profPass');
+  if(name) u.name = name;
+  if(email) u.email = email;
+  u.phone = phone; u.address = address;
+  if(pass) u.password = pass;
+  if(u._pendingPic){ u.profilePic = u._pendingPic; u._pendingPic = null; }
+  // Update nav avatar
+  var ava = document.getElementById('boAva');
+  if(ava){
+    if(u.profilePic){
+      ava.style.background='transparent';
+      ava.innerHTML='<img src="'+u.profilePic+'" style="width:100%;height:100%;object-fit:cover;border-radius:50%">';
+    } else {
+      ava.innerHTML='';
+      ava.style.background='var(--blue)';
+      ava.textContent=u.name.split(' ').map(function(n){return n[0]||'';}).join('').toUpperCase().slice(0,2);
+    }
+  }
+  var un = document.getElementById('boUname'); if(un) un.textContent=u.name;
+  saveToStorage(); saveAgentToSupabase(u);
+  alert('\u2713 Profile saved!');
+  gotoPanel('agent-profile');
+}
+
+// ══ INVENTORY REQUEST CORE HELPERS ════════════════════════════════════════
+
+// Send SMS via Brevo transactional SMS API
+async function sendSMSBrevo(phone, message){
+  if(!BREVO_API_KEY || !phone) return;
+  // Normalize phone: strip non-digits, ensure +1 prefix for US
+  var digits = phone.replace(/\D/g,'');
+  if(digits.length===10) digits = '1'+digits;
+  if(digits.length!==11) return; // not a valid US number
+  var intlPhone = '+'+digits;
+  try{
+    await fetch('https://api.brevo.com/v3/transactionalSMS/sms',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','api-key':BREVO_API_KEY},
+      body:JSON.stringify({
+        sender:'WMAMinc',
+        recipient: intlPhone,
+        content: message.slice(0,160)
+      })
+    });
+  } catch(e){ console.warn('SMS send failed:',e); }
+}
+
+// Show a persistent modal that CANNOT be dismissed without clicking the read button
+function showPersistentAlert(opts){
+  // opts: {title, body, icon, btnLabel, onRead}
+  var existing = document.getElementById('persistentAlertModal');
+  if(existing) existing.remove();
+
+  var overlay = document.createElement('div');
+  overlay.id = 'persistentAlertModal';
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,.75);'
+    +'display:flex;align-items:center;justify-content:center;padding:16px';
+  // NO onclick dismiss — must use button
+
+  var box = document.createElement('div');
+  box.style.cssText = 'background:white;border-radius:14px;width:min(480px,94vw);'
+    +'overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.45)';
+
+  // Header — red urgent bar
+  var hdr = document.createElement('div');
+  hdr.style.cssText = 'background:linear-gradient(135deg,#CC0000,#8b0000);padding:18px 24px;'
+    +'display:flex;align-items:center;gap:14px';
+  hdr.innerHTML = '<span style="font-size:1.8rem">'+(opts.icon||'\u26a0\ufe0f')+'</span>'
+    +'<div>'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;color:white;letter-spacing:3px">'
+    +(opts.title||'Important Notice')+'</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:rgba(255,255,255,.75);'
+    +'letter-spacing:2px;text-transform:uppercase;margin-top:2px">Action Required</div>'
+    +'</div>';
+  box.appendChild(hdr);
+
+  // Body
+  var body = document.createElement('div');
+  body.style.cssText = 'padding:22px 24px;font-family:Barlow Condensed,sans-serif;font-size:.9rem;'
+    +'color:#333;line-height:1.6';
+  body.innerHTML = opts.body||'';
+  box.appendChild(body);
+
+  // Footer
+  var footer = document.createElement('div');
+  footer.style.cssText = 'padding:16px 24px;background:#f8f8f8;border-top:1px solid #eee;'
+    +'display:flex;justify-content:flex-end';
+  var btn = document.createElement('button');
+  btn.textContent = opts.btnLabel||'\u2713 I\'ve Seen This';
+  btn.style.cssText = 'background:#CC0000;border:none;color:white;font-family:Bebas Neue,sans-serif;'
+    +'font-size:1rem;letter-spacing:3px;padding:12px 32px;border-radius:6px;cursor:pointer';
+  btn.onclick = function(){
+    overlay.remove();
+    if(typeof opts.onRead==='function') opts.onRead();
+  };
+  footer.appendChild(btn);
+  box.appendChild(footer);
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
+// Get approval chain for a request based on requester role
+// Returns array of {role, agentId (if specific), label, status}
+function getApprovalChain(req){
+  var agent = DB.agents.find(function(a){return a.id===req.agentId;});
+  if(!agent) return [];
+  var chain = [];
+
+  if(isOwner(agent)){ return []; } // owner needs no approvals
+
+  if(agent.role==='Field Agent'){
+    // Needs TL + MM + Inventory
+    if(agent.teamLeaderId){
+      chain.push({role:'Team Leader', agentId:agent.teamLeaderId, label:'Team Leader'});
+    }
+    if(agent.marketManagerId){
+      chain.push({role:'Market Manager', agentId:agent.marketManagerId, label:'Market Manager'});
+    }
+    chain.push({role:'Inventory', agentId:null, label:'Inventory Dept'});
+  } else if(agent.role==='Team Leader'){
+    // Needs MM + Inventory (unless TL has canApproveInventory, still needs Inventory)
+    if(agent.marketManagerId){
+      chain.push({role:'Market Manager', agentId:agent.marketManagerId, label:'Market Manager'});
+    }
+    chain.push({role:'Inventory', agentId:null, label:'Inventory Dept'});
+  } else if(agent.role==='Market Manager'||agent.role==='Campaign Manager'){
+    chain.push({role:'Inventory', agentId:null, label:'Inventory Dept'});
+  }
+  return chain;
+}
+
+// Get agents who still need to approve this request
+function getPendingApprovers(req){
+  var chain  = getApprovalChain(req);
+  var done   = req.approvals || {};
+  return chain.filter(function(step){
+    if(step.agentId) return !done[step.agentId];
+    // Role-based (Inventory): approved if any Inventory dept agent approved
+    return !done['role:'+step.role];
+  });
+}
+
+// Can the current user approve this request?
+function canIApprove(req){
+  var u = DB.current;
+  if(isOwner(u)) return req.status==='Pending';
+  var pending = getPendingApprovers(req);
+  return pending.some(function(step){
+    if(step.agentId) return step.agentId===u.id;
+    if(step.role==='Inventory') return isInventory(u)||u.canApproveInventory;
+    if(step.role==='Market Manager') return u.role==='Market Manager'||u.role==='Campaign Manager';
+    if(step.role==='Team Leader') return u.role==='Team Leader';
+    return false;
+  });
+}
+
+// Count agent current inventory for a specific carrier/campaign
+function agentInvCount(agentId, carrier, type){
+  // type: 'phone','upsell','sim','tablet' or null for all
+  return INVENTORY_DEVICES.filter(function(d){
+    var matchAgent   = d.holderId===agentId && d.status==='assigned';
+    var matchCarrier = !carrier || (d.carrier||'').toLowerCase()===(carrier||'').toLowerCase();
+    var matchType    = !type || (d.type||'').toLowerCase()===(type||'').toLowerCase();
+    return matchAgent && matchCarrier && matchType;
+  }).length;
+}
+
+// Get inventory summary for an agent: {carrier: {phones, sims, upsell, tablets, expiringSoon}}
+function agentInvSummary(agentId){
+  var summary = {};
+  INVENTORY_DEVICES.filter(function(d){
+    return d.holderId===agentId && d.status==='assigned';
+  }).forEach(function(d){
+    var c = d.carrier||'Unknown';
+    if(!summary[c]) summary[c]={phones:0,sims:0,upsell:0,tablets:0,expiringSoon:0,critical:0};
+    var t = (d.type||'phone').toLowerCase();
+    if(t==='phone')   summary[c].phones++;
+    else if(t==='sim') summary[c].sims++;
+    else if(t==='upsell') summary[c].upsell++;
+    else if(t==='tablet') summary[c].tablets++;
+    var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
+    if(dr!==null && dr<=10) summary[c].expiringSoon++;
+    if(dr!==null && dr<=5)  summary[c].critical++;
+  });
+  return summary;
+}
+
+// Get team inventory summary for a TL/MM
+function teamInvSummary(leaderId){
+  var team = DB.agents.filter(function(a){
+    return a.active && isSalesRole(a) &&
+      (a.teamLeaderId===leaderId || a.marketManagerId===leaderId || a.campaignManagerId===leaderId);
+  });
+  var result = [];
+  team.forEach(function(a){
+    var summary = agentInvSummary(a.id);
+    var total = Object.values(summary).reduce(function(s,v){
+      return s+v.phones+v.sims+v.upsell+v.tablets;
+    },0);
+    result.push({agent:a, summary:summary, total:total});
+  });
+  return result.sort(function(a,b){return a.total-b.total;}); // lowest inventory first
+}
+
+// Find low-performer inventory to redistribute
+function findRedistributableInventory(campaign, excludeAgentId){
+  // Returns devices from low performers or expiring soon that can be transferred
+  var carrier = campaign;
+  return INVENTORY_DEVICES.filter(function(d){
+    if(d.holderId===excludeAgentId) return false;
+    if(d.status!=='assigned') return false;
+    if((d.carrier||'').toLowerCase()!==(carrier||'').toLowerCase()) return false;
+    var holder = DB.agents.find(function(a){return a.id===d.holderId;});
+    if(!holder||!holder.active) return false;
+    var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
+    // Include if expiring in <=15 days OR holder has low sales
+    var isExpiring = dr!==null && dr<=15;
+    var isLowPerformer = (holder.sales||0) < 20;
+    return isExpiring || isLowPerformer;
+  }).slice(0,30); // cap at 30
+}
+
+// Notify full approval chain for a request + SMS
+function notifyApprovalChain(req, message, icon){
+  var chain = getApprovalChain(req);
+  var toIds = [];
+  chain.forEach(function(step){
+    if(step.agentId && toIds.indexOf(step.agentId)<0) toIds.push(step.agentId);
+    if(!step.agentId && step.role==='Inventory'){
+      DB.agents.filter(function(a){return a.active&&isInventory(a);}).forEach(function(a){
+        if(toIds.indexOf(a.id)<0) toIds.push(a.id);
+      });
+    }
+  });
+  // Push in-app notification
+  pushNotification({
+    type:'inventory', icon:icon||'\U0001f4e6',
+    title: message.title,
+    body:  message.body,
+    fromId: req.agentId, fromName: req.agentName,
+    formType:'inv-request', toIds:toIds, toRoles:['admin']
+  });
+  // Persistent modal for managers currently online
+  if(isOwner(DB.current)||isInventory(DB.current)||
+     DB.current.role==='Market Manager'||DB.current.role==='Team Leader'){
+    if(toIds.indexOf(DB.current.id)>=0){
+      showPersistentAlert({
+        icon: icon||'\U0001f4e6',
+        title: message.title,
+        body:  message.body
+      });
+    }
+  }
+  // SMS to all in chain who have a phone number
+  toIds.forEach(function(aid){
+    var a = DB.agents.find(function(x){return x.id===aid;});
+    if(a && a.phone){
+      sendSMSBrevo(a.phone,
+        'WMAMinc Alert: '+message.title+'\n'+message.body.replace(/<[^>]+>/g,'').slice(0,100));
+    }
+  });
+}
+
+// Check expiry alerts — call this on login and panel load
+function checkInventoryExpiryAlerts(){
+  var u = DB.current;
+  var isManager = isOwner(u)||isInventory(u)||u.role==='Market Manager'||
+                  u.role==='Campaign Manager'||u.role==='Team Leader';
+  if(!isManager) return;
+
+  var now = new Date();
+  // Only show once per day per user
+  var alertKey = 'wmam_inv_alert_'+u.id+'_'+now.toISOString().slice(0,10);
+  try{ if(localStorage.getItem(alertKey)) return; }catch(e){}
+
+  var critical = [], warning = [];
+  INVENTORY_DEVICES.forEach(function(d){
+    if(d.status!=='assigned') return;
+    var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
+    if(dr===null) return;
+    // Filter to this manager's scope
+    var holder = DB.agents.find(function(a){return a.id===d.holderId;});
+    if(!holder) return;
+    var inScope = isOwner(u)||isInventory(u)||
+      holder.teamLeaderId===u.id||holder.marketManagerId===u.id||
+      holder.campaignManagerId===u.id||holder.id===u.id;
+    if(!inScope) return;
+    if(dr<=5)  critical.push({d:d, holder:holder, dr:dr});
+    else if(dr<=10) warning.push({d:d, holder:holder, dr:dr});
+  });
+
+  if(critical.length===0 && warning.length===0) return;
+
+  var bodyLines = '';
+  if(critical.length>0){
+    bodyLines += '<div style="color:#CC0000;font-weight:700;margin-bottom:8px">\u26a0\ufe0f CRITICAL — '+critical.length+' device(s) expire in 5 days or less:</div>';
+    var seen = {};
+    critical.forEach(function(x){
+      var k = x.holder.name+'|'+x.d.carrier;
+      if(!seen[k]){ seen[k]=0; }
+      seen[k]++;
+    });
+    Object.keys(seen).forEach(function(k){
+      bodyLines += '<div style="margin-bottom:4px">\u2022 '+k.replace('|',' — ')+': '+seen[k]+' device(s)</div>';
+    });
+  }
+  if(warning.length>0){
+    bodyLines += '<div style="color:#D97706;font-weight:700;margin:10px 0 8px">\u26a0\ufe0f WARNING — '+warning.length+' device(s) expire in 6-10 days:</div>';
+    var seen2 = {};
+    warning.forEach(function(x){
+      var k = x.holder.name+'|'+x.d.carrier;
+      if(!seen2[k]){ seen2[k]=0; }
+      seen2[k]++;
+    });
+    Object.keys(seen2).forEach(function(k){
+      bodyLines += '<div style="margin-bottom:4px">\u2022 '+k.replace('|',' — ')+': '+seen2[k]+' device(s)</div>';
+    });
+  }
+
+  showPersistentAlert({
+    icon: '\u23f0',
+    title: 'Inventory Expiry Alert',
+    body: bodyLines+'<div style="margin-top:14px;font-size:.82rem;color:var(--muted)">Please take action to prevent device loss. Go to Inventory Dashboard to review.</div>',
+    btnLabel: '\u2713 Got It — I\'ll Take Action',
+    onRead: function(){
+      try{ localStorage.setItem(alertKey,'1'); }catch(e){}
+      // SMS the manager too
+      if(u.phone){
+        var smsMsg = 'WMAMinc Inventory Alert: '+critical.length+' devices critical (\u22645 days), '+warning.length+' devices warning (\u226410 days). Log in to review.';
+        sendSMSBrevo(u.phone, smsMsg);
+      }
+    }
+  });
+}
+
+// Monday 9am national call reminders
+function scheduleNationalCallReminders(){
+  // Only for agents (non-HR, non-Inventory)
+  var u = DB.current;
+  if(isHR(u)||isInventory(u)) return;
+
+  function msUntilNextMonday9amCST(){
+    var now = new Date();
+    // CST = UTC-6 (or UTC-5 CDT — use UTC-6 as base)
+    var utcOff = 6; // hours behind UTC for CST
+    var cstNow = new Date(now.getTime() - utcOff*3600000);
+    var day = cstNow.getDay(); // 0=Sun,1=Mon,...
+    var daysUntilMon = (day===1 && (cstNow.getHours()<9)) ? 0 : (8-day)%7||7;
+    var nextMon = new Date(cstNow);
+    nextMon.setDate(nextMon.getDate()+daysUntilMon);
+    nextMon.setHours(9,0,0,0);
+    return nextMon.getTime() - cstNow.getTime();
+  }
+
+  var msTo9am = msUntilNextMonday9amCST();
+  var msTo8_50 = msTo9am - 10*60*1000; // 10 min before
+  var msTo8_58 = msTo9am - 2*60*1000;  // 2 min before
+
+  function fireReminder(label, minsToCall){
+    var msg = minsToCall===10
+      ? 'WMAMinc: National Team Call starts in 10 minutes (9:00 AM CST)! Log in to the Back Office and join the call.'
+      : 'WMAMinc: National Team Call starts in 2 MINUTES! Join now at the Back Office.';
+    // In-app notification
+    pushNotification({
+      type:'info', icon:'\U0001f4f9',
+      title: 'National Team Call — '+label,
+      body: 'Our Monday National Team Call starts in <strong>'+minsToCall+' minutes</strong> at 9:00 AM CST. Log into the Back Office and click Meetings to join.',
+      fromId:null, fromName:'WMAMinc System', formType:'meetings',
+      toIds:[u.id], toRoles:[]
+    });
+    // Persistent modal
+    showPersistentAlert({
+      icon:'\U0001f4f9',
+      title:'National Team Call — '+label,
+      body:'<div style="font-size:.95rem">Our Monday National Team Call starts in <strong>'+minsToCall+' minutes</strong> at 9:00 AM CST.<br><br>Log into the Back Office and click <strong>Meetings</strong> to join the call.</div>',
+      btnLabel:'\u2713 Got It — I\'ll Join'
+    });
+    // SMS
+    if(u.phone) sendSMSBrevo(u.phone, msg);
+  }
+
+  // Schedule 10-min reminder
+  if(msTo8_50>0){
+    setTimeout(function(){ fireReminder('10 Minutes', 10); }, msTo8_50);
+  }
+  // Schedule 2-min reminder
+  if(msTo8_58>0){
+    setTimeout(function(){ fireReminder('2 Minutes', 2); }, msTo8_58);
+  }
+}
+
+
+// ── Universal panel header — renders at top of every panel ──
+function panelHeader(title, backLabel){
+  var bl = backLabel || '← Back';
+  return '<div style="display:flex;align-items:center;gap:12px;padding:14px 20px 10px;'
+    +'border-bottom:2px solid var(--blue);margin-bottom:18px;background:var(--white);'
+    +'position:sticky;top:0;z-index:10">'
+    +'<button onclick="goBack()" style="background:rgba(0,53,148,.07);border:1px solid rgba(0,53,148,.2);'
+    +'color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;'
+    +'text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0">'
+    +bl+'</button>'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:var(--blue)">'
+    +title+'</div>'
+    +'</div>';
+}
 function gotoPanel(id){
   if(!gotoPanel._skipHistory){
     var cur=gotoPanel._current||'bo';
@@ -6445,7 +7135,8 @@ function gotoPanel(id){
     lb:'Leaderboard',links:'My Links',myteam:'My Team',
     agents:'Manage Agents','ll-teams':'Manage Lifeline Teams',
     'team-photos':'Team Photos',reports:'Reports',alerts:'Alerts',
-    settings:'Settings','owner-control':'Owner Control Panel'
+    settings:'Settings','owner-control':'Owner Control Panel',
+    'agent-profile':'My Profile'
   };
   var titleEl3 = document.getElementById('boPgTitle');
   if(titleEl3) titleEl3.textContent = titles[id]||'Back Office';
@@ -6467,6 +7158,7 @@ function gotoPanel(id){
     agents:panelAgents,'ll-teams':panelLLTeams,
     'team-photos':panelTeamPhotos,reports:panelReports,
     alerts:panelAlerts,settings:panelSettings,
+    'agent-profile':panelAgentProfile,
     'owner-control':panelOwnerControl,
     'notifications':panelNotifications,
     'meetings':panelMeetings,
@@ -6532,7 +7224,20 @@ function panelBO(){
 
   // ══════════ SCOREBOARD ══════════
   if(isSalesRole(u)){
-    var sbProgs = Array.isArray(u.programs)&&u.programs.length ? u.programs : (u.program&&u.program!==''?[u.program]:[]);
+    // ── Programs: prefer Supabase programs array, fall back to program field ──
+    // Cap at 3 programs maximum
+    var rawProgs = (Array.isArray(u.programs)&&u.programs.length)
+      ? u.programs
+      : (u.program&&u.program!==''?[u.program]:[]);
+    var sbProgs = rawProgs.slice(0,3);
+    if(!sbProgs.length) sbProgs = ['Lifeline']; // default
+
+    var LIFELINE_CARRIERS = ['lifeline','gen mobile','truconnect','assurance','excess'];
+    function isLifelineCarrier(p){
+      var pl=(p||'').toLowerCase();
+      return pl==='lifeline'||LIFELINE_CARRIERS.some(function(c){return pl.indexOf(c)>=0;});
+    }
+
     var now         = new Date();
     var daysInMon   = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
     var daysLeftMon = daysInMon - now.getDate();
@@ -6540,187 +7245,384 @@ function panelBO(){
     var isTruConn   = carrier.indexOf('truconnect') >= 0;
     var dow         = now.getDay();
     var daysLeftWk  = 6 - (isTruConn ? (dow-1+7)%7 : dow);
-    var weekRule    = isTruConn ? 'Mon\u2013Sun' : 'Sun\u2013Sat';
-    var isLdrRole   = u.role==='Team Leader'||u.role==='Market Manager'||u.role==='Campaign Manager'||isOwner(u)||u.role==='admin';
 
+    // ── Carrier week rule per-program ──
+    function weekRuleForProg(prog){
+      // TruConnect Lifeline = Mon-Sun; all others = Sun-Sat
+      if(isTruConn && (prog==='Lifeline'||prog==='lifeline')) return 'Mon\u2013Sun';
+      return 'Sun\u2013Sat';
+    }
+
+    // ── Inventory batches — only for Lifeline programs ──
     var batchMap = {};
     INVENTORY_DEVICES.forEach(function(d){
       if(d.status !== 'available') return;
       var key = d.batchId||'default';
-      if(!batchMap[key]) batchMap[key]={count:0,expiryDate:d.expiryDate||null,assignedDate:d.assignedDate||null};
+      if(!batchMap[key]) batchMap[key]={count:0,expiryDate:d.expiryDate||null,assignedDate:d.assignedDate||null,carrier:d.carrier||''};
       batchMap[key].count++;
     });
-    var batches      = Object.values(batchMap);
-    var totalDevices = batches.reduce(function(s,b){return s+b.count;},0);
-    batches.sort(function(a,b){
+    var allBatches   = Object.values(batchMap);
+    var totalDevices = allBatches.reduce(function(s,b){return s+b.count;},0);
+    allBatches.sort(function(a,b){
       var da=invDaysRemaining(a.expiryDate,a.assignedDate),db=invDaysRemaining(b.expiryDate,b.assignedDate);
       if(da===null) return 1; if(db===null) return -1; return da-db;
     });
 
+    // ── Has Lifeline program? ──
+    var hasLifeline = sbProgs.some(function(p){ return p==='Lifeline'||isLifelineCarrier(p); });
+    var isMultiProg = sbProgs.length > 1;
+
+    // ── TL/MM team aggregation ──
+    var isLdrRole = u.role==='Team Leader'||u.role==='Market Manager'||u.role==='Campaign Manager'||isOwner(u)||u.role==='admin';
+    var myTeamAgents = [];
+    if(isLdrRole){
+      myTeamAgents = DB.agents.filter(function(a){
+        return a.active && isSalesRole(a) && a.id!==u.id &&
+          (a.teamLeaderId===u.id || a.marketManagerId===u.id || a.campaignManagerId===u.id);
+      });
+    }
+    var teamLabel = u.role==='Team Leader' ? 'TEAM' : 'MARKET';
+
+    function teamSalesForProg(prog){
+      // Uses unified agentProgSales — handles legacy u.sales correctly
+      return myTeamAgents.reduce(function(s,a){
+        return s + agentProgSales(a, prog, thisMonth);
+      },0);
+    }
+
+    // Show team split only when agent is a leader AND has team members
+    var showTeamSplit = isLdrRole && myTeamAgents.length > 0;
+
+    function teamSplitPanel(myNum, teamNum, col, goal){
+      var total = myNum + teamNum;
+      var teamGoal = goal * Math.max(1, myTeamAgents.length + 1);
+      var pct = teamGoal>0?Math.min(100,Math.round((total/teamGoal)*100)):0;
+      return '<div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:4px">'
+        +'<div style="background:rgba(21,101,192,.12);border:1px solid '+col+';border-radius:5px;padding:6px 8px;text-align:center">'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.45);margin-bottom:2px">MY SALES</div>'
+        +sbLED(myNum,26,46,4)
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.4rem;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,.3)">personal</div>'
+        +'</div>'
+        +'<div style="background:rgba(13,71,161,.2);border:1px solid #0D47A1;border-radius:5px;padding:6px 8px;text-align:center">'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.45);margin-bottom:2px">'+teamLabel+' TOTAL</div>'
+        +sbLED(teamNum,26,46,4).replace('fill="white"','fill="#1565C0"')
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.4rem;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,.3)">all agents</div>'
+        +'</div></div>'
+        +'<div style="background:rgba(255,255,255,.1);border-radius:2px;height:6px;margin-bottom:3px;overflow:hidden"><div style="background:'+col+';width:'+pct+'%;height:6px;border-radius:2px"></div></div>'
+        +'<div style="display:flex;justify-content:space-between;margin-bottom:5px">'
+        +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.4rem;color:rgba(255,255,255,.3)">Goal: '+teamGoal+'</span>'
+        +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.4rem;color:rgba(255,255,255,.3)">'+pct+'%</span>'
+        +'</div>';
+    }
+
     function expiryColor(dr){
-      if(dr===null) return '#1565C0';
+      if(dr===null||dr===undefined) return '#1565C0';
       if(dr<=5)  return '#ef4444';
       if(dr<=10) return '#f97316';
       return '#1565C0';
     }
 
-    var myTeamAgents = [];
-    if(isLdrRole){
-      myTeamAgents = DB.agents.filter(function(a){
-        return a.active && isSalesRole(a) && a.id!==u.id && (
-          a.teamLeaderId===u.id || a.marketManagerId===u.id || a.campaignManagerId===u.id
-        );
-      });
-    }
-    var teamMonthlySales = myTeamAgents.reduce(function(s,a){return s+(a.sales||0);},0);
-    var teamLabel = u.role==='Team Leader' ? 'TEAM' : 'MARKET';
+    // ── Segment definitions inline ──
+    var SEG_DEFS = '<defs>'
+      +'<symbol id="sb-s0" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="1" width="28" height="6" rx="2" fill="white"/><rect x="1" y="8" width="6" height="26" rx="2" fill="white"/><rect x="37" y="8" width="6" height="26" rx="2" fill="white"/><rect x="1" y="46" width="6" height="26" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/><rect x="8" y="73" width="28" height="6" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s1" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s2" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="1" width="28" height="6" rx="2" fill="white"/><rect x="37" y="8" width="6" height="26" rx="2" fill="white"/><rect x="8" y="37" width="28" height="6" rx="2" fill="white"/><rect x="1" y="46" width="6" height="26" rx="2" fill="white"/><rect x="8" y="73" width="28" height="6" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s3" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="1" width="28" height="6" rx="2" fill="white"/><rect x="37" y="8" width="6" height="26" rx="2" fill="white"/><rect x="8" y="37" width="28" height="6" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/><rect x="8" y="73" width="28" height="6" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s4" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="white"/><rect x="37" y="8" width="6" height="26" rx="2" fill="white"/><rect x="8" y="37" width="28" height="6" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s5" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="1" width="28" height="6" rx="2" fill="white"/><rect x="1" y="8" width="6" height="26" rx="2" fill="white"/><rect x="8" y="37" width="28" height="6" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/><rect x="8" y="73" width="28" height="6" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s6" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="1" width="28" height="6" rx="2" fill="white"/><rect x="1" y="8" width="6" height="26" rx="2" fill="white"/><rect x="8" y="37" width="28" height="6" rx="2" fill="white"/><rect x="1" y="46" width="6" height="26" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/><rect x="8" y="73" width="28" height="6" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s7" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="1" width="28" height="6" rx="2" fill="white"/><rect x="37" y="8" width="6" height="26" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s8" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="1" width="28" height="6" rx="2" fill="white"/><rect x="1" y="8" width="6" height="26" rx="2" fill="white"/><rect x="37" y="8" width="6" height="26" rx="2" fill="white"/><rect x="8" y="37" width="28" height="6" rx="2" fill="white"/><rect x="1" y="46" width="6" height="26" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/><rect x="8" y="73" width="28" height="6" rx="2" fill="white"/></symbol>'
+      +'<symbol id="sb-s9" viewBox="0 0 44 80"><rect x="8" y="1" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="1" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="8" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="37" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="37" y="46" width="6" height="26" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="73" width="28" height="6" rx="2" fill="rgba(255,255,255,.1)"/><rect x="8" y="1" width="28" height="6" rx="2" fill="white"/><rect x="1" y="8" width="6" height="26" rx="2" fill="white"/><rect x="37" y="8" width="6" height="26" rx="2" fill="white"/><rect x="8" y="37" width="28" height="6" rx="2" fill="white"/><rect x="37" y="46" width="6" height="26" rx="2" fill="white"/><rect x="8" y="73" width="28" height="6" rx="2" fill="white"/></symbol>'
+      +'</defs>';
 
-    var panelBg = 'repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(255,255,255,.012) 3px,rgba(255,255,255,.012) 4px),#0d0d0d';
-    var hdrSt   = 'font-family:Oswald,Arial Black,sans-serif;font-size:.72rem;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:#fff;line-height:1.35;min-height:48px;display:flex;align-items:center;justify-content:center;flex-direction:column;padding-bottom:8px;border-bottom:2px solid #1565C0;margin-bottom:12px;';
-    var lblSt   = 'font-family:Oswald,Arial,sans-serif;font-size:.55rem;font-weight:400;letter-spacing:4px;text-transform:uppercase;color:rgba(255,255,255,.5);margin-bottom:3px;';
-    var divSt   = 'height:2px;background:linear-gradient(90deg,transparent,#1565C0,#1976D2,#1565C0,transparent);margin:8px 0;';
-    var clkSVG  = '<svg width="26" height="26" viewBox="0 0 28 28"><circle cx="14" cy="14" r="12" fill="none" stroke="#1565C0" stroke-width="2"/><circle cx="14" cy="14" r="1.8" fill="#1565C0"/><line x1="14" y1="3.5" x2="14" y2="6" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/><line x1="14" y1="22" x2="14" y2="24.5" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/><line x1="3.5" y1="14" x2="6" y2="14" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/><line x1="22" y1="14" x2="24.5" y2="14" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/><line x1="14" y1="14" x2="14" y2="7.5" stroke="#1565C0" stroke-width="2.2" stroke-linecap="round"/><line x1="14" y1="14" x2="19.5" y2="14" stroke="#1565C0" stroke-width="1.8" stroke-linecap="round"/></svg>';
+    // ── Build LED number SVG (prefixed symbols, no glow) ──
+    var segMapSB={0:[1,1,1,0,1,1,1],1:[0,0,1,0,0,1,0],2:[1,0,1,1,1,0,1],3:[1,0,1,1,0,1,1],
+                  4:[0,1,1,1,0,1,0],5:[1,1,0,1,0,1,1],6:[1,1,0,1,1,1,1],7:[1,0,1,0,0,1,0],
+                  8:[1,1,1,1,1,1,1],9:[1,1,1,1,0,1,1]};
 
-    function clkBadge(num,lbl){
-      return '<div style="display:flex;align-items:center;justify-content:center;gap:6px;background:rgba(21,101,192,.18);border:2px solid #1565C0;border-radius:7px;padding:7px 9px;margin-top:auto;">'
-        +clkSVG+'<div><span style="font-family:Oswald,Arial Black,sans-serif;font-size:1.4rem;font-weight:700;color:#1565C0;line-height:1">'+num+'</span>'
-        +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.48rem;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.45);line-height:1.3;display:block">'+lbl+'</span></div></div>';
-    }
-
-    function splitPanel(myNum,teamNum,label,prog){
-      var g=PROG_GOALS[prog]||{weeklyGoal:50};
-      var tGoal=g.weeklyGoal*Math.max(1,myTeamAgents.length);
-      var total=myNum+teamNum;
-      var pct=tGoal>0?Math.min(100,Math.round((total/tGoal)*100)):0;
-      return '<div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:4px">'
-        +'<div style="background:rgba(21,101,192,.12);border:1px solid #1565C0;border-radius:6px;padding:7px 6px;text-align:center">'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.4);margin-bottom:3px">MY SALES</div>'
-        +'<div style="font-family:Courier New,monospace;font-size:2rem;font-weight:900;color:#fff;line-height:1">'+myNum+'</div>'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;text-transform:uppercase;color:rgba(255,255,255,.35)">personal</div>'
-        +'</div>'
-        +'<div style="background:rgba(13,71,161,.2);border:1px solid #0D47A1;border-radius:6px;padding:7px 6px;text-align:center">'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.4);margin-bottom:3px">'+label+' TOTAL</div>'
-        +'<div style="font-family:Courier New,monospace;font-size:2rem;font-weight:900;color:#1565C0;line-height:1">'+teamNum+'</div>'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;text-transform:uppercase;color:rgba(255,255,255,.35)">all agents</div>'
-        +'</div></div>'
-        +'<div style="background:rgba(255,255,255,.1);border-radius:3px;height:8px;margin-bottom:2px;overflow:hidden"><div style="background:linear-gradient(90deg,#0D47A1,#1976D2);width:'+pct+'%;height:8px;border-radius:3px"></div></div>'
-        +'<div style="display:flex;justify-content:space-between;margin-bottom:6px">'
-        +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;color:rgba(255,255,255,.35)">Goal: '+tGoal+'</span>'
-        +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;color:rgba(255,255,255,.35)">'+pct+'%</span></div>';
-    }
-
-    var segMap={0:[1,1,1,0,1,1,1],1:[0,0,1,0,0,1,0],2:[1,0,1,1,1,0,1],3:[1,0,1,1,0,1,1],4:[0,1,1,1,0,1,0],5:[1,1,0,1,0,1,1],6:[1,1,0,1,1,1,1],7:[1,0,1,0,0,1,0],8:[1,1,1,1,1,1,1],9:[1,1,1,1,0,1,1]};
-    function buildNum(num,dw,dh,gap){
-      var digits=String(num).split('').map(Number);
-      var tw=digits.length*dw+(digits.length-1)*gap;
-      var svg='<svg width="'+tw+'" height="'+dh+'" viewBox="0 0 '+tw+' '+dh+'" style="display:block;margin:0 auto">';
+    function sbLED(num, dw, dh, gap){
+      // dw=digit width, dh=digit height, gap=space between digits
+      var digits = String(num).split('').map(Number);
+      var tw = digits.length*dw + (digits.length-1)*gap;
+      var svg = '<svg width="'+tw+'" height="'+dh+'" viewBox="0 0 '+tw+' '+dh+'" style="display:block">';
+      // Inject defs once
+      svg += SEG_DEFS;
       digits.forEach(function(d,i){
-        var s=segMap[d]||segMap[0],t=6,g=2,ox=i*(dw+gap),mY=Math.round(dh/2)-Math.round(t/2);
-        function seg(on,x,y,w,h){return '<rect x="'+(ox+x)+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="3" fill="'+(on?'white':'rgba(255,255,255,.07)')+'"/>';}
-        svg+=seg(s[0],g+t,g,dw-2*(g+t),t)+seg(s[1],g,g+t,t,mY-g-t-g)+seg(s[2],dw-g-t,g+t,t,mY-g-t-g)
-            +seg(s[3],g+t,mY,dw-2*(g+t),t)+seg(s[4],g,mY+t+g,t,dh-mY-t-g-g-t)+seg(s[5],dw-g-t,mY+t+g,t,dh-mY-t-g-g-t)
-            +seg(s[6],g+t,dh-g-t,dw-2*(g+t),t);
+        var x = i*(dw+gap);
+        // scale the symbol viewBox (0 0 44 80) to dw x dh via a group transform
+        var scaleX = dw/44, scaleY = dh/80;
+        svg += '<g transform="translate('+x+',0) scale('+scaleX+','+scaleY+')">'
+          +'<use href="#sb-s'+d+'" width="44" height="80"/>'
+          +'</g>';
       });
-      return svg+'</svg>';
+      svg += '</svg>';
+      return svg;
     }
 
-    sbProgs.forEach(function(prog){
-      var goal=PROG_GOALS[prog]||{weeklyMin:1,weeklyGoal:50};
-      var weekGoal=goal.weeklyGoal, monGoal=weekGoal*4, mySales=u.sales||0;
-      var allProg=DB.agents.filter(function(a){return a.active&&isSalesRole(a)&&(Array.isArray(a.programs)?a.programs.indexOf(prog)>=0:a.program===prog);}).sort(function(a,b){return (b.sales||0)-(a.sales||0);});
-      var myRank=allProg.findIndex(function(a){return a.id===u.id;})+1;
-      var totProg=allProg.length;
-      var barPct=monGoal>0?Math.min(100,Math.round((totalDevices/monGoal)*100)):0;
+    // ── Clock SVG ──
+    var clkSVG = '<svg width="22" height="22" viewBox="0 0 28 28">'
+      +'<circle cx="14" cy="14" r="12" fill="none" stroke="#1565C0" stroke-width="2"/>'
+      +'<circle cx="14" cy="14" r="1.8" fill="#1565C0"/>'
+      +'<line x1="14" y1="4" x2="14" y2="7" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/>'
+      +'<line x1="14" y1="21" x2="14" y2="24" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/>'
+      +'<line x1="4" y1="14" x2="7" y2="14" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/>'
+      +'<line x1="21" y1="14" x2="24" y2="14" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/>'
+      +'<line x1="14" y1="14" x2="14" y2="8" stroke="#1565C0" stroke-width="2" stroke-linecap="round"/>'
+      +'<line x1="14" y1="14" x2="19" y2="14" stroke="#1565C0" stroke-width="1.5" stroke-linecap="round"/>'
+      +'</svg>';
 
-      // Build subtitle static text: PROGRAM • ROLE (date/time injected by ticker)
-      var sbCampaign = (u.carrier||u.campaign||prog).toUpperCase();
-      var sbRole     = (u.role||'Agent').toUpperCase();
-      var sbSubStatic = sbCampaign + ' \u2022 ' + sbRole + ' | ';
+    function clkBadge(num, lbl){
+      return '<div style="display:flex;align-items:center;justify-content:center;gap:5px;'
+        +'background:rgba(21,101,192,.18);border:2px solid #1565C0;border-radius:7px;padding:6px 8px;margin-top:auto;">'
+        +clkSVG
+        +'<div><span style="font-family:Oswald,Arial Black,sans-serif;font-size:1.2rem;font-weight:700;color:#1565C0;line-height:1">'+num+'</span>'
+        +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.45);line-height:1.3;display:block">'+lbl+'</span>'
+        +'</div></div>';
+    }
 
-      html+='<div style="border-radius:14px;padding:5px;margin-bottom:24px;background:linear-gradient(180deg,#1565C0 0%,#0D47A1 40%,#0A2F7A 60%,#0D47A1 100%);box-shadow:0 0 0 3px #000,0 0 0 8px #1565C0,0 0 0 10px #0A2F7A;">';
-      html+='<div style="border-radius:9px;overflow:hidden;border:2px solid #1565C0;">';
+    // ── Program color map ──
+    var progColors = {
+      'Lifeline':'#CC0000','Gen Mobile':'#CC0000','TruConnect':'#1565C0',
+      'Assurance':'#7c3aed','Excess':'#0891b2',
+      'ACA':'#059669','Internet':'#2563EB'
+    };
+    function progColor(p){ return progColors[p]||'#1565C0'; }
 
-      // Name bar — subtitle is ONE line: PROGRAM • ROLE | DAY, DATE | TIME
-      html+='<div style="background:linear-gradient(180deg,#111 0%,#0a0a0a 100%);padding:12px 20px;text-align:center;border-bottom:3px solid #1565C0;">'
-        +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:2.2rem;font-weight:700;letter-spacing:6px;color:#1565C0;text-transform:uppercase">'+u.name.toUpperCase()+'</div>'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.58rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.5);margin-top:5px">'
-        +sbSubStatic+'<span id="sb-clk-'+u.id+'">...</span>'
-        +'</div>'
-        +'</div>';
-      html+='<div style="height:2px;background:linear-gradient(90deg,#000,#1565C0,#1976D2,#1565C0,#000)"></div>';
-      html+='<div style="display:grid;grid-template-columns:1fr 1.2fr 1fr;align-items:stretch;">';
+    // ── Shared styles ──
+    var panBg  = 'repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(255,255,255,.012) 3px,rgba(255,255,255,.012) 4px),#0d0d0d';
+    var hdrSt  = 'font-family:Oswald,Arial Black,sans-serif;font-size:.68rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#fff;line-height:1.35;min-height:42px;display:flex;align-items:center;justify-content:center;flex-direction:column;padding-bottom:7px;border-bottom:2px solid #1565C0;margin-bottom:9px;';
+    var lblSt  = 'font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.5);margin-bottom:3px;';
+    var divSt  = 'height:2px;background:linear-gradient(90deg,transparent,#1565C0,#1976D2,#1565C0,transparent);margin:7px 0;';
 
-      // LEFT: MONTHLY
-      html+='<div style="border-right:2px solid #1565C0;padding:14px 12px 12px;text-align:center;background:'+panelBg+';display:flex;flex-direction:column;">';
-      html+='<div style="'+hdrSt+'">— MONTHLY<br>PRODUCTION —</div>';
-      if(isLdrRole&&myTeamAgents.length>0){ html+=splitPanel(mySales,teamMonthlySales,teamLabel,prog); }
-      else { html+='<div style="'+lblSt+'">SO FAR</div>'+buildNum(mySales,52,86,6)+'<div style="'+lblSt+';margin-top:4px;margin-bottom:8px">SO FAR</div>'; }
-      html+='<div style="'+divSt+'"></div>';
-      html+='<div style="font-family:Oswald,Arial Black,sans-serif;font-size:2.6rem;font-weight:700;color:#1565C0;line-height:1;margin-bottom:2px">'+daysLeftMon+'</div>';
-      html+='<div style="font-family:Oswald,Arial,sans-serif;font-size:.6rem;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.55);margin-bottom:10px">DAYS LEFT</div>';
-      html+=clkBadge(daysLeftMon,'DAYS<br>LEFT IN MONTH')+'</div>';
+    // ── Rank across all programs combined ──
+    var allSalesAgents = DB.agents.filter(function(a){return a.active&&isSalesRole(a);})
+      .sort(function(a,b){return (b.sales||0)-(a.sales||0);});
+    var myOverallRank  = allSalesAgents.findIndex(function(a){return a.id===u.id;})+1;
+    var totalSalesAgents = allSalesAgents.length;
+    // ── Per-program sales — derived from monthlySales (auto-resets with calendar) ──
+    var now2       = new Date();
+    var thisMonth  = now2.toISOString().slice(0,7);           // e.g. "2026-04"
+    var thisWeekKey= getWeekKey(now2, u.carrier||'');          // week-start date string
 
-      // CENTER: INVENTORY
-      html+='<div style="border-right:2px solid #1565C0;padding:14px 12px 12px;text-align:center;background:'+panelBg+';display:flex;flex-direction:column;">';
-      html+='<div style="'+hdrSt+';letter-spacing:1.5px;">AVAILABLE INVENTORY</div>';
-      html+='<div style="'+lblSt+'">TOTAL</div>'+buildNum(totalDevices,52,86,6);
-      html+='<div style="'+lblSt+';margin-top:4px;margin-bottom:8px">AVAILABLE</div>';
-      html+='<div style="'+divSt+'"></div>';
-      html+='<div style="margin-top:auto;">';
-      html+='<div style="font-family:Oswald,Arial,sans-serif;font-size:.6rem;font-weight:700;letter-spacing:4px;text-transform:uppercase;color:rgba(255,255,255,.5);margin-bottom:5px">EXPIRES IN</div>';
-      if(batches.length===0){
-        html+='<div style="font-family:Oswald,Arial,sans-serif;font-size:.7rem;color:rgba(255,255,255,.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px">NO INVENTORY</div>';
-      } else if(batches.length===1){
-        var dr=invDaysRemaining(batches[0].expiryDate,batches[0].assignedDate);
-        var drs=dr!==null?String(dr):'\u2014';
-        var urgC=expiryColor(dr);
-        html+='<div style="margin-bottom:12px"><span style="font-family:Oswald,Arial Black,sans-serif;font-size:2.4rem;font-weight:700;color:'+urgC+'">'+drs+'</span> <span style="font-family:Oswald,Arial,sans-serif;font-size:1.1rem;letter-spacing:3px;color:'+urgC+'">DAYS</span></div>';
-        var bp=monGoal>0?Math.min(100,Math.round((batches[0].count/monGoal)*100)):0;
-        html+='<div style="background:rgba(255,255,255,.1);border-radius:3px;height:12px;margin-bottom:3px;overflow:hidden"><div style="background:linear-gradient(90deg,#0D47A1,#1976D2);width:'+bp+'%;height:12px;border-radius:3px"></div></div>';
-        html+='<div style="display:flex;justify-content:flex-end;margin-bottom:2px"><span style="font-family:Oswald,Arial,sans-serif;font-size:.6rem;color:rgba(255,255,255,.5)">'+monGoal+'</span></div>';
-        html+='<div style="font-family:Oswald,Arial,sans-serif;font-size:.6rem;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4)">MONTHLY GOAL</div>';
-      } else {
-        var cols=Math.min(batches.length,3);
-        html+='<div style="display:grid;grid-template-columns:repeat('+cols+',1fr);gap:5px;margin-bottom:10px">';
-        batches.slice(0,cols).forEach(function(b){
-          var dr=invDaysRemaining(b.expiryDate,b.assignedDate);
-          var drs=dr!==null?String(dr):'\u2014';
-          var urgC=expiryColor(dr);
-          var pct=totalDevices>0?Math.min(100,Math.round((b.count/totalDevices)*100)):0;
-          html+='<div style="background:rgba(21,101,192,.15);border:1px solid '+urgC+';border-radius:6px;padding:8px 5px;text-align:center;">'
-            +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:1.6rem;font-weight:700;color:'+urgC+';line-height:1">'+drs+'</div>'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,.45);margin-top:2px">DAYS</div>'
-            +'<div style="background:rgba(255,255,255,.08);border-radius:2px;height:4px;margin:5px 0 4px;overflow:hidden"><div style="background:'+urgC+';width:'+pct+'%;height:4px;border-radius:2px"></div></div>'
-            +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:.95rem;font-weight:700;color:#fff;line-height:1">'+b.count+'</div>'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,.4)">DEVICES</div></div>';
-        });
-        html+='</div>';
-        html+='<div style="background:rgba(255,255,255,.1);border-radius:3px;height:12px;margin-bottom:3px;overflow:hidden"><div style="background:linear-gradient(90deg,#0D47A1,#1976D2);width:'+barPct+'%;height:12px;border-radius:3px"></div></div>';
-        html+='<div style="display:flex;justify-content:flex-end;margin-bottom:2px"><span style="font-family:Oswald,Arial,sans-serif;font-size:.6rem;color:rgba(255,255,255,.5)">'+monGoal+'</span></div>';
-        html+='<div style="font-family:Oswald,Arial,sans-serif;font-size:.6rem;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4)">MONTHLY GOAL</div>';
+    function salesForProg(prog, period){
+      // Uses unified agentProgSales helper — handles legacy u.sales fallback automatically
+      if(period==='week'){
+        // Weekly: read from weekSales entries for this week key
+        if(!u.monthlySales || !u.monthlySales.length) return 0;
+        return u.monthlySales.reduce(function(sum,m){
+          if(m.program!==prog || m.month!==thisMonth) return sum;
+          return sum + ((m.weekSales&&m.weekSales[thisWeekKey])||0);
+        },0);
       }
-      html+='</div></div>';
+      // Monthly: use unified helper that handles legacy data
+      return agentProgSales(u, prog, thisMonth);
+    }
 
-      // RIGHT: WEEKLY
-      html+='<div style="padding:14px 12px 12px;text-align:center;background:'+panelBg+';display:flex;flex-direction:column;">';
-      html+='<div style="'+hdrSt+'">— WEEKLY<br>PRODUCTION —</div>';
-      if(isLdrRole&&myTeamAgents.length>0){ html+=splitPanel(mySales,teamMonthlySales,teamLabel,prog); }
-      else { html+='<div style="'+lblSt+'">(Goal '+weekGoal+')</div>'+buildNum(mySales,52,86,6)+'<div style="'+lblSt+';margin-top:4px;margin-bottom:8px">THIS WEEK</div>'; }
-      html+='<div style="'+divSt+'"></div>';
-      html+='<div style="display:flex;align-items:center;justify-content:center;gap:3px;margin-bottom:2px">'
-        +'<span style="color:#1565C0;font-size:1.4rem;line-height:1">&#9733;</span>'
-        +'<span style="font-family:Oswald,Arial Black,sans-serif;font-size:2.6rem;font-weight:700;color:#1565C0;line-height:1">'+myRank+'</span></div>';
-      html+='<div style="font-family:Oswald,Arial,sans-serif;font-size:.6rem;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.55);margin-bottom:3px">RANK OUT OF '+totProg+'</div>';
-      html+='<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.3);margin-bottom:8px">Week: '+weekRule+'</div>';
-      html+=clkBadge(daysLeftWk,'DAYS<br>LEFT IN WEEK')+'</div>';
+    function salesForProgWeek(prog){ return salesForProg(prog,'week'); }
 
-      html+='</div>';
-      html+='<div style="height:5px;background:linear-gradient(90deg,#0A2F7A,#1565C0,#1976D2,#1565C0,#0A2F7A)"></div>';
-      html+='</div></div>';
+    // YTD sales for rank — uses unified helper
+    var mySales = agentYTDTotal(u);
 
-      // clock handled by global startSBClock()
-    });
+    function progGoal(p,type){
+      var g=PROG_GOALS[p]||{weeklyMin:1,weeklyGoal:50};
+      return type==='week'?g.weeklyGoal:g.weeklyGoal*4;
+    }
+
+    // ── Subtitle: all programs listed ──
+    var sbCampaign = sbProgs.join(', ').toUpperCase();
+    var sbRole     = (u.role||'Agent').toUpperCase();
+    var sbSubStatic = sbCampaign + ' \u2022 ' + sbRole + ' | ';
+
+    // ── Outer frame ──
+    html += '<div style="border-radius:14px;padding:5px;margin-bottom:24px;'
+      +'background:linear-gradient(180deg,#1565C0 0%,#0D47A1 40%,#0A2F7A 60%,#0D47A1 100%);'
+      +'box-shadow:0 0 0 3px #000,0 0 0 8px #1565C0,0 0 0 10px #0A2F7A;">';
+    html += '<div style="border-radius:9px;overflow:hidden;border:2px solid #1565C0;">';
+
+    // ── Name bar ──
+    var _pic = u.profilePic ? '<img src="'+u.profilePic+'" style="width:48px;height:48px;border-radius:50%;object-fit:cover;border:2px solid #1565C0;flex-shrink:0">' : '<div style="width:48px;height:48px;border-radius:50%;background:#1565C0;display:flex;align-items:center;justify-content:center;font-family:Oswald,sans-serif;font-size:1rem;font-weight:700;color:white;flex-shrink:0">'+u.name.split(' ').map(function(n){return n[0]||'';}).join('').toUpperCase().slice(0,2)+'</div>';
+    html += '<div style="background:linear-gradient(180deg,#111 0%,#0a0a0a 100%);padding:12px 20px;text-align:center;border-bottom:3px solid #1565C0;">'
+      +'<div style="display:flex;align-items:center;justify-content:center;gap:14px">'
+      +_pic
+      +'<div onclick="showYTDReport()" style="font-family:Oswald,Arial Black,sans-serif;font-size:2.2rem;font-weight:700;letter-spacing:6px;color:#1565C0;text-transform:uppercase;cursor:pointer;user-select:none" title="Click for Year-to-Date Report">'+u.name.toUpperCase()+'</div>'
+      +'</div>'
+      +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.55rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.5);margin-top:4px">'
+      +sbSubStatic+'<span id="sb-clk-'+u.id+'">...</span>'
+      +'</div>'
+      +'</div>';
+    html += '<div style="height:2px;background:linear-gradient(90deg,#000,#1565C0,#1976D2,#1565C0,#000)"></div>';
+
+    // ── 3-column body ──
+    html += '<div style="display:grid;grid-template-columns:1fr 1.2fr 1fr;align-items:stretch;">';
+
+    // ══════════ LEFT: MONTHLY PRODUCTION ══════════
+    html += '<div style="border-right:2px solid #1565C0;padding:12px 10px 10px;text-align:center;background:'+panBg+';display:flex;flex-direction:column;">';
+    html += '<div style="'+hdrSt+'">— MONTHLY<br>PRODUCTION —</div>';
+
+    if(!isMultiProg){
+      // Single program
+      var singleSales = salesForProg(sbProgs[0]);
+      if(showTeamSplit){
+        // TL/MM: show MY SALES + TEAM TOTAL side by side
+        var tSales = teamSalesForProg(sbProgs[0]);
+        var col0   = progColor(sbProgs[0]);
+        var goal0  = progGoal(sbProgs[0],'month');
+        html += teamSplitPanel(singleSales, tSales, col0, goal0);
+      } else {
+        html += '<div style="'+lblSt+'">SO FAR</div>';
+        html += '<div style="margin:0 auto 3px">'+sbLED(singleSales,44,80,6)+'</div>';
+        html += '<div style="'+lblSt+';margin-bottom:8px">SO FAR</div>';
+      }
+    } else {
+      // Multi-program — row per program
+      sbProgs.forEach(function(prog){
+        var col = progColor(prog);
+        var goal = progGoal(prog,'month');
+        var progSales = salesForProg(prog);
+        var pct = goal>0?Math.min(100,Math.round((progSales/goal)*100)):0;
+        if(showTeamSplit){
+          var tSales = teamSalesForProg(prog);
+          html += '<div style="border-radius:5px;padding:5px 8px;margin-bottom:4px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
+            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:3px">'+prog+'</div>'
+            +teamSplitPanel(progSales,tSales,col,goal)
+            +'</div>';
+        } else {
+          html += '<div style="border-radius:5px;padding:6px 8px;margin-bottom:5px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
+            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:3px">'+prog+'</div>'
+            +'<div style="display:flex;align-items:center;gap:7px">'
+            +'<div style="flex-shrink:0">'+sbLED(progSales,28,50,4)+'</div>'
+            +'<div style="flex:1;min-width:0">'
+            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.4rem;color:rgba(255,255,255,.4);margin-bottom:3px">/ '+goal+' goal</div>'
+            +'<div style="background:rgba(255,255,255,.08);border-radius:2px;height:4px;overflow:hidden"><div style="background:'+col+';width:'+pct+'%;height:4px;border-radius:2px"></div></div>'
+            +'</div></div></div>';
+        }
+      });
+    }
+
+    html += '<div style="'+divSt+'"></div>';
+    html += '<div style="font-family:Oswald,Arial Black,sans-serif;font-size:2rem;font-weight:700;color:#1565C0;line-height:1;margin-bottom:2px">'+daysLeftMon+'</div>';
+    html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.54rem;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.55);margin-bottom:7px">DAYS LEFT</div>';
+    html += clkBadge(daysLeftMon,'DAYS<br>LEFT IN MONTH');
+    html += '</div>';
+
+    // ══════════ CENTER: AVAILABLE INVENTORY ══════════
+    html += '<div style="border-right:2px solid #1565C0;padding:12px 10px 10px;text-align:center;background:'+panBg+';display:flex;flex-direction:column;">';
+    html += '<div style="'+hdrSt+';letter-spacing:1.5px;">AVAILABLE INVENTORY</div>';
+
+    if(!hasLifeline){
+      // ACA / Internet only — no inventory
+      html += '<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px 0">'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.65rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.25)">N/A</div>'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.2);margin-top:4px">Inventory not</div>'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.2)">applicable for</div>'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.2)">this program</div>'
+        +'</div>';
+    } else {
+      // Has Lifeline — show inventory
+      html += '<div style="'+lblSt+'">TOTAL</div>';
+      html += '<div style="margin:0 auto 3px">'+sbLED(totalDevices,44,80,6)+'</div>';
+      html += '<div style="'+lblSt+';margin-bottom:6px">AVAILABLE</div>';
+      html += '<div style="'+divSt+'"></div>';
+      html += '<div style="margin-top:auto;">';
+      html += '<div style="'+lblSt+';letter-spacing:4px;margin-bottom:5px">EXPIRES IN</div>';
+
+      if(allBatches.length===0){
+        html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.65rem;color:rgba(255,255,255,.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px">NO INVENTORY</div>';
+      } else if(allBatches.length===1){
+        var dr  = invDaysRemaining(allBatches[0].expiryDate,allBatches[0].assignedDate);
+        var drs = dr!==null?String(dr):'\u2014';
+        var urgC = expiryColor(dr);
+        html += '<div style="margin-bottom:10px">'
+          +'<span style="font-family:Oswald,Arial Black,sans-serif;font-size:2rem;font-weight:700;color:'+urgC+'">'+drs+'</span>'
+          +' <span style="font-family:Oswald,Arial,sans-serif;font-size:.9rem;letter-spacing:3px;color:'+urgC+'">DAYS</span></div>';
+        var bp = Math.min(100,Math.round((allBatches[0].count/200)*100));
+        html += '<div style="background:rgba(255,255,255,.1);border-radius:3px;height:11px;margin-bottom:3px;overflow:hidden"><div style="background:linear-gradient(90deg,#0D47A1,#1976D2);width:'+bp+'%;height:11px;border-radius:3px"></div></div>';
+        html += '<div style="display:flex;justify-content:flex-end;margin-bottom:2px"><span style="font-family:Oswald,Arial,sans-serif;font-size:.52rem;color:rgba(255,255,255,.5)">200</span></div>';
+        html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.52rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4)">MONTHLY GOAL</div>';
+      } else {
+        var cols = Math.min(allBatches.length,3);
+        html += '<div style="display:grid;grid-template-columns:repeat('+cols+',1fr);gap:4px;margin-bottom:8px">';
+        allBatches.slice(0,cols).forEach(function(b){
+          var dr   = invDaysRemaining(b.expiryDate,b.assignedDate);
+          var drs  = dr!==null?String(dr):'\u2014';
+          var urgC = expiryColor(dr);
+          var pct  = totalDevices>0?Math.min(100,Math.round((b.count/totalDevices)*100)):0;
+          html += '<div style="background:rgba(21,101,192,.12);border:1px solid '+urgC+';border-radius:5px;padding:5px 3px;text-align:center">'
+            +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:1.2rem;font-weight:700;color:'+urgC+';line-height:1">'+drs+'</div>'
+            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.38rem;text-transform:uppercase;color:rgba(255,255,255,.4);margin-bottom:2px">DAYS</div>'
+            +'<div style="background:rgba(255,255,255,.08);border-radius:2px;height:3px;margin-bottom:3px;overflow:hidden"><div style="background:'+urgC+';width:'+pct+'%;height:3px;border-radius:2px"></div></div>'
+            +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:.85rem;font-weight:700;color:#fff;line-height:1">'+b.count+'</div>'
+            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.36rem;text-transform:uppercase;color:rgba(255,255,255,.35)">DEVICES</div>'
+            +'</div>';
+        });
+        html += '</div>';
+        var totGoal = sbProgs.filter(function(p){return p==='Lifeline';}).length*200 || 200;
+        var totBarPct = totGoal>0?Math.min(100,Math.round((totalDevices/totGoal)*100)):0;
+        html += '<div style="background:rgba(255,255,255,.1);border-radius:3px;height:11px;margin-bottom:3px;overflow:hidden"><div style="background:linear-gradient(90deg,#0D47A1,#1976D2);width:'+totBarPct+'%;height:11px;border-radius:3px"></div></div>';
+        html += '<div style="display:flex;justify-content:flex-end;margin-bottom:2px"><span style="font-family:Oswald,Arial,sans-serif;font-size:.52rem;color:rgba(255,255,255,.5)">'+totGoal+'</span></div>';
+        html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.52rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4)">MONTHLY GOAL</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // ══════════ RIGHT: WEEKLY PRODUCTION ══════════
+    html += '<div style="padding:12px 10px 10px;text-align:center;background:'+panBg+';display:flex;flex-direction:column;">';
+    html += '<div style="'+hdrSt+'">— WEEKLY<br>PRODUCTION —</div>';
+
+    if(!isMultiProg){
+      var wg = progGoal(sbProgs[0],'week');
+      var singleWSales = salesForProgWeek(sbProgs[0]);
+      if(showTeamSplit){
+        var tWSales = teamSalesForProg(sbProgs[0]); // weekly team approx
+        html += teamSplitPanel(singleWSales, tWSales, progColor(sbProgs[0]), wg);
+      } else {
+        html += '<div style="'+lblSt+'">(Goal '+wg+')</div>';
+        html += '<div style="margin:0 auto 3px">'+sbLED(singleWSales,44,80,6)+'</div>';
+        html += '<div style="'+lblSt+';margin-bottom:8px">THIS WEEK</div>';
+      }
+    } else {
+      sbProgs.forEach(function(prog){
+        var col  = progColor(prog);
+        var wg   = progGoal(prog,'week');
+        var wSales = salesForProgWeek(prog);
+        var pct  = wg>0?Math.min(100,Math.round((wSales/wg)*100)):0;
+        var wRule= weekRuleForProg(prog);
+        if(showTeamSplit){
+          var tWSales = teamSalesForProg(prog);
+          html += '<div style="border-radius:5px;padding:5px 8px;margin-bottom:4px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
+            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:2px">'+prog+' · G:'+wg+'</div>'
+            +teamSplitPanel(wSales,tWSales,col,wg)
+            +'</div>';
+        } else {
+          html += '<div style="border-radius:5px;padding:6px 8px;margin-bottom:5px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
+            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:3px">'+prog+' · G:'+wg+'</div>'
+            +'<div style="display:flex;align-items:center;gap:7px">'
+            +'<div style="flex-shrink:0">'+sbLED(wSales,28,50,4)+'</div>'
+            +'<div style="flex:1;min-width:0">'
+            +'<div style="background:rgba(255,255,255,.08);border-radius:2px;height:4px;overflow:hidden;margin-bottom:3px"><div style="background:'+col+';width:'+pct+'%;height:4px;border-radius:2px"></div></div>'
+            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.38rem;color:rgba(255,255,255,.3)">'+wRule+'</div>'
+            +'</div></div></div>';
+        }
+      });
+    }
+
+    html += '<div style="'+divSt+'"></div>';
+    html += '<div style="display:flex;align-items:center;justify-content:center;gap:3px;margin-bottom:2px">'
+      +'<span style="color:#1565C0;font-size:1.3rem;line-height:1">&#9733;</span>'
+      +'<span style="font-family:Oswald,Arial Black,sans-serif;font-size:2rem;font-weight:700;color:#1565C0;line-height:1">'+myOverallRank+'</span>'
+      +'</div>';
+    html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.54rem;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.55);margin-bottom:7px">RANK OUT OF '+totalSalesAgents+'</div>';
+    html += clkBadge(daysLeftWk,'DAYS<br>LEFT IN WEEK');
+    html += '</div>';
+
+    html += '</div>'; // end 3-col
+    html += '<div style="height:5px;background:linear-gradient(90deg,#0A2F7A,#1565C0,#1976D2,#1565C0,#0A2F7A)"></div>';
+    html += '</div></div>'; // end inner + outer frame
   }
+
+  // clock handled by global startSBClock()
 
   // ══════════ TEAM VIEW (TL, MM, Admin see their team) ══════════
   if(isLdr||isAdmin){
@@ -7092,16 +7994,19 @@ function showImpersonateModal(){
   var box = document.createElement('div');
   box.style.cssText = 'background:white;border-radius:14px;width:min(480px,94vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.35)';
 
-  // Header
+  // Header — build close button as element to wire onclick directly
   var hdr = document.createElement('div');
   hdr.style.cssText = 'background:linear-gradient(135deg,var(--blue),#002268);padding:20px 24px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0';
-  hdr.innerHTML = '<div>'
-    + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:white;letter-spacing:3px">👁 VIEW AS AGENT</div>'
-    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:rgba(255,255,255,.7);margin-top:2px">Select any agent to see exactly what they see</div>'
-    + '</div>'
-    + '<button id="imp-close-x" style="background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:6px 14px;border-radius:4px;cursor:pointer">✕ Close</button>';
+  var hdrInfo = document.createElement('div');
+  hdrInfo.innerHTML = '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:white;letter-spacing:3px">👁 VIEW AS AGENT</div>'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:rgba(255,255,255,.7);margin-top:2px">Select any agent to see exactly what they see</div>';
+  var impCloseBtn = document.createElement('button');
+  impCloseBtn.textContent = '✕ Close';
+  impCloseBtn.style.cssText = 'background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:6px 14px;border-radius:4px;cursor:pointer';
+  impCloseBtn.onclick = function(){ overlay.remove(); };
+  hdr.appendChild(hdrInfo);
+  hdr.appendChild(impCloseBtn);
   box.appendChild(hdr);
-
   // Scrollable list
   var list = document.createElement('div');
   list.style.cssText = 'overflow-y:auto;flex:1;padding-bottom:12px';
@@ -7144,8 +8049,6 @@ function showImpersonateModal(){
   box.appendChild(list);
   overlay.appendChild(box);
   document.body.appendChild(overlay);
-  var closeX = document.getElementById('imp-close-x');
-  if(closeX) closeX.onclick = function(){ overlay.remove(); };
 }
 
 
@@ -7161,6 +8064,7 @@ function startImpersonation(agentId){
     +'<button onclick="returnToOwnerView()" style="background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.4);color:white;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;padding:5px 14px;border-radius:4px;cursor:pointer">Return to Owner View</button>';
   document.body.prepend(banner);
   var bo=document.getElementById('backoffice'); if(bo) bo.style.paddingTop='40px';
+  PANEL_HISTORY=[]; gotoPanel._current='bo'; gotoPanel._skipHistory=true;
   buildNav(target); gotoPanel('bo');
 }
 function returnToOwnerView(){
@@ -7168,6 +8072,7 @@ function returnToOwnerView(){
   var owner=IMPERSONATING; IMPERSONATING=null; DB.current=owner;
   var banner=document.getElementById('imp-banner'); if(banner) banner.remove();
   var bo=document.getElementById('backoffice'); if(bo) bo.style.paddingTop='';
+  PANEL_HISTORY=[]; gotoPanel._current='owner'; gotoPanel._skipHistory=true;
   buildNav(owner); gotoPanel('owner');
 }
 function openImpersonateModal(){
@@ -7519,21 +8424,24 @@ function panelAgents(){
   h += '</tbody></table></div>';
   return h;
 }
+// ══════════════════════════════════════════════
+//  HR PANELS
+// ══════════════════════════════════════════════
 
-// ══════════════════════════════════════════════
-//  PANEL: HR DASHBOARD
-// ══════════════════════════════════════════════
 function panelHRDashboard(){
-  var h = '<div class="bo-card" style="margin-bottom:16px"><div class="bo-card-head"><div class="bo-card-title">HR Dashboard</div></div>';
+  var h = '';
+  h = panelHeader('\U0001f465 HR Dashboard') + h;
+  h += '<div class="bo-card" style="margin-bottom:16px">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">HR Dashboard</div></div>';
   h += '<div style="padding:16px 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px">';
   var hrCards = [
-    {icon:'📅',label:'Schedule Training',   panel:'training-scheduled', desc:'Book new agent training session'},
-    {icon:'✅',label:'Training Complete',    panel:'training-complete',  desc:'Log completed training outcome'},
-    {icon:'📝',label:'Onboarding Queue',     panel:'onboarding-queue',   desc:'Manage paperwork & onboarding'},
-    {icon:'👤',label:'View All Agents',      panel:'agents',             desc:'Browse full agent roster'},
+    {icon:'\U0001f4c5',label:'Schedule Training',   panel:'training-scheduled', desc:'Book a new agent training session'},
+    {icon:'\u2705',    label:'Training Complete',    panel:'training-complete',  desc:'Log completed training outcome'},
+    {icon:'\U0001f4dd',label:'Onboarding Queue',     panel:'onboarding-queue',   desc:'Manage paperwork & onboarding'},
+    {icon:'\U0001f464',label:'View All Agents',      panel:'agents',             desc:'Browse full agent roster'},
   ];
   hrCards.forEach(function(c){
-    h += '<div onclick="gotoPanel(\''+c.panel+'\')" style="background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:16px;cursor:pointer;transition:all .15s" onmouseover="this.style.borderColor=\'var(--blue)\';this.style.background=\'rgba(0,53,148,.04)\'" onmouseout="this.style.borderColor=\'var(--border)\';this.style.background=\'#fafafa\'">'
+    h += '<div onclick="gotoPanel(this.dataset.p)" data-p="'+c.panel+'" style="background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:16px;cursor:pointer">'
       +'<div style="font-size:1.5rem;margin-bottom:8px">'+c.icon+'</div>'
       +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.88rem;font-weight:700;color:var(--brown);margin-bottom:4px">'+c.label+'</div>'
       +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">'+c.desc+'</div>'
@@ -7544,105 +8452,36 @@ function panelHRDashboard(){
 }
 
 function panelTrainingScheduled(){
-  return '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Schedule Training</div></div><div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">Use the <a href="https://form.jotform.com/91626043431147" target="_blank" style="color:var(--blue)">Training Schedule Form</a> to book a session, or click the HR button below.<br><br><button onclick="window.open(\'https://form.jotform.com/91626043431147\',\'_blank\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">Open Training Form →</button></div></div>';
+  var h = panelHeader('\U0001f4c5 Training Schedule');
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Schedule Training</div></div>'
+     + '<div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">'
+     + 'Use the Training Schedule Form to book a new agent session.<br><br>'
+     + '<button onclick="window.open(\'https://form.jotform.com/91626043431147\',\'_blank\')" '
+     + 'class="btn-fire" style="font-size:.72rem;padding:10px 20px">Open Training Form \u2192</button>'
+     + '</div></div>';
+  return h;
 }
 
 function panelTrainingComplete(){
-  return '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Training Complete</div></div><div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">Submit training outcomes using the form below.<br><br><button onclick="window.open(\'https://form.jotform.com/91177153990160\',\'_blank\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">Open Training Complete Form →</button></div></div>';
+  var h = panelHeader('\u2705 Training Complete');
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Training Complete</div></div>'
+     + '<div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">'
+     + 'Submit training outcomes using the form below.<br><br>'
+     + '<button onclick="window.open(\'https://form.jotform.com/91177153990160\',\'_blank\')" '
+     + 'class="btn-fire" style="font-size:.72rem;padding:10px 20px">Open Training Complete Form \u2192</button>'
+     + '</div></div>';
+  return h;
 }
 
 function panelOnboardingQueue(){
-  return '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Onboarding Queue</div></div><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No candidates currently in the onboarding queue.</div></div>';
+  var h = panelHeader('\U0001f4dd Onboarding Queue');
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Onboarding Queue</div></div>'
+     + '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">'
+     + 'No candidates currently in the onboarding queue.</div></div>';
+  return h;
 }
 
-// ══════════════════════════════════════════════
-//  INVENTORY PANELS (stubs — full versions already in file)
-// ══════════════════════════════════════════════
-// ══════════════════════════════════════════════
-//  INVENTORY EXPIRY HELPERS
-// ══════════════════════════════════════════════
 
-function invDaysRemaining(expiryDate, assignedDate){
-  // Countdown from assignedDate (not upload date). Expiry = assignedDate + 30 days.
-  // If expiryDate is explicitly set by HR, use that.
-  if(!assignedDate && !expiryDate) return null;
-  var expiry;
-  if(expiryDate){
-    expiry = new Date(expiryDate);
-  } else {
-    expiry = new Date(new Date(assignedDate).getTime() + 30*86400000);
-  }
-  var today = new Date();
-  today.setHours(0,0,0,0);
-  var diff = Math.floor((expiry - today) / 86400000);
-  return diff;
-}
-
-function invExpiryBadge(device){
-  // Returns HTML badge showing countdown status
-  var days = invDaysRemaining(device.expiryDate, device.assignedDate);
-  if(days === null) return '<span style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">Not assigned</span>';
-  var color, label;
-  if(days < 0){
-    color = '#CC0000';
-    label = 'EXPIRED ' + Math.abs(days) + 'd ago';
-  } else if(days === 0){
-    color = '#CC0000';
-    label = 'EXPIRES TODAY';
-  } else if(days <= 3){
-    color = '#CC0000';
-    label = days + 'd remaining';
-  } else if(days <= 7){
-    color = '#D97706';
-    label = days + 'd remaining';
-  } else {
-    color = '#059669';
-    label = days + 'd remaining';
-  }
-  return '<span style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;font-weight:700;color:'+color+'">'+label+'</span>';
-}
-
-function invExpiryBarColor(device){
-  var days = invDaysRemaining(device.expiryDate, device.assignedDate);
-  if(days === null) return '#ccc';
-  if(days <= 0) return '#CC0000';
-  if(days <= 3) return '#CC0000';
-  if(days <= 7) return '#D97706';
-  return '#059669';
-}
-
-function invExpiryBar(device){
-  // 30-day progress bar (countdown)
-  var days = invDaysRemaining(device.expiryDate, device.assignedDate);
-  if(days === null) return '';
-  var pct = Math.max(0, Math.min(100, Math.round((days/30)*100)));
-  var col = invExpiryBarColor(device);
-  return '<div style="background:#eee;border-radius:100px;height:5px;margin-top:3px">'
-    +'<div style="width:'+pct+'%;height:100%;border-radius:100px;background:'+col+';transition:width .5s"></div>'
-    +'</div>';
-}
-
-function saveInvDeletionRequests(){
-  try{ localStorage.setItem('wmam_inv_del_reqs', JSON.stringify(INV_DELETION_REQUESTS)); }catch(e){}
-  if(supaClient)(async function(){
-    await supaClient.from('app_settings').upsert(
-      {key:'inv_deletion_requests',value:JSON.stringify(INV_DELETION_REQUESTS)},
-      {onConflict:'key'}
-    ).catch(function(){});
-  })();
-}
-
-function saveInvPendingAssignments(){
-  try{ localStorage.setItem('wmam_inv_pending_assign', JSON.stringify(INV_PENDING_ASSIGNMENTS)); }catch(e){}
-  if(supaClient)(async function(){
-    await supaClient.from('app_settings').upsert(
-      {key:'inv_pending_assign',value:JSON.stringify(INV_PENDING_ASSIGNMENTS)},
-      {onConflict:'key'}
-    ).catch(function(){});
-  })();
-}
-
-// Request deletion of device(s) — Inventory Dept only, Owner must approve
 function invRequestDeletion(deviceIds, reason){
   var u = DB.current;
   if(!isInventory(u)&&!isOwner(u)){ alert('Inventory Department access only.'); return; }
@@ -7788,6 +8627,7 @@ function panelInvDashboard(){
   var pendingDels = INV_DELETION_REQUESTS.filter(function(r){return r.status==='pending';}).length;
 
   var h = '';
+  h += panelHeader('📊 Inventory Dashboard');
 
   // ── Deletion approval tasks (owner only) ──
   if(isOwner(u) && pendingDels > 0){
@@ -7946,6 +8786,7 @@ function panelInvUpload(){
   h += '<button onclick="processInvUpload()" class="btn-fire" style="width:100%;justify-content:center;padding:13px;font-size:.78rem;letter-spacing:3px">⬆ Upload Batch &rarr;</button>';
   h += '<div id="inv-up-msg" style="display:none;margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;padding:10px 14px;background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:6px;color:#059669"></div>';
   h += '</div></div></div>';
+  h = panelHeader('📤 Inventory Upload') + h;
   return h;
 }
 
@@ -8002,7 +8843,7 @@ function processInvUpload(){
 }
 
 function panelInvTransfer(){
-  return '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Transfer Devices</div></div><div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">To transfer devices between agents, use the Inventory Request panel\'s Transfer tab. All transfers require triple verification and recipient signature.<br><br><button onclick="gotoPanel(\'inv-request\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">Go to Transfer Tab →</button></div></div>';
+  return panelHeader('🔄 Inventory Transfer') + '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Transfer Devices</div></div><div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">To transfer devices between agents, use the Inventory Request panel\'s Transfer tab. All transfers require triple verification and recipient signature.<br><br><button onclick="gotoPanel(\'inv-request\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">Go to Transfer Tab →</button></div></div>';
 }
 
 function panelInvExport(){
@@ -8017,7 +8858,7 @@ function panelInvExport(){
   a.href = URL.createObjectURL(blob);
   a.download = 'wmaminc_inventory_'+new Date().toISOString().slice(0,10)+'.csv';
   a.click();
-  return '<div class="bo-card"><div style="padding:40px;text-align:center"><div style="font-size:2rem;margin-bottom:10px">\uD83D\uDCCA</div><div style="font-family:Barlow Condensed,sans-serif;font-size:1rem;color:var(--brown)">Export downloaded</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--muted);margin-top:6px">'+INVENTORY_DEVICES.length+' devices exported to CSV</div></div></div>';
+  return panelHeader('📤 Inventory Export') + '<div class="bo-card"><div style="padding:40px;text-align:center"><div style="font-size:2rem;margin-bottom:10px">\uD83D\uDCCA</div><div style="font-family:Barlow Condensed,sans-serif;font-size:1rem;color:var(--brown)">Export downloaded</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--muted);margin-top:6px">'+INVENTORY_DEVICES.length+' devices exported to CSV</div></div></div>';
 }
 
 function panelMyInventory(){
@@ -8049,6 +8890,7 @@ function panelMyInventory(){
     });
     h += '</div></div>';
   }
+  h = panelHeader('📱 My Inventory') + h;
   return h;
 }
 
@@ -8074,6 +8916,7 @@ function panelAgentCodes(){
     h += '</tr>';
   });
   h += '</tbody></table></div></div>';
+  h = panelHeader('🔑 Agent Codes') + h;
   return h;
 }
 
@@ -8092,6 +8935,7 @@ function panelGoalSettings(){
   h += '<button onclick="saveGoalSettings()" class="btn-fire" style="width:100%;justify-content:center;padding:12px;font-size:.78rem">Save Goals →</button>';
   h += '<div id="gs-saved" style="display:none;text-align:center;margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:#059669">✓ Goals saved.</div>';
   h += '</div></div>';
+  h = panelHeader('🎯 Goal Settings') + h;
   return h;
 }
 
@@ -8116,6 +8960,7 @@ function panelAnnounce(){
   var isAdmin = isOwner(u)||u.role==='admin'||u.role==='Market Manager'||u.role==='Campaign Manager';
   var msgs = CHANNEL_MSGS['national']||[];
   var h = '';
+  h += panelHeader('📢 Announcements');
   if(isAdmin){
     h += '<div class="bo-card" style="margin-bottom:16px"><div style="padding:16px 20px">';
     h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:10px">Post Company Announcement</div>';
@@ -8281,6 +9126,7 @@ function panelMeetings(){
   var u = DB.current;
   loadCallRoomHosts();
   var h = '';
+  h += panelHeader('📹 Meetings');
 
   // Header
   h += '<div style="background:linear-gradient(135deg,#0a0a1a,#0f0f2a);border-radius:12px;padding:24px 28px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between">'
@@ -8395,6 +9241,7 @@ function panelMeetingHosts(){
   });
 
   h += '</div></div>';
+  h = panelHeader('📹 Meeting Host Settings') + h;
   return h;
 }
 
@@ -8416,6 +9263,7 @@ function panelPayroll(){
   h+='Payroll management panel. Commission tracking, payment records, and agent pay history will appear here.<br><br>';
   h+='<button class="btn-fire" style="font-size:.72rem;padding:10px 20px">Coming Soon — Payroll Module</button>';
   h+='</div></div>';
+  h = panelHeader('💰 Payroll') + h;
   return h;
 }
 
@@ -8431,14 +9279,15 @@ function panelOnboarding(){
   h += 'New hire onboarding panel. Paperwork, contracts, setup checklist, and welcome materials will appear here.<br><br>';
   h += '<button onclick="gotoPanel(&quot;onboarding-queue&quot;)" class="btn-fire" style="font-size:.72rem;padding:10px 20px">?? View Onboarding Queue</button>';
   h += '</div></div>';
+  h = panelHeader('📋 Onboarding') + h;
   return h;
 }
 
 function panelApplications(){
-  return '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Applications</div></div><div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">Applications submitted through the public site will appear here. To view the application form, visit the Join Our Team page on the public site.</div></div>';
+  return panelHeader('📝 Applications') + '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Applications</div></div><div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">Applications submitted through the public site will appear here. To view the application form, visit the Join Our Team page on the public site.</div></div>';
 }
 function panelRecruitTracker(){
-  return '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Recruiter Tracker</div></div><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No recruiter data yet.</div></div>';
+  return panelHeader('🎯 Recruit Tracker') + '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Recruiter Tracker</div></div><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No recruiter data yet.</div></div>';
 }
 function panelSubs(){
   var u = DB.current;
@@ -8449,20 +9298,267 @@ function panelSubs(){
   h += '<input type="number" id="sub-count" class="f-input" style="max-width:80px" placeholder="Count" min="1" value="1">';
   h += '<button onclick="logSale()" class="btn-fire" style="font-size:.72rem;padding:9px 18px">Log Sale</button>';
   h += '</div></div></div>';
+  h = panelHeader('📝 Log Enrollments') + h;
   return h;
 }
 
 function logSale(){
   var u = DB.current;
-  var prog = document.getElementById('sub-prog').value;
-  var count = parseInt(document.getElementById('sub-count').value)||1;
-  u.sales = (u.sales||0)+count;
-  if(!u.monthlySales) u.monthlySales=[];
+  var prog  = (document.getElementById('sub-prog')||{value:''}).value || (u.program||'Lifeline');
+  var count = parseInt((document.getElementById('sub-count')||{value:'1'}).value)||1;
+  var now   = new Date();
+  var month = now.toISOString().slice(0,7);              // YYYY-MM
+  var week  = getWeekKey(now, (u.carrier||''));           // YYYY-WNN (carrier-aware)
+  var dateStr = now.toISOString().slice(0,10);            // YYYY-MM-DD
+
+  // Update aggregate sales total
+  u.sales = (u.sales||0) + count;
+
+  // Update monthlySales breakdown — {month, program, sales, weekSales:{weekKey:count}, entries:[{date,count}]}
+  if(!u.monthlySales) u.monthlySales = [];
+  var ms = u.monthlySales.find(function(m){ return m.month===month && m.program===prog; });
+  if(!ms){
+    ms = {month:month, program:prog, sales:0, weekSales:{}, entries:[]};
+    u.monthlySales.push(ms);
+  }
+  ms.sales = (ms.sales||0) + count;
+  if(!ms.weekSales) ms.weekSales = {};
+  ms.weekSales[week] = (ms.weekSales[week]||0) + count;
+  if(!ms.entries) ms.entries = [];
+  ms.entries.push({date:dateStr, count:count});
+
   saveToStorage();
   saveAgentToSupabase(u);
-  alert('\u2713 '+count+' '+prog+' enrollment(s) logged! Total: '+u.sales);
+  alert('\u2713 '+count+' '+prog+' enrollment(s) logged!');
   gotoPanel('subs');
 }
+
+// Get the ISO week key for a date, respecting carrier week start
+// TruConnect: Mon-Sun (ISO-like), everyone else: Sun-Sat
+function getWeekKey(date, carrier){
+  var d = new Date(date);
+  var isTruConn = (carrier||'').toLowerCase().indexOf('truconnect') >= 0;
+  var day = d.getDay(); // 0=Sun
+  // Adjust to week start
+  var offset = isTruConn ? (day===0?6:day-1) : day; // Mon=0 for TruConnect, Sun=0 for others
+  d.setDate(d.getDate() - offset);
+  return d.toISOString().slice(0,10); // week start date as key
+}
+// ══ UNIFIED SALES NORMALIZATION ══════════════════════════════
+// Called after loading agents from Supabase or localStorage.
+// Backfills monthlySales from u.sales for legacy agents so ALL
+// functions (scoreboard, YTD, reports, team stats) read consistently.
+function normalizeAgentSales(agent){
+  if(!agent || !isSalesRole(agent)) return;
+  var sales = agent.sales || 0;
+  if(!sales) return; // no sales to normalize
+
+  // Already has monthlySales entries — nothing to backfill
+  if(agent.monthlySales && agent.monthlySales.length > 0) return;
+
+  // Backfill: assign all historical sales to the agent's primary program
+  // under a synthetic month key so nothing is lost
+  var prog = agent.program || 'Lifeline';
+  var now  = new Date();
+  var month = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
+  var week  = getWeekKey(now, agent.carrier||'');
+
+  if(!agent.monthlySales) agent.monthlySales = [];
+  agent.monthlySales.push({
+    month: month,
+    program: prog,
+    sales: sales,
+    weekSales: {},  // no weekly breakdown available for legacy data
+    entries: []
+  });
+}
+
+// ── Get total sales for an agent across ALL programs for a given month ──
+function agentMonthlySalesTotal(agent, month){
+  if(!agent.monthlySales || !agent.monthlySales.length){
+    // Legacy fallback: if month matches current month return u.sales
+    var now = new Date();
+    var currMonth = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
+    return month===currMonth ? (agent.sales||0) : 0;
+  }
+  return agent.monthlySales.reduce(function(s,m){
+    return s + (m.month===month ? (m.sales||0) : 0);
+  },0);
+}
+
+// ── Get sales for an agent for a specific program + month ──
+function agentProgSales(agent, prog, month){
+  if(!agent.monthlySales || !agent.monthlySales.length){
+    // Legacy: only return u.sales if it's the agent's primary program + current month
+    var now = new Date();
+    var currMonth = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
+    var isPrimary = !prog || prog===agent.program || prog===(agent.programs&&agent.programs[0]);
+    return (month===currMonth && isPrimary) ? (agent.sales||0) : 0;
+  }
+  return agent.monthlySales.reduce(function(s,m){
+    return s + (m.month===month && m.program===prog ? (m.sales||0) : 0);
+  },0);
+}
+
+// ── Get YTD sales for an agent, broken down by program ──
+// Returns: {progName: total, ...}
+function agentYTDByProg(agent){
+  var yr = new Date().getFullYear().toString();
+  var result = {};
+
+  if(!agent.monthlySales || !agent.monthlySales.length){
+    // Legacy: attribute all u.sales to primary program
+    var prog = agent.program || (agent.programs&&agent.programs[0]) || 'Lifeline';
+    if(agent.sales > 0) result[prog] = agent.sales;
+    return result;
+  }
+
+  agent.monthlySales.forEach(function(m){
+    if(!m.month || !m.month.startsWith(yr)) return;
+    if(!result[m.program]) result[m.program] = 0;
+    result[m.program] += (m.sales||0);
+  });
+  return result;
+}
+
+// ── Get total YTD sales for an agent (all programs) ──
+function agentYTDTotal(agent){
+  var byProg = agentYTDByProg(agent);
+  return Object.values(byProg).reduce(function(s,v){return s+v;},0);
+}
+
+// ────────────────────────────────────────────────────────────
+
+
+function showYTDReport(){
+  var u   = DB.current;
+  var yr  = new Date().getFullYear().toString();
+
+  // ── Use unified YTD helper ──
+  function agentYTD(agent){
+    // agentYTDByProg handles legacy u.sales fallback automatically
+    var byProg = agentYTDByProg(agent);
+    var data = {};
+    Object.keys(byProg).forEach(function(prog){
+      data[prog] = {total: byProg[prog]};
+    });
+    return data;
+  }
+
+  var myYTD = agentYTD(u);
+
+  // ── Build modal content ──
+  var rows = '';
+  var grandTotal = 0;
+
+  if(u.role==='Field Agent'){
+    // Simple: per program totals — use agentYTDTotal for accurate total
+    grandTotal = agentYTDTotal(u);
+    Object.keys(myYTD).forEach(function(prog){
+      var t = myYTD[prog].total;
+      rows += '<tr><td style="padding:10px 14px;font-family:Oswald,sans-serif;font-size:.9rem;color:#1565C0;font-weight:700">'+prog+'</td>'
+        +'<td style="padding:10px 14px;font-family:Oswald,Arial Black,sans-serif;font-size:1.1rem;font-weight:900;color:#fff;text-align:right">'+t+'</td></tr>';
+    });
+  } else {
+    // TL / MM / Owner — include team breakdown
+    var myData = agentYTD(u);
+    grandTotal = agentYTDTotal(u);
+    Object.keys(myData).forEach(function(prog){
+      var t = myData[prog].total;
+      rows += '<tr style="background:rgba(21,101,192,.08)"><td style="padding:8px 14px;font-family:Oswald,sans-serif;font-size:.85rem;color:#1565C0;font-weight:700">'
+        +u.name+' (Me)</td>'
+        +'<td style="padding:8px 14px;font-family:Oswald,sans-serif;font-size:.75rem;color:rgba(255,255,255,.5)">'+prog+'</td>'
+        +'<td style="padding:8px 14px;font-family:Oswald,Arial Black,sans-serif;font-size:1rem;font-weight:900;color:#fff;text-align:right">'+t+'</td></tr>';
+    });
+
+    // Find all agents under this leader (include inactive)
+    var teamAgents = DB.agents.filter(function(a){
+      if(a.id===u.id) return false;
+      return a.teamLeaderId===u.id || a.marketManagerId===u.id || a.campaignManagerId===u.id;
+    });
+
+    // For MM: also include TLs under them and their agents
+    if(u.role==='Market Manager'||u.role==='Campaign Manager'||isOwner(u)){
+      var tlIds = teamAgents.map(function(a){return a.id;});
+      DB.agents.forEach(function(a){
+        if(a.id===u.id) return;
+        if(tlIds.indexOf(a.id)>=0) return; // already in
+        if(a.marketManagerId===u.id||a.campaignManagerId===u.id) teamAgents.push(a);
+      });
+    }
+
+    teamAgents.forEach(function(a){
+      var aYTD = agentYTD(a);
+      var aTotal = 0;
+      Object.keys(aYTD).forEach(function(prog){
+        aTotal += aYTD[prog].total;
+      });
+      if(aTotal===0) return; // skip agents with no sales this year
+      grandTotal += aTotal;
+
+      Object.keys(aYTD).forEach(function(prog){
+        var t = aYTD[prog].total;
+        if(t===0) return;
+        rows += '<tr><td style="padding:6px 14px;font-family:Oswald,sans-serif;font-size:.8rem;color:rgba(255,255,255,.7)">'
+          +a.name+(a.active===false?' <span style="font-size:.6rem;color:rgba(255,255,255,.35)">(inactive)</span>':'')+'</td>'
+          +'<td style="padding:6px 14px;font-family:Oswald,sans-serif;font-size:.75rem;color:rgba(255,255,255,.5)">'+prog+'</td>'
+          +'<td style="padding:6px 14px;font-family:Oswald,Arial Black,sans-serif;font-size:.95rem;font-weight:900;color:#fff;text-align:right">'+t+'</td></tr>';
+      });
+    });
+  }
+
+  // ── Build overlay ──
+  var existing = document.getElementById('ytd-modal');
+  if(existing) existing.remove();
+
+  var overlay = document.createElement('div');
+  overlay.id = 'ytd-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center';
+  overlay.onclick = function(e){ if(e.target===overlay) overlay.remove(); };
+
+  var box = document.createElement('div');
+  box.style.cssText = 'background:#0a0a0a;border:2px solid #1565C0;border-radius:14px;width:min(500px,94vw);max-height:85vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 0 0 4px #000,0 0 40px rgba(21,101,192,.4)';
+
+  // Header
+  var hdr = document.createElement('div');
+  hdr.style.cssText = 'background:linear-gradient(180deg,#111,#0a0a0a);padding:16px 20px;border-bottom:2px solid #1565C0;display:flex;align-items:center;justify-content:space-between;flex-shrink:0';
+  var hdrLeft = document.createElement('div');
+  hdrLeft.innerHTML = '<div style="font-family:Oswald,Arial Black,sans-serif;font-size:1.2rem;font-weight:700;letter-spacing:4px;color:#1565C0;text-transform:uppercase">'
+    +yr+' YEAR TO DATE</div>'
+    +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.58rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.45);margin-top:2px">'+u.name.toUpperCase()+'</div>';
+  var closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕';
+  closeBtn.style.cssText = 'background:rgba(21,101,192,.15);border:1px solid #1565C0;color:#1565C0;font-size:1rem;width:32px;height:32px;border-radius:50%;cursor:pointer;flex-shrink:0';
+  closeBtn.onclick = function(){ overlay.remove(); };
+  hdr.appendChild(hdrLeft);
+  hdr.appendChild(closeBtn);
+  box.appendChild(hdr);
+
+  // Grand total bar
+  var totBar = document.createElement('div');
+  totBar.style.cssText = 'padding:12px 20px;background:rgba(21,101,192,.1);border-bottom:1px solid rgba(21,101,192,.3);text-align:center;flex-shrink:0';
+  totBar.innerHTML = '<span style="font-family:Oswald,Arial,sans-serif;font-size:.6rem;letter-spacing:4px;text-transform:uppercase;color:rgba(255,255,255,.5)">TOTAL ENROLLMENTS</span>'
+    +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:2.5rem;font-weight:900;color:#1565C0;line-height:1;margin-top:4px">'+grandTotal+'</div>';
+  box.appendChild(totBar);
+
+  // Table
+  var tableWrap = document.createElement('div');
+  tableWrap.style.cssText = 'overflow-y:auto;flex:1';
+  var cols = (u.role==='Field Agent') ? '<col style="width:70%"><col style="width:30%">'
+    : '<col style="width:40%"><col style="width:30%"><col style="width:30%">';
+  var thead = (u.role==='Field Agent')
+    ? '<tr><th style="padding:8px 14px;font-family:Oswald,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4);text-align:left;border-bottom:1px solid rgba(21,101,192,.3)">PROGRAM</th><th style="padding:8px 14px;font-family:Oswald,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4);text-align:right;border-bottom:1px solid rgba(21,101,192,.3)">YTD</th></tr>'
+    : '<tr><th style="padding:8px 14px;font-family:Oswald,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4);text-align:left;border-bottom:1px solid rgba(21,101,192,.3)">AGENT</th><th style="padding:8px 14px;font-family:Oswald,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4);border-bottom:1px solid rgba(21,101,192,.3)">PROGRAM</th><th style="padding:8px 14px;font-family:Oswald,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4);text-align:right;border-bottom:1px solid rgba(21,101,192,.3)">YTD</th></tr>';
+
+  tableWrap.innerHTML = rows.length
+    ? '<table style="width:100%;border-collapse:collapse"><colgroup>'+cols+'</colgroup><thead>'+thead+'</thead><tbody>'+rows+'</tbody></table>'
+    : '<div style="padding:40px;text-align:center;font-family:Oswald,sans-serif;font-size:.8rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.3)">No enrollments recorded for '+yr+' yet.</div>';
+  box.appendChild(tableWrap);
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
 
 function panelLB(){
   var active = DB.agents.filter(function(a){ return a.active && isSalesRole(a); });
@@ -8478,6 +9574,7 @@ function panelLB(){
       +'<td style="font-weight:700;font-size:1.1rem;color:var(--red)">'+( a.sales||0)+'</td></tr>';
   });
   h += '</tbody></table></div></div>';
+  h = panelHeader('🏆 Leaderboard') + h;
   return h;
 }
 
@@ -8493,6 +9590,7 @@ function panelLinks(){
     cats[l.cat].push(l);
   });
   var h = '';
+  h += panelHeader('🔗 Manage Links');
   Object.keys(cats).forEach(function(cat){
     h += '<div class="bo-card" style="margin-bottom:16px"><div class="bo-card-head"><div class="bo-card-title">'+cat+'</div></div>';
     h += '<div style="display:flex;flex-direction:column;gap:6px;padding:12px 16px">';
@@ -8533,6 +9631,7 @@ function panelMyTeam(){
     h += '</tbody></table></div>';
   }
   h += '</div>';
+  h = panelHeader('👥 My Team') + h;
   return h;
 }
 
@@ -8720,7 +9819,10 @@ function openEditAgent(agentId){
     }, 50);
   }
 
-  openModal('addAgentModal');
+  // Ensure modal is fully reset before opening
+  var agentModal = document.getElementById('addAgentModal');
+  if(agentModal){ agentModal.classList.remove('open'); }
+  setTimeout(function(){ openModal('addAgentModal'); }, 10);
 }
 
 // ── Populate all dropdowns in Add/Edit Agent modal ──
@@ -8874,7 +9976,21 @@ function closeVideoCall(){
 // ══════════════════════════════════════════════
 function panelInvRequests(){
   var u=DB.current;
-  if(!isInventory(u)&&!isOwner(u)&&u.role!=='admin') return '<div style="padding:40px;text-align:center;color:var(--muted)">Inventory access only.</div>';
+  // Show alert for pending approvals that need this user
+  var myPendingApprovals = INVENTORY_REQUESTS.filter(function(r){
+    return r.status==='Pending' && canIApprove(r);
+  });
+  if(myPendingApprovals.length>0){
+    setTimeout(function(){
+      showPersistentAlert({
+        icon:'\U0001f4e6',
+        title:'Pending Approvals Require Your Attention',
+        body:'You have <strong>'+myPendingApprovals.length+' pending inventory request(s)</strong> that need your approval.<br><br>Please review each request below and approve or deny.',
+        btnLabel:'\u2713 Got It - I will Review Now'
+      });
+    }, 400);
+  }
+  if(!isInventory(u)&&!isOwner(u)&&u.role!=='admin'&&u.role!=='Market Manager'&&u.role!=='Campaign Manager'&&u.role!=='Team Leader') return '<div style="padding:40px;text-align:center;color:var(--muted)">Inventory access only.</div>';
   var pending=INVENTORY_REQUESTS.filter(function(r){return r.status==='Pending';});
   var h='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">'
     +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:3px;text-transform:uppercase;color:var(--muted)">'+pending.length+' PENDING &middot; '+INVENTORY_REQUESTS.length+' TOTAL</div>'
@@ -8909,37 +10025,132 @@ function panelInvRequests(){
     h+='</div></div>';
   });
   h+='</div>';
+  h = panelHeader('📋 Inventory Requests') + h;
   return h;
 }
 
 function approveInvRequest(id){
-  var req=INVENTORY_REQUESTS.find(function(r){return r.id===id;});
+  var u   = DB.current;
+  var req = INVENTORY_REQUESTS.find(function(r){return r.id===id;});
   if(!req) return;
-  req.status='Approved'; req.approvedBy=DB.current.name; req.approvedDate=new Date().toISOString().slice(0,10);
-  if(req.type==='supply'&&req.items){
-    req.items.forEach(function(si){
-      var stock=SUPPLY_INVENTORY[si.id]; if(!stock) return;
-      if(!stock.assigned) stock.assigned={};
-      var deduct=Math.min(si.qty,stock.available||0);
-      stock.available=Math.max(0,(stock.available||0)-deduct);
-      stock.assigned[req.agentId]=(stock.assigned[req.agentId]||0)+deduct;
-    });
-    saveSupplyInventory();
+
+  // Owner can approve anything instantly
+  if(isOwner(u)){
+    req.status='Approved'; req.approvedBy=u.name; req.approvedDate=new Date().toISOString().slice(0,10);
+    req.approvals = req.approvals||{};
+    req.approvals['owner'] = {name:u.name, date:req.approvedDate};
+    _finalizeApprovedRequest(req);
+    saveInventory();
+    alert('✓ Request APPROVED by Owner.');
+    gotoPanel('inv-requests');
+    return;
   }
-  saveInventory();
-  if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
-  CHANNEL_MSGS['national'].unshift({id:channelMsgNextId++,from:'Inventory System',role:'Inventory',init:'IN',time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),type:'announcement',text:'✅ REQUEST APPROVED — '+req.agentName+' | Approved by '+req.approvedBy,photo:null});
+
+  // Record this approver's approval
+  if(!req.approvals) req.approvals = {};
+  var approvalKey = (isInventory(u)||u.canApproveInventory) ? 'role:Inventory'
+    : (u.role==='Market Manager'||u.role==='Campaign Manager') ? 'role:Market Manager'
+    : (u.role==='Team Leader') ? 'role:Team Leader'
+    : 'agent:'+u.id;
+  req.approvals[approvalKey] = {name:u.name, date:new Date().toISOString().slice(0,10)};
+
+  // Check if fully approved
+  var stillPending = getPendingApprovers(req);
+  if(stillPending.length===0){
+    req.status='Approved'; req.approvedBy=u.name; req.approvedDate=new Date().toISOString().slice(0,10);
+    _finalizeApprovedRequest(req);
+    saveInventory();
+    // Notify the requesting agent
+    pushNotification({
+      type:'inventory', icon:'✅',
+      title:'Request Approved — '+req.agentName,
+      body:'Your inventory request for '+req.campaign+' has been fully approved and will be fulfilled.',
+      fromId:u.id, fromName:u.name, formType:'inv-request',
+      toIds:[req.agentId], toRoles:[]
+    });
+    var agent = DB.agents.find(function(a){return a.id===req.agentId;});
+    if(agent && agent.phone) sendSMSBrevo(agent.phone,
+      'WMAMinc: Your inventory request for '+req.campaign+' is APPROVED! It will be fulfilled by the Inventory team.');
+    alert('✓ Request fully APPROVED! Agent has been notified.');
+  } else {
+    saveInventory();
+    // Notify next approver
+    var nextStep = stillPending[0];
+    var nextIds = [];
+    if(nextStep.agentId) nextIds = [nextStep.agentId];
+    else if(nextStep.role==='Inventory'){
+      DB.agents.filter(function(a){return a.active&&isInventory(a);}).forEach(function(a){ nextIds.push(a.id); });
+    }
+    pushNotification({
+      type:'inventory', icon:'📦',
+      title:'Approval Needed — '+req.agentName+' s Request',
+      body:'<strong>'+u.name+'</strong> has approved this request. Your approval is now needed as <strong>'+nextStep.label+'</strong>.',
+      fromId:u.id, fromName:u.name, formType:'inv-request',
+      toIds:nextIds, toRoles:['admin']
+    });
+    nextIds.forEach(function(aid){
+      var a = DB.agents.find(function(x){return x.id===aid;});
+      if(a && a.phone) sendSMSBrevo(a.phone,
+        'WMAMinc: Your approval is needed for '+req.agentName+' s inventory request ('+req.campaign+'). Log in to review.');
+      // Show persistent modal if this person is currently logged in
+      if(a && a.id===DB.current.id){
+        showPersistentAlert({
+          icon:'📦',
+          title:'Approval Required — Inventory Request',
+          body:'<strong>'+req.agentName+'</strong> inventory request needs your approval as <strong>'+nextStep.label+'</strong>.<br><br>Please review in the Inventory Requests panel.',
+          btnLabel:'Got It - I will Review'
+        });
+      }
+    });
+    alert('✓ Your approval recorded. Waiting for: '+stillPending.map(function(s){return s.label;}).join(', '));
+  }
   gotoPanel('inv-requests');
 }
 
+function _finalizeApprovedRequest(req){
+  if(req.type==='supply'||req.type==='starter-kit'){
+    if(req.items) req.items.forEach(function(si){
+      var stock = SUPPLY_INVENTORY[si.id]; if(!stock) return;
+      var deduct = Math.min(si.qty, stock.available||0);
+      stock.available = Math.max(0,(stock.available||0)-deduct);
+      if(!stock.assigned) stock.assigned={};
+      stock.assigned[req.agentId] = (stock.assigned[req.agentId]||0)+deduct;
+    });
+    saveSupplyInventory();
+  }
+  // Announce
+  if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
+  CHANNEL_MSGS['national'].unshift({
+    id:channelMsgNextId++, from:'Inventory System', role:'Inventory', init:'IN',
+    time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
+    type:'announcement',
+    text:'✅ REQUEST APPROVED — '+req.agentName+' | Approved by '+req.approvedBy,
+    photo:null
+  });
+}
+
+
 function denyInvRequest(id){
-  var reason=prompt('Reason for denying this request (optional):');
-  var req=INVENTORY_REQUESTS.find(function(r){return r.id===id;});
+  var u   = DB.current;
+  var reason = prompt('Reason for denying this request:');
+  if(reason===null) return; // cancelled
+  var req = INVENTORY_REQUESTS.find(function(r){return r.id===id;});
   if(!req) return;
-  req.status='Denied'; req.approvedBy=DB.current.name; req.denyReason=reason||'Denied';
+  req.status='Denied'; req.approvedBy=u.name; req.denyReason=reason||'Denied';
   saveInventory();
+  // Notify requesting agent
+  pushNotification({
+    type:'inventory', icon:'❌',
+    title:'Request Denied — '+req.agentName,
+    body:'Your inventory request for '+(req.campaign||'starter kit')+' was denied by '+u.name+(reason?': '+reason:'.'),
+    fromId:u.id, fromName:u.name, formType:'inv-request', toIds:[req.agentId], toRoles:[]
+  });
+  var agent = DB.agents.find(function(a){return a.id===req.agentId;});
+  if(agent && agent.phone) sendSMSBrevo(agent.phone,
+    'WMAMinc: Your inventory request was denied by '+u.name+(reason?'. Reason: '+reason:'.')+' Log in for details.');
   gotoPanel('inv-requests');
 }
+
 
 function panelInvAudit(){
   var u=DB.current;
@@ -8956,6 +10167,7 @@ function panelInvAudit(){
   h+='<button onclick="submitAuditOnly()" class="btn-fire" style="width:100%;justify-content:center;padding:12px;font-size:.78rem">Submit Audit →</button>';
   h+='<div id="audit-msg" style="display:none;margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.8rem"></div>';
   h+='</div></div>';
+  h = panelHeader('✅ Inventory Audit') + h;
   return h;
 }
 
@@ -8983,6 +10195,7 @@ function panelPendingTransfers(){
   var myIncoming=PENDING_TRANSFERS.filter(function(p){return p.toId===u.id&&p.status==='Awaiting Recipient Signature';});
   var awaitingApproval=canApprove?PENDING_TRANSFERS.filter(function(p){return p.status==='Awaiting Final Approval';}):[];
   var h='';
+  h += panelHeader('🔄 Pending Transfers');
   if(myIncoming.length){
     h+='<div style="background:rgba(204,0,0,.06);border:2px solid rgba(204,0,0,.3);border-radius:10px;padding:18px;margin-bottom:18px">';
     h+='<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--red);letter-spacing:2px;margin-bottom:10px">⚠ ACTION REQUIRED — Sign to Confirm Receipt</div>';
@@ -9114,6 +10327,7 @@ function panelSupplyMgmt(){
     h+='</tbody></table></div></div>';
   });
   h+='<div id="sm-saved" style="display:none;text-align:center;margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:#059669">✓ Stock levels saved.</div>';
+  h = panelHeader('🗂 Supply Management') + h;
   return h;
 }
 
@@ -9143,68 +10357,256 @@ function saveSupplyStock(){
 }
 
 function panelInvRequest(){
-  var u=DB.current;
+  var u = DB.current;
   if(isHR(u)||isInventory(u)) return '<div style="padding:40px;text-align:center;color:var(--muted)">Not available for this role.</div>';
-  var codedCamps=agentCodedCampaigns(u);
-  var hasLifeline=codedCamps.length>0;
-  var isOK=agentIsOklahoma(u);
-  var hasTruConnect=codedCamps.indexOf('TruConnect')>=0;
-  var h='<div style="max-width:760px;margin:0 auto">';
-  h+='<div style="background:linear-gradient(135deg,#003594,#002268);border-radius:10px;padding:20px 26px;margin-bottom:18px;color:white"><div style="font-family:Bebas Neue,sans-serif;font-size:1.7rem;letter-spacing:3px">Inventory Request</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.75;margin-top:3px">Request starter kit, devices, or initiate a transfer. All requests require Inventory dept approval.</div></div>';
-  h+='<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap">';
-  h+='<button id="irTab-kit" onclick="irSwitchTab(\'kit\')" class="btn-fire" style="font-size:.72rem;padding:9px 20px">🎒 Starter Kit</button>';
-  if(hasLifeline) h+='<button id="irTab-device" onclick="irSwitchTab(\'device\')" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;border-radius:4px;cursor:pointer">📱 Devices</button>';
-  h+='<button id="irTab-transfer" onclick="irSwitchTab(\'transfer\')" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;border-radius:4px;cursor:pointer">🔄 Transfer</button>';
-  h+='</div>';
-  // Starter kit tab
-  h+='<div id="irPanel-kit"><div class="bo-card" style="padding:22px 26px;margin-bottom:14px">';
-  h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:var(--blue);font-weight:700;margin-bottom:14px">Starter Kit Items</div>';
-  var kitItems=['tent-5x5','banner','tablecloth','shirt-s','shirt-m','shirt-l','shirt-xl','shirt-xxl','shirt-xxxl'];
-  SUPPLY_CATALOG.filter(function(item){return kitItems.indexOf(item.id)>=0;}).forEach(function(item){
-    var stock=SUPPLY_INVENTORY[item.id]||{available:0};
-    var avail=stock.available||0;
-    var sc=avail>0?'#059669':'#CC0000';
-    h+='<div style="display:flex;align-items:center;gap:10px;background:#fafafa;border:1px solid var(--border);border-radius:7px;padding:10px 13px;margin-bottom:7px">'
-      +'<span style="font-size:1.2rem">'+item.icon+'</span>'
-      +'<div style="flex:1;font-family:Barlow Condensed,sans-serif;font-size:.82rem;font-weight:700;color:var(--brown)">'+item.name+'</div>'
-      +'<span style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:'+sc+'">'+avail+' avail</span>'
-      +'<input type="number" id="ir-sup-'+item.id+'" min="0" value="0" style="width:54px;padding:5px;border:2px solid var(--border);border-radius:5px;font-family:Bebas Neue,sans-serif;font-size:1rem;text-align:center;color:var(--brown)">'
-      +'</div>';
+
+  var codedCamps = agentCodedCampaigns(u);
+  var hasLifeline = codedCamps.length > 0;
+  var isLdrRole   = u.role==='Team Leader'||u.role==='Market Manager'||u.role==='Campaign Manager';
+  var h = '<div style="max-width:800px;margin:0 auto">';
+
+  // ── Header banner ──
+  h += '<div style="background:linear-gradient(135deg,#003594,#002268);border-radius:10px;'
+     + 'padding:20px 26px;margin-bottom:18px;color:white">'
+     + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.7rem;letter-spacing:3px">Inventory Request</div>'
+     + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.75;margin-top:3px">'
+     + 'All requests require approval. Orders remain Pending until fully approved.</div></div>';
+
+  // ── Pending requests badge for this agent ──
+  var myPending = INVENTORY_REQUESTS.filter(function(r){
+    return r.agentId===u.id && r.status==='Pending';
   });
-  h+='<div style="margin-top:12px"><label class="f-label">Notes (optional)</label><textarea id="ir-sup-reason" class="f-textarea" style="min-height:50px" placeholder="Event or shift info..."></textarea></div>';
-  h+='<div id="ir-sup-error" style="display:none;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem;margin-top:8px"></div>';
-  h+='<button onclick="submitSupplyRequest()" class="btn-fire" style="width:100%;justify-content:center;padding:12px;font-size:.78rem;letter-spacing:3px;margin-top:14px">Submit Starter Kit Request →</button>';
-  h+='</div></div>';
-  // Device tab
-  h+='<div id="irPanel-device" style="display:none"><div class="bo-card" style="padding:22px 26px;margin-bottom:14px">';
-  if(hasLifeline){
-    h+='<div style="margin-bottom:12px"><label class="f-label">Campaign *</label><select class="f-select" id="ir-campaign" onchange="irUpdateDeviceOptions()"><option value="">-- Select Campaign --</option>'+codedCamps.map(function(c){return '<option value="'+c+'">'+c+'</option>';}).join('')+'</select></div>';
-    h+='<div id="ir-device-options"><div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted);text-align:center;padding:12px;font-style:italic">Select a campaign first</div></div>';
-    h+='<div style="margin-top:12px"><label class="f-label">Reason *</label><textarea class="f-textarea" id="ir-reason" style="min-height:50px" placeholder="Why do you need these devices?"></textarea></div>';
-    h+='<div id="ir-error" style="display:none;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem;margin-top:8px"></div>';
-    h+='<button onclick="submitInvRequest()" class="btn-fire" style="width:100%;justify-content:center;padding:12px;font-size:.78rem;letter-spacing:3px;margin-top:14px">Submit Device Request →</button>';
-  } else {
-    h+='<div style="text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif;padding:20px">No coded Lifeline campaigns. Contact HR to have your codes entered.</div>';
+  if(myPending.length){
+    h += '<div style="background:rgba(204,0,0,.06);border:2px solid rgba(204,0,0,.3);border-radius:8px;'
+       + 'padding:12px 18px;margin-bottom:16px;display:flex;align-items:center;gap:12px">'
+       + '<span style="font-size:1.3rem">\u23f3</span>'
+       + '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;font-weight:700;color:var(--red);">'
+       + 'APPROVAL REQUIRED \u2014 ORDER PENDING</div>'
+       + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">'
+       + 'You have '+myPending.length+' pending request(s). Your order will be fulfilled once all required approvals are received.</div>'
+       + '</div></div>';
   }
-  h+='</div></div>';
-  // Transfer tab
-  h+='<div id="irPanel-transfer" style="display:none"><div class="bo-card" style="padding:22px 26px;margin-bottom:14px">';
-  h+='<div style="background:rgba(204,0,0,.04);border:1px solid rgba(204,0,0,.2);border-radius:8px;padding:12px 16px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)"><strong style="color:var(--red)">🔐 3-Step Transfer:</strong> Submit → Recipient signs → Inventory dept approves.</div>';
-  var canReceive=DB.agents.filter(function(a){ return a.active&&a.id!==u.id&&!isHR(a)&&!isInventory(a); });
-  h+='<div style="margin-bottom:12px"><label class="f-label">Transfer To *</label><select class="f-select" id="ir-xfer-to"><option value="">-- Select Recipient --</option>'+canReceive.map(function(a){return '<option value="'+a.id+'">'+a.name+' ('+a.role+')</option>';}).join('')+'</select></div>';
-  var mySupply=[];
+
+  // ── Tab buttons ──
+  h += '<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap">';
+  h += '<button id="irTab-kit" onclick="irSwitchTab(\'kit\')" class="btn-fire" style="font-size:.72rem;padding:9px 20px">'
+     + '\U0001f392 Starter Kit</button>';
+  if(hasLifeline){
+    h += '<button id="irTab-device" onclick="irSwitchTab(\'device\')" '
+       + 'style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);'
+       + 'font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;'
+       + 'padding:9px 20px;border-radius:4px;cursor:pointer">\U0001f4f1 Devices</button>';
+  }
+  h += '<button id="irTab-transfer" onclick="irSwitchTab(\'transfer\')" '
+     + 'style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);'
+     + 'font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;'
+     + 'padding:9px 20px;border-radius:4px;cursor:pointer">\U0001f504 Transfer</button>';
+  h += '</div>';
+
+  // ════════════════════════════════════
+  // TAB 1: STARTER KIT
+  // ════════════════════════════════════
+  h += '<div id="irPanel-kit">';
+  h += '<div class="bo-card" style="padding:22px 26px;margin-bottom:14px">';
+
+  // What's in the kit
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;font-weight:700;'
+     + 'letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin-bottom:10px">What\'s Included</div>';
+  h += '<div style="background:rgba(0,53,148,.04);border:1px solid rgba(0,53,148,.15);border-radius:8px;'
+     + 'padding:14px 18px;margin-bottom:16px">';
+  h += '<div style="display:flex;flex-wrap:wrap;gap:10px">';
+  ['\u26fa\ufe0f 5\xd75 Canopy Tent','\U0001f6a9 Campaign Banner','\U0001f7e6 Branded Tablecloth','\U0001f455 Campaign Shirt (size your choice)'].forEach(function(item){
+    h += '<div style="background:white;border:1px solid var(--border);border-radius:6px;padding:7px 12px;'
+       + 'font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+item+'</div>';
+  });
+  h += '</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:10px">'
+     + '\u26a0\ufe0f <strong>Subject to availability.</strong> Items are pre-bundled and ship together. '
+     + 'Substitutions are not available \u2014 contact Inventory for special requests.</div>';
+  h += '</div>';
+
+  // Shirt size only
+  h += '<div class="f-field" style="max-width:260px;margin-bottom:16px">'
+     + '<label class="f-label">Shirt Size *</label>'
+     + '<select class="f-select" id="ir-kit-size">'
+     + '<option value="">-- Select Size --</option>'
+     + ['S','M','L','XL','2XL','3XL'].map(function(s){ return '<option value="'+s+'">'+s+'</option>'; }).join('')
+     + '</select></div>';
+
+  h += '<div class="f-field" style="margin-bottom:14px">'
+     + '<label class="f-label">Notes (optional)</label>'
+     + '<textarea class="f-textarea" id="ir-kit-notes" style="min-height:50px" '
+     + 'placeholder="Event info, location, or special notes..."></textarea></div>';
+
+  h += '<div id="ir-kit-error" style="display:none;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem;margin-bottom:8px"></div>';
+  h += '<button onclick="submitStarterKitRequest()" class="btn-fire" '
+     + 'style="width:100%;justify-content:center;padding:12px;font-size:.78rem;letter-spacing:3px;margin-top:4px">'
+     + 'Submit Starter Kit Request \u2192</button>';
+  h += '</div></div>';
+
+  // ════════════════════════════════════
+  // TAB 2: DEVICES
+  // ════════════════════════════════════
+  h += '<div id="irPanel-device" style="display:none">';
+  if(hasLifeline){
+    h += '<div class="bo-card" style="padding:22px 26px;margin-bottom:14px">';
+
+    // TL/MM: show team inventory summary first
+    if(isLdrRole){
+      var teamSumData = teamInvSummary(u.id);
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;font-weight:700;'
+         + 'letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin-bottom:10px">'
+         + '\U0001f465 Team Inventory on Hand</div>';
+      if(teamSumData.length===0){
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted);'
+           + 'margin-bottom:16px">No team members with assigned inventory.</div>';
+      } else {
+        h += '<div style="overflow-x:auto;margin-bottom:16px"><table style="width:100%;border-collapse:collapse">';
+        h += '<thead><tr style="background:#f4f6f8">'
+           + '<th style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 10px;text-align:left">Agent</th>'
+           + '<th style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 10px;text-align:center">Phones</th>'
+           + '<th style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 10px;text-align:center">SIMs</th>'
+           + '<th style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 10px;text-align:center">Upsell</th>'
+           + '<th style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 10px;text-align:center">Total</th>'
+           + '<th style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 10px;text-align:center">Expiring</th>'
+           + '</tr></thead><tbody>';
+        teamSumData.forEach(function(td,i){
+          var totalP=0,totalS=0,totalU=0,totalExp=0;
+          Object.values(td.summary).forEach(function(v){totalP+=v.phones;totalS+=v.sims;totalU+=v.upsell;totalExp+=v.expiringSoon;});
+          var rowBg = i%2===0?'#fff':'#fafafa';
+          var expColor = totalExp>0?'color:#CC0000;font-weight:700':'color:var(--muted)';
+          h += '<tr style="background:'+rowBg+';border-top:1px solid var(--border)">'
+             + '<td style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;font-weight:700;color:var(--brown);padding:8px 10px">'+td.agent.name+'</td>'
+             + '<td style="text-align:center;font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--blue);padding:8px 10px">'+totalP+'</td>'
+             + '<td style="text-align:center;font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--blue);padding:8px 10px">'+totalS+'</td>'
+             + '<td style="text-align:center;font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--blue);padding:8px 10px">'+totalU+'</td>'
+             + '<td style="text-align:center;font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--brown);padding:8px 10px;font-weight:700">'+td.total+'</td>'
+             + '<td style="text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.8rem;padding:8px 10px;'+expColor+'">'+totalExp+'</td>'
+             + '</tr>';
+        });
+        h += '</tbody></table></div>';
+      }
+      h += '<div style="height:1px;background:var(--border);margin-bottom:16px"></div>';
+    }
+
+    // My personal inventory on hand
+    var mySummary = agentInvSummary(u.id);
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;font-weight:700;'
+       + 'letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin-bottom:10px">'
+       + '\U0001f4f1 Your Current Inventory on Hand</div>';
+    if(Object.keys(mySummary).length===0){
+      h += '<div style="background:rgba(204,0,0,.04);border:1px solid rgba(204,0,0,.2);border-radius:8px;'
+         + 'padding:12px 16px;margin-bottom:16px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">'
+         + '\u26a0\ufe0f You have no inventory currently assigned. A request will be submitted for new devices.</div>';
+    } else {
+      h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:16px">';
+      Object.keys(mySummary).forEach(function(carrier){
+        var s = mySummary[carrier];
+        var tot = s.phones+s.sims+s.upsell+s.tablets;
+        var critBorder = s.critical>0?'border-color:#CC0000':s.expiringSoon>0?'border-color:#D97706':'';
+        h += '<div style="background:#fafafa;border:2px solid var(--border);border-radius:8px;padding:12px 14px;'+critBorder+'">'
+           + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin-bottom:8px">'+carrier+'</div>'
+           + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">'
+           + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)">Phones</div>'
+           + '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--brown);text-align:right">'+s.phones+'</div>'
+           + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)">SIMs</div>'
+           + '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--brown);text-align:right">'+s.sims+'</div>'
+           + (s.upsell>0?'<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)">Upsell</div><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--brown);text-align:right">'+s.upsell+'</div>':'')
+           + '</div>'
+           + (s.expiringSoon>0?'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:'+(s.critical>0?'#CC0000':'#D97706')+';margin-top:6px;font-weight:700">\u26a0 '+s.expiringSoon+' expiring soon</div>':'')
+           + '</div>';
+      });
+      h += '</div>';
+    }
+
+    // Redistribution suggestion (low inventory case)
+    var myTotal = Object.values(mySummary).reduce(function(s,v){return s+v.phones+v.sims;},0);
+    if(myTotal < 10 && codedCamps.length>0){
+      var redist = findRedistributableInventory(codedCamps[0], u.id);
+      if(redist.length>0){
+        h += '<div style="background:rgba(5,150,105,.06);border:1px solid rgba(5,150,105,.3);border-radius:8px;'
+           + 'padding:12px 16px;margin-bottom:16px">'
+           + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;font-weight:700;color:#059669;margin-bottom:6px">'
+           + '\u267b\ufe0f Inventory Available for Redistribution</div>'
+           + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">'
+           + 'You have low inventory. There are <strong>'+redist.length+' devices</strong> in your market '
+           + 'from low performers or expiring batches that can be transferred to you first before new inventory is ordered. '
+           + 'Your manager may redirect existing inventory before approving new devices.</div></div>';
+      }
+    }
+
+    h += '<div style="height:1px;background:var(--border);margin-bottom:16px"></div>';
+
+    // Campaign selector
+    h += '<div style="margin-bottom:12px"><label class="f-label">Campaign *</label>'
+       + '<select class="f-select" id="ir-campaign" onchange="irUpdateDeviceOptions()">'
+       + '<option value="">-- Select Campaign --</option>'
+       + codedCamps.map(function(c){ return '<option value="'+c+'">'+c+'</option>'; }).join('')
+       + '</select></div>';
+    h += '<div id="ir-device-options"><div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;'
+       + 'color:var(--muted);text-align:center;padding:12px;font-style:italic">Select a campaign above</div></div>';
+    h += '<div style="margin-top:12px"><label class="f-label">Reason for Request *</label>'
+       + '<textarea class="f-textarea" id="ir-reason" style="min-height:60px" '
+       + 'placeholder="Why do you need these devices? (event, territory, new enrollment push...)"></textarea></div>';
+
+    // Approval chain preview
+    var fakeReq = {agentId:u.id, approvals:{}};
+    var chain = getApprovalChain(fakeReq);
+    if(chain.length>0){
+      h += '<div style="background:rgba(0,53,148,.04);border:1px solid rgba(0,53,148,.15);border-radius:8px;'
+         + 'padding:12px 16px;margin-top:14px">'
+         + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;font-weight:700;letter-spacing:2px;'
+         + 'text-transform:uppercase;color:var(--blue);margin-bottom:8px">\U0001f510 Approval Chain</div>'
+         + '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">';
+      chain.forEach(function(step,i){
+        h += '<div style="background:white;border:1px solid var(--border);border-radius:100px;'
+           + 'padding:5px 12px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--brown)">'
+           + step.label+'</div>';
+        if(i < chain.length-1) h += '<span style="color:var(--muted)">\u2192</span>';
+      });
+      h += '</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted);margin-top:8px">'
+         + 'Your request will remain Pending until all parties above have approved.</div></div>';
+    }
+
+    h += '<div id="ir-error" style="display:none;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem;margin-top:8px"></div>';
+    h += '<button onclick="submitInvRequest()" class="btn-fire" '
+       + 'style="width:100%;justify-content:center;padding:12px;font-size:.78rem;letter-spacing:3px;margin-top:14px">'
+       + 'Submit Device Request \u2192</button>';
+    h += '</div>';
+  } else {
+    h += '<div class="bo-card" style="padding:30px;text-align:center;color:var(--muted);'
+       + 'font-family:Barlow Condensed,sans-serif">No coded Lifeline campaigns. Contact HR.</div>';
+  }
+  h += '</div>';
+
+  // ════════════════════════════════════
+  // TAB 3: TRANSFER (unchanged)
+  // ════════════════════════════════════
+  h += '<div id="irPanel-transfer" style="display:none"><div class="bo-card" style="padding:22px 26px;margin-bottom:14px">';
+  h += '<div style="background:rgba(204,0,0,.04);border:1px solid rgba(204,0,0,.2);border-radius:8px;'
+     + 'padding:12px 16px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)">'
+     + '<strong style="color:var(--red)">\U0001f510 3-Step Transfer:</strong> Submit \u2192 Recipient signs \u2192 Inventory dept approves.</div>';
+  var canReceive = DB.agents.filter(function(a){ return a.active&&a.id!==u.id&&!isHR(a)&&!isInventory(a); });
+  h += '<div style="margin-bottom:12px"><label class="f-label">Transfer To *</label>'
+     + '<select class="f-select" id="ir-xfer-to"><option value="">-- Select Recipient --</option>'
+     + canReceive.map(function(a){ return '<option value="'+a.id+'">'+a.name+' ('+a.role+')</option>'; }).join('')
+     + '</select></div>';
+  var mySupply = [];
   SUPPLY_CATALOG.forEach(function(item){ var stock=SUPPLY_INVENTORY[item.id]||{assigned:{}}; var qty=(stock.assigned&&stock.assigned[u.id])||0; if(qty>0) mySupply.push({item:item,qty:qty}); });
   if(mySupply.length){
-    h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Items to Transfer</div>';
-    h+='<div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:12px">';
-    mySupply.forEach(function(si,i){ h+='<div style="display:flex;align-items:center;gap:10px;padding:9px 13px;'+(i%2===0?'background:#fafafa;':'')+'"><span>'+si.item.icon+'</span><div style="flex:1;font-family:Barlow Condensed,sans-serif;font-size:.8rem;font-weight:700;color:var(--brown)">'+si.item.name+'</div><span style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted)">Have: '+si.qty+'</span><input type="number" id="ir-xfer-'+si.item.id+'" min="0" max="'+si.qty+'" value="0" style="width:52px;padding:4px;border:2px solid var(--border);border-radius:4px;font-family:Bebas Neue,sans-serif;font-size:1rem;text-align:center;color:var(--brown)"></div>'; });
-    h+='</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Items to Transfer</div>';
+    h += '<div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:12px">';
+    mySupply.forEach(function(si,i){ h += '<div style="display:flex;align-items:center;gap:10px;padding:9px 13px;'+(i%2===0?'background:#fafafa;':'')+'">'+'<span>'+si.item.icon+'</span><div style="flex:1;font-family:Barlow Condensed,sans-serif;font-size:.8rem;font-weight:700;color:var(--brown)">'+si.item.name+'</div><span style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted)">Have: '+si.qty+'</span><input type="number" id="ir-xfer-'+si.item.id+'" min="0" max="'+si.qty+'" value="0" style="width:52px;padding:4px;border:2px solid var(--border);border-radius:4px;font-family:Bebas Neue,sans-serif;font-size:1rem;text-align:center;color:var(--brown)"></div>'; });
+    h += '</div>';
   }
-  h+='<div style="margin-bottom:12px"><label class="f-label">Transfer Notes *</label><textarea class="f-textarea" id="ir-xfer-notes" style="min-height:50px" placeholder="Reason for transfer..."></textarea></div>';
-  h+='<div id="ir-xfer-error" style="display:none;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem;margin-bottom:8px"></div>';
-  h+='<button onclick="submitSupplyTransfer()" class="btn-fire" style="width:100%;justify-content:center;padding:12px;font-size:.78rem;letter-spacing:3px">Submit Transfer for Recipient Confirmation →</button>';
-  h+='</div></div>';
-  h+='</div>';
+  h += '<div style="margin-bottom:12px"><label class="f-label">Transfer Notes *</label>'
+     + '<textarea class="f-textarea" id="ir-xfer-notes" style="min-height:50px" placeholder="Reason for transfer..."></textarea></div>';
+  h += '<div id="ir-xfer-error" style="display:none;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem;margin-bottom:8px"></div>';
+  h += '<button onclick="submitSupplyTransfer()" class="btn-fire" style="width:100%;justify-content:center;padding:12px;font-size:.78rem;letter-spacing:3px">Submit Transfer for Recipient Confirmation \u2192</button>';
+  h += '</div></div>';
+
+  h += '</div>';
+  h = panelHeader('\U0001f4e6 Inventory Request') + h;
   return h;
 }
 
@@ -9265,65 +10667,109 @@ function submitSupplyRequest(){
 }
 
 function submitInvRequest(){
-  var u=DB.current;
-  var campaign=(document.getElementById('ir-campaign')||{value:''}).value;
-  var freePhones=parseInt((document.getElementById('ir-free-phones')||{value:'0'}).value)||0;
-  var upsellPhones=parseInt((document.getElementById('ir-upsell-phones')||{value:'0'}).value)||0;
-  var sims=parseInt((document.getElementById('ir-sims')||{value:'0'}).value)||0;
-  var tablets=parseInt((document.getElementById('ir-tablets')||{value:'0'}).value)||0;
-  var reason=(document.getElementById('ir-reason')||{value:''}).value.trim();
-  var errEl=document.getElementById('ir-error'); if(errEl) errEl.style.display='none';
+  var u = DB.current;
+  var campaign = (document.getElementById('ir-campaign')||{value:''}).value;
+  var freePhones   = parseInt((document.getElementById('ir-free-phones')||{value:'0'}).value)||0;
+  var upsellPhones = parseInt((document.getElementById('ir-upsell-phones')||{value:'0'}).value)||0;
+  var sims         = parseInt((document.getElementById('ir-sims')||{value:'0'}).value)||0;
+  var tablets      = parseInt((document.getElementById('ir-tablets')||{value:'0'}).value)||0;
+  var reason       = (document.getElementById('ir-reason')||{value:''}).value.trim();
+  var errEl = document.getElementById('ir-error');
+  if(errEl) errEl.style.display='none';
 
-  // ── 5-DAY INVENTORY BLOCK RULE ──
-  // If any batch has ≤5 days remaining, only Inventory dept / Owner can submit
+  // 5-day block check
   var minDaysLeft = null;
   INVENTORY_DEVICES.forEach(function(d){
     if(d.status!=='available') return;
     var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
-    if(dr!==null && (minDaysLeft===null || dr < minDaysLeft)) minDaysLeft = dr;
+    if(dr!==null && (minDaysLeft===null || dr<minDaysLeft)) minDaysLeft = dr;
   });
-  var isBlockedRole = !isOwner(u) && u.role!=='Inventory' && u.role!=='admin';
-  if(isBlockedRole && minDaysLeft!==null && minDaysLeft<=5){
+  if(!isOwner(u) && u.role!=='Inventory' && u.role!=='admin' && minDaysLeft!==null && minDaysLeft<=5){
     if(errEl){
-      errEl.innerHTML='🔒 <strong>Inventory Request Blocked</strong><br>Your current inventory expires in '+minDaysLeft+' day'+(minDaysLeft===1?'':'s')+'. Requests are restricted at 5 days or less.'
-        +'<br><span style="font-size:.8em;color:var(--muted)">Contact the Inventory Department or Owner for an emergency request.</span>';
+      errEl.innerHTML='🔒 <strong>Inventory Request Blocked</strong><br>Current inventory expires in '+minDaysLeft+' day(s). Requests restricted at 5 days or less.';
       errEl.style.display='block';
     }
-    // Push urgent notification to Inventory + Owner
-    pushNotification({
-      type:'alert', icon:'🔒',
-      title:'Inventory Block — '+u.name,
-      body:u.name+' attempted an inventory request but is blocked ('+minDaysLeft+' days remaining). Immediate review required.',
-      fromId:u.id, fromName:u.name, formType:'inv-request',
-      toIds:[], toRoles:['Inventory']
-    });
     return;
   }
-  if(!campaign){if(errEl){errEl.textContent='⚠ Select a campaign.';errEl.style.display='block';} return;}
-  if(!freePhones&&!upsellPhones&&!sims&&!tablets){if(errEl){errEl.textContent='⚠ Request at least 1 device.';errEl.style.display='block';} return;}
-  var req={id:'req-'+INV_NEXT_ID++,type:'device',agentId:u.id,agentName:u.name,agentRole:u.role,campaign:campaign,phones:freePhones+upsellPhones,upsell:upsellPhones,sims:sims,tablets:tablets,reason:reason,date:new Date().toISOString().slice(0,10),status:'Pending',approvedBy:null,approvedDate:null};
-  INVENTORY_REQUESTS.unshift(req); saveInventory();
+  if(!campaign){ if(errEl){ errEl.textContent='⚠ Select a campaign.'; errEl.style.display='block'; } return; }
+  if(!freePhones&&!upsellPhones&&!sims&&!tablets){ if(errEl){ errEl.textContent='⚠ Request at least 1 device.'; errEl.style.display='block'; } return; }
+
+  var req = {
+    id:'req-'+INV_NEXT_ID++, type:'device',
+    agentId:u.id, agentName:u.name, agentRole:u.role,
+    campaign:campaign, phones:freePhones+upsellPhones, upsell:upsellPhones,
+    sims:sims, tablets:tablets, reason:reason,
+    date:new Date().toISOString().slice(0,10),
+    status:'Pending', approvals:{},
+    approvedBy:null, approvedDate:null
+  };
+  INVENTORY_REQUESTS.unshift(req);
+  saveInventory();
+
+  // Notify entire approval chain with persistent modal + SMS
+  notifyApprovalChain(req, {
+    title: '📦 Inventory Request — '+u.name,
+    body:  '<strong>'+u.name+'</strong> ('+u.role+') has submitted an inventory request for <strong>'+campaign+'</strong>.<br>'
+          +'<br>📱 Phones: '+(freePhones+upsellPhones)+'&nbsp;&nbsp;💿 SIMs: '+sims
+          +(tablets?' &nbsp;&nbsp;📱 Tablets: '+tablets:'')
+          +'<br><br>Status: <strong style="color:#CC0000">Pending Approval</strong><br>'
+          +'Please review in the Inventory Requests panel.'
+  }, '📦');
+
+  // Announce in national channel
   if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
-  CHANNEL_MSGS['national'].unshift({id:channelMsgNextId++,from:'Inventory System',role:'Inventory',init:'IN',time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),type:'announcement',text:'📱 DEVICE REQUEST — '+u.name+' ('+u.role+') | '+campaign+' | '+(freePhones+upsellPhones)+' phones, '+sims+' SIMs'+( tablets?' + '+tablets+' tablets':'')+' | Pending Approval',photo:null});
-  // Push in-app notification to TL, MM, Inventory dept, Admin, Owner
-  var invRecips = getNotifRecipients(u.id);
-  // Also add all Inventory role agents
-  DB.agents.filter(function(a){return a.active&&a.role==='Inventory';}).forEach(function(a){
-    if(invRecips.indexOf(a.id)<0) invRecips.push(a.id);
+  CHANNEL_MSGS['national'].unshift({
+    id:channelMsgNextId++, from:'Inventory System', role:'Inventory', init:'IN',
+    time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
+    type:'announcement',
+    text:'📦 DEVICE REQUEST — '+u.name+' ('+u.role+') | '+campaign
+        +' | '+(freePhones+upsellPhones)+' phones, '+sims+' SIMs'+(tablets?' + '+tablets+' tablets':'')
+        +' | Pending Approval',
+    photo:null
   });
-  pushNotification({
-    type:     'inventory',
-    icon:     '📦',
-    title:    'Inventory Request — ' + u.name,
-    body:     u.name + ' (' + u.role + ') requested: ' + (req.phones) + ' phones, ' + req.sims + ' SIMs' + (req.tablets ? ', ' + req.tablets + ' tablets' : '') + ' for ' + campaign + '. Status: Pending Approval.',
-    fromId:   u.id,
-    fromName: u.name,
-    formType: 'inv-request',
-    toIds:    invRecips,
-    toRoles:  ['Inventory']
-  });
+
+  alert('✓ Request submitted! Your order is PENDING approval from your management chain and Inventory.');
   gotoPanel('inv-request');
 }
+
+
+function submitStarterKitRequest(){
+  var u = DB.current;
+  var size  = (document.getElementById('ir-kit-size')||{value:''}).value;
+  var notes = (document.getElementById('ir-kit-notes')||{value:''}).value.trim();
+  var errEl = document.getElementById('ir-kit-error');
+  if(errEl) errEl.style.display='none';
+  if(!size){ if(errEl){ errEl.textContent='⚠ Please select a shirt size.'; errEl.style.display='block'; } return; }
+
+  var req = {
+    id:'req-'+INV_NEXT_ID++, type:'starter-kit',
+    agentId:u.id, agentName:u.name, agentRole:u.role,
+    shirtSize:size, notes:notes,
+    items:[
+      {id:'tent-5x5',name:'5x5 Canopy Tent',qty:1},
+      {id:'banner',name:'Campaign Banner',qty:1},
+      {id:'tablecloth',name:'Branded Tablecloth',qty:1},
+      {id:'shirt-'+size.toLowerCase(),name:'Campaign Shirt ('+size+')',qty:1}
+    ],
+    date:new Date().toISOString().slice(0,10),
+    status:'Pending', approvals:{},
+    approvedBy:null, approvedDate:null
+  };
+  INVENTORY_REQUESTS.unshift(req);
+  saveInventory();
+
+  notifyApprovalChain(req, {
+    title: '🎒 Starter Kit Request — '+u.name,
+    body:  '<strong>'+u.name+'</strong> ('+u.role+') has requested a Starter Kit.<br>'
+          +'<br>👕 Shirt Size: <strong>'+size+'</strong>'
+          +(notes?'<br>📝 Notes: '+notes:'')
+          +'<br><br>Status: <strong style="color:#CC0000">Pending Approval</strong>'
+  }, '🎒');
+
+  alert('✓ Starter Kit request submitted! Pending approval. You will be notified when approved.');
+  gotoPanel('inv-request');
+}
+
 
 function submitSupplyTransfer(){
   var u=DB.current;
@@ -9368,8 +10814,8 @@ function launchJitsi(chId, chName, displayName, isModerator){
       if(jitsiApi){ try{jitsiApi.dispose();}catch(e){} jitsiApi=null; }
       jitsiApi = new JitsiMeetExternalAPI('meet.jit.si',{
         roomName:roomName, parentNode:container, width:'100%', height:'100%',
-        userInfo:{displayName:displayName},
-        configOverwrite:{startWithAudioMuted:false,startWithVideoMuted:false,
+        userInfo:{displayName:displayName,avatarUrl:DB.current&&DB.current.profilePic?DB.current.profilePic:''},
+        configOverwrite:{startWithAudioMuted:false,startWithVideoMuted:true,
           prejoinPageEnabled:false,disableDeepLinking:true,enableWelcomePage:false,
           toolbarButtons:['microphone','camera','desktop','chat','raisehand',
             'tileview','select-background','filmstrip','mute-everyone','hangup',
@@ -9505,6 +10951,14 @@ function showWaitingRoom(chId,chName,displayName){
   var liveEl=document.getElementById('vcLiveIndicator'); if(liveEl) liveEl.style.display='none';
   var chNameEl=document.getElementById('wr-channel-name'); if(chNameEl) chNameEl.textContent=chName.toUpperCase();
   var selfChip=document.getElementById('wr-self-chip'); if(selfChip) selfChip.textContent=(u?u.name:displayName)+' (You)';
+  // Show profile pic in waiting room if available
+  var wrAvatar = document.getElementById('wr-user-avatar');
+  if(wrAvatar && u && u.profilePic){
+    wrAvatar.style.backgroundImage = 'url('+u.profilePic+')';
+    wrAvatar.style.backgroundSize  = 'cover';
+    wrAvatar.style.backgroundPosition = 'center';
+    wrAvatar.innerHTML = '';
+  }
   if(endBtn){ endBtn.textContent='\u2715 Leave'; endBtn.onclick=function(){ wrStopMusic(); wrLeave(chId,u?u.id:displayName); closeVideoCall(); }; }
   // Build playlist UI
   var pl=document.getElementById('wr-playlist');
@@ -9998,6 +11452,8 @@ setTimeout(initSocialBars, 100);
     <div id="videoWaitingRoom" style="display:none;flex:1;background:linear-gradient(160deg,#0a0a1a 0%,#0d0d2e 60%,#120a20 100%);overflow-y:auto">
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100%;padding:32px 24px;gap:0">
 
+        <!-- Agent profile pic avatar -->
+        <div id="wr-user-avatar" style="width:80px;height:80px;border-radius:50%;background:linear-gradient(135deg,#0D47A1,#003594);display:flex;align-items:center;justify-content:center;margin:0 auto 20px;border:3px solid rgba(96,165,250,.4);font-family:'Bebas Neue',sans-serif;font-size:1.6rem;color:white;letter-spacing:2px;overflow:hidden;flex-shrink:0"></div>
         <!-- WMAMinc. branding -->
         <div style="text-align:center;margin-bottom:28px">
           <div style="font-family:'Bebas Neue',sans-serif;font-size:2.4rem;color:white;letter-spacing:5px;line-height:1">WMAMINC.</div>
