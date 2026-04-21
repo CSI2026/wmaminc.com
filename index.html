@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-  <script src="https://meet.jit.si/external_api.js"></script>
+  <script src="https://unpkg.com/@daily-co/daily-js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -17413,7 +17413,12 @@ async function endCallState(chId){
 }
 
 function closeVideoCall(){
+  // Dispose both old Jitsi frame (legacy) and new Daily frame, whichever is active.
   if(jitsiApi){ try{jitsiApi.dispose();}catch(e){} jitsiApi=null; }
+  if(typeof dailyCallFrame !== 'undefined' && dailyCallFrame){
+    try{ dailyCallFrame.destroy(); }catch(e){}
+    dailyCallFrame = null;
+  }
   wrStopMusic();
   var modal=document.getElementById('videoCallModal');
   var waitDiv=document.getElementById('videoWaitingRoom');
@@ -18252,7 +18257,37 @@ function submitSupplyTransfer(){
 // ══════════════════════════════════════════════
 //  JITSI / VIDEO CALL LAUNCH
 // ══════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
+//  VIDEO CALL LAUNCHER — Daily.co edition
+//  Previously this used meet.jit.si which had server-side moderator
+//  gates we couldn't override, caching bugs, random "connection failed"
+//  errors, and no professional support. We now use Daily.co's pre-built
+//  iframe — 5 rooms created manually in the Daily dashboard, URLs
+//  hardcoded below (NO API key in this file, nothing to leak).
+//
+//  The function name stays launchJitsi() for backward compatibility so
+//  every caller elsewhere in the file continues to work unchanged.
+// ══════════════════════════════════════════════════════════════
+
+// Map of channel id → Daily room URL. Rooms were created in the Daily
+// dashboard at https://dashboard.daily.co → Rooms. Each is an "open"
+// room on the free tier, no moderator required, no prejoin gate.
+var DAILY_ROOMS = {
+  'room-national':  'https://wmaminc.daily.co/National',
+  'room-lifeline':  'https://wmaminc.daily.co/Lifeline',
+  'room-internet':  'https://wmaminc.daily.co/Internet',
+  'room-aca':       'https://wmaminc.daily.co/ACA',
+  'room-office':    'https://wmaminc.daily.co/Office'
+};
+// Fallback room for any other channel id (team rooms, etc.). We route
+// all non-core rooms to National so nothing is broken while we decide
+// whether to add more rooms per team.
+var DAILY_FALLBACK_ROOM = 'https://wmaminc.daily.co/National';
+
+var dailyCallFrame = null; // singleton — dispose before creating a new one
+
 function launchJitsi(chId, chName, displayName, isModerator){
+  // Keeping the name launchJitsi() means callers don't have to change.
   try{
     var modal     = document.getElementById('videoCallModal');
     var container = document.getElementById('jitsiContainer');
@@ -18261,138 +18296,132 @@ function launchJitsi(chId, chName, displayName, isModerator){
       alert('Video call interface failed to load. Please refresh the page and try again.');
       return;
     }
-  if(waitDiv) waitDiv.style.display='none';
-  container.style.display='block';
-  container.innerHTML='';
+    if(waitDiv) waitDiv.style.display='none';
+    container.style.display='block';
+    container.innerHTML='';
 
-  var roomName = 'WMAMinc-' + chId.replace(/[^a-z0-9]/gi,'-');
-  var roomURL  = 'https://meet.jit.si/' + roomName;
-  var isHTTPS  = window.location.protocol==='https:';
+    // Resolve the room URL — prefer the exact mapping, fall back to National.
+    var roomURL = DAILY_ROOMS[chId] || DAILY_FALLBACK_ROOM;
 
-  // Reveal the modal first — even if Jitsi fails to mount we still want
-  // the user to see the iframe fallback inside the same overlay.
-  modal.style.display='flex';
+    modal.style.display='flex';
 
-  var titleEl=document.getElementById('videoCallTitle');
-  if(titleEl) titleEl.textContent=chName+(isModerator?' \u2014 You are Host':'');
-  var badge=document.getElementById('videoCallHostBadge');
-  if(badge) badge.style.display=isModerator?'inline-flex':'none';
-  var liveEl=document.getElementById('vcLiveIndicator');
-  if(liveEl) liveEl.style.display='inline-flex';
-  var endBtnEl=document.getElementById('videoCallEndBtn');
-  if(endBtnEl){
-    if(isModerator){
-      endBtnEl.textContent='\u23F9 End for Everyone';
-      endBtnEl.onclick=function(){endCallState(chId);closeVideoCall();};
-    } else {
-      endBtnEl.textContent='\u2715 Leave Call';
-      endBtnEl.onclick=closeVideoCall;
-    }
-  }
-
-  if(isHTTPS && typeof JitsiMeetExternalAPI !== 'undefined'){
-    try{
-      if(jitsiApi){ try{jitsiApi.dispose();}catch(e){} jitsiApi=null; }
-      jitsiApi = new JitsiMeetExternalAPI('meet.jit.si',{
-        roomName:roomName, parentNode:container, width:'100%', height:'100%',
-        userInfo:{displayName:displayName,avatarUrl:DB.current&&DB.current.profilePic?DB.current.profilePic:''},
-        configOverwrite:{
-          startWithAudioMuted:false,startWithVideoMuted:true,
-          prejoinPageEnabled:false,disableDeepLinking:true,enableWelcomePage:false,
-          // ── Suppress the 8x8 "Build a video solution" promo card that
-          //    Jitsi shows by default at the end of every call.
-          enableClosePage:false,
-          hideConferenceSubject:true,
-          hideConferenceTimer:false,
-          toolbarButtons:['microphone','camera','desktop','chat','raisehand',
-            'tileview','select-background','filmstrip','mute-everyone','hangup',
-            'fullscreen','settings','recording','sharedvideo','stats','security']
-        },
-        interfaceConfigOverwrite:{
-          SHOW_JITSI_WATERMARK:false,SHOW_WATERMARK_FOR_GUESTS:false,
-          MOBILE_APP_PROMO:false,HIDE_INVITE_MORE_HEADER:true,DEFAULT_BACKGROUND:'#0a0a1a',
-          SHOW_BRAND_WATERMARK:false,SHOW_POWERED_BY:false,
-          // Extra suppression for the post-call promo screen
-          SHOW_PROMOTIONAL_CLOSE_PAGE:false,
-          ENABLE_FEEDBACK_ANIMATION:false,
-          DISABLE_FEEDBACK_AND_PROMOTIONAL_CONTENT:true
-        }
-      });
+    var titleEl = document.getElementById('videoCallTitle');
+    if(titleEl) titleEl.textContent = chName + (isModerator?' \u2014 You are Host':'');
+    var badge = document.getElementById('videoCallHostBadge');
+    if(badge) badge.style.display = isModerator?'inline-flex':'none';
+    var liveEl = document.getElementById('vcLiveIndicator');
+    if(liveEl) liveEl.style.display = 'inline-flex';
+    var endBtnEl = document.getElementById('videoCallEndBtn');
+    if(endBtnEl){
       if(isModerator){
-        jitsiApi.addEventListener('videoConferenceJoined',function(){
-          try{jitsiApi.executeCommand('displayName',displayName);}catch(e){}
-          try{jitsiApi.executeCommand('toggleLobby',true);}catch(e){}
-        });
+        endBtnEl.textContent = '\u23F9 End for Everyone';
+        endBtnEl.onclick = function(){ endCallState(chId); closeVideoCall(); };
+      } else {
+        endBtnEl.textContent = '\u2715 Leave Call';
+        endBtnEl.onclick = closeVideoCall;
       }
-      // Close our modal the instant anyone hangs up — don't wait for the
-      // promo page (which we suppressed above) or for "ready to close".
-      jitsiApi.addEventListener('videoConferenceLeft',function(){
-        if(isModerator) endCallState(chId);
-        closeVideoCall();
-      });
-      jitsiApi.addEventListener('readyToClose',function(){
-        if(isModerator) endCallState(chId);
-        closeVideoCall();
-      });
-      // Pop out button
-      var popBtn=document.createElement('button');
-      popBtn.textContent='\u2197 Pop Out';
-      popBtn.style.cssText='position:absolute;top:60px;right:14px;z-index:1000;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer';
-      popBtn.onclick=function(){ window.open('https://meet.jit.si/'+roomName+'#userInfo.displayName='+encodeURIComponent(displayName),'_blank'); };
-      if(container.parentNode) container.parentNode.style.position='relative';
-      container.parentNode.appendChild(popBtn);
-    }catch(err){
-      console.error('Jitsi external API failed:', err);
-      vcIframeFallback(roomName, roomURL, chId, chName, displayName, isModerator, container);
     }
-  } else {
-    // Either not HTTPS or external API didn't load — use in-page iframe.
-    vcIframeFallback(roomName, roomURL, chId, chName, displayName, isModerator, container);
-  }
+
+    // Dispose any prior call frame before creating a new one. Daily's SDK
+    // will throw "Duplicate DailyIframe instances" otherwise.
+    if(dailyCallFrame){
+      try{ dailyCallFrame.destroy(); }catch(e){}
+      dailyCallFrame = null;
+    }
+
+    // Fallback if the Daily SDK didn't load (ad-blocker, offline). Use a
+    // plain iframe pointed at the room URL — Daily's prebuilt UI still
+    // renders correctly that way.
+    if(typeof window.DailyIframe === 'undefined'){
+      console.warn('Daily SDK missing — falling back to bare iframe');
+      container.innerHTML = '<div style="position:relative;width:100%;height:100%;background:#0a0a1a">'
+        + '<iframe src="' + roomURL + '?t=' + encodeURIComponent(displayName)
+        + '" allow="camera; microphone; fullscreen; display-capture; autoplay" '
+        + 'style="width:100%;height:100%;border:0;display:block" allowfullscreen></iframe>'
+        + '</div>';
+      return;
+    }
+
+    // Build a Daily call frame inside our container. Their prebuilt UI
+    // handles the mic/cam controls, chat, screen share, tile view — we
+    // just point it at the room.
+    dailyCallFrame = window.DailyIframe.createFrame(container, {
+      iframeStyle: {
+        width:'100%', height:'100%', border:'0', background:'#0a0a1a'
+      },
+      showLeaveButton: true,
+      showFullscreenButton: true,
+      showLocalVideo: true,
+      showParticipantsBar: true,
+      theme: {
+        colors: {
+          accent:         '#003594',  // WMAMinc blue
+          accentText:     '#FFFFFF',
+          background:     '#0a0a1a',
+          backgroundAccent:'#141428',
+          baseText:       '#FFFFFF',
+          border:         '#2a2a44',
+          mainAreaBg:     '#0a0a1a',
+          mainAreaBgAccent:'#141428',
+          mainAreaText:   '#FFFFFF',
+          supportiveText: '#9ca3af'
+        }
+      }
+    });
+
+    // Join the room. Daily handles the camera/mic permission prompt.
+    dailyCallFrame.join({
+      url: roomURL,
+      userName: displayName,
+      startAudioOff: false,
+      startVideoOff: true  // match your previous UX where video started off
+    }).catch(function(err){
+      console.error('[Daily] join failed:', err);
+      alert('Could not connect to the call.\n\n' + (err && err.errorMsg ? err.errorMsg : err));
+    });
+
+    // When user hangs up from Daily's own leave button, close our modal.
+    dailyCallFrame.on('left-meeting', function(){
+      if(isModerator) endCallState(chId);
+      closeVideoCall();
+    });
+
+    // Surface any fatal errors so we can see them instead of silent fails.
+    dailyCallFrame.on('error', function(e){
+      console.error('[Daily] error event:', e);
+    });
+
   }catch(err){
-    alert('Video call launch failed: '+(err && err.message ? err.message : err));
+    console.error('[launchJitsi] fatal:', err);
+    alert('Video call launch failed: ' + (err && err.message ? err.message : err));
   }
 }
 
-// In-page iframe fallback — works when the Jitsi external_api.js fails to
-// load (corporate firewall, mobile browser, or HTTP page). This avoids the
-// old popup-window approach which gets killed by browser popup blockers.
-function vcIframeFallback(roomName, roomURL, chId, chName, displayName, isModerator, container){
-  var iframeURL = roomURL + '#userInfo.displayName=' + encodeURIComponent(displayName)
-                + '&config.prejoinPageEnabled=false'
-                + '&config.startWithAudioMuted=false'
-                + '&config.startWithVideoMuted=true'
-                + '&config.enableClosePage=false'
-                + '&interfaceConfig.MOBILE_APP_PROMO=false'
-                + '&interfaceConfig.SHOW_JITSI_WATERMARK=false'
-                + '&interfaceConfig.SHOW_PROMOTIONAL_CLOSE_PAGE=false'
-                + '&interfaceConfig.DISABLE_FEEDBACK_AND_PROMOTIONAL_CONTENT=true'
-                + '&interfaceConfig.ENABLE_FEEDBACK_ANIMATION=false';
-  container.innerHTML = ''
-    + '<div style="position:relative;width:100%;height:100%;background:#0a0a1a">'
-    +   '<iframe src="' + iframeURL + '" allow="camera; microphone; fullscreen; display-capture; autoplay" '
-    +     'style="width:100%;height:100%;border:0;display:block" allowfullscreen></iframe>'
-    +   '<button onclick="window.open(\'' + roomURL + '#userInfo.displayName=' + encodeURIComponent(displayName) + '\',\'_blank\')" '
-    +     'style="position:absolute;top:10px;right:14px;z-index:1000;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer">'
-    +     '↗ Open in New Tab'
-    +   '</button>'
-    + '</div>';
+// Back-compat alias — if anything still calls launchDaily directly.
+function launchDaily(chId, chName, displayName, isModerator){
+  return launchJitsi(chId, chName, displayName, isModerator);
 }
 
 // Backward-compat: keep the old name in case anything else calls it.
-function vcPopupFallback(roomName, roomURL, chId, chName, displayName, isModerator, container){
-  vcIframeFallback(roomName, roomURL, chId, chName, displayName, isModerator, container);
-}
+// Legacy alias — no-op now. The old Jitsi iframe fallback was removed
+// when we migrated to Daily.co. launchJitsi() now handles its own
+// "SDK missing" fallback internally.
+function vcPopupFallback(){ /* intentionally empty */ }
 
 // ══════════════════════════════════════════════
 //  WAITING ROOM (with music player)
 // ══════════════════════════════════════════════
+// Playlist uses known-stable, free-to-use audio hosts. Pixabay's CDN URLs
+// change frequently (file hashes get regenerated) which was silently
+// breaking the player — hence the previous "no music" reports. We now use
+// SoundHelix (deterministic URLs maintained for years) and surface any
+// network/autoplay failures instead of swallowing them.
 var WR_PLAYLIST = [
-  {title:'Energy (Instrumental)',   artist:'Pump-Up Mix',    url:'https://cdn.pixabay.com/audio/2024/02/15/audio_0c7e1b5c85.mp3'},
-  {title:'Motivational Rise',       artist:'Hype Tracks',    url:'https://cdn.pixabay.com/audio/2023/10/30/audio_940a6b8e79.mp3'},
-  {title:'Corporate Drive',         artist:'Business Beats', url:'https://cdn.pixabay.com/audio/2023/06/09/audio_1a49d8f419.mp3'},
-  {title:'Champion Mindset',        artist:'Team Music',     url:'https://cdn.pixabay.com/audio/2024/03/11/audio_0b4a7c2d91.mp3'},
-  {title:'Upbeat Background',       artist:'Focus Series',   url:'https://cdn.pixabay.com/audio/2022/03/15/audio_44c58fc9b6.mp3'}
+  {title:'Pump-Up Mix',         artist:'Instrumental',   url:'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3'},
+  {title:'Focus Flow',          artist:'Lounge',         url:'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3'},
+  {title:'Corporate Drive',     artist:'Business Beats', url:'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3'},
+  {title:'Team Momentum',       artist:'Energy',         url:'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3'},
+  {title:'Upbeat Background',   artist:'Focus Series',   url:'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-5.mp3'}
 ];
 var wrAudio=null, wrTrackIdx=0, wrIsPlaying=false, wrWaiters={};
 
@@ -18404,9 +18433,21 @@ function wrPlayTrack(idx){
   wrAudio.volume=(parseInt(((document.getElementById('wr-volume')||{value:'60'}).value))||60)/100;
   wrAudio.addEventListener('timeupdate',function(){ var fill=document.getElementById('wr-progress-fill'); if(fill&&wrAudio.duration) fill.style.width=(wrAudio.currentTime/wrAudio.duration*100)+'%'; });
   wrAudio.addEventListener('ended',function(){wrNext();});
-  wrAudio.play().catch(function(){});
+  wrAudio.addEventListener('error',function(e){
+    console.warn('[wrPlayTrack] audio error for '+t.url, e);
+  });
+  var playPromise = wrAudio.play();
+  if(playPromise && playPromise.catch){
+    playPromise.catch(function(err){
+      console.warn('[wrPlayTrack] play() rejected — likely autoplay policy or 404:', err);
+      // Show a "click to play" hint so the user knows they can tap to start
+      var hint = document.getElementById('wr-play-hint');
+      if(hint){ hint.style.display='block'; }
+    });
+  }
   wrIsPlaying=true;
-  var btn=document.getElementById('wr-play-btn'); if(btn) btn.textContent='\u23F8';
+  var btn=document.getElementById('wr-play-btn');
+  if(btn) btn.textContent='\u23F8';
   var np=document.getElementById('wr-now-playing'); if(np) np.textContent=t.title;
   var ar=document.getElementById('wr-artist'); if(ar) ar.textContent=t.artist;
 }
