@@ -2572,6 +2572,13 @@ function hasAdminLevel(a){ return hasDept(a, 'admin') || a && a.role === 'admin'
 
 // Show the right sub-options panel and highlight the chosen card.
 function aaSetCategory(cat){
+  // ── Sensitive-field lock: non-Owner editors cannot change an existing
+  //    agent's role category. Adding a new agent is fine — the lock is
+  //    only set on openEditAgent for non-Owners.
+  if(window._aaSensitiveLocked){
+    console.log('[aaSetCategory] blocked — sensitive fields are locked (non-Owner editing existing agent).');
+    return;
+  }
   // Visual highlight on the chooser cards
   var cards = document.querySelectorAll('#aaCatChooser .aa-cat-card');
   cards.forEach(function(c){
@@ -2647,9 +2654,71 @@ function aaSetCategory(cat){
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+// aaApplySensitiveLock(locked) — visually dim/disable the sensitive
+// sections of the Edit Agent modal when a non-Owner is editing an
+// existing agent. Locked sections: Role Category chooser, sub-role
+// panels (Sales/IBO/Office), department access (deptAccess) checklist,
+// and the Can-Host-Call toggle. Everything else (name, username,
+// password, email, phone, address, start date, profile pic, links,
+// markets assignment) stays fully editable.
+//
+// Called by openEditAgent() for non-Owner viewers, and cleared
+// (false) by openAddAgent() so Adding always starts unlocked.
+// ══════════════════════════════════════════════════════════════
+function aaApplySensitiveLock(locked){
+  var blocks = [
+    'aaCatChooser',    // 3-card category chooser
+    'aaSubSales',      // sales sub-role radios + programs
+    'aaSubIBO',        // IBO sub-options + markets
+    'aaSubOffice',     // office dept checkboxes + Office Manager flag
+    'aaDeptAccessRow', // deptAccess grants (already Owner-only elsewhere, belt+suspenders)
+    'aaCanHostCallRow' // can-host-call toggle
+  ];
+  blocks.forEach(function(id){
+    var el = document.getElementById(id);
+    if(!el) return;
+    if(locked){
+      el.style.opacity = '0.45';
+      el.style.pointerEvents = 'none';
+      el.setAttribute('data-locked','1');
+      // Also disable any inputs/selects inside for belt-and-suspenders
+      var inputs = el.querySelectorAll('input, select, button, textarea');
+      inputs.forEach(function(i){ i.disabled = true; });
+    } else {
+      el.style.opacity = '';
+      el.style.pointerEvents = '';
+      el.removeAttribute('data-locked');
+      var inputs2 = el.querySelectorAll('input, select, button, textarea');
+      inputs2.forEach(function(i){ i.disabled = false; });
+    }
+  });
+  // Show a small informational hint when locked.
+  var hintId = 'aaLockHint';
+  var existing = document.getElementById(hintId);
+  if(locked){
+    if(!existing){
+      var hint = document.createElement('div');
+      hint.id = hintId;
+      hint.style.cssText = 'margin:10px 0;padding:10px 14px;background:rgba(147,51,234,.08);border:1px solid rgba(147,51,234,.25);border-radius:6px;color:#7C3AED;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1px';
+      hint.innerHTML = '🔒 <strong>Role & permissions locked</strong> — Only the Owner can change this agent\'s role category, sub-role, or department access. You can still edit name, contact info, password, and assignments.';
+      var chooser = document.getElementById('aaCatChooser');
+      if(chooser && chooser.parentNode) chooser.parentNode.insertBefore(hint, chooser);
+    }
+  } else {
+    if(existing && existing.parentNode) existing.parentNode.removeChild(existing);
+  }
+}
+
 // Sales sub-position radio change → push value into hidden select.
 function aaSetSubRole(cat, value){
   if(cat !== 'sales') return;
+  // ── Sensitive-field lock: non-Owner editors cannot change sub-role on
+  //    existing agents. Adding a new agent is fine.
+  if(window._aaSensitiveLocked){
+    console.log('[aaSetSubRole] blocked — sensitive fields are locked.');
+    return;
+  }
   var roleEl = document.getElementById('aaRole');
   if(roleEl){ roleEl.value = value; }
   if(typeof toggleLLFields === 'function') toggleLLFields();
@@ -2783,24 +2852,49 @@ function aaResetRoleData(){
     }
   }
 
-  // Persist to Supabase. Uses the existing upsert path the app uses
-  // elsewhere so the record is immediately durable, not lost on reload.
+  // Persist to Supabase. Try the full write first (with category/depts);
+  // if those columns don't exist in the schema, fall back to updating
+  // just the columns that definitely exist so the role still clears.
   if(typeof supaClient !== 'undefined' && supaClient){
+    var resetFull = {
+      id: a.id, name: a.name, username: a.username, password: a.password,
+      role: '', email: a.email||'',
+      programs: JSON.stringify([]),
+      program: '', carrier: '', channels: JSON.stringify(a.channels),
+      agent_codes: JSON.stringify({}),
+      category: null, depts: JSON.stringify({}),
+      office_manager: false,
+      ibo_markets: JSON.stringify([]),
+      can_host_call: false,
+      team_leader_id: null, market_manager_id: null, campaign_manager_id: null,
+      active: a.active
+    };
+    var resetLegacy = {
+      id: a.id, name: a.name, username: a.username, password: a.password,
+      role: '', email: a.email||'',
+      programs: JSON.stringify([]),
+      program: '', carrier: '', channels: JSON.stringify(a.channels),
+      agent_codes: JSON.stringify({}),
+      can_host_call: false,
+      team_leader_id: null, market_manager_id: null, campaign_manager_id: null,
+      active: a.active
+    };
     try{
-      supaClient.from('agents').upsert({
-        id: a.id, name: a.name, username: a.username, password: a.password,
-        role: '', email: a.email||'',
-        programs: JSON.stringify([]),
-        program: '', carrier: '', channels: JSON.stringify(a.channels),
-        agent_codes: JSON.stringify({}),
-        category: null, depts: JSON.stringify({}),
-        office_manager: false,
-        ibo_markets: JSON.stringify([]),
-        can_host_call: false,
-        team_leader_id: null, market_manager_id: null, campaign_manager_id: null,
-        active: a.active
-      }, {onConflict:'id'}).then(function(){}).catch(function(e){
-        console.warn('[aaResetRoleData] Supabase upsert failed:', e);
+      supaClient.from('agents').upsert(resetFull, {onConflict:'id'}).then(function(res){
+        if(res && res.error){
+          console.warn('[aaResetRoleData] Full upsert rejected, retrying legacy:', res.error.message);
+          supaClient.from('agents').upsert(resetLegacy, {onConflict:'id'}).then(function(res2){
+            if(res2 && res2.error){
+              console.error('[aaResetRoleData] Legacy also failed:', res2.error.message);
+            } else {
+              console.log('✓ Reset saved (legacy mode)');
+            }
+          });
+        } else {
+          console.log('✓ Reset saved to Supabase');
+        }
+      }).catch(function(e){
+        console.warn('[aaResetRoleData] Supabase upsert threw:', e);
       });
     }catch(e){ console.warn('[aaResetRoleData] threw:', e); }
   }
@@ -2997,9 +3091,12 @@ window.fixAgent = function(id, category, subRole){
     return;
   }
 
-  // Persist to Supabase.
+  // Persist to Supabase. Try the full update (with category/depts) first;
+  // if Supabase rejects because those columns don't exist in the schema,
+  // fall back to updating just the columns that are guaranteed to exist.
+  // This way the role always gets saved even if the schema wasn't migrated.
   if(typeof supaClient !== 'undefined' && supaClient){
-    supaClient.from('agents').upsert({
+    var fullRow = {
       id: a.id, name: a.name, username: a.username, password: a.password,
       role: a.role, email: a.email||'',
       programs: JSON.stringify([]),
@@ -3010,10 +3107,39 @@ window.fixAgent = function(id, category, subRole){
       office_manager: false,
       ibo_markets: JSON.stringify([]),
       active: a.active
-    }, {onConflict:'id'}).then(function(){
-      console.log('✓ Agent '+a.name+' fixed: category='+category+', role='+a.role);
+    };
+    var legacyRow = {
+      id: a.id, name: a.name, username: a.username, password: a.password,
+      role: a.role, email: a.email||'',
+      programs: JSON.stringify([]),
+      program: '', carrier: '',
+      agent_codes: JSON.stringify({}),
+      active: a.active
+    };
+    supaClient.from('agents').upsert(fullRow, {onConflict:'id'}).then(function(res){
+      if(res && res.error){
+        console.warn('[fixAgent] Full upsert rejected:', res.error.message || res.error);
+        console.warn('[fixAgent] Retrying without category/depts columns (legacy schema)...');
+        supaClient.from('agents').upsert(legacyRow, {onConflict:'id'}).then(function(res2){
+          if(res2 && res2.error){
+            console.error('[fixAgent] Legacy upsert also failed:', res2.error.message || res2.error);
+            console.error('⚠️ Supabase save FAILED. Local change will be lost on reload. Update her record manually in Supabase Table Editor.');
+          } else {
+            console.log('✓ Agent '+a.name+' saved to Supabase (legacy mode — category/depts columns missing from schema)');
+            console.log('ℹ️ To persist category/depts too, add these columns to your agents table in Supabase:');
+            console.log('   • category (text, nullable)');
+            console.log("   • depts (jsonb, default '{}')");
+            console.log('   • office_manager (bool, default false)');
+            console.log("   • ibo_markets (jsonb, default '[]')");
+          }
+        }).catch(function(e){
+          console.error('[fixAgent] Legacy upsert threw:', e);
+        });
+      } else {
+        console.log('✓ Agent '+a.name+' fully saved to Supabase: category='+category+', role='+a.role);
+      }
     }).catch(function(e){
-      console.error('Supabase upsert failed:', e);
+      console.error('[fixAgent] Supabase upsert threw:', e);
     });
   }
   try{ if(typeof saveToStorage === 'function') saveToStorage(); }catch(e){}
@@ -4423,10 +4549,19 @@ function agentHasDeptAccess(agent, panelKey){
 //  Only Owner, Admin role, or Onboarding Dept can edit other people's
 //  profiles. Everyone else can only view/edit their own.
 // ══════════════════════════════════════════════════════════════
+// ── Who can OPEN the Edit Agent modal and edit non-sensitive profile fields?
+// Allowed: Owner + legacy admin + HR (dept or role) + Onboarding (dept or role).
+// Sensitive fields (role category, sub-role, dept flags, deptAccess checklist,
+// Payroll Access whitelist, Reset Role Data, Permanently Delete) are gated
+// by isOwner() checks elsewhere — NEVER by this helper. So allowing HR here
+// gives them edit access to identity/contact fields without granting the
+// ability to escalate anyone's permissions.
 function canEditAgentProfiles(user){
   if(!user) return false;
   if(isOwner(user)) return true;
   if(user.role==='admin') return true;
+  if(isHR(user)) return true;
+  if(agentHasDeptAccess(user,'hr-dashboard')) return true;
   if(isOnboarding(user)) return true;
   if(agentHasDeptAccess(user,'onboarding')) return true;
   return false;
@@ -5991,7 +6126,7 @@ function safeJSON(val, fallback){
 // ── Save agent to Supabase ──
 async function saveAgentToSupabase(agent){
   if(!supaClient) { saveToStorage(); return; }
-  var data = {
+  var full = {
     id: agent.id, name: agent.name, username: agent.username, password: agent.password,
     role: agent.role, email: agent.email||'',
     programs: JSON.stringify(agent.programs||[]),
@@ -5999,7 +6134,6 @@ async function saveAgentToSupabase(agent){
     team: agent.team||null,
     team_leader_id: agent.teamLeaderId||null,
     market_manager_id: agent.marketManagerId||null,
-    campaign_manager_id: agent.campaignManagerId||null,
     campaign_manager_id: agent.campaignManagerId||null,
     active: agent.active, sales: agent.sales||0,
     monthly_sales: JSON.stringify(agent.monthlySales||[]),
@@ -6011,17 +6145,27 @@ async function saveAgentToSupabase(agent){
     profile_pic:  agent.profilePic||'',
     phone:        agent.phone||'',
     address:      agent.address||'',
-    // ── Pass A: new role-category fields. If your Supabase agents table
-    //    doesn't have these columns yet, the upsert will simply ignore them
-    //    (Postgres rejects unknown columns silently in upsert with onConflict).
-    //    Add the columns later via Supabase Dashboard → Table Editor:
-    //      category text, depts jsonb, office_manager bool, ibo_markets jsonb
+    // New category/depts columns. If the Supabase schema doesn't have
+    // these, the upsert below will fail and we'll retry without them.
     category:       agent.category || null,
     depts:          JSON.stringify(agent.depts || {}),
     office_manager: agent.officeManager === true,
     ibo_markets:    JSON.stringify(agent.iboMarkets || [])
   };
-  await sbUpsert('agents', data);
+  // Try the full write first.
+  var res = await sbUpsert('agents', full);
+  // sbUpsert typically throws on error; this extra check is a belt-and-
+  // suspenders in case it returns an error object. If it failed because
+  // of unknown columns, retry without them so the agent still saves.
+  if(res && res.error){
+    console.warn('[saveAgentToSupabase] Full save rejected, retrying without category/depts:', res.error.message || res.error);
+    var legacy = Object.assign({}, full);
+    delete legacy.category;
+    delete legacy.depts;
+    delete legacy.office_manager;
+    delete legacy.ibo_markets;
+    await sbUpsert('agents', legacy);
+  }
 }
 
 async function deleteAgentFromSupabase(agentId){
@@ -9707,11 +9851,13 @@ function doLogin(){
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
   loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
-  if(isOwner(found))          setTimeout(function(){ gotoPanel('owner'); },100);
-  else if(isHR(found))        setTimeout(function(){ gotoPanel('hr-dashboard'); },100);
-  else if(isInventory(found)) setTimeout(function(){ gotoPanel('inv-dashboard'); },100);
-  else if(isPayroll(found))   setTimeout(function(){ gotoPanel('payroll'); },100);
-  else if(isOnboarding(found))setTimeout(function(){ gotoPanel('onboarding'); },100);
+  // POST-LOGIN LANDING PAGE ROUTING
+  // Owner → Owner Control (their actual home)
+  // Everyone else → panelBO (the main back-office dashboard)
+  // Office users (HR/Inventory/Payroll/Onboarding) should see their colored
+  // welcome card on the dashboard first, NOT be dropped directly into their
+  // sub-panel. They can click the nav item to open the sub-panel when ready.
+  if(isOwner(found)) setTimeout(function(){ gotoPanel('owner'); },100);
 }
 
 function doLogout(){
@@ -9909,10 +10055,17 @@ function buildNav(u){
     h += boNavBtn('myteam','👥 My Team');
   }
 
-  // Team Rooms
-  var myTeams = LIFELINE_TEAMS.filter(function(t){
-    return t.members && t.members.indexOf(u.id) >= 0;
-  });
+  // Team Rooms / Markets.
+  // Inventory has GLOBAL visibility — they need to see every market,
+  // including IBO markets, because they manage inventory everywhere.
+  // Owner also sees every market. Everyone else sees only markets
+  // where they're a member.
+  var seesAllMarkets = isOwner(u) || isInventory(u) || (u.depts && u.depts.inventory === true);
+  var myTeams = seesAllMarkets
+    ? LIFELINE_TEAMS.filter(function(t){ return t.active !== false; })
+    : LIFELINE_TEAMS.filter(function(t){
+        return t.members && t.members.indexOf(u.id) >= 0;
+      });
   if(myTeams.length){
     var teamDrop = myTeams.map(function(t){
       return boDropBtn('lt-'+t.id,'📍 '+t.name);
@@ -10655,6 +10808,26 @@ function agentInvCount(agentId, carrier, type){
     var matchType    = !type || (d.type||'').toLowerCase()===(type||'').toLowerCase();
     return matchAgent && matchCarrier && matchType;
   }).length;
+}
+
+// ── Days remaining until a device's expiry date.
+// Returns the number of days from today to the expiryDate (can be negative
+// if already past). Null if either date is missing. Used by Inventory
+// dashboard's expiringSoon/critical counts. Previously this function was
+// called by 10+ call-sites but never defined, which crashed the Inventory
+// landing page with "invDaysRemaining is not defined".
+function invDaysRemaining(expiryDate, assignedDate){
+  if(!expiryDate) return null;
+  try{
+    var exp = new Date(expiryDate);
+    if(isNaN(exp.getTime())) return null;
+    var now = new Date();
+    // Zero out time of day so we count whole days, not hours
+    exp.setHours(0,0,0,0);
+    now.setHours(0,0,0,0);
+    var ms  = exp.getTime() - now.getTime();
+    return Math.floor(ms / (1000*60*60*24));
+  }catch(e){ return null; }
 }
 
 // Get inventory summary for an agent: {carrier: {phones, sims, upsell, tablets, expiringSoon}}
@@ -17674,12 +17847,16 @@ function openAgentMasterProfile(agentId){
 function openAddAgent(){
   // ── PERMISSION LOCK ──
   if(!canEditAgentProfiles(DB.current)){
-    alert('Only the Owner, Admin, or Onboarding Department can add new agents.');
+    alert('Only the Owner, HR, or Onboarding can add new agents.');
     return;
   }
   // Hide Reset/Delete — only applies to existing agents.
   var ownerActionsAdd=document.getElementById('aaOwnerActions');
   if(ownerActionsAdd) ownerActionsAdd.style.display = 'none';
+  // ── Clear any "sensitive fields locked" marker from a previous Edit session
+  //    so that all fields start fully editable for Add.
+  window._aaSensitiveLocked = false;
+  try{ aaApplySensitiveLock(false); }catch(e){}
   // Reset form
   // Clear the editing ID so fillMarketsChecklist starts with nothing checked
   window._aaEditingId = null;
@@ -17768,12 +17945,26 @@ function openEditAgent(agentId){
   var viewer=DB.current;
 
   // ── PERMISSION LOCK ──
-  // Only Owner/Admin/Onboarding can edit anyone's profile.
+  // Only Owner/HR/Onboarding can edit anyone's profile.
   // Anyone else can only edit their own profile.
   if(!canEditAgentProfiles(viewer) && agentId !== viewer.id){
-    alert('You can only edit your own profile. Contact the Owner, Admin, or Onboarding Department to update another agent.');
+    alert('You can only edit your own profile. Contact the Owner, HR, or Onboarding to update another agent.');
     return;
   }
+
+  // ── NON-OWNER EDIT LOCKDOWN ──
+  // HR/Onboarding CAN edit most fields, but they must NOT be able to escalate
+  // someone's permissions or change a user's fundamental role.
+  // When a non-Owner is editing an EXISTING agent (not adding), lock down:
+  //   • Role Category chooser (Sales / IBO / Office)
+  //   • Sub-role radios (Field Agent / TL / MM / CM)
+  //   • Department checkboxes (HR / Inv / Payroll / Onboarding / OM flag)
+  //   • Department access grants ("deptAccess" checklist)
+  //   • Can-Host-Call toggle
+  // They CAN still edit: name, username, phone, email, address, password,
+  // start date, profile pic, links, markets assignment, active flag.
+  window._aaSensitiveLocked = !isOwner(viewer);
+  try{ aaApplySensitiveLock(window._aaSensitiveLocked); }catch(e){ console.warn('[openEditAgent] applySensitiveLock:', e); }
 
   // Remember which agent is being edited — used by fillMarketsChecklist to pre-check existing markets
   window._aaEditingId = agentId;
@@ -19400,6 +19591,42 @@ function wrSetVolume(val){ if(wrAudio) wrAudio.volume=parseInt(val)/100; }
 function wrSeek(e){ var bar=document.getElementById('wr-progress-bar'); if(!bar||!wrAudio||!wrAudio.duration) return; var rect=bar.getBoundingClientRect(); wrAudio.currentTime=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width))*wrAudio.duration; }
 function wrStopMusic(){ if(wrAudio){wrAudio.pause();wrAudio=null;} wrIsPlaying=false; }
 
+// ── TAP TO PLAY MUSIC ──
+// Browsers block autoplay without a user gesture. This creates a
+// prominent one-tap button so users can kick off the playlist.
+// Once they tap it, audio plays; the button is hidden and the
+// standard player controls take over. If audio fails to load (404,
+// CORS), shows a friendly fallback message.
+function wrShowTapToPlay(){
+  var container = document.getElementById('wr-play-hint');
+  if(!container){
+    // No dedicated hint slot — look for the playlist container and
+    // insert the tap button at the top as a fallback.
+    container = document.getElementById('wr-playlist');
+  }
+  if(!container) return;
+  container.style.display = 'block';
+  container.innerHTML = '<button onclick="wrUserStartMusic()" style="width:100%;padding:14px;background:linear-gradient(135deg,#0EA5E9,#0369A1);color:white;border:none;border-radius:10px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.85rem;letter-spacing:2px;text-transform:uppercase;font-weight:700;box-shadow:0 4px 14px rgba(14,165,233,.35);transition:transform .15s" onmouseover="this.style.transform=\'translateY(-1px)\'" onmouseout="this.style.transform=\'\'">▶ Tap to play waiting room music</button>'
+    + '<div style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:rgba(255,255,255,.45);text-align:center;letter-spacing:1px">Browser requires a tap to start audio</div>';
+}
+
+function wrUserStartMusic(){
+  // Rebuild the real playlist UI (was replaced by the tap button).
+  var pl = document.getElementById('wr-playlist');
+  if(pl){
+    pl.innerHTML = WR_PLAYLIST.map(function(t,i){
+      return '<div onclick="wrPlayTrack('+i+')" style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;cursor:pointer;background:'+(i===wrTrackIdx?'rgba(0,53,148,.4)':'transparent')+';border:1px solid '+(i===wrTrackIdx?'rgba(96,165,250,.3)':'transparent')+'">'
+        + '<span style="font-size:.75rem;color:'+(i===wrTrackIdx?'#60A5FA':'rgba(255,255,255,.4)')+'">'+(i===wrTrackIdx?'\u25B6':'\u25CB')+'</span>'
+        + '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:'+(i===wrTrackIdx?'white':'rgba(255,255,255,.65)')+'">'+t.title+'</div>'
+        + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:rgba(255,255,255,.3)">'+t.artist+'</div></div></div>';
+    }).join('');
+  }
+  var hint = document.getElementById('wr-play-hint');
+  if(hint && hint !== pl) hint.style.display = 'none';
+  // Now play — we have a user gesture so autoplay policy is satisfied.
+  wrPlayTrack(0);
+}
+
 async function wrJoin(chId,agentName,agentId){
   wrWaiters[agentId]={name:agentName,joinedAt:Date.now()};
   if(supaClient){ try{ var waiterKey='waiters_'+chId; var existing=await supaClient.from('app_settings').select('value').eq('key',waiterKey).single(); var list=(existing&&existing.data)?JSON.parse(existing.data.value)||{}:{}; list[agentId]={name:agentName,joinedAt:Date.now()}; await supaClient.from('app_settings').upsert({key:waiterKey,value:JSON.stringify(list)},{onConflict:'key'}); }catch(e){} }
@@ -19439,7 +19666,12 @@ function showWaitingRoom(chId,chName,displayName){
   // Build playlist UI
   var pl=document.getElementById('wr-playlist');
   if(pl) pl.innerHTML=WR_PLAYLIST.map(function(t,i){ return '<div onclick="wrPlayTrack('+i+')" style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;cursor:pointer;background:'+(i===wrTrackIdx?'rgba(0,53,148,.4)':'transparent')+';border:1px solid '+(i===wrTrackIdx?'rgba(96,165,250,.3)':'transparent')+'">'+'<span style="font-size:.75rem;color:'+(i===wrTrackIdx?'#60A5FA':'rgba(255,255,255,.4)')+'">'+(i===wrTrackIdx?'\u25B6':'\u25CB')+'</span>'+'<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:'+(i===wrTrackIdx?'white':'rgba(255,255,255,.65)')+'">'+t.title+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:rgba(255,255,255,.3)">'+t.artist+'</div></div></div>'; }).join('');
-  setTimeout(function(){wrPlayTrack(0);},800);
+  // ── WAITING ROOM MUSIC ──
+  // Browsers block audio autoplay without a user gesture. Instead of
+  // silently failing, show a visible "Tap to play music" prompt that
+  // the user clicks to start the first track. After the first click,
+  // nextTrack() and prevTrack() can play without extra gestures.
+  wrShowTapToPlay();
   wrJoin(chId,u?u.name:displayName,u?u.id:displayName);
   wrFetchParticipants(chId);
   if(waitDiv._poll) clearInterval(waitDiv._poll);
