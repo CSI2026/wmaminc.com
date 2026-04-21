@@ -18538,20 +18538,29 @@ async function startCall(chId,chName){
 
 async function joinCall(chId,chName){
   var u=DB.current;
-  var info=ACTIVE_CALLS[chId];
-  if(!info||!info.active){
-    // Ask Supabase whether a call is live. If the row doesn't exist yet
-    // (first load) or any network/client error throws, treat as "no call"
-    // and proceed to the waiting room — don't crash the handler.
+  // ── UNIFIED WAITING ROOM ──
+  // Per Calvin's request (2026-04-21), every team call should show our
+  // custom waiting room first — music, participant list, branding — not
+  // drop the user straight into Daily.co's pre-join. The waiting room
+  // polls every 5s and auto-transitions into the live Daily call as soon
+  // as the host starts it (or is already started). So we don't need to
+  // branch on active/inactive here anymore — just always show it.
+  //
+  // Previously: if active → launchJitsi directly; if inactive → showWaitingRoom.
+  // Now: always showWaitingRoom; it'll launch Jitsi on its own.
+  //
+  // Still prime ACTIVE_CALLS from Supabase so the waiting room knows the
+  // state on its very first poll (avoids up to 5s extra wait when joining
+  // a call that's already live).
+  if(!ACTIVE_CALLS[chId] || !ACTIVE_CALLS[chId].active){
     if(supaClient){
       try{
         var r=await supaClient.from('app_settings').select('value').eq('key','call_'+chId).single();
-        if(r&&r.data){info=JSON.parse(r.data.value);ACTIVE_CALLS[chId]=info;}
-      }catch(e){ /* no active-call row yet — fall through to waiting room */ }
+        if(r&&r.data){ ACTIVE_CALLS[chId] = JSON.parse(r.data.value); }
+      }catch(e){ /* no call row yet — fine */ }
     }
   }
-  if(!info||!info.active){ showWaitingRoom(chId,chName,u.name); return; }
-  launchJitsi(chId,chName,u.name,false);
+  showWaitingRoom(chId,chName,u.name);
 }
 
 async function endCallState(chId){
@@ -19749,10 +19758,76 @@ function showWaitingRoom(chId,chName,displayName){
     if(!supaClient) return;
     try{
       var r=await supaClient.from('app_settings').select('value').eq('key','call_'+chId).single();
-      if(r&&r.data){ var info=JSON.parse(r.data.value); if(info&&info.active){ clearInterval(waitDiv._poll); clearInterval(waitDiv._partPoll); wrLeave(chId,u?u.id:displayName); wrStopMusic(); if(waitDiv) waitDiv.style.display='none'; if(container) container.style.display='block'; if(liveEl) liveEl.style.display='inline-flex'; launchJitsi(chId,chName,displayName,false); } }
+      if(r&&r.data){
+        var info=JSON.parse(r.data.value);
+        if(info&&info.active){
+          // Call is live — update status UI and reveal Join Live button.
+          // Do NOT auto-transition; let the user choose when to leave
+          // the waiting room (they may still be listening to music or
+          // waiting for their camera/mic to be ready).
+          wrShowLiveStatus();
+          ACTIVE_CALLS[chId] = info;
+        }
+      }
     }catch(e){ /* no row yet — keep waiting */ }
   },6000);
+  // Stash channel context on the modal so wrJoinLiveNow can read it.
+  if(waitDiv){
+    waitDiv._chId = chId;
+    waitDiv._chName = chName;
+    waitDiv._displayName = displayName;
+  }
+  // ── IMMEDIATE LIVE CHECK ──
+  // If the call was already live when the user entered the waiting room
+  // (pre-populated by joinCall's Supabase lookup), show the Join Live
+  // button right away so they don't have to wait up to 6s for the next
+  // poll tick. They still see the waiting room first — music, participants,
+  // branding — and choose when to join.
+  if(ACTIVE_CALLS[chId] && ACTIVE_CALLS[chId].active){
+    wrShowLiveStatus();
+  }
   modal.style.display='flex';
+}
+
+// ── wrShowLiveStatus() — called when the call goes live (or when the
+// user enters a waiting room whose call is already live). Switches the
+// status indicator from "WAITING FOR HOST" to "LIVE NOW" and reveals
+// the green Join Live button so the user can enter the Daily call on
+// their own schedule.
+function wrShowLiveStatus(){
+  var dot = document.getElementById('wr-status-dot');
+  var txt = document.getElementById('wr-status-text');
+  var hint = document.getElementById('wr-waiter-badge');
+  var btn = document.getElementById('wr-join-live-btn');
+  if(dot) dot.style.background = '#EF4444';  // red pulse = live
+  if(txt){
+    txt.textContent = 'LIVE NOW';
+    txt.style.color = '#EF4444';
+  }
+  if(hint) hint.textContent = 'Host has started the call — join when ready';
+  if(btn) btn.style.display = 'inline-block';
+}
+
+// ── wrJoinLiveNow() — fired by the green Join Live button. Tears down
+// the waiting room (stops music, stops polling, removes self from
+// waiter list) and launches the Daily call.
+function wrJoinLiveNow(){
+  var waitDiv = document.getElementById('videoWaitingRoom');
+  var container = document.getElementById('jitsiContainer');
+  var liveEl = document.getElementById('vcLiveIndicator');
+  if(!waitDiv) return;
+  var chId = waitDiv._chId;
+  var chName = waitDiv._chName;
+  var displayName = waitDiv._displayName;
+  var u = DB.current;
+  try{ if(waitDiv._poll) clearInterval(waitDiv._poll); }catch(e){}
+  try{ if(waitDiv._partPoll) clearInterval(waitDiv._partPoll); }catch(e){}
+  try{ wrLeave(chId, u ? u.id : displayName); }catch(e){}
+  wrStopMusic();
+  waitDiv.style.display = 'none';
+  if(container) container.style.display = 'block';
+  if(liveEl) liveEl.style.display = 'inline-flex';
+  launchJitsi(chId, chName, displayName, false);
 }
 
 // ══════════════════════════════════════════════
@@ -20258,10 +20333,14 @@ setTimeout(initSocialBars, 100);
         <div style="text-align:center;margin-bottom:24px">
           <div id="wr-channel-name" style="font-family:'Bebas Neue',sans-serif;font-size:1.5rem;color:#60A5FA;letter-spacing:3px"></div>
           <div style="display:flex;align-items:center;justify-content:center;gap:8px;margin-top:8px">
-            <div style="width:8px;height:8px;border-radius:50%;background:#00C851;animation:vcPulse 1.5s infinite;flex-shrink:0"></div>
-            <span style="font-family:'Barlow Condensed',sans-serif;font-size:.75rem;color:rgba(255,255,255,.5);letter-spacing:2px;text-transform:uppercase">WAITING FOR HOST</span>
+            <div id="wr-status-dot" style="width:8px;height:8px;border-radius:50%;background:#00C851;animation:vcPulse 1.5s infinite;flex-shrink:0"></div>
+            <span id="wr-status-text" style="font-family:'Barlow Condensed',sans-serif;font-size:.75rem;color:rgba(255,255,255,.5);letter-spacing:2px;text-transform:uppercase">WAITING FOR HOST</span>
           </div>
           <div id="wr-waiter-badge" style="margin-top:10px;font-family:'Barlow Condensed',sans-serif;font-size:.72rem;color:rgba(255,255,255,.35)">You will be let in automatically when the call goes live</div>
+          <!-- Join Live button — shown only when the call is active. Lets
+               the user choose when to leave the waiting room (music +
+               prep) and enter the live Daily call. -->
+          <button id="wr-join-live-btn" onclick="wrJoinLiveNow()" style="display:none;margin-top:14px;padding:12px 28px;background:linear-gradient(135deg,#00C851,#059669);color:white;border:none;border-radius:10px;cursor:pointer;font-family:'Barlow Condensed',sans-serif;font-size:.85rem;letter-spacing:2px;text-transform:uppercase;font-weight:700;box-shadow:0 4px 14px rgba(0,200,81,.35);transition:transform .15s" onmouseover="this.style.transform='translateY(-1px)'" onmouseout="this.style.transform=''">🎥 Join Live Call</button>
         </div>
 
         <!-- ── MUSIC PLAYER ── -->
