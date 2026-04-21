@@ -2618,13 +2618,13 @@ function aaSetCategory(cat){
   var roleEl = document.getElementById('aaRole');
   if(roleEl){
     if(cat === 'sales'){
-      // If a sales radio is already checked, keep it; otherwise default to Field Agent.
+      // If a sales radio is already checked, keep it. Otherwise leave the
+      // role blank — the Owner must explicitly click a sub-position
+      // (Field Agent / TL / MM / CM). We no longer auto-pick Field Agent
+      // so nobody gets silently defaulted into a sales role they didn't
+      // mean to assign.
       var checked = document.querySelector('input[name="aaSalesPos"]:checked');
-      roleEl.value = checked ? checked.value : 'Field Agent';
-      if(!checked){
-        var fa = document.querySelector('input[name="aaSalesPos"][value="Field Agent"]');
-        if(fa) fa.checked = true;
-      }
+      roleEl.value = checked ? checked.value : '';
     } else if(cat === 'ibo'){
       roleEl.value = 'IBO';
       // Render (or re-render) the IBO markets list whenever the category
@@ -2632,16 +2632,10 @@ function aaSetCategory(cat){
       // elsewhere while the modal was open.
       if(typeof aaRenderIboMarkets === 'function') aaRenderIboMarkets();
     } else if(cat === 'office'){
-      // Office category — derive role from currently-checked depts.
+      // Office category — derive role from currently-checked depts. If
+      // none are checked, role stays blank — the Owner must pick at
+      // least one department box. No more HR auto-default.
       aaSetSubDepts();
-      // If nothing is checked yet, default to HR for a sensible legacy role.
-      var anyChecked = ['aaDeptHR','aaDeptInventory','aaDeptPayroll','aaDeptOnboarding','aaDeptAdmin'].some(function(id){
-        var el = document.getElementById(id); return el && el.checked;
-      });
-      if(!anyChecked){
-        var hr = document.getElementById('aaDeptHR');
-        if(hr){ hr.checked = true; aaSetSubDepts(); }
-      }
     }
     // Stash the chosen category on the form so saveAgent() can read it later
     // (Pass D will wire that). For now it's harmless metadata.
@@ -2702,13 +2696,15 @@ function aaSetSubDepts(){
   // Stash the full dept map as a JSON attribute saveAgent can read.
   roleEl.setAttribute('data-depts', JSON.stringify(depts));
   // Pick a "primary" legacy role for backward-compat. Admin wins if checked
-  // because it grants the broadest access.
+  // because it grants the broadest access. NO FALLBACK — if the Owner
+  // hasn't checked any dept, leave role blank so save validation can
+  // catch it instead of silently assigning a department nobody chose.
   if(depts.admin)            roleEl.value = 'admin';
   else if(depts.hr)          roleEl.value = 'HR';
   else if(depts.inventory)   roleEl.value = 'Inventory';
   else if(depts.payroll)     roleEl.value = 'Payroll';
   else if(depts.onboarding)  roleEl.value = 'Onboarding';
-  else                       roleEl.value = 'HR'; // fallback when none picked
+  else                       roleEl.value = '';  // no default — force explicit pick
   if(typeof toggleLLFields === 'function') toggleLLFields();
 }
 
@@ -2840,7 +2836,7 @@ function aaResetRoleData(){
 // agent from Supabase AND local DB. Use only when Reset doesn't fix a
 // stuck record. Unrecoverable — re-creating the user requires a new
 // username + password + fresh onboarding.
-function aaDeletePermanently(){
+async function aaDeletePermanently(){
   if(!isOwner(DB.current)){ alert('Only the Owner can permanently delete agents.'); return; }
   var agentId = parseInt((document.getElementById('aaId')||{value:'0'}).value||'0');
   if(!agentId){ alert('No agent loaded to delete.'); return; }
@@ -2849,6 +2845,9 @@ function aaDeletePermanently(){
   if(isOwner(a)){ alert('Cannot delete the Owner account.'); return; }
 
   var name = a.name;
+  // Single confirm dialog with the warning baked in — skipping the
+  // double-prompt because some browsers block the second prompt() after
+  // a confirm() in the same handler.
   var msg = 'PERMANENTLY DELETE ' + name + '?\n\n'
     + 'This is UNRECOVERABLE. It removes:\n'
     + '  • Their entire agent record from the database\n'
@@ -2856,10 +2855,10 @@ function aaDeletePermanently(){
     + '  • Their team memberships\n'
     + '  • Their Payroll Access grant (if any)\n\n'
     + 'If you just want to clean up their role data, use "Reset Role Data" instead.\n\n'
-    + 'Type DELETE (in caps) in the next prompt to confirm.';
+    + 'Click OK to DELETE PERMANENTLY.';
   if(!confirm(msg)) return;
-  var typed = prompt('Type DELETE to confirm permanent deletion of ' + name + ':');
-  if(typed !== 'DELETE'){ alert('Deletion cancelled.'); return; }
+
+  console.log('[aaDeletePermanently] Deleting agent id='+agentId+' name='+name);
 
   // Remove from Payroll whitelist if present.
   if(typeof PAYROLL_ACCESS !== 'undefined' && Array.isArray(PAYROLL_ACCESS)){
@@ -2882,10 +2881,20 @@ function aaDeletePermanently(){
     });
   }
 
-  // Hard delete from Supabase (agents + team_members).
-  if(typeof deleteAgentFromSupabase === 'function'){
-    try{ deleteAgentFromSupabase(agentId); }
-    catch(e){ console.warn('[aaDeletePermanently] Supabase delete threw:', e); }
+  // Hard delete from Supabase (agents + team_members). AWAIT this so we
+  // actually know it completed before repainting the UI — without await
+  // the user could save a new record that collides with the old row
+  // still in transit.
+  if(typeof deleteAgentFromSupabase === 'function' && typeof supaClient !== 'undefined' && supaClient){
+    try{
+      await deleteAgentFromSupabase(agentId);
+      console.log('[aaDeletePermanently] Supabase delete succeeded for id='+agentId);
+    }catch(e){
+      console.error('[aaDeletePermanently] Supabase delete failed:', e);
+      alert('⚠️ Database deletion failed: ' + (e && e.message ? e.message : e) + '\n\nThe record was removed from the current view but may still exist in the database. Refresh the page to check.');
+    }
+  } else {
+    console.warn('[aaDeletePermanently] No Supabase client — local delete only');
   }
 
   // Remove from local DB.agents array.
@@ -2898,8 +2907,116 @@ function aaDeletePermanently(){
   try{ closeModal('addAgentModal'); }catch(e){}
   try{ gotoPanel('agents'); }catch(e){}
 
-  alert('✓ ' + name + ' has been permanently deleted.\n\nYou can now create a fresh profile for them if needed.');
+  alert('✓ ' + name + ' has been permanently deleted.\n\nIf you still see them in the agent list after refreshing, please let the developer know.');
 }
+
+// ══════════════════════════════════════════════════════════════
+//  EMERGENCY CONSOLE HELPERS — Owner can call these from DevTools
+//  to force-fix broken agent records when the UI is misbehaving.
+//
+//  Usage from Chrome Console (while logged in as Owner):
+//    fixAgent(4, 'office', 'hr')   → set agent 4 to Office/HR
+//    fixAgent(4, 'sales', 'Field Agent')
+//    fixAgent(4, 'ibo')
+//    hardDeleteAgent(4)            → permanently delete agent id 4
+//    showAgent(4)                  → print the full record
+// ══════════════════════════════════════════════════════════════
+window.showAgent = function(id){
+  var a = DB.agents.find(function(x){return x.id===id;});
+  if(!a){ console.warn('No agent with id '+id); return null; }
+  console.log(a);
+  return a;
+};
+
+window.fixAgent = function(id, category, subRole){
+  if(!isOwner(DB.current)){ console.error('Only the Owner can run fixAgent.'); return; }
+  var a = DB.agents.find(function(x){return x.id===id;});
+  if(!a){ console.error('No agent with id '+id); return; }
+  if(isOwner(a)){ console.error('Cannot modify the Owner account.'); return; }
+
+  // Wipe role-related fields before re-applying.
+  a.role          = '';
+  a.category      = category;
+  a.depts         = {};
+  a.programs      = [];
+  a.program       = '';
+  a.carrier       = '';
+  a.agentCodes    = {};
+  a.deptAccess    = [];
+  a.officeManager = false;
+  a.iboMarkets    = [];
+
+  if(category === 'office'){
+    // subRole is the dept key: 'hr', 'inventory', 'payroll', 'onboarding', 'admin'
+    var deptKey = (subRole||'').toLowerCase();
+    if(['hr','inventory','payroll','onboarding','admin'].indexOf(deptKey) < 0){
+      console.error('Invalid office dept. Use: hr, inventory, payroll, onboarding, or admin.');
+      return;
+    }
+    a.depts[deptKey] = true;
+    if(deptKey === 'admin')         a.role = 'admin';
+    else if(deptKey === 'hr')       a.role = 'HR';
+    else if(deptKey === 'inventory')a.role = 'Inventory';
+    else if(deptKey === 'payroll')  a.role = 'Payroll';
+    else if(deptKey === 'onboarding') a.role = 'Onboarding';
+  } else if(category === 'sales'){
+    var valid = ['Field Agent','Team Leader','Market Manager','Campaign Manager'];
+    if(valid.indexOf(subRole) < 0){
+      console.error('Invalid sales role. Use: Field Agent, Team Leader, Market Manager, or Campaign Manager.');
+      return;
+    }
+    a.role = subRole;
+  } else if(category === 'ibo'){
+    a.role = 'IBO';
+  } else {
+    console.error('Invalid category. Use: sales, office, or ibo.');
+    return;
+  }
+
+  // Persist to Supabase.
+  if(typeof supaClient !== 'undefined' && supaClient){
+    supaClient.from('agents').upsert({
+      id: a.id, name: a.name, username: a.username, password: a.password,
+      role: a.role, email: a.email||'',
+      programs: JSON.stringify([]),
+      program: '', carrier: '',
+      agent_codes: JSON.stringify({}),
+      category: a.category,
+      depts: JSON.stringify(a.depts),
+      office_manager: false,
+      ibo_markets: JSON.stringify([]),
+      active: a.active
+    }, {onConflict:'id'}).then(function(){
+      console.log('✓ Agent '+a.name+' fixed: category='+category+', role='+a.role);
+    }).catch(function(e){
+      console.error('Supabase upsert failed:', e);
+    });
+  }
+  try{ if(typeof saveToStorage === 'function') saveToStorage(); }catch(e){}
+  console.log('✓ Updated locally. Agent '+a.name+' is now: category='+category+', role='+a.role+', depts='+JSON.stringify(a.depts));
+  console.log('Reload the page or log out/in to see the new dashboard.');
+  return a;
+};
+
+window.hardDeleteAgent = async function(id){
+  if(!isOwner(DB.current)){ console.error('Only the Owner can run hardDeleteAgent.'); return; }
+  var a = DB.agents.find(function(x){return x.id===id;});
+  if(!a){ console.error('No agent with id '+id); return; }
+  if(isOwner(a)){ console.error('Cannot delete the Owner account.'); return; }
+  console.log('Deleting '+a.name+' (id='+id+')...');
+  if(typeof deleteAgentFromSupabase === 'function' && typeof supaClient !== 'undefined' && supaClient){
+    try{
+      await deleteAgentFromSupabase(id);
+      console.log('✓ Supabase delete succeeded');
+    }catch(e){
+      console.error('Supabase delete failed:', e);
+    }
+  }
+  DB.agents = DB.agents.filter(function(x){ return x.id !== id; });
+  try{ if(typeof saveToStorage === 'function') saveToStorage(); }catch(e){}
+  try{ gotoPanel('agents'); }catch(e){}
+  console.log('✓ Agent '+id+' deleted. Reload to confirm.');
+};
 
 // Called by openEditAgent — populate the new chooser from the agent record
 // so the right category + sub-options are preselected.
@@ -7063,6 +7180,23 @@ function saveAgentForm(){
   var uname=document.getElementById('aaUser').value.trim();
   var pw=document.getElementById('aaPass').value.trim();
   if(!name||!uname||!pw){alert('Please fill in Name, Username, and Password.');return;}
+  // ── Require explicit role + category. No more silent defaulting to
+  //    Field Agent/Lifeline. If the Owner didn't pick a category or
+  //    (for sales/office) didn't pick a sub-role/dept, block the save.
+  var roleElCheck = document.getElementById('aaRole');
+  var chosenCat = roleElCheck ? roleElCheck.getAttribute('data-category') : '';
+  if(!chosenCat){
+    alert('Please pick a Role Category: 🎯 Sales / 🏢 IBO / 💼 Office.');
+    return;
+  }
+  if(chosenCat === 'sales' && !role){
+    alert('Please pick a Sales Position (Field Agent / Team Leader / Market Manager / Campaign Manager).');
+    return;
+  }
+  if(chosenCat === 'office' && !role){
+    alert('Please check at least one Office Department (HR / Inventory / Payroll / Onboarding / Administrator).');
+    return;
+  }
   var progs=[];
   WMAM_PROGRAMS.filter(function(p){return p.active;}).forEach(function(p){
     var safeId='aaProg'+p.name.replace(/[^a-zA-Z0-9]/g,'');
@@ -17558,12 +17692,22 @@ function openAddAgent(){
     var w=document.getElementById('aa-code-wrap-'+k); if(w) w.style.display='none';
     var l=document.getElementById('aa-code-locked-'+k); if(l) l.style.display='block';
   });
-  var roleEl=document.getElementById('aaRole'); if(roleEl) roleEl.value='Field Agent';
+  var roleEl=document.getElementById('aaRole'); if(roleEl) roleEl.value='';  // was: 'Field Agent'
   var actEl=document.getElementById('aaActive'); if(actEl) actEl.checked=true;
-  // ── Pass B: reset and default the new role-category chooser ──
+  // ── Reset all chooser state. Do NOT auto-pick a category — the Owner
+  //    must explicitly click Sales / IBO / Office so nobody is silently
+  //    created as a Field Agent by accident.
   if(typeof aaResetSubOptions === 'function') aaResetSubOptions();
   if(typeof aaUpdateOfficeManagerVisibility === 'function') aaUpdateOfficeManagerVisibility();
-  if(typeof aaSetCategory === 'function') aaSetCategory('sales'); // default to Sales
+  // Visually reset category cards to unselected + hide all sub-panels until a pick is made
+  document.querySelectorAll('#aaCatChooser .aa-cat-card').forEach(function(c){
+    c.style.borderColor = 'var(--sand)';
+    c.style.background  = 'white';
+    c.style.boxShadow   = 'none';
+  });
+  ['aaSubSales','aaSubIBO','aaSubOffice'].forEach(function(id){
+    var el = document.getElementById(id); if(el) el.style.display = 'none';
+  });
   // Set modal title
   var titleEl=document.getElementById('aaFormTitle'); if(titleEl) titleEl.textContent='Add New Agent';
   var subEl=document.getElementById('aaModalSub'); if(subEl) subEl.textContent='Fill in all fields then save';
