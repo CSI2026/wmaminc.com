@@ -2717,7 +2717,7 @@ function aaApplySensitiveLock(locked){
       var hint = document.createElement('div');
       hint.id = hintId;
       hint.style.cssText = 'margin:10px 0;padding:10px 14px;background:rgba(147,51,234,.08);border:1px solid rgba(147,51,234,.25);border-radius:6px;color:#7C3AED;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1px';
-      hint.innerHTML = '🔒 <strong>Role & permissions locked</strong> — Only the Owner can change this agent\'s role category, sub-role, or department access. You can still edit name, contact info, password, and assignments.';
+      hint.innerHTML = '🔒 <strong>Role & permissions locked</strong> — Only the Owner or an Administrator can change this agent\'s role category, sub-role, or department access. You can still edit name, contact info, password, and assignments.';
       var chooser = document.getElementById('aaCatChooser');
       if(chooser && chooser.parentNode) chooser.parentNode.insertBefore(hint, chooser);
     }
@@ -5524,7 +5524,7 @@ function canViewOwnerPL(user){
 function canEditAgentProfiles(user){
   if(!user) return false;
   if(isOwner(user)) return true;
-  if(user.role==='admin') return true;
+  if(typeof isAdminRole === 'function' && isAdminRole(user)) return true;
   if(isHR(user)) return true;
   if(agentHasDeptAccess(user,'hr-dashboard')) return true;
   if(isOnboarding(user)) return true;
@@ -8383,12 +8383,20 @@ function copyAgentCreds(){
   var u=document.getElementById('aaCredUser').textContent;
   var p=document.getElementById('aaCredPass').textContent;
   var viewer = DB.current;
-  // Only owner can assign admin role
+  // Only owner can assign admin role (but admins can copy existing admin creds)
   var selectedRole = document.getElementById('aaRole').value;
   if(selectedRole==='admin' && !isOwner(viewer)){
-    alert('Only the Owner can assign the Administrator role.');
-    document.getElementById('aaRole').value = 'Field Agent';
-    return;
+    var editingId = window._aaEditingId;
+    var existingRecord = editingId ? DB.agents.find(function(x){return x.id===editingId;}) : null;
+    var wasAlreadyAdmin = existingRecord && (
+      existingRecord.role === 'admin' || existingRecord.role === 'Administrator' ||
+      (existingRecord.depts && (existingRecord.depts.admin===true || existingRecord.depts.administrator===true))
+    );
+    if(!wasAlreadyAdmin){
+      alert('Only the Owner can grant the Administrator role. Use the Owner Panel → ⭐ Administrators card.');
+      document.getElementById('aaRole').value = 'Field Agent';
+      return;
+    }
   }
   var name=document.getElementById('aaName').value.trim();
   var email=document.getElementById('aaEmail')?document.getElementById('aaEmail').value.trim():'';
@@ -8434,12 +8442,27 @@ function clearAllLinks(){
 function saveAgentForm(){
   var u = DB.current;
   var viewer = DB.current;
-  // Only owner can assign admin role
   var selectedRole = document.getElementById('aaRole').value;
+  // Block attempts to PROMOTE someone to Administrator. Only the Owner
+  // can do that, via the Owner Panel ⭐ Administrators card. If someone
+  // tries to force role='admin' through the hidden <select> here, reject.
+  // We allow editing an EXISTING admin without re-setting them — check
+  // if the stored record was already an admin.
   if(selectedRole==='admin' && !isOwner(viewer)){
-    alert('Only the Owner can assign the Administrator role.');
-    document.getElementById('aaRole').value = 'Field Agent';
-    return;
+    var editingId = window._aaEditingId;
+    var existingRecord = editingId ? DB.agents.find(function(x){return x.id===editingId;}) : null;
+    var wasAlreadyAdmin = existingRecord && (
+      existingRecord.role === 'admin' ||
+      existingRecord.role === 'Administrator' ||
+      (existingRecord.depts && (existingRecord.depts.admin===true || existingRecord.depts.administrator===true))
+    );
+    if(!wasAlreadyAdmin){
+      alert('Only the Owner can grant the Administrator role. Use the Owner Panel → ⭐ Administrators card.');
+      document.getElementById('aaRole').value = 'Field Agent';
+      return;
+    }
+    // Was already admin. Fall through — the save will preserve admin
+    // status because the hidden aaDeptAdmin input is preserved too.
   }
   var name=document.getElementById('aaName').value.trim();
   var email=document.getElementById('aaEmail')?document.getElementById('aaEmail').value.trim():'';
@@ -8696,6 +8719,14 @@ function saveAgentForm(){
 function deactivateAgent(id, name){
   if(!canEditAgentProfiles(DB.current)){
     alert('Only the Owner, Admin, or Onboarding Department can deactivate agents.');
+    return;
+  }
+  // Owner account is never deactivatable by anyone. Even Calvin himself
+  // should not be able to deactivate Calvin — it would lock the whole
+  // system. If he ever needs that for some reason, there's a console path.
+  var target = DB.agents.find(function(x){ return x.id===id; });
+  if(target && isOwner(target)){
+    alert('🔒 The Owner account cannot be deactivated.');
     return;
   }
   if(!confirm('Deactivate ' + name + '?\n\nThey will be marked inactive and cannot log in. You can reactivate them at any time from their profile.')) return;
@@ -21050,26 +21081,47 @@ function openEditAgent(agentId){
   if(!a) return;
   var viewer=DB.current;
 
+  // ── OWNER-PROFILE PROTECTION ──
+  // No one except the Owner can edit the Owner's profile. Not admins,
+  // not HR, not Onboarding. This prevents any form of permission
+  // escalation, password reset, or account takeover — the Owner's
+  // login is the master key to everything in this system.
+  if(isOwner(a) && !isOwner(viewer)){
+    alert('🔒 This profile is protected.\n\nOnly Calvin can edit the Owner account. If you need something changed (name, email, etc.), ask Calvin directly.');
+    return;
+  }
+
   // ── PERMISSION LOCK ──
-  // Only Owner/HR/Onboarding can edit anyone's profile.
+  // Only Owner/Admin/HR/Onboarding can edit anyone's profile.
   // Anyone else can only edit their own profile.
   if(!canEditAgentProfiles(viewer) && agentId !== viewer.id){
     alert('You can only edit your own profile. Contact the Owner, HR, or Onboarding to update another agent.');
     return;
   }
 
-  // ── NON-OWNER EDIT LOCKDOWN ──
-  // HR/Onboarding CAN edit most fields, but they must NOT be able to escalate
-  // someone's permissions or change a user's fundamental role.
-  // When a non-Owner is editing an EXISTING agent (not adding), lock down:
+  // ── NON-OWNER / NON-ADMIN EDIT LOCKDOWN ──
+  // Admins CAN change another agent's role, sub-role, and dept checkboxes
+  // just like the Owner. What they CANNOT do is assign the Administrator
+  // role to anyone — that's enforced separately: the Administrator
+  // checkbox is removed from this modal entirely and Administrator
+  // assignment happens only via the Owner Panel ⭐ Administrators card
+  // (which non-Owners cannot reach).
+  //
+  // HR / Onboarding (without Admin) still get the lock — they can edit
+  // identity/contact fields but not role/permissions, preventing an HR
+  // clerk from promoting themselves or someone else.
+  //
+  // Locked fields (for non-Owner, non-Admin editors):
   //   • Role Category chooser (Sales / IBO / Office)
   //   • Sub-role radios (Field Agent / TL / MM / CM)
-  //   • Department checkboxes (HR / Inv / Payroll / Onboarding / OM flag)
+  //   • Department checkboxes (HR / Inv / Payroll / Onboarding)
   //   • Department access grants ("deptAccess" checklist)
   //   • Can-Host-Call toggle
-  // They CAN still edit: name, username, phone, email, address, password,
-  // start date, profile pic, links, markets assignment, active flag.
-  window._aaSensitiveLocked = !isOwner(viewer);
+  // Still editable by everyone with edit access: name, username, phone,
+  // email, address, password, start date, profile pic, links, markets
+  // assignment, active flag.
+  var canChangeRoleFields = isOwner(viewer) || (typeof isAdminRole==='function' && isAdminRole(viewer));
+  window._aaSensitiveLocked = !canChangeRoleFields;
   try{ aaApplySensitiveLock(window._aaSensitiveLocked); }catch(e){ console.warn('[openEditAgent] applySensitiveLock:', e); }
 
   // Remember which agent is being edited — used by fillMarketsChecklist to pre-check existing markets
