@@ -3469,6 +3469,326 @@ function revokePayrollAccess(agentId){
 }
 
 // ══════════════════════════════════════════════════════════════
+//  PAYROLL UPLOAD ACCESS — separate whitelist for uploading weekly
+//  pay files. This is distinct from PAYROLL_ACCESS (which gates who
+//  can VIEW payroll). An assistant like K-Anna can be granted upload
+//  access without seeing everyone's commissions, and access can be
+//  revoked without affecting any of her other permissions.
+//
+//  Only the Owner can modify this list. Owner always has access.
+//  Stored: localStorage + Supabase app_settings.payroll_upload_access
+// ══════════════════════════════════════════════════════════════
+var PAYROLL_UPLOAD_ACCESS = [];
+
+function loadPayrollUploadAccess(){
+  try{
+    var raw = localStorage.getItem('wmam_payroll_upload_access');
+    PAYROLL_UPLOAD_ACCESS = raw ? (JSON.parse(raw) || []) : [];
+  }catch(e){ PAYROLL_UPLOAD_ACCESS = []; }
+}
+
+function savePayrollUploadAccess(){
+  try{ localStorage.setItem('wmam_payroll_upload_access', JSON.stringify(PAYROLL_UPLOAD_ACCESS)); }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    supaClient.from('app_settings').upsert(
+      {key:'payroll_upload_access', value: JSON.stringify(PAYROLL_UPLOAD_ACCESS)},
+      {onConflict:'key'}
+    ).then(function(){}).catch(function(){});
+  }
+}
+
+function hasPayrollUploadAccess(user){
+  if(!user) return false;
+  if(isOwner(user)) return true;
+  return PAYROLL_UPLOAD_ACCESS.indexOf(user.id) >= 0;
+}
+
+function grantPayrollUploadAccess(agentId){
+  if(!isOwner(DB.current)){ alert('Only the Owner can grant Payroll Upload access.'); return; }
+  var a = DB.agents.find(function(x){return x.id===agentId;});
+  if(!a) return;
+  if(PAYROLL_UPLOAD_ACCESS.indexOf(agentId) < 0) PAYROLL_UPLOAD_ACCESS.push(agentId);
+  savePayrollUploadAccess();
+  alert('✓ Payroll Upload access granted to '+a.name);
+}
+
+function revokePayrollUploadAccess(agentId){
+  if(!isOwner(DB.current)){ alert('Only the Owner can revoke Payroll Upload access.'); return; }
+  var a = DB.agents.find(function(x){return x.id===agentId;});
+  var idx = PAYROLL_UPLOAD_ACCESS.indexOf(agentId);
+  if(idx >= 0) PAYROLL_UPLOAD_ACCESS.splice(idx, 1);
+  savePayrollUploadAccess();
+  alert('✓ Payroll Upload access revoked'+(a?' for '+a.name:''));
+}
+
+// ══════════════════════════════════════════════════════════════
+//  PAYROLL WEEKS — raw imported pay data by carrier by week.
+//  Each week record stores the raw activations from the carrier's
+//  email, BEFORE any commission calculation. Commission is computed
+//  in Phase 2 using rate sheets Calvin supplies separately.
+//
+//  Record shape:
+//  {
+//    id: 'pw-<timestamp>',
+//    carrier: 'Gen Mobile' | 'Assurance',
+//    periodStart: '2026-04-05',
+//    periodEnd:   '2026-04-11',
+//    uploadedAt:  ISO string,
+//    uploadedBy:  agent.id,
+//    status:      'draft' | 'finalized',
+//    companyNet:  1275076  // cents — what carrier paid Calvin this week (optional)
+//    rows: [
+//      {
+//        agentCode:   'MaliqueShaw2517',
+//        agentId:     3,                  // null if unmatched
+//        market:      'Lafayette B LA',
+//        activations: { NLAD: 120, 'NLAD+': 0, CA: 0, 'CA+NLAD': 0, TRB: 0, Data: 0, BYOD_SIM: 0, Email: 13 },
+//        chargebacks: [ { date:'4/6/2026', order:'8933612', model:'Hot Pepper Cascabel', imei:'...', type:'Upsell', amount:-15 } ],
+//        chargebackTotal: -1470  // cents
+//      }
+//    ],
+//    unmatched:   [ 'MMGC9CM', 'xyzCode' ]  // codes we couldn't resolve
+//  }
+// ══════════════════════════════════════════════════════════════
+var PAYROLL_WEEKS = [];
+
+function loadPayrollWeeks(){
+  try{
+    var raw = localStorage.getItem('wmam_payroll_weeks');
+    PAYROLL_WEEKS = raw ? (JSON.parse(raw) || []) : [];
+  }catch(e){ PAYROLL_WEEKS = []; }
+}
+
+function savePayrollWeeks(){
+  try{ localStorage.setItem('wmam_payroll_weeks', JSON.stringify(PAYROLL_WEEKS)); }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    supaClient.from('app_settings').upsert(
+      {key:'payroll_weeks', value: JSON.stringify(PAYROLL_WEEKS)},
+      {onConflict:'key'}
+    ).then(function(){}).catch(function(){});
+  }
+}
+
+// ── Parse a Gen Mobile weekly pay email body (plain text).
+// Expected format (from real sample):
+//   "GENMOBILE (4/5 - 4/11)"
+//   header: Team Name | Agent (Short) | 1-NLAD | 2-NLAD+ | 3-CA | 4-CA+NLAD | 5-TRB | Total | Data | BYOD SIM | Email
+//   rows: "MMG CIR Lafayette B LA\tMaliqueShaw2517\t120\t0\t0\t0\t0\t120\t0\t0\t13"
+//   (market-subtotal rows have empty agent column — we skip those)
+//   breakeven chargeback section at bottom: Market | Agent | DATE | ORDER | MODEL | IMEI | TYPE | B/E
+// Returns { periodStart, periodEnd, rows: {code: {market, activations, chargebacks[], chargebackTotal}}, unmatchedCodes: [] }
+function parseGenMobilePayEmail(text){
+  if(!text || typeof text !== 'string') return null;
+  var result = { periodStart:'', periodEnd:'', rows:{}, errors:[] };
+
+  // Find "GENMOBILE (M/D - M/D)" header.
+  var pm = text.match(/GEN\s*MOBILE\s*\(([\d\/]+)\s*-\s*([\d\/]+)\)/i);
+  if(pm){
+    result.periodStart = ppNormalizeDate(pm[1]);
+    result.periodEnd   = ppNormalizeDate(pm[2]);
+  } else {
+    result.errors.push('Could not find "GENMOBILE (M/D - M/D)" header. Dates left blank.');
+  }
+
+  var lines = text.split(/\r?\n/);
+  var inTable = false;
+  var inChargebacks = false;
+
+  for(var i=0; i<lines.length; i++){
+    var line = lines[i];
+    if(!line.trim()) continue;
+
+    // Detect header row of the activations table.
+    if(/Team\s+Name.*Agent.*NLAD/i.test(line)){ inTable = true; inChargebacks = false; continue; }
+    // Detect header row of the chargeback table.
+    if(/BREAKEVEN.*Upsell/i.test(line) || /Agent.*DATE.*ORDER.*MODEL.*IMEI.*TYPE.*B\/E/i.test(line)){
+      inTable = false; inChargebacks = true; continue;
+    }
+
+    if(inTable){
+      // Activations row. Split by tab, fall back to multi-space.
+      var cols = line.split(/\t/);
+      if(cols.length < 3) cols = line.split(/\s{2,}/);
+      if(cols.length < 7) continue;  // not a data row
+      var market = (cols[0]||'').trim();
+      var code   = (cols[1]||'').trim();
+      if(!code) continue;  // market-subtotal row (blank agent column) — skip
+      // Skip the ASSURANCE header line if it accidentally falls through here
+      if(/ASSURANCE/i.test(market)) { inTable = false; continue; }
+      var n = function(s){ var x=parseInt((s||'').trim(),10); return isNaN(x)?0:x; };
+      result.rows[code] = {
+        agentCode:   code,
+        market:      market.replace(/^MMG\s+CIR\s+/i,''),
+        activations: {
+          NLAD:      n(cols[2]),
+          'NLAD+':   n(cols[3]),
+          CA:        n(cols[4]),
+          'CA+NLAD': n(cols[5]),
+          TRB:       n(cols[6]),
+          Total:     n(cols[7]),
+          Data:      n(cols[8]),
+          BYOD_SIM:  n(cols[9]),
+          Email:     n(cols[10])
+        },
+        chargebacks: [],
+        chargebackTotal: 0
+      };
+    }
+    else if(inChargebacks){
+      var cbCols = line.split(/\t/);
+      if(cbCols.length < 7) cbCols = line.split(/\s{2,}/);
+      if(cbCols.length < 7) continue;
+      var cbCode   = (cbCols[1]||'').trim();
+      if(!cbCode) continue;
+      if(!result.rows[cbCode]){
+        // Agent appears in chargebacks but had 0 activations — create row anyway
+        result.rows[cbCode] = {
+          agentCode: cbCode,
+          market:    (cbCols[0]||'').trim().replace(/^MMG\s+CIR\s+/i,''),
+          activations: { NLAD:0,'NLAD+':0,CA:0,'CA+NLAD':0,TRB:0,Total:0,Data:0,BYOD_SIM:0,Email:0 },
+          chargebacks: [], chargebackTotal: 0
+        };
+      }
+      // Amount is in the last column, formatted like "($15)" or "-$15" — normalize to negative cents.
+      var amtRaw = (cbCols[cbCols.length-1]||'').trim();
+      var amt = parseFloat(amtRaw.replace(/[^\d.\-]/g,'')) || 0;
+      if(amtRaw.indexOf('(') >= 0 && amt > 0) amt = -amt;
+      if(amt > 0) amt = -amt;  // always negative — upsell deductions
+      var cbEntry = {
+        date:  (cbCols[2]||'').trim(),
+        order: (cbCols[3]||'').trim(),
+        model: (cbCols[4]||'').trim(),
+        imei:  (cbCols[5]||'').trim(),
+        type:  (cbCols[6]||'').trim(),
+        amount: Math.round(amt*100)  // store as cents
+      };
+      result.rows[cbCode].chargebacks.push(cbEntry);
+      result.rows[cbCode].chargebackTotal += cbEntry.amount;
+    }
+  }
+  return result;
+}
+
+// ── Parse an Assurance Wireless weekly pay email body.
+// Expected format:
+//   "ASSURANCE (M/D - M/D)"
+//   header: Distributor | Agent | CA SIM | CA PHONE | NLAD SIM | NLAD PHONE | Total | Data | BE | No Usage Count | Deact Count
+//   rows: "CIR\tMMGC9CN\t0\t0\t0\t10\t10\t0\t0\t0\t3"
+//   (distributor-subtotal rows have empty agent column — skip)
+function parseAssurancePayEmail(text){
+  if(!text || typeof text !== 'string') return null;
+  var result = { periodStart:'', periodEnd:'', rows:{}, errors:[] };
+  var pm = text.match(/ASSURANCE\s*\(([\d\/]+)\s*-\s*([\d\/]+)\)/i);
+  if(pm){
+    result.periodStart = ppNormalizeDate(pm[1]);
+    result.periodEnd   = ppNormalizeDate(pm[2]);
+  } else {
+    result.errors.push('Could not find "ASSURANCE (M/D - M/D)" header. Dates left blank.');
+  }
+
+  var lines = text.split(/\r?\n/);
+  var inTable = false;
+  for(var i=0; i<lines.length; i++){
+    var line = lines[i];
+    if(!line.trim()) continue;
+    if(/Distributor.*Agent.*NLAD/i.test(line)){ inTable = true; continue; }
+    if(!inTable) continue;
+    var cols = line.split(/\t/);
+    if(cols.length < 3) cols = line.split(/\s{2,}/);
+    if(cols.length < 6) continue;
+    var distributor = (cols[0]||'').trim();
+    var code        = (cols[1]||'').trim();
+    if(!code) continue;  // distributor-subtotal row
+    if(/GENMOBILE|ASSURANCE/i.test(distributor)) { inTable = false; continue; }
+    var n = function(s){ var x=parseInt((s||'').trim(),10); return isNaN(x)?0:x; };
+    result.rows[code] = {
+      agentCode:   code,
+      distributor: distributor,
+      activations: {
+        'CA SIM':     n(cols[2]),
+        'CA PHONE':   n(cols[3]),
+        'NLAD SIM':   n(cols[4]),
+        'NLAD PHONE': n(cols[5]),
+        Total:        n(cols[6]),
+        Data:         n(cols[7]),
+        BE:           n(cols[8]),
+        NoUsage:      n(cols[9]),
+        Deact:        n(cols[10])
+      },
+      chargebacks: [],
+      chargebackTotal: 0
+    };
+  }
+  return result;
+}
+
+// ── Normalize a date like "4/5" or "4/5/2026" to "YYYY-MM-DD".
+// Assumes current year if not provided in the input.
+function ppNormalizeDate(raw){
+  if(!raw) return '';
+  var parts = raw.trim().split('/');
+  if(parts.length < 2) return raw;
+  var now = new Date();
+  var year = parts.length === 3 ? parts[2] : now.getFullYear();
+  if(year.length === 2) year = '20'+year;
+  var mm = ('0'+parts[0]).slice(-2);
+  var dd = ('0'+parts[1]).slice(-2);
+  return year+'-'+mm+'-'+dd;
+}
+
+// ── Match every parsed row to an agent by agentCodes[campaign].
+// Returns { matched: [{row, agent}], unmatched: [row] }.
+// CARRIER is 'Gen Mobile' or 'Assurance' — keys into agent.agentCodes.
+function ppMatchRowsToAgents(parsed, carrier){
+  var matched = [], unmatched = [];
+  var codeKey = carrier;  // agentCodes uses the full carrier name as key
+  var rows = parsed.rows || {};
+  Object.keys(rows).forEach(function(code){
+    var row = rows[code];
+    var agent = DB.agents.find(function(a){
+      var ac = a.agentCodes || {};
+      return ac[codeKey] && ac[codeKey].trim() === code.trim();
+    });
+    if(agent){ matched.push({ row: row, agent: agent }); }
+    else     { unmatched.push(row); }
+  });
+  return { matched: matched, unmatched: unmatched };
+}
+
+// ── Assign an agent code to an agent's profile. Used from the preview
+// screen when an unmatched row needs a one-time mapping. Next upload
+// with the same code will auto-match.
+function ppAssignCodeToAgent(agentId, carrier, code){
+  var agent = DB.agents.find(function(a){return a.id===agentId;});
+  if(!agent) return false;
+  if(!agent.agentCodes) agent.agentCodes = {};
+  agent.agentCodes[carrier] = code;
+  // Persist via the normal agent save path.
+  if(typeof saveAgentToSupabase === 'function'){
+    try{ saveAgentToSupabase(agent); }catch(e){ console.warn('[ppAssignCode] save failed:',e); }
+  }
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+
+// ── Sum totals across all rows (for preview header).
+function ppTotalActivations(rows){
+  var total = 0;
+  Object.keys(rows || {}).forEach(function(k){
+    var a = rows[k].activations || {};
+    total += (a.Total || 0);
+  });
+  return total;
+}
+function ppTotalChargebacks(rows){
+  var total = 0;
+  Object.keys(rows || {}).forEach(function(k){
+    total += (rows[k].chargebackTotal || 0);
+  });
+  return total;  // cents
+}
+
+// ══════════════════════════════════════════════════════════════
 //  IMPERSONATION GRANT SYSTEM
 //  Only the Owner can impersonate by default. Owner can also grant
 //  time-limited impersonation access to SPECIFIC named agents (not
@@ -6121,6 +6441,8 @@ async function loadFromSupabase(){
         if(s.key==='campaign_docs' && s.value){ try{var cd=JSON.parse(s.value);if(cd&&typeof cd==='object')Object.keys(cd).forEach(function(k){if(CAMPAIGN_DOCS[k])Object.assign(CAMPAIGN_DOCS[k],cd[k]);});}catch(e){} }
         if(s.key==='agent_contracts' && s.value){ try{var ac2=JSON.parse(s.value);if(ac2.status)AGENT_ONBOARDING_STATUS=ac2.status;if(ac2.signed)AGENT_SIGNED_DOCS=ac2.signed;if(ac2.banking)AGENT_BANKING_INFO=ac2.banking;if(ac2.tasks)ONBOARDING_TASKS=ac2.tasks;if(ac2.taskNextId)OB_TASK_NEXT_ID=ac2.taskNextId;}catch(e){} }
         if(s.key==='payroll_access' && s.value){ try{var pa=JSON.parse(s.value);if(Array.isArray(pa))PAYROLL_ACCESS=pa;}catch(e){} }
+        if(s.key==='payroll_upload_access' && s.value){ try{var pua=JSON.parse(s.value);if(Array.isArray(pua))PAYROLL_UPLOAD_ACCESS=pua;}catch(e){} }
+        if(s.key==='payroll_weeks' && s.value){ try{var pw=JSON.parse(s.value);if(Array.isArray(pw))PAYROLL_WEEKS=pw;}catch(e){} }
         // ── INVENTORY STORES — pull from Supabase so every device is
         //    visible to every user with permission, not just the device
         //    that scanned them in. Each block is wrapped in its own try
@@ -9933,7 +10255,7 @@ function doLogin(){
   launchBO(found);
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
-  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
+  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
   // POST-LOGIN LANDING PAGE ROUTING
   // Owner → Owner Control (their actual home)
   // Everyone else → panelBO (the main back-office dashboard)
@@ -10036,11 +10358,19 @@ function buildNav(u){
     );
   }
 
-  // Payroll Portal
-  if(canAccess(u,'payroll')){
-    h += boGroupDrop('dd-payroll','💰 Payroll ▾',
-      boDropBtn('payroll','💰 Commission Summary')
-    );
+  // Payroll Portal. Show the Payroll group to anyone who has either
+  // Payroll VIEW access (sees commissions) or Payroll UPLOAD access
+  // (can stage pay files). Inside, only render items they can use.
+  var showPayrollGroup = canAccess(u,'payroll') || hasPayrollUploadAccess(u);
+  if(showPayrollGroup){
+    var payrollItems = '';
+    if(canAccess(u,'payroll')){
+      payrollItems += boDropBtn('payroll','💰 Commission Summary');
+    }
+    if(hasPayrollUploadAccess(u)){
+      payrollItems += boDropBtn('payroll-upload','📤 Upload Weekly Pay File');
+    }
+    if(payrollItems) h += boGroupDrop('dd-payroll','💰 Payroll ▾', payrollItems);
   }
 
   // Onboarding Portal
@@ -11190,7 +11520,10 @@ function panelHeader(title, backLabel){
     +title+'</div>'
     +'</div>';
 }
-function gotoPanel(id){
+function gotoPanel(id, params){
+  // Stash optional params so child panels (like payroll-week-detail)
+  // can read things like weekId without polluting the URL.
+  gotoPanel._params = params || null;
   if(!gotoPanel._skipHistory){
     var cur=gotoPanel._current||'bo';
     if(cur!==id){ PANEL_HISTORY.push(cur); if(PANEL_HISTORY.length>30) PANEL_HISTORY.shift(); }
@@ -11287,6 +11620,9 @@ function gotoPanel(id){
     alerts:panelAlerts,settings:panelSettings,
     'agent-profile':panelAgentProfile,
     'owner-control':panelOwnerControl,
+    'payroll-upload':panelPayrollUpload,
+    'payroll-upload-preview':panelPayrollUploadPreview,
+    'payroll-week-detail':panelPayrollWeekDetail,
     'notifications':panelNotifications,
     'meetings':panelMeetings,
     'meeting-hosts':panelMeetingHosts,
@@ -13284,7 +13620,438 @@ function panelOwner(){
 
   h += '</div></div>';
 
+  // ── PAYROLL UPLOAD ACCESS CONTROL ──────────────────────────
+  // Separate whitelist for who can upload weekly pay files. Different
+  // from Payroll VIEW access. Owner can grant/revoke to K-Anna or
+  // anyone else without that person inheriting other payroll rights.
+  h += '<div class="bo-card" style="margin-top:20px;border-left:4px solid #059669">';
+  h += '<div class="bo-card-head" style="background:rgba(5,150,105,.05)">'
+    +'<div class="bo-card-title" style="color:#059669">📤 Payroll Upload Access Control</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">Who can paste weekly pay emails and stage imports</div>'
+    +'</div>';
+  h += '<div style="padding:18px 20px">';
+  h += '<div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">';
+  h += '<button onclick="gotoPanel(\'payroll-upload\')" class="btn-fire" style="background:#059669;border-color:#059669;padding:10px 22px">📤 Open Payroll Upload →</button>';
+  h += '</div>';
+
+  if(PAYROLL_UPLOAD_ACCESS.length){
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Currently Authorized ('+PAYROLL_UPLOAD_ACCESS.length+')</div>';
+    h += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">';
+    PAYROLL_UPLOAD_ACCESS.forEach(function(aid){
+      var ag = DB.agents.find(function(x){return x.id===aid;});
+      if(!ag){ return; }
+      h += '<div style="display:flex;align-items:center;gap:8px;background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:100px;padding:5px 5px 5px 12px">'
+        +'<span style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);font-weight:700">'+ag.name+'</span>'
+        +'<span style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:var(--muted)">('+ag.role+')</span>'
+        +'<button onclick="revokePayrollUploadAccess('+ag.id+');gotoPanel(\'owner\');" title="Revoke Upload access" style="background:rgba(204,0,0,.15);border:none;color:var(--red);font-family:Bebas Neue,sans-serif;font-size:.7rem;width:22px;height:22px;border-radius:50%;cursor:pointer">×</button>'
+        +'</div>';
+    });
+    h += '</div>';
+  } else {
+    h += '<div style="padding:14px 16px;background:var(--offwhite);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted);margin-bottom:16px">No one else has Upload access yet — only you can paste new pay files. Grant access to someone (like K-Anna) below.</div>';
+  }
+
+  var eligibleUp = DB.agents.filter(function(a){
+    return a.active && !isOwner(a) && PAYROLL_UPLOAD_ACCESS.indexOf(a.id) < 0;
+  });
+  eligibleUp.sort(function(a,b){ return (a.name||'').localeCompare(b.name||''); });
+  h += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+    +'<label style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Grant to:</label>'
+    +'<select id="payrollUploadGrantSelect" style="flex:1;min-width:240px;padding:8px 12px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;background:white">'
+    +'<option value="">— Select an agent —</option>';
+  eligibleUp.forEach(function(a){
+    h += '<option value="'+a.id+'">'+a.name+' · '+a.role+'</option>';
+  });
+  h += '</select>'
+    +'<button onclick="var s=document.getElementById(\'payrollUploadGrantSelect\');var id=parseInt(s.value);if(!id){alert(\'Pick an agent first.\');return;}grantPayrollUploadAccess(id);gotoPanel(\'owner\');" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 18px;border-radius:6px;cursor:pointer;font-weight:700">+ Grant Upload Access</button>'
+    +'</div>';
+
+  h += '<div style="margin-top:12px;padding:10px 14px;background:rgba(5,150,105,.06);border-left:3px solid #059669;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--brown);line-height:1.5">'
+    +'<strong>📌 Note:</strong> Upload Access lets someone paste weekly pay emails and save imports. It does NOT grant them access to view anyone\'s commissions or the P&L. Those are controlled separately via Payroll Access above.'
+    +'</div>';
+
+  h += '</div></div>';
+
   return h;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  PAYROLL UPLOAD — Phase 1: paste the weekly pay email from
+//  the carrier, parse it, show preview, save raw activations.
+//  Phase 2 (commission calculation) and Phase 3 (P&L dashboard)
+//  are layered on top once Calvin supplies the rate sheets.
+//
+//  Access: Owner always. Anyone in PAYROLL_UPLOAD_ACCESS whitelist.
+// ══════════════════════════════════════════════════════════════
+function panelPayrollUpload(){
+  var u = DB.current;
+  if(!hasPayrollUploadAccess(u)){
+    return panelHeader('💰 Payroll Upload') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Payroll Upload access is restricted. Only the Owner can grant access to this feature.</div></div>';
+  }
+  var h = panelHeader('💰 Payroll Upload — Weekly Pay Files');
+
+  // Intro / instructions
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted);line-height:1.6">';
+  h += '<strong style="color:var(--brown)">How this works:</strong> Copy the entire body of your weekly pay email (Gen Mobile + Assurance are usually in the same email) and paste it below. The parser will extract each agent\'s activations by matching the carrier\'s agent code to the code stored in each agent\'s profile. Unmatched rows appear in the preview where you can assign them to an agent on the fly.<br><br>';
+  h += '<strong style="color:var(--brown)">Phase 1 (now):</strong> Imports raw activation counts only. Commission is NOT calculated yet. That gets wired in Phase 2 once commission rates are finalized.';
+  h += '</div>';
+
+  // Paste box
+  h += '<div class="bo-card" style="margin-bottom:20px">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">📥 Paste Weekly Pay Email</div></div>';
+  h += '<div style="padding:20px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Email body (tab-delimited preferred)</div>';
+  h += '<textarea id="pp-paste" class="f-textarea" style="width:100%;min-height:240px;font-family:monospace;font-size:.78rem" placeholder="Paste the entire email body here — both GENMOBILE and ASSURANCE sections will be detected automatically."></textarea>';
+  h += '<div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">';
+  h += '<button onclick="ppParseAndPreview()" class="btn-fire" style="padding:10px 24px">▶ Parse & Preview</button>';
+  h += '<button onclick="document.getElementById(\'pp-paste\').value=\'\'" style="padding:10px 18px;background:rgba(153,27,27,.08);border:1px solid rgba(153,27,27,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Clear</button>';
+  h += '</div>';
+  h += '</div></div>';
+
+  // History section
+  if(PAYROLL_WEEKS.length){
+    h += '<div class="bo-card">';
+    h += '<div class="bo-card-head"><div class="bo-card-title">📊 Imported Weeks</div></div>';
+    h += '<div style="padding:14px 18px"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif"><thead><tr style="border-bottom:1px solid var(--border)">';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Carrier</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Period</th>';
+    h += '<th style="text-align:right;padding:8px 10px;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Agents</th>';
+    h += '<th style="text-align:right;padding:8px 10px;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Activations</th>';
+    h += '<th style="text-align:right;padding:8px 10px;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Chargebacks</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Status</th>';
+    h += '<th></th></tr></thead><tbody>';
+    var sortedWeeks = PAYROLL_WEEKS.slice().sort(function(a,b){return (b.uploadedAt||'').localeCompare(a.uploadedAt||'');});
+    sortedWeeks.forEach(function(w){
+      var totalAct = (w.rows||[]).reduce(function(s,r){return s+((r.activations && r.activations.Total)||0);},0);
+      var totalCB  = (w.rows||[]).reduce(function(s,r){return s+(r.chargebackTotal||0);},0);
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:10px"><strong>'+w.carrier+'</strong></td>';
+      h += '<td style="padding:10px;font-size:.8rem">'+w.periodStart+' → '+w.periodEnd+'</td>';
+      h += '<td style="padding:10px;text-align:right">'+(w.rows||[]).length+'</td>';
+      h += '<td style="padding:10px;text-align:right;font-weight:700;color:var(--blue)">'+totalAct+'</td>';
+      h += '<td style="padding:10px;text-align:right;color:#991B1B">$'+(totalCB/100).toFixed(2)+'</td>';
+      var statusColor = w.status==='finalized' ? '#059669' : '#D97706';
+      h += '<td style="padding:10px"><span style="display:inline-block;padding:3px 10px;border-radius:10px;background:rgba('+(w.status==='finalized'?'5,150,105':'217,119,6')+',.12);color:'+statusColor+';font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;font-weight:700">'+(w.status||'draft')+'</span></td>';
+      h += '<td style="padding:10px;text-align:right"><button onclick="gotoPanel(\'payroll-week-detail\',{weekId:\''+w.id+'\'})" style="background:none;border:1px solid var(--blue);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer">View</button></td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+  return h;
+}
+
+// Parse pasted email and stage a preview. Uses window._ppStaged to
+// hold the parsed data until the user commits (Save) or cancels.
+function ppParseAndPreview(){
+  var text = (document.getElementById('pp-paste')||{value:''}).value;
+  if(!text.trim()){ alert('Please paste the pay email body first.'); return; }
+  var gm = null, aw = null;
+  if(/GEN\s*MOBILE\s*\(/i.test(text)) gm = parseGenMobilePayEmail(text);
+  if(/ASSURANCE\s*\(/i.test(text))    aw = parseAssurancePayEmail(text);
+  if(!gm && !aw){
+    alert('Could not detect Gen Mobile or Assurance headers in the pasted text. Make sure you pasted the full email body including the "GENMOBILE (M/D - M/D)" or "ASSURANCE (M/D - M/D)" header lines.');
+    return;
+  }
+  window._ppStaged = { gm: gm, aw: aw, rawText: text };
+  gotoPanel('payroll-upload-preview');
+}
+
+// ── Preview panel: shows matched + unmatched rows for GM and AW.
+function panelPayrollUploadPreview(){
+  var u = DB.current;
+  if(!hasPayrollUploadAccess(u)){
+    return panelHeader('💰 Payroll Preview') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Access restricted.</div></div>';
+  }
+  var staged = window._ppStaged;
+  if(!staged || (!staged.gm && !staged.aw)){
+    return panelHeader('💰 Payroll Preview') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No staged upload found. Go back and paste the email.<br><br><button onclick="gotoPanel(\'payroll-upload\')" class="btn-fire" style="padding:10px 20px;margin-top:10px">← Back to Upload</button></div></div>';
+  }
+  var h = panelHeader('💰 Payroll Preview — Review Before Save');
+
+  // Top action strip
+  h += '<div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">';
+  h += '<button onclick="ppCommitStaged()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">✓ Save This Import</button>';
+  h += '<button onclick="ppCancelStaged()" style="padding:10px 18px;background:rgba(153,27,27,.08);border:1px solid rgba(153,27,27,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Cancel & Discard</button>';
+  h += '</div>';
+
+  // Render each carrier section
+  if(staged.gm) h += ppRenderCarrierPreview('Gen Mobile', staged.gm);
+  if(staged.aw) h += ppRenderCarrierPreview('Assurance',  staged.aw);
+  return h;
+}
+
+function ppRenderCarrierPreview(carrier, parsed){
+  var match = ppMatchRowsToAgents(parsed, carrier);
+  var matched = match.matched, unmatched = match.unmatched;
+  var totalAct = 0, totalCB = 0;
+  Object.keys(parsed.rows||{}).forEach(function(k){
+    totalAct += (parsed.rows[k].activations && parsed.rows[k].activations.Total) || 0;
+    totalCB += parsed.rows[k].chargebackTotal || 0;
+  });
+  var h = '';
+  h += '<div class="bo-card" style="margin-bottom:20px;border-left:5px solid '+(carrier==='Gen Mobile'?'#2a7de1':'#D97706')+'">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">📦 '+carrier+' — '+(parsed.periodStart||'(no date)')+' → '+(parsed.periodEnd||'(no date)')+'</div>';
+  h += '<div style="display:flex;gap:16px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">';
+  h += '<span><strong style="color:var(--blue)">'+Object.keys(parsed.rows||{}).length+'</strong> rows</span>';
+  h += '<span><strong style="color:#059669">'+matched.length+'</strong> matched</span>';
+  h += '<span><strong style="color:#991B1B">'+unmatched.length+'</strong> unmatched</span>';
+  h += '<span><strong>'+totalAct+'</strong> total activations</span>';
+  if(totalCB) h += '<span style="color:#991B1B"><strong>$'+(totalCB/100).toFixed(2)+'</strong> chargebacks</span>';
+  h += '</div></div>';
+  h += '<div style="padding:16px 18px">';
+
+  if(parsed.errors && parsed.errors.length){
+    h += '<div style="background:rgba(217,119,6,.06);border:1px solid rgba(217,119,6,.3);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:#D97706">⚠ Parser warnings: '+parsed.errors.join(' • ')+'</div>';
+  }
+
+  // Unmatched section first so the user sees what needs attention.
+  if(unmatched.length){
+    h += '<div style="background:rgba(204,0,0,.04);border:1px solid rgba(204,0,0,.25);border-radius:8px;padding:14px;margin-bottom:16px">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;color:#991B1B;letter-spacing:1.5px;margin-bottom:10px">⚠ '+unmatched.length+' Unmatched Agent Code(s)</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:12px">These codes aren\'t in anyone\'s profile yet. Assign each to an agent — the code will be saved to their profile so next week\'s upload auto-matches.</div>';
+    unmatched.forEach(function(row){
+      var total = (row.activations && row.activations.Total) || 0;
+      h += '<div style="display:flex;align-items:center;gap:12px;padding:8px 10px;background:white;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;flex-wrap:wrap">';
+      h += '<div style="flex:1;min-width:200px"><strong style="font-family:monospace;color:var(--brown)">'+row.agentCode+'</strong>';
+      if(row.market) h += ' <span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">· '+row.market+'</span>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">'+total+' activations</div></div>';
+      h += '<select id="pp-assign-'+carrier.replace(/\s+/g,'')+'-'+row.agentCode.replace(/[^\w]/g,'')+'" style="padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.75rem">';
+      h += '<option value="">— Pick an agent —</option>';
+      DB.agents.filter(function(a){return a.active;}).sort(function(a,b){return a.name.localeCompare(b.name);}).forEach(function(a){
+        h += '<option value="'+a.id+'">'+a.name+' ('+a.username+')</option>';
+      });
+      h += '</select>';
+      h += '<button onclick="ppAssignUnmatched(\''+carrier+'\',\''+row.agentCode.replace(/'/g,"\\'")+'\')" style="padding:7px 14px;background:var(--blue);color:white;border:none;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">Assign</button>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // Matched table
+  if(matched.length){
+    h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif"><thead><tr style="border-bottom:2px solid var(--border)">';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Agent</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Code</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Market</th>';
+    h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Activations</th>';
+    h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Chargebacks</th>';
+    h += '</tr></thead><tbody>';
+    matched.forEach(function(m){
+      var total = (m.row.activations && m.row.activations.Total) || 0;
+      var cb = m.row.chargebackTotal || 0;
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:8px 10px"><strong>'+m.agent.name+'</strong><div style="font-size:.7rem;color:var(--muted)">'+m.agent.username+'</div></td>';
+      h += '<td style="padding:8px 10px;font-family:monospace;font-size:.78rem">'+m.row.agentCode+'</td>';
+      h += '<td style="padding:8px 10px;font-size:.78rem">'+(m.row.market||m.row.distributor||'')+'</td>';
+      h += '<td style="padding:8px 10px;text-align:right;font-weight:700;color:var(--blue)">'+total+'</td>';
+      h += '<td style="padding:8px 10px;text-align:right;color:'+(cb?'#991B1B':'var(--muted2)')+'">'+(cb?'$'+(cb/100).toFixed(2):'—')+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table>';
+  } else {
+    h += '<div style="padding:16px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No rows matched yet. Assign unmatched codes above to build the import.</div>';
+  }
+  h += '</div></div>';
+  return h;
+}
+
+// Handle "Assign" click on an unmatched row — saves code to agent profile,
+// then re-renders the preview so the row moves to the Matched section.
+function ppAssignUnmatched(carrier, code){
+  var sel = document.getElementById('pp-assign-'+carrier.replace(/\s+/g,'')+'-'+code.replace(/[^\w]/g,''));
+  if(!sel || !sel.value){ alert('Pick an agent first.'); return; }
+  var agentId = parseInt(sel.value, 10);
+  if(!agentId){ alert('Invalid agent selection.'); return; }
+  var ok = ppAssignCodeToAgent(agentId, carrier, code);
+  if(ok){
+    var agent = DB.agents.find(function(a){return a.id===agentId;});
+    alert('✓ '+code+' assigned to '+agent.name+'. Future uploads will auto-match.');
+    gotoPanel('payroll-upload-preview');  // re-render
+  } else {
+    alert('Could not save code. See console.');
+  }
+}
+
+// Commit staged upload into PAYROLL_WEEKS.
+function ppCommitStaged(){
+  var staged = window._ppStaged;
+  if(!staged){ alert('Nothing to save.'); return; }
+  var u = DB.current;
+  var saved = 0;
+  ['gm','aw'].forEach(function(key){
+    var parsed = staged[key];
+    if(!parsed) return;
+    var carrier = (key==='gm') ? 'Gen Mobile' : 'Assurance';
+    var match = ppMatchRowsToAgents(parsed, carrier);
+    var rows = [];
+    match.matched.forEach(function(m){
+      rows.push({
+        agentCode:       m.row.agentCode,
+        agentId:         m.agent.id,
+        agentName:       m.agent.name,
+        market:          m.row.market || m.row.distributor || '',
+        activations:     m.row.activations,
+        chargebacks:     m.row.chargebacks || [],
+        chargebackTotal: m.row.chargebackTotal || 0
+      });
+    });
+    var unmatchedCodes = match.unmatched.map(function(r){return r.agentCode;});
+    var weekRecord = {
+      id:          'pw-'+Date.now()+'-'+key,
+      carrier:     carrier,
+      periodStart: parsed.periodStart,
+      periodEnd:   parsed.periodEnd,
+      uploadedAt:  new Date().toISOString(),
+      uploadedBy:  u.id,
+      status:      'draft',
+      rows:        rows,
+      unmatchedCodes: unmatchedCodes
+    };
+    PAYROLL_WEEKS.push(weekRecord);
+    saved++;
+  });
+  savePayrollWeeks();
+  window._ppStaged = null;
+  alert('✓ '+saved+' week(s) saved to payroll history.');
+  gotoPanel('payroll-upload');
+}
+
+function ppCancelStaged(){
+  if(!confirm('Discard this pasted pay file without saving?')) return;
+  window._ppStaged = null;
+  gotoPanel('payroll-upload');
+}
+
+// ── Week Detail view — opens a single saved import.
+function panelPayrollWeekDetail(){
+  var u = DB.current;
+  if(!hasPayrollUploadAccess(u)){
+    return panelHeader('💰 Week Detail') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Access restricted.</div></div>';
+  }
+  var weekId = (gotoPanel._params && gotoPanel._params.weekId) || null;
+  var w = PAYROLL_WEEKS.find(function(x){return x.id===weekId;});
+  if(!w){
+    return panelHeader('💰 Week Detail') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Week not found.<br><br><button onclick="gotoPanel(\'payroll-upload\')" class="btn-fire" style="padding:10px 20px;margin-top:10px">← Back</button></div></div>';
+  }
+  var h = panelHeader('💰 '+w.carrier+' — '+w.periodStart+' → '+w.periodEnd);
+
+  // Action row — finalize / delete
+  if(isOwner(u)){
+    h += '<div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">';
+    if(w.status !== 'finalized'){
+      h += '<button onclick="ppFinalizeWeek(\''+w.id+'\')" class="btn-fire" style="padding:8px 20px;background:#059669;border-color:#059669">✓ Finalize</button>';
+    } else {
+      h += '<span style="padding:8px 18px;background:rgba(5,150,105,.12);border:1px solid rgba(5,150,105,.3);color:#059669;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;font-weight:700;border-radius:6px">✓ Finalized</span>';
+    }
+    h += '<button onclick="ppDeleteWeek(\''+w.id+'\')" style="padding:8px 18px;background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Delete</button>';
+    h += '</div>';
+  }
+
+  // Summary
+  var totalAct = (w.rows||[]).reduce(function(s,r){return s+((r.activations && r.activations.Total)||0);},0);
+  var totalCB  = (w.rows||[]).reduce(function(s,r){return s+(r.chargebackTotal||0);},0);
+  h += '<div class="bo-stats" style="margin-bottom:20px">';
+  h += '<div class="bo-stat"><div class="bs-label">Agents</div><div class="bs-val" style="color:var(--blue)">'+(w.rows||[]).length+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Total Activations</div><div class="bs-val" style="color:var(--blue)">'+totalAct+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Chargebacks</div><div class="bs-val" style="color:#991B1B">$'+(totalCB/100).toFixed(2)+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Uploaded By</div><div class="bs-val" style="font-size:1rem">'+((DB.agents.find(function(a){return a.id===w.uploadedBy;})||{}).name||'—')+'</div></div>';
+  h += '</div>';
+
+  // Rows table
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Agent Breakdown</div></div>';
+  h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+  h += '<thead><tr style="border-bottom:2px solid var(--border)">';
+  h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Agent</th>';
+  h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Code</th>';
+  h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Market</th>';
+  // Activation columns depend on carrier
+  var activationKeys = [];
+  (w.rows||[]).forEach(function(r){
+    Object.keys(r.activations||{}).forEach(function(k){
+      if(k!=='Total' && activationKeys.indexOf(k)<0) activationKeys.push(k);
+    });
+  });
+  activationKeys.forEach(function(k){
+    h += '<th style="text-align:right;padding:8px 6px;font-size:.65rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">'+k.replace('_',' ')+'</th>';
+  });
+  h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Total</th>';
+  h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Chargebacks</th>';
+  h += '</tr></thead><tbody>';
+  (w.rows||[]).forEach(function(r){
+    h += '<tr style="border-bottom:1px solid var(--border)">';
+    h += '<td style="padding:8px 10px"><strong>'+(r.agentName||'—')+'</strong></td>';
+    h += '<td style="padding:8px 10px;font-family:monospace;font-size:.78rem">'+r.agentCode+'</td>';
+    h += '<td style="padding:8px 10px;font-size:.78rem">'+(r.market||'—')+'</td>';
+    activationKeys.forEach(function(k){
+      var v = (r.activations && r.activations[k]) || 0;
+      h += '<td style="padding:8px 6px;text-align:right">'+(v||'—')+'</td>';
+    });
+    var tot = (r.activations && r.activations.Total) || 0;
+    h += '<td style="padding:8px 10px;text-align:right;font-weight:700;color:var(--blue)">'+tot+'</td>';
+    h += '<td style="padding:8px 10px;text-align:right;color:'+(r.chargebackTotal?'#991B1B':'var(--muted2)')+'">'+(r.chargebackTotal?'$'+(r.chargebackTotal/100).toFixed(2):'—')+'</td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+
+  // Chargeback details (collapsible)
+  var cbRows = [];
+  (w.rows||[]).forEach(function(r){
+    (r.chargebacks||[]).forEach(function(cb){
+      cbRows.push(Object.assign({agentName:r.agentName,agentCode:r.agentCode}, cb));
+    });
+  });
+  if(cbRows.length){
+    h += '<div class="bo-card" style="margin-top:16px"><div class="bo-card-head"><div class="bo-card-title">🔻 Upsell Chargebacks ('+cbRows.length+')</div></div>';
+    h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border)"><th style="text-align:left;padding:6px 10px;font-size:.68rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">Agent</th><th style="text-align:left;padding:6px 10px;font-size:.68rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">Date</th><th style="text-align:left;padding:6px 10px;font-size:.68rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">Order</th><th style="text-align:left;padding:6px 10px;font-size:.68rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">Model</th><th style="text-align:left;padding:6px 10px;font-size:.68rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">IMEI</th><th style="text-align:right;padding:6px 10px;font-size:.68rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">Amount</th></tr></thead><tbody>';
+    cbRows.forEach(function(cb){
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:6px 10px;font-size:.78rem">'+(cb.agentName||cb.agentCode)+'</td>';
+      h += '<td style="padding:6px 10px;font-size:.78rem">'+cb.date+'</td>';
+      h += '<td style="padding:6px 10px;font-size:.78rem;font-family:monospace">'+cb.order+'</td>';
+      h += '<td style="padding:6px 10px;font-size:.78rem">'+cb.model+'</td>';
+      h += '<td style="padding:6px 10px;font-size:.75rem;font-family:monospace">'+cb.imei+'</td>';
+      h += '<td style="padding:6px 10px;text-align:right;color:#991B1B;font-weight:700">$'+(cb.amount/100).toFixed(2)+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  if((w.unmatchedCodes||[]).length){
+    h += '<div class="bo-card" style="margin-top:16px;border-left:4px solid #991B1B"><div class="bo-card-head"><div class="bo-card-title" style="color:#991B1B">⚠ Unmatched Codes ('+(w.unmatchedCodes||[]).length+')</div></div>';
+    h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted)">These agent codes weren\'t assigned to anyone when this week was imported. They weren\'t saved to any agent — the activations are still in the raw email. Re-upload after assigning these codes in the respective agent profiles to capture them.<div style="margin-top:10px;font-family:monospace;font-size:.78rem">'+w.unmatchedCodes.join(', ')+'</div></div></div>';
+  }
+  return h;
+}
+
+function ppFinalizeWeek(weekId){
+  if(!isOwner(DB.current)){ alert('Only the Owner can finalize a payroll week.'); return; }
+  if(!confirm('Finalize this week? Once finalized, the raw data is locked — you can still view it, but commission calculation (Phase 2) will treat this as the approved source.')) return;
+  var w = PAYROLL_WEEKS.find(function(x){return x.id===weekId;});
+  if(!w) return;
+  w.status = 'finalized';
+  w.finalizedAt = new Date().toISOString();
+  w.finalizedBy = DB.current.id;
+  savePayrollWeeks();
+  alert('✓ Week finalized.');
+  gotoPanel('payroll-week-detail',{weekId:weekId});
+}
+
+function ppDeleteWeek(weekId){
+  if(!isOwner(DB.current)){ alert('Only the Owner can delete a payroll week.'); return; }
+  var w = PAYROLL_WEEKS.find(function(x){return x.id===weekId;});
+  if(!w) return;
+  if(!confirm('Delete this week permanently? This cannot be undone.\n\n'+w.carrier+' · '+w.periodStart+' → '+w.periodEnd)) return;
+  var idx = PAYROLL_WEEKS.indexOf(w);
+  if(idx >= 0) PAYROLL_WEEKS.splice(idx, 1);
+  savePayrollWeeks();
+  alert('✓ Week deleted.');
+  gotoPanel('payroll-upload');
 }
 
 function panelAgents(){
