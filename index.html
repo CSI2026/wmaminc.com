@@ -12049,6 +12049,24 @@ function gotoPanel(id, params){
   // Stash optional params so child panels (like payroll-week-detail)
   // can read things like weekId without polluting the URL.
   gotoPanel._params = params || null;
+
+  // ── COMP ACKNOWLEDGMENT GATE ────────────────────────────────────
+  // If this user has any unsigned or pendingAddendum assignments,
+  // force them to the acknowledgment panel before they can do anything
+  // else. The only escape hatches are: notifications, the comp-ack
+  // panel itself, and signing out (handled outside gotoPanel).
+  // Owner is exempt from this gate to avoid getting locked out of
+  // managing the system.
+  try{
+    if(typeof ppGetMyPendingAssignments === 'function' && DB && DB.current && !isOwner(DB.current)){
+      var pending = ppGetMyPendingAssignments();
+      var allowed = ['comp-acknowledge','notifications'];
+      if(pending.length && allowed.indexOf(id) < 0){
+        id = 'comp-acknowledge';  // redirect
+      }
+    }
+  }catch(e){ console.warn('[gotoPanel] comp gate check failed', e); }
+
   if(!gotoPanel._skipHistory){
     var cur=gotoPanel._current||'bo';
     if(cur!==id){ PANEL_HISTORY.push(cur); if(PANEL_HISTORY.length>30) PANEL_HISTORY.shift(); }
@@ -12154,6 +12172,7 @@ function gotoPanel(id, params){
     'comp-templates':panelCompTemplates,
     'comp-assignments':panelCompAssignments,
     'comp-assign-edit':panelCompAssignEdit,
+    'comp-acknowledge':panelCompAcknowledge,
     'notifications':panelNotifications,
     'meetings':panelMeetings,
     'meeting-hosts':panelMeetingHosts,
@@ -13070,6 +13089,40 @@ function panelBO(){
       });
       html += '</div></div>';
       html += '</div>';
+    }
+  }
+
+  // ══════════ MY COMP PLANS (Agent-facing) ══════════
+  // Show agents their own active comp plans + any pending acknowledgments.
+  // Owner is excluded — they manage all plans from Owner Panel.
+  if((isAgent||isLdr||isMgr) && !isOwner(u) && typeof COMP_ASSIGNMENTS !== 'undefined'){
+    var _myAssignments = COMP_ASSIGNMENTS.filter(function(x){return x.agentId===u.id;});
+    if(_myAssignments.length){
+      html += '<div class="bo-card" style="margin-bottom:18px;border-left:5px solid #7c3aed">';
+      html += '<div class="bo-card-head" style="background:rgba(124,58,237,.05)"><div class="bo-card-title" style="color:#7c3aed">💰 My Compensation Plans</div></div>';
+      html += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+      html += '<thead><tr style="border-bottom:2px solid var(--border)">';
+      html += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Plan</th>';
+      html += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Status</th>';
+      html += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Signed</th>';
+      html += '<th></th></tr></thead><tbody>';
+      _myAssignments.forEach(function(a){
+        var _plan = ppGetPlanById(a.planId);
+        var _statusColor = a.pendingAddendum?'#D97706':(a.signedAt?'#059669':'var(--muted2)');
+        var _statusText = a.pendingAddendum?'⚠ Addendum Pending':(a.signedAt?'✓ Active':'⏳ Awaiting Sign');
+        html += '<tr style="border-bottom:1px solid var(--border)">';
+        html += '<td style="padding:8px 10px"><strong>'+(_plan?ppPlanLabel(_plan):'(plan deleted)')+'</strong></td>';
+        html += '<td style="padding:8px 10px"><span style="display:inline-block;padding:3px 10px;border-radius:10px;background:rgba('+(a.pendingAddendum?'217,119,6':a.signedAt?'5,150,105':'120,120,120')+',.12);color:'+_statusColor+';font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;font-weight:700">'+_statusText+'</span></td>';
+        html += '<td style="padding:8px 10px;font-size:.78rem;color:var(--muted)">'+(a.signedAt?a.signedAt.slice(0,10):'<em>Not signed</em>')+'</td>';
+        html += '<td style="padding:8px 10px;text-align:right">';
+        if(!a.signedAt || a.pendingAddendum){
+          html += '<button onclick="gotoPanel(\'comp-acknowledge\')" class="btn-fire" style="padding:6px 14px;background:#7c3aed;border-color:#7c3aed;font-size:.7rem">'+(a.pendingAddendum?'Acknowledge':'Sign Now')+' →</button>';
+        } else if(_plan){
+          html += '<button onclick="ppViewContract(\''+a.id+'\')" style="background:none;border:1px solid var(--blue);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer">View Contract</button>';
+        }
+        html += '</td></tr>';
+      });
+      html += '</tbody></table></div></div>';
     }
   }
 
@@ -15165,9 +15218,26 @@ function ppSaveCompPlanFromForm(){
       affected.forEach(function(a){
         a.pendingAddendum = true;
         a.addendumPlanVersion = p.version;
+        // Push in-app notification so they see it in the bell
+        try{
+          var ag = DB.agents.find(function(x){return x.id===a.agentId;});
+          pushNotification({
+            type:'alert',
+            icon:'⚠',
+            title:'Comp Plan UPDATED — Addendum Required',
+            body:'Your compensation plan for '+(p.campaign||a.campaign)+' has been updated to v'+p.version+'. You must log in and acknowledge the addendum before continuing.',
+            fromId: DB.current.id,
+            fromName: DB.current.name,
+            toIds: [a.agentId]
+          });
+          // Email + SMS via Brevo (best effort)
+          if(typeof ppNotifyAgentOfCompChange === 'function'){
+            ppNotifyAgentOfCompChange(ag, p, /*isAddendum=*/true);
+          }
+        }catch(e){ console.warn('[comp addendum notify]', e); }
       });
       saveCompAssignments();
-      alert('✓ Plan updated to v'+p.version+'.\n\n⚠ '+affected.length+' agent'+(affected.length===1?' has':'s have')+' been flagged for addendum acknowledgment. They will see a "Plan Updated" notice on their dashboard the next time they log in. (Email + SMS notification will be wired in a follow-up.)');
+      alert('✓ Plan updated to v'+p.version+'.\n\n⚠ '+affected.length+' agent'+(affected.length===1?' has':'s have')+' been flagged for addendum acknowledgment.\n\n• In-app notifications pushed.\n• Email + SMS sent via Brevo if API key is configured.\n• They will see a blocking screen until they acknowledge.');
     } else {
       alert('✓ Plan updated to v'+p.version+'.');
     }
@@ -15385,9 +15455,208 @@ function ppSaveAssignmentFromForm(){
   COMP_ASSIGNMENTS.push(a);
   saveCompAssignments();
   var agent = DB.agents.find(function(x){return x.id===a.agentId;});
-  alert('✓ Comp plan assigned to '+agent.name+'.\n\nThey will see the contract on their next login (blocking screen). Email + SMS notification will be wired in a follow-up build.');
+  var plan  = ppGetPlanById(a.planId);
+
+  // ── Push an in-app notification so the agent sees the bell + the
+  // blocking screen on next render. This is the lightweight in-portal
+  // version. Email + SMS via Brevo fire below if API key is configured.
+  try{
+    pushNotification({
+      type:'alert',
+      icon:'📋',
+      title:'New Compensation Plan — Action Required',
+      body:'Calvin Williams has assigned you a new compensation plan for '+ (plan ? ppPlanLabel(plan) : a.campaign) +'. You must review and acknowledge before continuing to use the portal.',
+      fromId: DB.current.id,
+      fromName: DB.current.name,
+      toIds: [a.agentId]
+    });
+  }catch(e){ console.warn('[ppSaveAssignment] notif push failed', e); }
+
+  // ── Try Email + SMS via Brevo if available. Best-effort — never blocks.
+  try{ if(typeof ppNotifyAgentOfCompChange === 'function'){
+    ppNotifyAgentOfCompChange(agent, plan, /*isAddendum=*/false);
+  }}catch(e){ console.warn('[ppSaveAssignment] Brevo notify failed', e); }
+
   window._ppEditingAssignment = null;
+  alert('✓ Comp plan assigned to '+agent.name+'.\n\n'+
+        '• An in-app notification has been pushed.\n' +
+        '• They will see a blocking screen on their next portal login until they acknowledge.\n' +
+        '• Email + SMS sent via Brevo if API key is configured (Owner Panel → Brevo settings).');
   gotoPanel('comp-assignments');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  AGENT-SIDE COMP FUNCTIONS
+//  Used by the dashboard card + blocking screen.
+// ─────────────────────────────────────────────────────────────────────
+
+// Return all assignments for the current logged-in agent that need their
+// attention — either unsigned (brand new) or pendingAddendum (plan edited
+// after they signed). Drives the blocking screen and the bell badge.
+function ppGetMyPendingAssignments(){
+  var u = DB.current;
+  if(!u) return [];
+  return COMP_ASSIGNMENTS.filter(function(a){
+    if(a.agentId !== u.id) return false;
+    return !a.signedAt || a.pendingAddendum === true;
+  });
+}
+
+// Mark an assignment as signed/acknowledged by the current agent.
+// Captures the timestamp + a typed signature string for the audit trail.
+function ppAgentAcknowledgeAssignment(assignmentId, signatureText){
+  var u = DB.current;
+  if(!u){ alert('Not logged in.'); return; }
+  var a = COMP_ASSIGNMENTS.find(function(x){return x.id===assignmentId;});
+  if(!a){ alert('Assignment not found.'); return; }
+  if(a.agentId !== u.id){
+    alert('You can only acknowledge your own comp plan.'); return;
+  }
+  if(!signatureText || !signatureText.trim()){
+    alert('Type your full name as your signature.'); return;
+  }
+  // If this was an addendum, log the prior sig + ack the new version.
+  if(a.pendingAddendum){
+    if(!a.addendumHistory) a.addendumHistory = [];
+    a.addendumHistory.push({
+      previousSignedAt: a.signedAt,
+      previousSignature: a.signature,
+      acknowledgedAt: new Date().toISOString(),
+      acknowledgedSignature: signatureText.trim()
+    });
+    a.pendingAddendum = false;
+  }
+  a.signedAt = new Date().toISOString();
+  a.signature = signatureText.trim();
+  saveCompAssignments();
+  alert('✓ Acknowledged. Your comp plan is now active. You can view it anytime from your dashboard.');
+  // Force a fresh dashboard render
+  if(typeof gotoPanel === 'function'){
+    gotoPanel('bo');
+  }
+}
+
+// Best-effort Email + SMS via Brevo. Silent fail if no API key. Calvin
+// can configure his Brevo key in Owner Panel — same key already used for
+// call-live SMS notifications. Stubbed to no-op when key is missing.
+function ppNotifyAgentOfCompChange(agent, plan, isAddendum){
+  if(!agent) return;
+  var subject = isAddendum
+    ? 'Comp Plan Addendum — Action Required'
+    : 'New Compensation Plan Assigned';
+  var bodyText = (isAddendum
+    ? 'Your compensation plan has been updated. You must log in to the portal and acknowledge the addendum before continuing.'
+    : 'Calvin Williams has assigned you a new compensation plan for '+ (plan?ppPlanLabel(plan):agent.role) +'. Log in to the portal to review and acknowledge.');
+  var key = (typeof BREVO_API_KEY !== 'undefined' && BREVO_API_KEY) ? BREVO_API_KEY : '';
+  if(!key){
+    console.log('[ppNotifyAgentOfCompChange] No Brevo API key — skipping email/SMS');
+    return;
+  }
+  // Fire email (Brevo /v3/smtp/email)
+  if(agent.email){
+    try{
+      fetch('https://api.brevo.com/v3/smtp/email', {
+        method:'POST',
+        headers:{'accept':'application/json','api-key':key,'content-type':'application/json'},
+        body: JSON.stringify({
+          sender:{name:'WMAMinc Portal', email:'noreply@wmaminc.com'},
+          to:[{email:agent.email, name:agent.name}],
+          subject: subject,
+          textContent: bodyText + '\n\n— WMAMinc Back Office'
+        })
+      }).then(function(){console.log('[Brevo] email sent to '+agent.email);})
+        .catch(function(e){console.warn('[Brevo] email failed:',e);});
+    }catch(e){ console.warn('[Brevo] email throw:',e); }
+  }
+  // Fire SMS (Brevo /v3/transactionalSMS/sms) if phone exists
+  if(agent.phone){
+    try{
+      fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
+        method:'POST',
+        headers:{'accept':'application/json','api-key':key,'content-type':'application/json'},
+        body: JSON.stringify({
+          sender:'WMAMinc',
+          recipient: agent.phone.replace(/[^\d]/g,''),
+          content:'WMAMinc Portal: '+subject+'. Log in to acknowledge: https://wmaminc.com/'
+        })
+      }).then(function(){console.log('[Brevo] SMS sent to '+agent.phone);})
+        .catch(function(e){console.warn('[Brevo] SMS failed:',e);});
+    }catch(e){ console.warn('[Brevo] SMS throw:',e); }
+  }
+}
+
+// ── AGENT-FACING ACKNOWLEDGMENT PANEL ────────────────────────────────
+// This is the blocking screen the agent gets stuck on until they sign
+// every pending comp assignment. The gotoPanel() gate redirects them
+// here on every navigation attempt while they have pending items.
+function panelCompAcknowledge(){
+  var u = DB.current;
+  if(!u){ return panelHeader('Comp Plan Review') +
+    '<div class="bo-card"><div style="padding:40px;text-align:center;font-family:Barlow Condensed,sans-serif">Not logged in.</div></div>'; }
+  var pending = (typeof ppGetMyPendingAssignments === 'function') ? ppGetMyPendingAssignments() : [];
+
+  // Already caught up? Show a brief confirmation + button to dashboard.
+  if(!pending.length){
+    return panelHeader('✓ Comp Plan Review') +
+      '<div class="bo-card" style="border-left:5px solid #059669"><div style="padding:40px;text-align:center;font-family:Barlow Condensed,sans-serif"><div style="font-size:3rem;margin-bottom:10px">✓</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:#059669;letter-spacing:2px">All Comp Plans Acknowledged</div><div style="margin-top:8px;color:var(--muted)">You\'re all caught up.</div><br><button onclick="gotoPanel(\'bo\')" class="btn-fire" style="padding:10px 24px">Continue to Dashboard →</button></div></div>';
+  }
+
+  // First pending — render its full contract + signature.
+  var assignment = pending[0];
+  var plan = ppGetPlanById(assignment.planId);
+  if(!plan){
+    return panelHeader('Comp Plan Review') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:#991B1B;font-family:Barlow Condensed,sans-serif">⚠ This comp plan can no longer be loaded. Contact Calvin Williams.</div></div>';
+  }
+  var contract = ppGenerateContractText(u, plan);
+  var isAddendum = !!assignment.pendingAddendum;
+  var headerColor = isAddendum ? '#D97706' : '#7c3aed';
+  var headerLabel = isAddendum ? '⚠ ADDENDUM — Compensation Plan Updated' : '📋 New Compensation Plan — Action Required';
+
+  var h = '';
+  h += '<div style="background:linear-gradient(135deg,'+headerColor+',rgba(0,0,0,.7));border-radius:10px;padding:20px 24px;margin-bottom:20px;color:white">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.7rem;letter-spacing:2.5px">'+headerLabel+'</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:rgba(255,255,255,.85);margin-top:4px;line-height:1.5">';
+  if(isAddendum){
+    h += 'Your compensation plan for <strong>'+ppPlanLabel(plan)+'</strong> has been updated. You must review and acknowledge the new terms before continuing to use the portal. Until you acknowledge, all other features are locked.';
+  } else {
+    h += 'Calvin Williams has assigned you a new compensation plan. Please read the contract carefully and sign at the bottom. Until you sign, all other features in the portal are locked.';
+  }
+  h += '</div>';
+  if(pending.length > 1){
+    h += '<div style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:rgba(255,255,255,.95);background:rgba(0,0,0,.18);padding:6px 12px;border-radius:4px;display:inline-block">📋 You have <strong>'+pending.length+' pending</strong> — this is #1 of '+pending.length+'</div>';
+  }
+  h += '</div>';
+
+  // Contract text body
+  h += '<div class="bo-card" style="margin-bottom:20px;border-left:5px solid '+headerColor+'">';
+  h += '<div class="bo-card-head" style="background:rgba('+(isAddendum?'217,119,6':'124,58,237')+',.05)"><div class="bo-card-title">📄 Your Contract</div></div>';
+  h += '<div style="padding:0;background:#fafafa;max-height:560px;overflow-y:auto">';
+  h += '<div style="background:white;margin:24px;padding:32px 40px;border:1px solid var(--border);border-radius:6px;font-family:Georgia,serif;font-size:.92rem;line-height:1.75;color:#1a1a1a;white-space:pre-wrap;box-shadow:0 1px 3px rgba(0,0,0,.04)">'+
+    contract.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+
+    '</div>';
+  h += '</div></div>';
+
+  // Show prior signature if this is an addendum
+  if(isAddendum && assignment.signature){
+    h += '<div style="background:rgba(217,119,6,.05);border:1px solid rgba(217,119,6,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.6">';
+    h += '<strong style="color:#D97706">📋 Your prior signature on file:</strong> "'+(assignment.signature||'')+'" on '+(assignment.signedAt||'').slice(0,10)+'.<br>By acknowledging this addendum, you accept the updated terms above as the new active version of your compensation agreement.';
+    h += '</div>';
+  }
+
+  // Signature input
+  h += '<div class="bo-card" style="margin-bottom:14px;border-left:5px solid '+headerColor+'">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">✍️ '+(isAddendum?'Acknowledge Addendum':'Sign Contract')+'</div></div>';
+  h += '<div style="padding:18px 22px">';
+  h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:700;display:block;margin-bottom:8px">Type your full legal name as your signature</label>';
+  h += '<input type="text" id="cpa-sig" placeholder="'+u.name+'" style="width:100%;padding:14px 16px;border:2px solid var(--sand);border-radius:8px;font-family:Caveat,Georgia,cursive;font-size:1.6rem;color:#003594;background:white">';
+  h += '<div style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">By typing your name above, you legally bind yourself to the terms of this compensation '+(isAddendum?'addendum':'agreement')+'.</div>';
+  h += '<div style="display:flex;gap:10px;margin-top:18px;flex-wrap:wrap">';
+  h += '<button onclick="ppAgentAcknowledgeAssignment(\''+assignment.id+'\', (document.getElementById(\'cpa-sig\')||{}).value)" class="btn-fire" style="padding:12px 32px;background:'+headerColor+';border-color:'+headerColor+';font-size:.85rem">✓ '+(isAddendum?'Acknowledge Addendum':'Sign & Activate')+'</button>';
+  h += '</div>';
+  h += '</div></div>';
+
+  return h;
 }
 
 function ppRemoveAssignment(assignmentId){
