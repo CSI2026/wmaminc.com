@@ -5574,10 +5574,41 @@ function loadSupplyInventory(){
   }catch(e){}
 }
 
-function isHR(u)         { return u && u.role==='HR'; }
-function isInventory(u)  { return u && u.role==='Inventory'; }
-function isPayroll(u)    { return u && u.role==='Payroll'; }
-function isOnboarding(u) { return u && u.role==='Onboarding'; }
+// ──────────────────────────────────────────────────────────────────
+// OFFICE ROLE CHECKS — check BOTH legacy u.role string AND the newer
+// u.depts.* flags. An agent can be configured in three ways:
+//   1. Legacy: u.role === 'HR' (one dept only, old profile)
+//   2. New:    u.depts.hr === true (multi-dept capable)
+//   3. Admin:  u.depts.administrator === true (all-dept office worker)
+//
+// The Administrator flag is special: per the profile form copy
+// ("Selecting Administrator automatically grants access to every
+// department except Owner-only controls"), any Administrator is
+// treated as belonging to every office dept.
+//
+// FIX 2026-04-24: Previously these only checked u.role, so an agent
+// like K-Anna with depts.{hr, inventory, payroll, administrator}:true
+// but role='HR' was only matched by isHR. isInventory/isPayroll/
+// isOnboarding returned false — hiding every other dept's nav items.
+// ──────────────────────────────────────────────────────────────────
+function _uDepts(u){ return (u && u.depts) || {}; }
+function _isAdminDept(u){ var d=_uDepts(u); return !!(d.admin || d.administrator); }
+function isHR(u){
+  if(!u) return false;
+  return u.role==='HR' || _uDepts(u).hr === true || _isAdminDept(u);
+}
+function isInventory(u){
+  if(!u) return false;
+  return u.role==='Inventory' || _uDepts(u).inventory === true || _isAdminDept(u);
+}
+function isPayroll(u){
+  if(!u) return false;
+  return u.role==='Payroll' || _uDepts(u).payroll === true || _isAdminDept(u);
+}
+function isOnboarding(u){
+  if(!u) return false;
+  return u.role==='Onboarding' || _uDepts(u).onboarding === true || _isAdminDept(u);
+}
 function isHRorInv(u)    { return isHR(u)||isInventory(u); }
 function isOfficeRole(u) { return isHR(u)||isInventory(u)||isPayroll(u)||isOnboarding(u); }
 function isMgrRole(u)    { return u && (u.role==='Market Manager'||u.role==='Campaign Manager'); }
@@ -5673,12 +5704,16 @@ function canAccess(u, area){
           || (isTL  && tlHasCodedReports(u,'Gen Mobile'));
 
     // ── Sales-focused panels ──
+    // IBOs also get their docs / daily audit / links / inv-request because
+    // they operate just like a contractor — but they DON'T see the full
+    // company leaderboard or submissions feed (they have their own isolated
+    // mini-org-chart per Calvin's design).
     case 'leaderboard':      return isSales;
     case 'submissions':      return isSales;
-    case 'links':            return isSales;
-    case 'my-documents':     return isSales;
-    case 'daily-audit':      return isSales;
-    case 'inv-request':      return isSales;
+    case 'links':            return isSales || isIBOCategory(u);
+    case 'my-documents':     return isSales || isIBOCategory(u);
+    case 'daily-audit':      return isSales || isIBOCategory(u);
+    case 'inv-request':      return isSales || isIBOCategory(u);
 
     // ── Everyone logged in (sales + IBO + managers get community; office does not) ──
     case 'announcements':    return !isOfficeRole(u);
@@ -10340,6 +10375,13 @@ function postToTeam(teamId) {
 // ══════════════════════
 function panelLLTeams() {
   const u = DB.current;
+  // Panel-level access gate: the nav hides this for most users, but direct
+  // navigation (via back button, bookmarks, or old session URLs) would
+  // otherwise show it. Gate by the same canAccess rule used in the nav.
+  if(!canAccess(u,'ll-teams')){
+    return panelHeader('📍 Markets') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Market management is restricted to Owner, Managers, and the Onboarding department.</div></div>';
+  }
   // Only lifeline agents available to assign
   const lifelineAgents = DB.agents.filter(a => a.active && (a.program === 'Lifeline' || a.program === 'Multi'));
 
@@ -12276,11 +12318,30 @@ function panelBO(){
     var isOB  = isOBx;
     var isHRp = isHRx;
     var isInv = isInvx;
+    // CRITICAL: Payroll is whitelist-gated (hasPayrollAccess). Having
+    // depts.payroll=true does NOT grant commission visibility — that
+    // requires an explicit Owner grant via PAYROLL_ACCESS. So for the
+    // dashboard routing we only use "payroll" as a landing page if the
+    // user can actually open it. Otherwise they'd land on a locked
+    // screen and be trapped. This applies even when their primary
+    // role field is 'Payroll' — upload-only users go elsewhere.
+    var prCanOpen = (typeof hasPayrollAccess === 'function') ? hasPayrollAccess(u) : false;
     var deptIcon, deptName, deptColor, mainPanel;
-    if(isPR)       { deptIcon='💰'; deptName='Payroll Department';    deptColor='#fb923c'; mainPanel='payroll'; }
-    else if(isOB)  { deptIcon='📋'; deptName='Onboarding Department'; deptColor='#a78bfa'; mainPanel='onboarding'; }
+    // PICK DASHBOARD BY PRIMARY ROLE FIRST (what the Owner set as the
+    // agent's role field) — so K-Anna (role='HR' + depts.hr/inv/pay/admin)
+    // lands on HR Department dashboard, not Payroll. This matches user
+    // intent: the legacy role tells us what their "primary" dept is.
+    // Fall back to dept-flag priority if role doesn't pick one.
+    var primary = (u && u.role) || '';
+    if(primary === 'HR' && isHRp)                 { deptIcon='👥'; deptName='HR Department';         deptColor='#F472B6'; mainPanel='hr-dashboard'; }
+    else if(primary === 'Inventory' && isInv)     { deptIcon='📦'; deptName='Inventory Department';  deptColor='#06b6d4'; mainPanel='inv-dashboard'; }
+    else if(primary === 'Payroll' && prCanOpen)   { deptIcon='💰'; deptName='Payroll Department';    deptColor='#fb923c'; mainPanel='payroll'; }
+    else if(primary === 'Onboarding' && isOB)     { deptIcon='📋'; deptName='Onboarding Department'; deptColor='#a78bfa'; mainPanel='onboarding'; }
+    // Fallback ordering (when role field doesn't match a dept).
     else if(isHRp) { deptIcon='👥'; deptName='HR Department';         deptColor='#F472B6'; mainPanel='hr-dashboard'; }
+    else if(isOB)  { deptIcon='📋'; deptName='Onboarding Department'; deptColor='#a78bfa'; mainPanel='onboarding'; }
     else if(isInv) { deptIcon='📦'; deptName='Inventory Department';  deptColor='#06b6d4'; mainPanel='inv-dashboard'; }
+    else if(isPR && prCanOpen) { deptIcon='💰'; deptName='Payroll Department'; deptColor='#fb923c'; mainPanel='payroll'; }
     else           { deptIcon='🏢'; deptName='Office';                 deptColor='#6b7280'; mainPanel='bo'; }
 
     // Quick stats
@@ -15803,6 +15864,11 @@ function panelAgents(){
 // ══════════════════════════════════════════════
 
 function panelHRDashboard(){
+  var u = DB.current;
+  if(!canAccess(u,'hr')){
+    return panelHeader('👥 HR Dashboard') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 HR Dashboard is restricted to HR department staff, administrators, and Owner.</div></div>';
+  }
   var h = '';
   h = panelHeader('👥 HR Dashboard') + h;
   h += '<div class="bo-card" style="margin-bottom:16px">';
@@ -15827,6 +15893,12 @@ function panelHRDashboard(){
 }
 
 function panelTrainingScheduled(){
+  var u = DB.current;
+  // Training scheduling belongs to HR, TL, MM, Onboarding, and Owner.
+  if(!isOwner(u) && !isHR(u) && !isOnboarding(u) && u.role!=='Team Leader' && u.role!=='Market Manager'){
+    return panelHeader('📅 Training Schedule') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Training management is restricted to HR, Team Leaders, Market Managers, Onboarding, and Owner.</div></div>';
+  }
   var h = panelHeader('📅 Training Schedule');
   h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Schedule Training</div></div>'
      + '<div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">'
@@ -15838,6 +15910,11 @@ function panelTrainingScheduled(){
 }
 
 function panelTrainingComplete(){
+  var u = DB.current;
+  if(!isOwner(u) && !isHR(u) && !isOnboarding(u) && u.role!=='Team Leader' && u.role!=='Market Manager'){
+    return panelHeader('✅ Training Complete') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Training management is restricted to HR, Team Leaders, Market Managers, Onboarding, and Owner.</div></div>';
+  }
   var h = panelHeader('\u2705 Training Complete');
   h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Training Complete</div></div>'
      + '<div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">'
@@ -15849,6 +15926,12 @@ function panelTrainingComplete(){
 }
 
 function panelOnboardingQueue(){
+  var u = DB.current;
+  // Onboarding Queue is visible to HR, Onboarding dept, and Owner.
+  if(!isOwner(u) && !isHR(u) && !isOnboarding(u)){
+    return panelHeader('📝 Onboarding Queue') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Onboarding Queue is restricted to HR, Onboarding staff, and Owner.</div></div>';
+  }
   var h = panelHeader('📝 Onboarding Queue');
   h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Onboarding Queue</div></div>'
      + '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">'
@@ -18608,6 +18691,15 @@ function gmConfirmActivationUpload(batchId){
 // ── Transfers Panel ──
 function panelGMTransfers(){
   var u = DB.current;
+  // Gate: same rule used in the nav — only users who can see Gen Mobile
+  // inventory content should reach this panel. Agents signing their own
+  // transfer agreements qualify because they're coded on Gen Mobile.
+  if(!isOwner(u) && !isInventory(u) && !agentCodedOn(u,'Gen Mobile')
+     && !(u.role==='Market Manager' && typeof mmHasCodedReports==='function' && mmHasCodedReports(u,'Gen Mobile'))
+     && !(u.role==='Team Leader'    && typeof tlHasCodedReports==='function' && tlHasCodedReports(u,'Gen Mobile'))){
+    return panelHeader('🔄 Gen Mobile — Transfers') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Gen Mobile tools require a Gen Mobile agent code on your profile. Ask the Owner to add your code.</div></div>';
+  }
   var h = panelHeader('🔄 Gen Mobile — Transfers');
 
   var pending = GM_TRANSFERS.filter(function(t){return t.status==='pending-approval';});
