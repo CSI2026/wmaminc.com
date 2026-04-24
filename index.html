@@ -3570,6 +3570,237 @@ function savePayrollWeeks(){
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+//  COMPENSATION PLANS — Phase 2.
+//
+//  Owner-only system to define how each agent role gets paid per
+//  campaign. Built to handle Calvin's real comp complexity:
+//    • Retroactive sliding scale (all acts that week recalc at the
+//      higher rate when the threshold is hit — NOT tiered)
+//    • Flat rate
+//    • Percentage (mainly for TL/MM/IBO overrides)
+//    • Per-activation modifiers (email bonus +$1, BYOD +$5)
+//    • Upsell deductions (subtracted from weekly gross)
+//    • Nested services for Chuzo: Chuzo (campaign) → Spectrum
+//      (service) → unlimited line items (1Gig, 500mb, mobile, TV)
+//    • Per-role plans: Field Agent, Team Lead, Market Manager, IBO
+//    • Versioning + addendum workflow when a plan is updated
+//
+//  Plan record shape:
+//  {
+//    id:        'cp-<ts>',
+//    campaign:  'Gen Mobile' | 'Assurance' | 'TruConnect' | 'Chuzo' | ...,
+//    service:   'Spectrum' | 'Xfinity' | null,   // null when not Chuzo
+//    role:      'Field Agent' | 'Team Lead' | 'Market Manager' | 'IBO',
+//    rateType:  'flat' | 'sliding' | 'percentage',
+//    flatCents:    900,                          // for flat
+//    slidingTiers: [{minActs:1, maxActs:30, rateCents:900},
+//                   {minActs:31,maxActs:null,rateCents:1100}], // retroactive!
+//    pctOf:        'team_gross' | 'personal_gross', // for percentage
+//    pctValue:     5,                            // 5%
+//    modifiers: [
+//      {id:'m1', name:'Customer Email Added', triggerType:'per_act',
+//       bonusCents:100},
+//      {id:'m2', name:'BYOD (SIM only)',      triggerType:'per_act',
+//       bonusCents:500}
+//    ],
+//    upsellHandling: 'deduct_from_weekly',        // deducts upsell $ from total
+//    lineItems: [                                  // Chuzo services only
+//      {id:'li-1', name:'Internet 1 Gig',  rateType:'flat', flatCents:2500},
+//      {id:'li-2', name:'Mobile 2-Line',   rateType:'flat', flatCents:2000},
+//    ],
+//    notes:     'Free-form notes for the contract addendum',
+//    createdAt: ISO,
+//    updatedAt: ISO,
+//    version:   1,                                // bumps on edit
+//    createdBy: agentId
+//  }
+//
+//  ASSIGNMENTS link a plan to a specific agent (one-to-one):
+//  {
+//    id:           'ca-<ts>',
+//    agentId:      4,
+//    planId:       'cp-...',
+//    campaign:     'Gen Mobile',
+//    assignedAt:   ISO,
+//    assignedBy:   ownerId,
+//    signedAt:     ISO|null,           // null until agent acknowledges
+//    pendingAddendum: false,           // true when plan was edited
+//    addendumVersion: 1                // matches plan.version at sign time
+//  }
+//
+//  TEMPLATES — editable contract text per role. {role: text}.
+// ══════════════════════════════════════════════════════════════
+var COMP_PLANS = [];
+var COMP_ASSIGNMENTS = [];
+var COMP_TEMPLATES = {};
+
+function loadCompPlans(){
+  try{
+    var raw = localStorage.getItem('wmam_comp_plans');
+    COMP_PLANS = raw ? (JSON.parse(raw) || []) : [];
+  }catch(e){ COMP_PLANS = []; }
+  try{
+    var raw2 = localStorage.getItem('wmam_comp_assignments');
+    COMP_ASSIGNMENTS = raw2 ? (JSON.parse(raw2) || []) : [];
+  }catch(e){ COMP_ASSIGNMENTS = []; }
+  try{
+    var raw3 = localStorage.getItem('wmam_comp_templates');
+    COMP_TEMPLATES = raw3 ? (JSON.parse(raw3) || {}) : {};
+  }catch(e){ COMP_TEMPLATES = {}; }
+  // Seed default templates if empty.
+  if(!COMP_TEMPLATES['Field Agent']){
+    COMP_TEMPLATES['Field Agent'] = ppDefaultContractTemplate('Field Agent');
+  }
+  if(!COMP_TEMPLATES['Team Lead']){
+    COMP_TEMPLATES['Team Lead'] = ppDefaultContractTemplate('Team Lead');
+  }
+  if(!COMP_TEMPLATES['Market Manager']){
+    COMP_TEMPLATES['Market Manager'] = ppDefaultContractTemplate('Market Manager');
+  }
+  if(!COMP_TEMPLATES['IBO']){
+    COMP_TEMPLATES['IBO'] = ppDefaultContractTemplate('IBO');
+  }
+}
+
+function saveCompPlans(){
+  try{ localStorage.setItem('wmam_comp_plans', JSON.stringify(COMP_PLANS)); }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    supaClient.from('app_settings').upsert(
+      {key:'comp_plans', value: JSON.stringify(COMP_PLANS)},
+      {onConflict:'key'}
+    ).then(function(){}).catch(function(){});
+  }
+}
+
+function saveCompAssignments(){
+  try{ localStorage.setItem('wmam_comp_assignments', JSON.stringify(COMP_ASSIGNMENTS)); }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    supaClient.from('app_settings').upsert(
+      {key:'comp_assignments', value: JSON.stringify(COMP_ASSIGNMENTS)},
+      {onConflict:'key'}
+    ).then(function(){}).catch(function(){});
+  }
+}
+
+function saveCompTemplates(){
+  try{ localStorage.setItem('wmam_comp_templates', JSON.stringify(COMP_TEMPLATES)); }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    supaClient.from('app_settings').upsert(
+      {key:'comp_templates', value: JSON.stringify(COMP_TEMPLATES)},
+      {onConflict:'key'}
+    ).then(function(){}).catch(function(){});
+  }
+}
+
+function ppDefaultContractTemplate(role){
+  return 'WILLIAMS MARKETING & MANAGEMENT INC.\n' +
+    'INDEPENDENT CONTRACTOR COMPENSATION AGREEMENT — ' + (role||'').toUpperCase() + '\n' +
+    '\n' +
+    'This Agreement is entered into between Williams Marketing & Management Inc.\n' +
+    '("Company") and {{AGENT_NAME}} ("Contractor"), effective {{EFFECTIVE_DATE}}.\n' +
+    '\n' +
+    '1. ROLE\n' +
+    'Contractor will perform the duties of {{ROLE}} on the {{CAMPAIGN}} campaign.\n' +
+    '\n' +
+    '2. COMPENSATION STRUCTURE\n' +
+    '{{COMPENSATION_DETAILS}}\n' +
+    '\n' +
+    '3. UPSELL CHARGEBACKS\n' +
+    'Any upsell amounts billed back to the Company by the carrier will be\n' +
+    'deducted from Contractor\'s weekly gross commission.\n' +
+    '\n' +
+    '4. PAYMENT SCHEDULE\n' +
+    'Compensation will be paid on a weekly basis following carrier remittance.\n' +
+    '\n' +
+    '5. MODIFICATIONS\n' +
+    'Company reserves the right to modify this compensation structure with\n' +
+    'written notice. Any modifications will be issued as an addendum and\n' +
+    'require Contractor acknowledgment to remain in effect.\n' +
+    '\n' +
+    '6. ACKNOWLEDGMENT\n' +
+    'By accepting this Agreement, Contractor confirms understanding of the\n' +
+    'compensation structure described above.\n' +
+    '\n' +
+    'Agent Signature: ____________________   Date: ____________\n' +
+    'Company:         Williams Marketing & Management Inc.\n' +
+    'Owner:           Calvin Williams\n';
+}
+
+// ── Ordered list of campaigns the comp system should know about.
+// Pulled from CAMPAIGN_REGISTRY when available, else from a static fallback
+// so the panel still works on a fresh portal.
+function ppKnownCampaigns(){
+  var defaults = ['Gen Mobile','Assurance','TruConnect','Excess','Chuzo','Astound','ACA'];
+  if(typeof CAMPAIGN_REGISTRY === 'object' && CAMPAIGN_REGISTRY){
+    var fromReg = Object.keys(CAMPAIGN_REGISTRY);
+    if(fromReg.length){
+      // Merge — registry first, then any defaults missing.
+      defaults.forEach(function(d){ if(fromReg.indexOf(d)<0) fromReg.push(d); });
+      return fromReg;
+    }
+  }
+  return defaults;
+}
+
+// ── Services nested inside a campaign (for Chuzo and any future
+// campaigns that work like Chuzo). Calvin can edit this list per
+// campaign through the comp panel UI.
+function ppCampaignServices(campaign){
+  // Stored on a per-campaign keyed object in localStorage.
+  try{
+    var raw = localStorage.getItem('wmam_campaign_services');
+    var map = raw ? JSON.parse(raw) : {};
+    if(map[campaign]) return map[campaign];
+  }catch(e){}
+  // Defaults for known multi-service campaigns.
+  if(campaign === 'Chuzo') return ['Spectrum','Xfinity','AT&T','Verizon','T-Mobile','Frontier','Optimum'];
+  return [];
+}
+
+function ppSaveCampaignServices(campaign, services){
+  try{
+    var raw = localStorage.getItem('wmam_campaign_services');
+    var map = raw ? JSON.parse(raw) : {};
+    map[campaign] = services;
+    localStorage.setItem('wmam_campaign_services', JSON.stringify(map));
+    if(typeof supaClient !== 'undefined' && supaClient){
+      supaClient.from('app_settings').upsert(
+        {key:'campaign_services', value: JSON.stringify(map)},
+        {onConflict:'key'}
+      ).then(function(){}).catch(function(){});
+    }
+  }catch(e){ console.warn('[ppSaveCampaignServices]', e); }
+}
+
+// ── Find an assignment for an agent + campaign (used by agent dashboard).
+function ppGetAssignmentForAgent(agentId, campaign){
+  return COMP_ASSIGNMENTS.find(function(a){
+    return a.agentId === agentId && a.campaign === campaign;
+  });
+}
+
+// ── Find a plan by id.
+function ppGetPlanById(planId){
+  return COMP_PLANS.find(function(p){return p.id===planId;});
+}
+
+// ── Format cents as $X.XX
+function ppFmtCents(c){
+  if(c == null) return '—';
+  return '$' + (c/100).toFixed(2);
+}
+
+// ── Friendly label for a plan (used in lists + assignment dropdowns).
+function ppPlanLabel(plan){
+  if(!plan) return '';
+  var label = plan.campaign;
+  if(plan.service) label += ' › ' + plan.service;
+  label += ' · ' + plan.role;
+  if(plan.version > 1) label += ' (v'+plan.version+')';
+  return label;
+}
+
 // ── Parse a Gen Mobile weekly pay email body (plain text).
 // Expected format (from real sample):
 //   "GENMOBILE (4/5 - 4/11)"
@@ -6733,6 +6964,10 @@ async function loadFromSupabase(){
         if(s.key==='payroll_access' && s.value){ try{var pa=JSON.parse(s.value);if(Array.isArray(pa))PAYROLL_ACCESS=pa;}catch(e){} }
         if(s.key==='payroll_upload_access' && s.value){ try{var pua=JSON.parse(s.value);if(Array.isArray(pua))PAYROLL_UPLOAD_ACCESS=pua;}catch(e){} }
         if(s.key==='payroll_weeks' && s.value){ try{var pw=JSON.parse(s.value);if(Array.isArray(pw))PAYROLL_WEEKS=pw;}catch(e){} }
+        if(s.key==='comp_plans' && s.value){ try{var cp=JSON.parse(s.value);if(Array.isArray(cp))COMP_PLANS=cp;}catch(e){} }
+        if(s.key==='comp_assignments' && s.value){ try{var ca=JSON.parse(s.value);if(Array.isArray(ca))COMP_ASSIGNMENTS=ca;}catch(e){} }
+        if(s.key==='comp_templates' && s.value){ try{var ct=JSON.parse(s.value);if(typeof ct==='object'&&ct)COMP_TEMPLATES=ct;}catch(e){} }
+        if(s.key==='campaign_services' && s.value){ try{localStorage.setItem('wmam_campaign_services', s.value);}catch(e){} }
         // ── INVENTORY STORES — pull from Supabase so every device is
         //    visible to every user with permission, not just the device
         //    that scanned them in. Each block is wrapped in its own try
@@ -10545,7 +10780,7 @@ function doLogin(){
   launchBO(found);
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
-  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
+  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadCompPlans(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
   // POST-LOGIN LANDING PAGE ROUTING
   // Owner → Owner Control (their actual home)
   // Everyone else → panelBO (the main back-office dashboard)
@@ -11914,6 +12149,11 @@ function gotoPanel(id, params){
     'payroll-upload-detect':panelPayrollUploadDetect,
     'payroll-upload-preview':panelPayrollUploadPreview,
     'payroll-week-detail':panelPayrollWeekDetail,
+    'comp-plans':panelCompPlans,
+    'comp-plan-edit':panelCompPlanEdit,
+    'comp-templates':panelCompTemplates,
+    'comp-assignments':panelCompAssignments,
+    'comp-assign-edit':panelCompAssignEdit,
     'notifications':panelNotifications,
     'meetings':panelMeetings,
     'meeting-hosts':panelMeetingHosts,
@@ -13963,6 +14203,43 @@ function panelOwner(){
 
   h += '</div></div>';
 
+  // ── COMPENSATION PLANS HUB ─────────────────────────────────
+  // Owner-only. Manages plan templates per campaign + role + service,
+  // contract templates per role, and per-agent assignments.
+  var planCount = (typeof COMP_PLANS !== 'undefined' && COMP_PLANS) ? COMP_PLANS.length : 0;
+  var assignCount = (typeof COMP_ASSIGNMENTS !== 'undefined' && COMP_ASSIGNMENTS) ? COMP_ASSIGNMENTS.length : 0;
+  var pendingAddenda = (typeof COMP_ASSIGNMENTS !== 'undefined' && COMP_ASSIGNMENTS) ?
+    COMP_ASSIGNMENTS.filter(function(a){return a.pendingAddendum;}).length : 0;
+
+  h += '<div class="bo-card" style="margin-top:20px;border-left:4px solid #7c3aed">';
+  h += '<div class="bo-card-head" style="background:rgba(124,58,237,.05)">'
+    +'<div class="bo-card-title" style="color:#7c3aed">💰 Compensation Plans</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">Build & assign comp structures per campaign, service, and role</div>'
+    +'</div>';
+  h += '<div style="padding:18px 20px">';
+
+  // Stats row
+  h += '<div style="display:flex;gap:14px;margin-bottom:16px;flex-wrap:wrap">';
+  h += '<div style="flex:1;min-width:140px;padding:10px 14px;background:rgba(124,58,237,.06);border-radius:6px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:2px">Comp Plans</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.6rem;color:#7c3aed">'+planCount+'</div></div>';
+  h += '<div style="flex:1;min-width:140px;padding:10px 14px;background:rgba(5,150,105,.06);border-radius:6px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:2px">Assignments</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.6rem;color:#059669">'+assignCount+'</div></div>';
+  if(pendingAddenda){
+    h += '<div style="flex:1;min-width:140px;padding:10px 14px;background:rgba(217,119,6,.08);border-radius:6px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:2px">⚠ Pending Addenda</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.6rem;color:#D97706">'+pendingAddenda+'</div></div>';
+  }
+  h += '</div>';
+
+  // Action buttons
+  h += '<div style="display:flex;gap:10px;flex-wrap:wrap">';
+  h += '<button onclick="gotoPanel(\'comp-plans\')" class="btn-fire" style="background:#7c3aed;border-color:#7c3aed;padding:10px 22px">📋 Manage Comp Plans →</button>';
+  h += '<button onclick="gotoPanel(\'comp-assignments\')" style="padding:10px 18px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer;font-weight:700">👥 Agent Assignments</button>';
+  h += '<button onclick="gotoPanel(\'comp-templates\')" style="padding:10px 18px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer;font-weight:700">📄 Contract Templates</button>';
+  h += '</div>';
+
+  h += '<div style="margin-top:12px;padding:10px 14px;background:rgba(124,58,237,.06);border-left:3px solid #7c3aed;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--brown);line-height:1.5">'
+    +'<strong>📌 How it works:</strong> Build a comp plan once per campaign × role × service. Assign it to specific agents one-by-one. When you edit a plan after agents are assigned, the system flags every assigned agent for an addendum acknowledgment. Email + SMS notification on edits will be wired in a follow-up build.'
+    +'</div>';
+
+  h += '</div></div>';
+
   return h;
 }
 
@@ -14511,6 +14788,692 @@ function ppDeleteWeek(weekId){
   savePayrollWeeks();
   alert('✓ Week deleted.');
   gotoPanel('payroll-upload');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  COMP PLANS — Owner-only panel set.
+//  Hub: panel-comp-plans (list + jump-offs)
+//  Edit: panel-comp-plan-edit (create / edit a plan)
+//  Templates: panel-comp-templates (edit role contract text)
+//  Assign: panel-comp-assignments (manage who has what)
+//  Assign Edit: panel-comp-assign-edit (assign a plan to one agent)
+// ══════════════════════════════════════════════════════════════
+function panelCompPlans(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('💰 Compensation Plans') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Compensation Plans are managed exclusively by the Owner.</div></div>';
+  }
+  var h = panelHeader('💰 Compensation Plans');
+
+  // Top action strip
+  h += '<div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">';
+  h += '<button onclick="ppNewCompPlan()" class="btn-fire" style="padding:10px 22px;background:#7c3aed;border-color:#7c3aed">+ Create New Plan</button>';
+  h += '<button onclick="gotoPanel(\'comp-templates\')" style="padding:10px 18px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">📄 Edit Contract Templates</button>';
+  h += '<button onclick="gotoPanel(\'comp-assignments\')" style="padding:10px 18px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">👥 Agent Assignments</button>';
+  h += '</div>';
+
+  // Intro
+  h += '<div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted);line-height:1.6">';
+  h += '<strong style="color:var(--brown)">How comp plans work:</strong> Each plan defines how a specific role gets paid on a specific campaign. You build the plan once, then assign it to individual agents. When you edit a plan after agents have signed it, the system flags every assigned agent for an addendum acknowledgment.<br><br>';
+  h += '<strong style="color:var(--brown)">Three rate types:</strong> <em>Flat Rate</em> ($X per activation) · <em>Retroactive Sliding Scale</em> (every act recalcs at the higher rate when threshold hit) · <em>Percentage</em> (% of team or personal gross — for TL/MM/IBO overrides).<br><br>';
+  h += '<strong style="color:var(--brown)">Modifiers:</strong> Add per-activation bonuses like "Customer Email +$1" or "BYOD +$5". Upsell chargebacks subtract from the weekly gross.<br><br>';
+  h += '<strong style="color:var(--brown)">Multi-service campaigns</strong> (like Chuzo): pick the service inside the plan (Spectrum, Xfinity, etc.) and add unlimited line items (Internet 1Gig, Mobile, TV, Insurance) — each with its own rate.';
+  h += '</div>';
+
+  // Group plans by campaign
+  var byCampaign = {};
+  COMP_PLANS.forEach(function(p){
+    if(!byCampaign[p.campaign]) byCampaign[p.campaign] = [];
+    byCampaign[p.campaign].push(p);
+  });
+
+  if(!COMP_PLANS.length){
+    h += '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No comp plans created yet. Click <strong>+ Create New Plan</strong> above to build your first one.</div></div>';
+    return h;
+  }
+
+  Object.keys(byCampaign).sort().forEach(function(camp){
+    var plans = byCampaign[camp];
+    var color = camp==='Gen Mobile' ? '#2a7de1' :
+                camp==='TruConnect' ? '#7c3aed' :
+                camp==='Assurance'  ? '#D97706' :
+                camp==='Chuzo'      ? '#059669' :
+                '#9333EA';
+    h += '<div class="bo-card" style="margin-bottom:20px;border-left:5px solid '+color+'">';
+    h += '<div class="bo-card-head"><div class="bo-card-title">📋 '+camp+' <span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);font-weight:400;margin-left:8px">'+plans.length+' plan'+(plans.length===1?'':'s')+'</span></div></div>';
+    h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border)">';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Role</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Service</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Rate Type</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Summary</th>';
+    h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Assigned</th>';
+    h += '<th></th></tr></thead><tbody>';
+    plans.sort(function(a,b){return (a.role||'').localeCompare(b.role||'');}).forEach(function(p){
+      var assignedCount = COMP_ASSIGNMENTS.filter(function(a){return a.planId===p.id;}).length;
+      var rateTypeLabel = p.rateType==='flat'?'Flat':(p.rateType==='sliding'?'Sliding':'Percentage');
+      var summary = '';
+      if(p.rateType==='flat')      summary = ppFmtCents(p.flatCents) + ' / activation';
+      else if(p.rateType==='sliding'){
+        var tiers = (p.slidingTiers||[]).slice().sort(function(a,b){return (a.minActs||0)-(b.minActs||0);});
+        summary = tiers.map(function(t){
+          var range = t.maxActs ? (t.minActs+'–'+t.maxActs) : (t.minActs+'+');
+          return range+' acts: '+ppFmtCents(t.rateCents);
+        }).join(' · ');
+      }
+      else if(p.rateType==='percentage') summary = (p.pctValue||0)+'% of '+(p.pctOf==='team_gross'?'team gross':'personal gross');
+      if((p.lineItems||[]).length) summary += ' · ' + p.lineItems.length + ' line items';
+      if((p.modifiers||[]).length) summary += ' · ' + p.modifiers.length + ' modifier'+(p.modifiers.length===1?'':'s');
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:8px 10px"><strong>'+p.role+'</strong>'+(p.version>1?' <span style="color:var(--muted);font-size:.7rem">v'+p.version+'</span>':'')+'</td>';
+      h += '<td style="padding:8px 10px;font-size:.78rem">'+(p.service||'—')+'</td>';
+      h += '<td style="padding:8px 10px;font-size:.78rem">'+rateTypeLabel+'</td>';
+      h += '<td style="padding:8px 10px;font-size:.78rem;color:var(--muted)">'+(summary||'—')+'</td>';
+      h += '<td style="padding:8px 10px;text-align:right"><span style="display:inline-block;padding:2px 10px;border-radius:10px;background:'+(assignedCount?'rgba(5,150,105,.12)':'rgba(120,120,120,.08)')+';color:'+(assignedCount?'#059669':'var(--muted2)')+';font-size:.7rem;font-weight:700">'+assignedCount+' agent'+(assignedCount===1?'':'s')+'</span></td>';
+      h += '<td style="padding:8px 10px;text-align:right;white-space:nowrap">';
+      h += '<button onclick="ppEditCompPlan(\''+p.id+'\')" style="background:none;border:1px solid var(--blue);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer;margin-right:4px">Edit</button>';
+      h += '<button onclick="ppDeleteCompPlan(\''+p.id+'\')" style="background:none;border:1px solid #991B1B;color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer">Delete</button>';
+      h += '</td></tr>';
+    });
+    h += '</tbody></table></div></div>';
+  });
+
+  return h;
+}
+
+function ppNewCompPlan(){
+  // Create a blank plan in memory and route to the editor.
+  window._ppEditingPlan = {
+    id:        'cp-'+Date.now(),
+    campaign:  '',
+    service:   '',
+    role:      'Field Agent',
+    rateType:  'flat',
+    flatCents: 0,
+    slidingTiers: [
+      {minActs:1,  maxActs:30,  rateCents:0},
+      {minActs:31, maxActs:null,rateCents:0}
+    ],
+    pctOf:     'personal_gross',
+    pctValue:  0,
+    modifiers: [],
+    lineItems: [],
+    upsellHandling: 'deduct_from_weekly',
+    notes:     '',
+    version:   1,
+    createdAt: new Date().toISOString(),
+    createdBy: DB.current.id,
+    isNew:     true
+  };
+  gotoPanel('comp-plan-edit');
+}
+
+function ppEditCompPlan(planId){
+  var plan = ppGetPlanById(planId);
+  if(!plan){ alert('Plan not found.'); return; }
+  // Deep clone so cancel doesn't mutate the saved record.
+  window._ppEditingPlan = JSON.parse(JSON.stringify(plan));
+  window._ppEditingPlan.isNew = false;
+  // Snapshot the original for diff/addendum.
+  window._ppEditingPlanOriginal = JSON.parse(JSON.stringify(plan));
+  gotoPanel('comp-plan-edit');
+}
+
+function ppDeleteCompPlan(planId){
+  if(!isOwner(DB.current)){ alert('Only the Owner can delete a comp plan.'); return; }
+  var plan = ppGetPlanById(planId);
+  if(!plan) return;
+  var assigned = COMP_ASSIGNMENTS.filter(function(a){return a.planId===planId;});
+  var msg = 'Delete this comp plan permanently?\n\n'+ppPlanLabel(plan);
+  if(assigned.length){
+    msg += '\n\n⚠ '+assigned.length+' agent'+(assigned.length===1?' is':'s are')+' currently assigned to this plan. Their assignments will also be removed.';
+  }
+  if(!confirm(msg)) return;
+  COMP_PLANS = COMP_PLANS.filter(function(p){return p.id!==planId;});
+  COMP_ASSIGNMENTS = COMP_ASSIGNMENTS.filter(function(a){return a.planId!==planId;});
+  saveCompPlans();
+  saveCompAssignments();
+  alert('✓ Plan deleted.');
+  gotoPanel('comp-plans');
+}
+
+// ── EDITOR PANEL ──────────────────────────────────────────────
+function panelCompPlanEdit(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('💰 Edit Comp Plan') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div></div>';
+  }
+  var p = window._ppEditingPlan;
+  if(!p){
+    return panelHeader('💰 Edit Comp Plan') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No plan loaded. <button onclick="gotoPanel(\'comp-plans\')" class="btn-fire" style="margin-top:14px;padding:10px 20px">← Back to Plans</button></div></div>';
+  }
+  var h = panelHeader(p.isNew?'💰 Create Compensation Plan':'💰 Edit Compensation Plan');
+
+  // Top action strip
+  h += '<div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">';
+  h += '<button onclick="ppSaveCompPlanFromForm()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">✓ Save Plan</button>';
+  h += '<button onclick="if(confirm(\'Discard changes?\')){gotoPanel(\'comp-plans\');}" style="padding:10px 18px;background:rgba(153,27,27,.08);border:1px solid rgba(153,27,27,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Cancel</button>';
+  h += '</div>';
+
+  // Section 1: Identity (campaign, service, role)
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">1️⃣ Plan Identity</div></div><div style="padding:18px 20px">';
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px">';
+  // Campaign
+  h += '<div><label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:700">Campaign *</label>';
+  h += '<select id="cpf-campaign" onchange="window._ppEditingPlan.campaign=this.value;window._ppEditingPlan.service=\'\';gotoPanel(\'comp-plan-edit\')" style="width:100%;padding:8px 10px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;background:white;margin-top:4px">';
+  h += '<option value="">— Pick a campaign —</option>';
+  ppKnownCampaigns().forEach(function(c){
+    h += '<option value="'+c+'"'+(p.campaign===c?' selected':'')+'>'+c+'</option>';
+  });
+  h += '</select></div>';
+  // Service (only if campaign has nested services)
+  var services = p.campaign ? ppCampaignServices(p.campaign) : [];
+  h += '<div><label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:700">Service'+(services.length?' *':' (none for this campaign)')+'</label>';
+  if(services.length){
+    h += '<select id="cpf-service" onchange="window._ppEditingPlan.service=this.value" style="width:100%;padding:8px 10px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;background:white;margin-top:4px">';
+    h += '<option value="">— Pick a service —</option>';
+    services.forEach(function(s){
+      h += '<option value="'+s+'"'+(p.service===s?' selected':'')+'>'+s+'</option>';
+    });
+    h += '</select>';
+    h += '<div style="margin-top:6px"><button onclick="ppManageCampaignServices(\''+p.campaign+'\')" style="background:none;border:none;color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;padding:0">+ Manage Services</button></div>';
+  } else {
+    h += '<div style="padding:8px 10px;background:var(--cream);border:1.5px solid var(--sand);border-radius:6px;color:var(--muted2);font-style:italic;font-size:.82rem;margin-top:4px">N/A — single-service campaign</div>';
+    if(p.campaign){
+      h += '<div style="margin-top:6px"><button onclick="ppManageCampaignServices(\''+p.campaign+'\')" style="background:none;border:none;color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;padding:0">+ Add Services to '+p.campaign+'</button></div>';
+    }
+  }
+  h += '</div>';
+  // Role
+  h += '<div><label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:700">Role *</label>';
+  h += '<select id="cpf-role" onchange="window._ppEditingPlan.role=this.value" style="width:100%;padding:8px 10px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;background:white;margin-top:4px">';
+  ['Field Agent','Team Lead','Market Manager','IBO'].forEach(function(r){
+    h += '<option value="'+r+'"'+(p.role===r?' selected':'')+'>'+r+'</option>';
+  });
+  h += '</select></div>';
+  h += '</div></div></div>';
+
+  // Section 2: Rate Structure
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">2️⃣ Rate Structure</div></div><div style="padding:18px 20px">';
+  h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:700;display:block;margin-bottom:8px">Rate Type *</label>';
+  h += '<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap">';
+  ['flat','sliding','percentage'].forEach(function(t){
+    var label = t==='flat'?'💵 Flat Rate':(t==='sliding'?'📊 Retroactive Sliding Scale':'🟢 Percentage');
+    var sel = (p.rateType===t);
+    h += '<label style="flex:1;min-width:180px;padding:14px 16px;border:2px solid '+(sel?'#7c3aed':'var(--border)')+';border-radius:8px;background:'+(sel?'rgba(124,58,237,.05)':'white')+';cursor:pointer;display:flex;align-items:center;gap:10px">';
+    h += '<input type="radio" name="cpf-rateType" value="'+t+'" '+(sel?'checked':'')+' onchange="window._ppEditingPlan.rateType=this.value;gotoPanel(\'comp-plan-edit\')" style="accent-color:#7c3aed">';
+    h += '<span style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1px;color:'+(sel?'#7c3aed':'var(--brown)')+'">'+label+'</span>';
+    h += '</label>';
+  });
+  h += '</div>';
+
+  // Show fields per rate type
+  if(p.rateType === 'flat'){
+    h += '<div style="display:grid;grid-template-columns:200px 1fr;gap:14px;align-items:center">';
+    h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);font-weight:700">Rate per Activation:</label>';
+    h += '<div style="display:flex;align-items:center;gap:6px"><span style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--brown)">$</span>';
+    h += '<input type="number" step="0.01" min="0" id="cpf-flatRate" value="'+((p.flatCents||0)/100).toFixed(2)+'" onchange="window._ppEditingPlan.flatCents=Math.round(parseFloat(this.value||0)*100)" style="width:120px;padding:8px 10px;border:1.5px solid var(--sand);border-radius:6px;font-family:monospace;font-size:.95rem">';
+    h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted);margin-left:8px">per activation</span></div>';
+    h += '</div>';
+  }
+  else if(p.rateType === 'sliding'){
+    h += '<div style="background:rgba(124,58,237,.05);border:1px solid rgba(124,58,237,.2);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5">';
+    h += '<strong>Retroactive sliding scale:</strong> When the agent hits a threshold for the week, ALL of that week\'s activations recalculate at the new rate. Example: 1–30 acts at $9, 31+ at $11. If they do 33 acts, they get paid 33 × $11 = $363 (not 30×$9 + 3×$11).';
+    h += '</div>';
+    h += '<div style="margin-bottom:10px"><strong style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">Tiers:</strong></div>';
+    (p.slidingTiers||[]).forEach(function(tier, idx){
+      h += '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;padding:10px;background:var(--cream);border:1px solid var(--border);border-radius:6px;flex-wrap:wrap">';
+      h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">Tier '+(idx+1)+':</span>';
+      h += '<input type="number" min="1" value="'+(tier.minActs||1)+'" onchange="window._ppEditingPlan.slidingTiers['+idx+'].minActs=parseInt(this.value||1)" style="width:70px;padding:6px 8px;border:1.5px solid var(--sand);border-radius:4px;font-family:monospace" title="Min activations">';
+      h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)">to</span>';
+      h += '<input type="number" min="1" value="'+(tier.maxActs||'')+'" placeholder="∞" onchange="var v=this.value.trim();window._ppEditingPlan.slidingTiers['+idx+'].maxActs=v?parseInt(v):null" style="width:70px;padding:6px 8px;border:1.5px solid var(--sand);border-radius:4px;font-family:monospace" title="Max activations (blank = no cap)">';
+      h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)">acts/week =</span>';
+      h += '<span style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;color:var(--brown)">$</span>';
+      h += '<input type="number" step="0.01" min="0" value="'+((tier.rateCents||0)/100).toFixed(2)+'" onchange="window._ppEditingPlan.slidingTiers['+idx+'].rateCents=Math.round(parseFloat(this.value||0)*100)" style="width:90px;padding:6px 8px;border:1.5px solid var(--sand);border-radius:4px;font-family:monospace" title="Rate per activation in this tier">';
+      h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">per act</span>';
+      h += '<button onclick="window._ppEditingPlan.slidingTiers.splice('+idx+',1);gotoPanel(\'comp-plan-edit\')" style="margin-left:auto;padding:4px 10px;background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:4px;cursor:pointer">× Remove</button>';
+      h += '</div>';
+    });
+    h += '<button onclick="window._ppEditingPlan.slidingTiers.push({minActs:1,maxActs:null,rateCents:0});gotoPanel(\'comp-plan-edit\')" style="background:rgba(124,58,237,.08);border:1px dashed rgba(124,58,237,.4);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 16px;border-radius:6px;cursor:pointer;margin-top:6px">+ Add Tier</button>';
+  }
+  else if(p.rateType === 'percentage'){
+    h += '<div style="background:rgba(124,58,237,.05);border:1px solid rgba(124,58,237,.2);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5">';
+    h += '<strong>Percentage:</strong> Most useful for TL/MM/IBO overrides. The agent earns X% of either their personal gross or their team\'s total gross for the week.';
+    h += '</div>';
+    h += '<div style="display:grid;grid-template-columns:200px 1fr;gap:14px;align-items:center">';
+    h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);font-weight:700">Percentage:</label>';
+    h += '<div style="display:flex;align-items:center;gap:6px">';
+    h += '<input type="number" step="0.01" min="0" max="100" id="cpf-pctValue" value="'+(p.pctValue||0)+'" onchange="window._ppEditingPlan.pctValue=parseFloat(this.value||0)" style="width:100px;padding:8px 10px;border:1.5px solid var(--sand);border-radius:6px;font-family:monospace;font-size:.95rem">';
+    h += '<span style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--brown)">%</span>';
+    h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-left:6px">of</span>';
+    h += '<select id="cpf-pctOf" onchange="window._ppEditingPlan.pctOf=this.value" style="padding:8px 10px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;background:white">';
+    h += '<option value="personal_gross"'+(p.pctOf==='personal_gross'?' selected':'')+'>their personal gross</option>';
+    h += '<option value="team_gross"'+(p.pctOf==='team_gross'?' selected':'')+'>their team\'s gross</option>';
+    h += '</select></div>';
+    h += '</div>';
+  }
+  h += '</div></div>';
+
+  // Section 3: Modifiers (per-act bonuses like Email +$1, BYOD +$5)
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">3️⃣ Per-Activation Modifiers <span style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;font-weight:400;color:var(--muted);margin-left:8px">(Email bonus, BYOD bonus, etc.)</span></div></div><div style="padding:18px 20px">';
+  h += '<div style="background:rgba(124,58,237,.05);border:1px solid rgba(124,58,237,.2);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5">';
+  h += 'Modifiers add a bonus to specific activations based on a flag in the pay file. Example: <em>Customer Email +$1</em> when the agent enrolls them in email; <em>BYOD +$5</em> when the customer brings their own device (no IMEI).';
+  h += '</div>';
+  (p.modifiers||[]).forEach(function(m, idx){
+    h += '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;padding:10px;background:var(--cream);border:1px solid var(--border);border-radius:6px;flex-wrap:wrap">';
+    h += '<input type="text" value="'+(m.name||'').replace(/"/g,'&quot;')+'" placeholder="Modifier name (e.g. Customer Email)" onchange="window._ppEditingPlan.modifiers['+idx+'].name=this.value" style="flex:1;min-width:200px;padding:6px 8px;border:1.5px solid var(--sand);border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.82rem">';
+    h += '<span style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;color:var(--brown)">+$</span>';
+    h += '<input type="number" step="0.01" min="0" value="'+((m.bonusCents||0)/100).toFixed(2)+'" onchange="window._ppEditingPlan.modifiers['+idx+'].bonusCents=Math.round(parseFloat(this.value||0)*100)" style="width:90px;padding:6px 8px;border:1.5px solid var(--sand);border-radius:4px;font-family:monospace">';
+    h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">per act</span>';
+    h += '<button onclick="window._ppEditingPlan.modifiers.splice('+idx+',1);gotoPanel(\'comp-plan-edit\')" style="margin-left:auto;padding:4px 10px;background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:4px;cursor:pointer">× Remove</button>';
+    h += '</div>';
+  });
+  h += '<button onclick="if(!window._ppEditingPlan.modifiers)window._ppEditingPlan.modifiers=[];window._ppEditingPlan.modifiers.push({id:\'m-\'+Date.now(),name:\'\',triggerType:\'per_act\',bonusCents:0});gotoPanel(\'comp-plan-edit\')" style="background:rgba(124,58,237,.08);border:1px dashed rgba(124,58,237,.4);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 16px;border-radius:6px;cursor:pointer;margin-top:6px">+ Add Modifier</button>';
+  h += '</div></div>';
+
+  // Section 4: Line Items (for Chuzo services etc.)
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">4️⃣ Line Items <span style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;font-weight:400;color:var(--muted);margin-left:8px">(Internet 1Gig, Mobile, TV — for multi-product services)</span></div></div><div style="padding:18px 20px">';
+  h += '<div style="background:rgba(5,150,105,.05);border:1px solid rgba(5,150,105,.2);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5">';
+  h += '<strong>Use this for Chuzo services or any plan where one campaign covers multiple products with different rates.</strong> Example for Spectrum: Internet 1Gig $25, Internet 500mb $20, Mobile single $15, TV add-on $10. Each line item has its own rate.';
+  h += '</div>';
+  (p.lineItems||[]).forEach(function(li, idx){
+    h += '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;padding:10px;background:var(--cream);border:1px solid var(--border);border-radius:6px;flex-wrap:wrap">';
+    h += '<input type="text" value="'+(li.name||'').replace(/"/g,'&quot;')+'" placeholder="Line item name (e.g. Internet 1 Gig)" onchange="window._ppEditingPlan.lineItems['+idx+'].name=this.value" style="flex:1;min-width:220px;padding:6px 8px;border:1.5px solid var(--sand);border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.82rem">';
+    h += '<select onchange="window._ppEditingPlan.lineItems['+idx+'].rateType=this.value;gotoPanel(\'comp-plan-edit\')" style="padding:6px 8px;border:1.5px solid var(--sand);border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;background:white">';
+    h += '<option value="flat"'+((li.rateType||'flat')==='flat'?' selected':'')+'>Flat</option>';
+    h += '<option value="sliding"'+(li.rateType==='sliding'?' selected':'')+'>Sliding</option>';
+    h += '</select>';
+    if((li.rateType||'flat')==='flat'){
+      h += '<span style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;color:var(--brown)">$</span>';
+      h += '<input type="number" step="0.01" min="0" value="'+((li.flatCents||0)/100).toFixed(2)+'" onchange="window._ppEditingPlan.lineItems['+idx+'].flatCents=Math.round(parseFloat(this.value||0)*100)" style="width:100px;padding:6px 8px;border:1.5px solid var(--sand);border-radius:4px;font-family:monospace">';
+      h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">per sale</span>';
+    } else {
+      h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);font-style:italic">Sliding tiers — edit after save</span>';
+      // Future: inline mini sliding tier editor for line items
+    }
+    h += '<button onclick="window._ppEditingPlan.lineItems.splice('+idx+',1);gotoPanel(\'comp-plan-edit\')" style="margin-left:auto;padding:4px 10px;background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:4px;cursor:pointer">× Remove</button>';
+    h += '</div>';
+  });
+  h += '<button onclick="if(!window._ppEditingPlan.lineItems)window._ppEditingPlan.lineItems=[];window._ppEditingPlan.lineItems.push({id:\'li-\'+Date.now(),name:\'\',rateType:\'flat\',flatCents:0});gotoPanel(\'comp-plan-edit\')" style="background:rgba(5,150,105,.08);border:1px dashed rgba(5,150,105,.4);color:#059669;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 16px;border-radius:6px;cursor:pointer;margin-top:6px">+ Add Line Item</button>';
+  h += '</div></div>';
+
+  // Section 5: Notes for the contract
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">5️⃣ Plan Notes <span style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;font-weight:400;color:var(--muted);margin-left:8px">(Optional — appears in the contract addendum section)</span></div></div><div style="padding:18px 20px">';
+  h += '<textarea id="cpf-notes" onchange="window._ppEditingPlan.notes=this.value" style="width:100%;min-height:90px;padding:10px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.85rem" placeholder="Any special terms, exceptions, or context for this plan...">'+(p.notes||'').replace(/</g,'&lt;')+'</textarea>';
+  h += '</div></div>';
+
+  // Bottom save bar (sticky feeling)
+  h += '<div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">';
+  h += '<button onclick="ppSaveCompPlanFromForm()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">✓ Save Plan</button>';
+  h += '<button onclick="if(confirm(\'Discard changes?\')){gotoPanel(\'comp-plans\');}" style="padding:10px 18px;background:rgba(153,27,27,.08);border:1px solid rgba(153,27,27,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Cancel</button>';
+  h += '</div>';
+
+  return h;
+}
+
+function ppSaveCompPlanFromForm(){
+  var p = window._ppEditingPlan;
+  if(!p){ alert('No plan in progress.'); return; }
+
+  // Validate required fields
+  if(!p.campaign){ alert('Pick a campaign first.'); return; }
+  var services = ppCampaignServices(p.campaign);
+  if(services.length && !p.service){
+    alert('This campaign has services — pick one (or click "Manage Services" if the list is wrong).');
+    return;
+  }
+  if(!p.role){ alert('Pick a role.'); return; }
+
+  // Validate rate type fields
+  if(p.rateType==='flat' && !(p.flatCents>0)){
+    if(!confirm('Flat rate is $0.00 — save anyway?')) return;
+  }
+  if(p.rateType==='sliding'){
+    if(!(p.slidingTiers||[]).length){ alert('Sliding scale needs at least one tier.'); return; }
+    var anyZero = p.slidingTiers.some(function(t){return !(t.rateCents>0);});
+    if(anyZero && !confirm('One or more tiers have a $0 rate — save anyway?')) return;
+  }
+  if(p.rateType==='percentage' && !(p.pctValue>0)){
+    if(!confirm('Percentage is 0% — save anyway?')) return;
+  }
+
+  // Find affected assignments BEFORE we mutate the plan
+  var affected = COMP_ASSIGNMENTS.filter(function(a){return a.planId===p.id;});
+
+  if(p.isNew){
+    delete p.isNew;
+    p.createdAt = new Date().toISOString();
+    p.version = 1;
+    COMP_PLANS.push(p);
+    saveCompPlans();
+    window._ppEditingPlan = null;
+    alert('✓ Plan created.');
+    gotoPanel('comp-plans');
+  } else {
+    delete p.isNew;
+    p.updatedAt = new Date().toISOString();
+    p.version = (p.version||1) + 1;
+    var idx = COMP_PLANS.findIndex(function(x){return x.id===p.id;});
+    if(idx >= 0) COMP_PLANS[idx] = p;
+    saveCompPlans();
+
+    // Flag affected assignments for addendum acknowledgment
+    if(affected.length){
+      affected.forEach(function(a){
+        a.pendingAddendum = true;
+        a.addendumPlanVersion = p.version;
+      });
+      saveCompAssignments();
+      alert('✓ Plan updated to v'+p.version+'.\n\n⚠ '+affected.length+' agent'+(affected.length===1?' has':'s have')+' been flagged for addendum acknowledgment. They will see a "Plan Updated" notice on their dashboard the next time they log in. (Email + SMS notification will be wired in a follow-up.)');
+    } else {
+      alert('✓ Plan updated to v'+p.version+'.');
+    }
+    window._ppEditingPlan = null;
+    window._ppEditingPlanOriginal = null;
+    gotoPanel('comp-plans');
+  }
+}
+
+// ── MANAGE CAMPAIGN SERVICES (modal-style — uses prompt for now) ──
+function ppManageCampaignServices(campaign){
+  if(!campaign){ alert('Pick a campaign first.'); return; }
+  var current = ppCampaignServices(campaign);
+  var msg = 'Services inside '+campaign+':\n\n'+
+    (current.length ? current.join('\n') : '(none yet)') +
+    '\n\nEdit the comma-separated list below. Leave blank to remove all services from this campaign.';
+  var input = prompt(msg, current.join(', '));
+  if(input === null) return;  // cancelled
+  var newList = input.split(',').map(function(s){return s.trim();}).filter(function(s){return s.length;});
+  ppSaveCampaignServices(campaign, newList);
+  alert('✓ Services updated for '+campaign+'.\n\n'+newList.length+' service'+(newList.length===1?'':'s')+': '+(newList.join(', ')||'(none)'));
+  gotoPanel('comp-plan-edit');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  CONTRACT TEMPLATES — editable text per role.
+// ══════════════════════════════════════════════════════════════
+function panelCompTemplates(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('📄 Contract Templates') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div></div>';
+  }
+  var h = panelHeader('📄 Contract Templates');
+
+  h += '<div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">';
+  h += '<button onclick="gotoPanel(\'comp-plans\')" style="padding:10px 18px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">← Back to Comp Plans</button>';
+  h += '</div>';
+
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted);line-height:1.6">';
+  h += '<strong style="color:var(--brown)">How templates work:</strong> When you assign a comp plan to an agent, the system fills in placeholders in the template for that agent\'s role and generates a personalized contract. Edit each role\'s template here.<br><br>';
+  h += '<strong style="color:var(--brown)">Available placeholders:</strong> <code style="background:var(--cream);padding:2px 6px;border-radius:3px">{{AGENT_NAME}}</code> · <code style="background:var(--cream);padding:2px 6px;border-radius:3px">{{ROLE}}</code> · <code style="background:var(--cream);padding:2px 6px;border-radius:3px">{{CAMPAIGN}}</code> · <code style="background:var(--cream);padding:2px 6px;border-radius:3px">{{EFFECTIVE_DATE}}</code> · <code style="background:var(--cream);padding:2px 6px;border-radius:3px">{{COMPENSATION_DETAILS}}</code> (the rate breakdown is auto-injected here).';
+  h += '</div>';
+
+  ['Field Agent','Team Lead','Market Manager','IBO'].forEach(function(role){
+    var key = 'tpl-'+role.replace(/\s+/g,'');
+    var tpl = COMP_TEMPLATES[role] || ppDefaultContractTemplate(role);
+    h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">📄 '+role+' Contract</div></div><div style="padding:18px 20px">';
+    h += '<textarea id="'+key+'" style="width:100%;min-height:280px;padding:14px;border:1.5px solid var(--sand);border-radius:6px;font-family:monospace;font-size:.78rem;line-height:1.5">'+tpl.replace(/</g,'&lt;')+'</textarea>';
+    h += '<div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">';
+    h += '<button onclick="ppSaveTemplate(\''+role+'\',\''+key+'\')" class="btn-fire" style="padding:8px 18px;background:#059669;border-color:#059669">✓ Save '+role+' Template</button>';
+    h += '<button onclick="if(confirm(\'Reset '+role+' template to factory default? Current text will be lost.\')){COMP_TEMPLATES[\''+role+'\']=ppDefaultContractTemplate(\''+role+'\');saveCompTemplates();gotoPanel(\'comp-templates\');}" style="padding:8px 16px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">↻ Reset to Default</button>';
+    h += '</div>';
+    h += '</div></div>';
+  });
+
+  return h;
+}
+
+function ppSaveTemplate(role, fieldId){
+  var el = document.getElementById(fieldId);
+  if(!el){ alert('Field not found.'); return; }
+  COMP_TEMPLATES[role] = el.value;
+  saveCompTemplates();
+  alert('✓ '+role+' template saved.');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  AGENT ASSIGNMENTS — link plans to specific agents.
+// ══════════════════════════════════════════════════════════════
+function panelCompAssignments(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('👥 Agent Comp Assignments') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div></div>';
+  }
+  var h = panelHeader('👥 Agent Comp Assignments');
+
+  h += '<div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">';
+  h += '<button onclick="ppNewAssignment()" class="btn-fire" style="padding:10px 22px;background:#7c3aed;border-color:#7c3aed">+ New Assignment</button>';
+  h += '<button onclick="gotoPanel(\'comp-plans\')" style="padding:10px 18px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">← Back to Comp Plans</button>';
+  h += '</div>';
+
+  if(!COMP_ASSIGNMENTS.length){
+    h += '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No comp plans assigned to anyone yet. Click <strong>+ New Assignment</strong> above to assign your first one.</div></div>';
+    return h;
+  }
+
+  // Group assignments by agent
+  var byAgent = {};
+  COMP_ASSIGNMENTS.forEach(function(a){
+    if(!byAgent[a.agentId]) byAgent[a.agentId] = [];
+    byAgent[a.agentId].push(a);
+  });
+
+  Object.keys(byAgent).forEach(function(aid){
+    var assignments = byAgent[aid];
+    var agent = DB.agents.find(function(x){return x.id===parseInt(aid);});
+    if(!agent) return;
+    h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">👤 '+agent.name+' <span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;font-weight:400;color:var(--muted);margin-left:8px">'+agent.username+' · '+agent.role+'</span></div></div>';
+    h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border)">';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Plan</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Assigned</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Signed</th>';
+    h += '<th style="text-align:left;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Status</th>';
+    h += '<th></th></tr></thead><tbody>';
+    assignments.forEach(function(a){
+      var plan = ppGetPlanById(a.planId);
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:8px 10px"><strong>'+(plan?ppPlanLabel(plan):'(plan deleted)')+'</strong></td>';
+      h += '<td style="padding:8px 10px;font-size:.78rem;color:var(--muted)">'+(a.assignedAt||'').slice(0,10)+'</td>';
+      h += '<td style="padding:8px 10px;font-size:.78rem;color:var(--muted)">'+(a.signedAt?a.signedAt.slice(0,10):'<em style="color:#D97706">Not signed</em>')+'</td>';
+      var statusColor = a.pendingAddendum?'#D97706':(a.signedAt?'#059669':'var(--muted2)');
+      var statusText = a.pendingAddendum?'⚠ Addendum Pending':(a.signedAt?'✓ Active':'⏳ Awaiting Sign');
+      h += '<td style="padding:8px 10px"><span style="display:inline-block;padding:3px 10px;border-radius:10px;background:rgba('+(a.pendingAddendum?'217,119,6':a.signedAt?'5,150,105':'120,120,120')+',.12);color:'+statusColor+';font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;font-weight:700">'+statusText+'</span></td>';
+      h += '<td style="padding:8px 10px;text-align:right;white-space:nowrap">';
+      h += '<button onclick="ppViewContract(\''+a.id+'\')" style="background:none;border:1px solid var(--blue);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer;margin-right:4px">View Contract</button>';
+      h += '<button onclick="ppRemoveAssignment(\''+a.id+'\')" style="background:none;border:1px solid #991B1B;color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer">Remove</button>';
+      h += '</td></tr>';
+    });
+    h += '</tbody></table></div></div>';
+  });
+
+  return h;
+}
+
+function ppNewAssignment(){
+  // Stash a blank assignment + open the assign editor.
+  window._ppEditingAssignment = {
+    id:        'ca-'+Date.now(),
+    agentId:   null,
+    planId:    null,
+    campaign:  null,
+    assignedAt: new Date().toISOString(),
+    assignedBy: DB.current.id,
+    signedAt:  null,
+    pendingAddendum: false,
+    isNew:     true
+  };
+  gotoPanel('comp-assign-edit');
+}
+
+function panelCompAssignEdit(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('👥 New Assignment') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div></div>';
+  }
+  var a = window._ppEditingAssignment;
+  if(!a){
+    return panelHeader('👥 New Assignment') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No assignment in progress.<br><br><button onclick="gotoPanel(\'comp-assignments\')" class="btn-fire" style="padding:10px 20px">← Back</button></div></div>';
+  }
+  var h = panelHeader('👥 Assign Compensation Plan');
+
+  h += '<div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">';
+  h += '<button onclick="ppSaveAssignmentFromForm()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">✓ Assign & Send</button>';
+  h += '<button onclick="if(confirm(\'Discard this assignment?\')){gotoPanel(\'comp-assignments\');}" style="padding:10px 18px;background:rgba(153,27,27,.08);border:1px solid rgba(153,27,27,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Cancel</button>';
+  h += '</div>';
+
+  // Step 1: Pick agent
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">1️⃣ Pick the Agent</div></div><div style="padding:18px 20px">';
+  h += '<select id="caf-agent" onchange="window._ppEditingAssignment.agentId=parseInt(this.value)||null" style="width:100%;padding:10px 12px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.95rem;background:white">';
+  h += '<option value="">— Pick an agent —</option>';
+  DB.agents.filter(function(x){return x.active;}).sort(function(x,y){return x.name.localeCompare(y.name);}).forEach(function(x){
+    h += '<option value="'+x.id+'"'+(a.agentId===x.id?' selected':'')+'>'+x.name+' ('+x.username+') — '+x.role+'</option>';
+  });
+  h += '</select>';
+  h += '</div></div>';
+
+  // Step 2: Pick plan
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">2️⃣ Pick the Comp Plan</div></div><div style="padding:18px 20px">';
+  if(!COMP_PLANS.length){
+    h += '<div style="padding:14px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No comp plans exist yet. <button onclick="gotoPanel(\'comp-plans\')" style="background:none;border:none;color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.85rem;cursor:pointer;text-decoration:underline">Create one first →</button></div>';
+  } else {
+    h += '<select id="caf-plan" onchange="var p=ppGetPlanById(this.value);window._ppEditingAssignment.planId=this.value;window._ppEditingAssignment.campaign=p?p.campaign:null" style="width:100%;padding:10px 12px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.95rem;background:white">';
+    h += '<option value="">— Pick a plan —</option>';
+    COMP_PLANS.slice().sort(function(x,y){return ppPlanLabel(x).localeCompare(ppPlanLabel(y));}).forEach(function(p){
+      h += '<option value="'+p.id+'"'+(a.planId===p.id?' selected':'')+'>'+ppPlanLabel(p)+'</option>';
+    });
+    h += '</select>';
+  }
+  h += '</div></div>';
+
+  // Step 3: Preview contract
+  if(a.agentId && a.planId){
+    var agent = DB.agents.find(function(x){return x.id===a.agentId;});
+    var plan = ppGetPlanById(a.planId);
+    if(agent && plan){
+      var contract = ppGenerateContractText(agent, plan);
+      h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">3️⃣ Contract Preview</div></div><div style="padding:18px 20px">';
+      h += '<div style="background:var(--cream);border:1px solid var(--border);border-radius:6px;padding:18px 22px;font-family:Georgia,serif;font-size:.85rem;line-height:1.7;color:var(--brown);white-space:pre-wrap;max-height:500px;overflow:auto">'+contract.replace(/</g,'&lt;')+'</div>';
+      h += '</div></div>';
+    }
+  }
+
+  return h;
+}
+
+function ppSaveAssignmentFromForm(){
+  var a = window._ppEditingAssignment;
+  if(!a){ alert('No assignment in progress.'); return; }
+  if(!a.agentId){ alert('Pick an agent.'); return; }
+  if(!a.planId){ alert('Pick a comp plan.'); return; }
+  // Check for duplicate (same agent + same campaign)
+  var dup = COMP_ASSIGNMENTS.find(function(x){
+    return x.agentId===a.agentId && x.campaign===a.campaign && x.id !== a.id;
+  });
+  if(dup){
+    if(!confirm('This agent already has a comp plan for '+a.campaign+'. Replacing it will remove the old assignment. Continue?')) return;
+    COMP_ASSIGNMENTS = COMP_ASSIGNMENTS.filter(function(x){return x.id !== dup.id;});
+  }
+  delete a.isNew;
+  COMP_ASSIGNMENTS.push(a);
+  saveCompAssignments();
+  var agent = DB.agents.find(function(x){return x.id===a.agentId;});
+  alert('✓ Comp plan assigned to '+agent.name+'.\n\nThey will see the contract on their next login (blocking screen). Email + SMS notification will be wired in a follow-up build.');
+  window._ppEditingAssignment = null;
+  gotoPanel('comp-assignments');
+}
+
+function ppRemoveAssignment(assignmentId){
+  if(!isOwner(DB.current)){ alert('Only the Owner can remove an assignment.'); return; }
+  var a = COMP_ASSIGNMENTS.find(function(x){return x.id===assignmentId;});
+  if(!a) return;
+  var agent = DB.agents.find(function(x){return x.id===a.agentId;});
+  if(!confirm('Remove this comp plan assignment?\n\n'+(agent?agent.name+' · ':'')+a.campaign)) return;
+  COMP_ASSIGNMENTS = COMP_ASSIGNMENTS.filter(function(x){return x.id!==assignmentId;});
+  saveCompAssignments();
+  alert('✓ Assignment removed.');
+  gotoPanel('comp-assignments');
+}
+
+function ppViewContract(assignmentId){
+  var a = COMP_ASSIGNMENTS.find(function(x){return x.id===assignmentId;});
+  if(!a){ alert('Assignment not found.'); return; }
+  var agent = DB.agents.find(function(x){return x.id===a.agentId;});
+  var plan = ppGetPlanById(a.planId);
+  if(!agent || !plan){ alert('Contract data missing.'); return; }
+  var contract = ppGenerateContractText(agent, plan);
+  // Open in a new window for printing/saving
+  var w = window.open('','_blank');
+  if(!w){ alert('Pop-up blocker prevented opening the contract. Allow pop-ups for this site.'); return; }
+  w.document.write(
+    '<!DOCTYPE html><html><head><title>Contract — '+agent.name+'</title>'+
+    '<style>body{font-family:Georgia,serif;line-height:1.7;color:#1a1a1a;max-width:780px;margin:40px auto;padding:0 30px;white-space:pre-wrap}h1{font-family:Bebas Neue,sans-serif;letter-spacing:2px}@media print{body{margin:0;padding:20px}}</style>'+
+    '</head><body>'+contract.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</body></html>'
+  );
+  w.document.close();
+}
+
+// ── Render the contract text by filling template placeholders.
+function ppGenerateContractText(agent, plan){
+  var tpl = COMP_TEMPLATES[plan.role] || ppDefaultContractTemplate(plan.role);
+  var compDetails = ppRenderCompDetails(plan);
+  var effective = new Date().toISOString().slice(0,10);
+  return tpl
+    .replace(/\{\{AGENT_NAME\}\}/g,        agent.name||'')
+    .replace(/\{\{ROLE\}\}/g,              plan.role||'')
+    .replace(/\{\{CAMPAIGN\}\}/g,          plan.campaign + (plan.service?' › '+plan.service:''))
+    .replace(/\{\{EFFECTIVE_DATE\}\}/g,    effective)
+    .replace(/\{\{COMPENSATION_DETAILS\}\}/g, compDetails);
+}
+
+function ppRenderCompDetails(plan){
+  var lines = [];
+  lines.push('Campaign: ' + plan.campaign + (plan.service?' › '+plan.service:''));
+  lines.push('Role:     ' + plan.role);
+  lines.push('');
+  if(plan.rateType === 'flat'){
+    lines.push('Base Rate: ' + ppFmtCents(plan.flatCents) + ' per activation (flat).');
+  } else if(plan.rateType === 'sliding'){
+    lines.push('Base Rate: Retroactive sliding scale (all weekly activations recalculate at the higher rate when threshold is hit):');
+    (plan.slidingTiers||[]).forEach(function(t){
+      var range = t.maxActs ? (t.minActs+'–'+t.maxActs) : (t.minActs+'+');
+      lines.push('  • ' + range + ' activations/week: ' + ppFmtCents(t.rateCents) + ' each');
+    });
+  } else if(plan.rateType === 'percentage'){
+    lines.push('Override Rate: ' + (plan.pctValue||0) + '% of ' + (plan.pctOf==='team_gross'?'team gross':'personal gross') + ' for the pay period.');
+  }
+  if((plan.modifiers||[]).length){
+    lines.push('');
+    lines.push('Per-Activation Bonuses:');
+    plan.modifiers.forEach(function(m){
+      lines.push('  • ' + (m.name||'(unnamed)') + ': +' + ppFmtCents(m.bonusCents));
+    });
+  }
+  if((plan.lineItems||[]).length){
+    lines.push('');
+    lines.push('Line Items:');
+    plan.lineItems.forEach(function(li){
+      var rate = (li.rateType||'flat')==='flat' ? ppFmtCents(li.flatCents) + ' per sale' : '(sliding scale)';
+      lines.push('  • ' + (li.name||'(unnamed)') + ': ' + rate);
+    });
+  }
+  if(plan.upsellHandling === 'deduct_from_weekly'){
+    lines.push('');
+    lines.push('Upsell Chargebacks: Any upsell amounts billed back to the Company will be deducted from your weekly gross commission.');
+  }
+  if(plan.notes){
+    lines.push('');
+    lines.push('Additional Notes:');
+    lines.push(plan.notes);
+  }
+  return lines.join('\n');
 }
 
 function panelAgents(){
