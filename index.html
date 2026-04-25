@@ -1698,6 +1698,18 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
         <div id="aaCMModelHelp" style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;line-height:1.5"></div>
       </div>
 
+      <!-- TRUCONNECT OVERRIDE STYLE (only visible for Campaign Manager / IBO roles) -->
+      <div class="f-field" id="aaTCModelRow" style="display:none;margin-bottom:14px;background:rgba(220,38,38,.05);border:1.5px solid rgba(220,38,38,.25);border-radius:8px;padding:14px">
+        <label class="f-label" style="color:#dc2626">📶 TruConnect Override Style</label>
+        <div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-bottom:8px;line-height:1.5">TruConnect comp pattern. Independent from Gen Mobile — same person can have different override styles per campaign.</div>
+        <select id="aaTCModel" class="f-select" onchange="aaTCModelChanged()" style="width:100%">
+          <option value="none">— No TruConnect override (personal pay only) —</option>
+          <option value="tc-cm-difference">💵 TC CM Difference — Tanita's pattern: agents standard, I keep $30 Tribal flat / $2 NLAD diff</option>
+          <option value="tc-cm-consolidated">⭐ TC CM Consolidated — Juan's pattern: all deals route to me at $25 flat both ways</option>
+        </select>
+        <div id="aaTCModelHelp" style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;line-height:1.5"></div>
+      </div>
+
       <!-- INTERNET CAMPAIGNS — Chuzo & Astound with agent codes -->
       <div id="aaInternetRow" style="display:none;margin-bottom:14px">
         <div class="f-field">
@@ -2732,7 +2744,8 @@ function aaApplySensitiveLock(locked){
     'aaSubOffice',     // office dept checkboxes + Office Manager flag
     'aaDeptAccessRow', // deptAccess grants (already Owner-only elsewhere, belt+suspenders)
     'aaCanHostCallRow',// can-host-call toggle
-    'aaCMModelRow'     // CM override style — pay-affecting, Owner only
+    'aaCMModelRow',    // GM override style — pay-affecting, Owner only
+    'aaTCModelRow'     // TC override style — pay-affecting, Owner only
   ];
   blocks.forEach(function(id){
     var el = document.getElementById(id);
@@ -4782,6 +4795,360 @@ function gmCalculateWeek(weekRows){
 }
 
 function gmFormatBreakdown(perAgent){
+  var out = [];
+  Object.keys(perAgent).forEach(function(aid){
+    var entry = perAgent[aid];
+    var agent = DB.agents.find(function(x){return x.id===parseInt(aid);});
+    out.push({
+      agentId: parseInt(aid),
+      agentName: agent ? agent.name : 'Agent #'+aid,
+      total: entry.amount,
+      rows: entry.rows,
+      breakdown: entry.breakdown
+    });
+  });
+  out.sort(function(a,b){ return b.total - a.total; });
+  return out;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  TRUCONNECT COMMISSION ENGINE — V1 (person-attribute design)
+//
+//  Mirrors the Gen Mobile architecture: pay model lives on the Campaign
+//  Manager / IBO's agent record as the `tcModel` field. Markets carry a
+//  campaignManager id pointing to that person.
+//
+//  Three tcModel values:
+//   • 'none'                — standard market (default)
+//   • 'tc-cm-difference'    — Tanita: agents/TL/MM at standard, CM keeps
+//                              Tribal $30 difference + $10 NLAD personal
+//                              + $2 NLAD difference on agents below
+//   • 'tc-cm-consolidated'  — Juan: ALL deals route to him at $25 flat
+//                              both NLAD and Tribal
+//
+//  RATES:
+//    NLAD:
+//      Agent      = $8 flat
+//      TL         = $8 flat (NO TL override on NLAD — per Calvin's spec)
+//      MM         = $10 flat (personal); $2/each override on agent NLAD
+//      CM (diff)  = $10 flat (personal); $2/each override on agent + TL NLAD
+//      CM (cons)  = $25 flat (all deals route)
+//
+//    Tribal:
+//      Agent      = sliding $18 (1-30) → $23 (31+, retroactive)
+//      TL         = sliding $23 (1-30) → $25 (31+, retroactive); override
+//                    on agent enrollment = TL tier rate − agent tier rate
+//      MM         = NO MM LAYER ON TRIBAL — skipped
+//      CM (diff)  = $28 flat personal; $30 flat override per enrollment
+//                    by anyone below (TL or agent)
+//      CM (cons)  = $25 flat (all deals route)
+//
+//    Universal:
+//      Port-in/out = +$7 flat to the personal enroller only (no override)
+//      Chargebacks = negative cents per row, deducted from enroller
+// ════════════════════════════════════════════════════════════════════════
+
+var TC_RATES = {
+  // Standard agent/TL/MM rates (apply when CM has tcModel === 'none' or
+  // 'tc-cm-difference')
+  nlad: {
+    agent:    8,
+    tl:       8,    // TL has no special NLAD treatment — same as agent
+    mm:       10,
+    mmOverridePerAgentEnrollment: 2  // $10 − $8
+  },
+  tribal: {
+    agentTier: { tier1Cap:30, tier1:18, tier2:23 },  // sliding retroactive
+    tlTier:    { tier1Cap:30, tier1:23, tier2:25 }   // sliding retroactive on TL personal count
+  },
+  // Tanita's CM-difference rates
+  cmDifference: {
+    nladPersonal:        10,
+    nladOverridePerAgent: 2,  // applied to agent + TL enrollments below
+    tribalPersonal:      28,
+    tribalOverridePerEnrollment: 30  // FLAT $30 per Tribal enrollment by anyone below CM
+  },
+  // Juan's consolidated rates
+  cmConsolidated: {
+    nladFlat:   25,
+    tribalFlat: 25
+  },
+  // Universal bonus
+  portInOut: 7
+};
+
+// Look up the tcModel for an agent record. Defaults to 'none'.
+function tcCmModelOf(agent){
+  if(!agent) return 'none';
+  return agent.tcModel || 'none';
+}
+
+// Look up the team's Campaign Manager / IBO. Returns agent or null.
+function tcMarketCM(team){
+  if(!team || !team.campaignManager) return null;
+  return DB.agents.find(function(a){return a.id===team.campaignManager;}) || null;
+}
+
+// Apply retroactive sliding tier — same helper as gmSlidingTotal but
+// duplicated for clarity; could share but keeping engines independent
+// to prevent cross-campaign breakage.
+function tcSlidingTotal(count, tier){
+  if(!count || count <= 0) return 0;
+  if(count <= tier.tier1Cap) return count * tier.tier1;
+  return count * tier.tier2;
+}
+
+// Determine which tier rate applies to an individual count.
+function tcTierRate(count, tier){
+  if(count <= tier.tier1Cap) return tier.tier1;
+  return tier.tier2;
+}
+
+// Calculate TruConnect pay for one week.
+//
+// weekRows: array of {
+//   agentId,             // who personally enrolled (number, REQUIRED)
+//   isTribal,            // bool
+//   isPort,              // bool — port-in/out enrollment (+$7 bonus)
+//   chargebackCents      // negative cents (deduction); optional
+// }
+//
+// Returns: { perAgent: {agentId:{amount,breakdown,rows}}, byTeam, warnings }
+function tcCalculateWeek(weekRows){
+  var byAgent = {};
+  var byTeam  = {};
+  var warnings = [];
+
+  // Input validation
+  if(!Array.isArray(weekRows)){
+    console.error('[tcCalculateWeek] FATAL: weekRows is not an array');
+    return { perAgent:{}, byTeam:{}, warnings:['Invalid input: weekRows must be an array'] };
+  }
+  weekRows.forEach(function(r, idx){
+    if(!r || typeof r !== 'object'){
+      warnings.push('Row '+idx+' is not an object — skipped');
+      return;
+    }
+    if(!r.agentId || typeof r.agentId !== 'number'){
+      warnings.push('Row '+idx+' missing or invalid agentId ('+r.agentId+')');
+    }
+    if(r.chargebackCents !== undefined && r.chargebackCents !== null){
+      if(typeof r.chargebackCents !== 'number'){
+        warnings.push('Row '+idx+' chargebackCents not a number: '+r.chargebackCents);
+      } else if(r.chargebackCents > 0){
+        warnings.push('Row '+idx+' has POSITIVE chargebackCents ('+r.chargebackCents+'). TruConnect chargebacks must be negative cents (deductions). Treating as 0 — verify your parser.');
+        r.chargebackCents = 0;
+      } else if(r.chargebackCents < -1000000){
+        warnings.push('Row '+idx+' chargebackCents extreme value ('+r.chargebackCents+' cents = $'+(r.chargebackCents/100).toFixed(2)+'). Possible parser error — verify before paying.');
+      }
+    }
+  });
+  if(warnings.length){
+    console.warn('[tcCalculateWeek] ⚠️ '+warnings.length+' input warnings:');
+    warnings.forEach(function(w){ console.warn('  - '+w); });
+  }
+
+  // Helper: credit an agent and record a breakdown line.
+  function bump(agentId, amount, label, count, rate){
+    if(!byAgent[agentId]) byAgent[agentId] = { amount:0, breakdown:[], rows:0 };
+    byAgent[agentId].amount += amount;
+    byAgent[agentId].breakdown.push({ label:label, count:count, rate:rate, amount:amount });
+    if(count) byAgent[agentId].rows += count;
+  }
+
+  // Pass 1: bucket rows by team and tally per-agent counts
+  weekRows.forEach(function(r){
+    // Reuse the GM team-resolution helper — teams are shared across campaigns
+    var team = (typeof gmAgentTeam === 'function') ? gmAgentTeam(r.agentId) : null;
+    var teamId = team ? team.id : '__no_team__';
+    if(!byTeam[teamId]){
+      byTeam[teamId] = { team:team, rows:[], nladCount:0, tribalCount:0,
+                         portCount:0, agents:{} };
+    }
+    var t = byTeam[teamId];
+    t.rows.push(r);
+    if(r.isTribal) t.tribalCount++; else t.nladCount++;
+    if(r.isPort)   t.portCount++;
+    if(!t.agents[r.agentId]) t.agents[r.agentId] = {nlad:0, tribal:0, ports:0, cb:0};
+    var a = t.agents[r.agentId];
+    if(r.isTribal) a.tribal++; else a.nlad++;
+    if(r.isPort)   a.ports++;
+    if(r.chargebackCents) a.cb += r.chargebackCents;
+  });
+
+  // Pass 2: per-team calculation, dispatched by CM's tcModel
+  Object.keys(byTeam).forEach(function(teamId){
+    var t = byTeam[teamId];
+    var team = t.team;
+    var cm = tcMarketCM(team);
+    var tcModel = tcCmModelOf(cm);
+
+    // ────────── PATH: tc-cm-consolidated (Juan) ──────────
+    // ALL activations route to the CM at flat $25 NLAD / $25 Tribal.
+    // Other agents in the market get $0 from company; CM pays them privately.
+    if(tcModel === 'tc-cm-consolidated'){
+      var cmId = cm.id;
+      var marketLabel = team ? (team.city || team.name) : 'market';
+
+      // Aggregate everything across the market
+      var nladPay   = t.nladCount   * TC_RATES.cmConsolidated.nladFlat;
+      var tribalPay = t.tribalCount * TC_RATES.cmConsolidated.tribalFlat;
+      // Port-in/out goes to whoever PERSONALLY enrolled — but in
+      // consolidated, the CM is functionally the doer-of-record on every
+      // routed deal. So ports go to him too.
+      var portPay   = t.portCount   * TC_RATES.portInOut;
+      // Chargebacks roll up to CM
+      var cbCents = 0;
+      t.rows.forEach(function(r){ if(r.chargebackCents) cbCents += r.chargebackCents; });
+
+      if(t.nladCount)   bump(cmId, nladPay,    'NLAD ('+marketLabel+' consolidated)',   t.nladCount,   TC_RATES.cmConsolidated.nladFlat);
+      if(t.tribalCount) bump(cmId, tribalPay,  'Tribal ('+marketLabel+' consolidated)', t.tribalCount, TC_RATES.cmConsolidated.tribalFlat);
+      if(t.portCount)   bump(cmId, portPay,    'Port-in/out bonus',                     t.portCount,   TC_RATES.portInOut);
+      if(cbCents)       bump(cmId, cbCents/100,'Chargebacks',                           0,             0);
+
+      // Other agents: $0 with explicit "routed" line for tracking
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        if(aidI === cmId) return;
+        var a = t.agents[aidStr];
+        bump(aidI, 0, 'Routed to CM ('+marketLabel+' consolidated)', a.nlad+a.tribal, 0);
+      });
+      return;
+    }
+
+    // ────────── STANDARD AGENT BASE (paths: 'none' and 'tc-cm-difference') ──────────
+    // Agents and TL paid at base rates. MM and CM diff overrides apply on top.
+
+    var tlId = team ? team.leader : null;
+    var mmId = team ? team.marketManager : null;
+    var cmId = cm ? cm.id : null;
+
+    // Layer 1: pay agents and TL at their base rates
+    Object.keys(t.agents).forEach(function(aidStr){
+      var aidI = parseInt(aidStr);
+      var a = t.agents[aidStr];
+      var personalLabel = '';
+
+      // NLAD personal
+      if(a.nlad){
+        var nladRate, nladLabel;
+        if(aidI === cmId && tcModel === 'tc-cm-difference'){
+          nladRate  = TC_RATES.cmDifference.nladPersonal;  // $10
+          nladLabel = 'Personal NLAD ($'+nladRate+')';
+        } else if(aidI === mmId){
+          nladRate  = TC_RATES.nlad.mm;                     // $10
+          nladLabel = 'Personal NLAD ($'+nladRate+' MM rate)';
+        } else if(aidI === tlId){
+          nladRate  = TC_RATES.nlad.tl;                     // $8
+          nladLabel = 'Personal NLAD ($'+nladRate+' TL rate)';
+        } else {
+          nladRate  = TC_RATES.nlad.agent;                  // $8
+          nladLabel = 'NLAD enrollments';
+        }
+        bump(aidI, a.nlad * nladRate, nladLabel, a.nlad, nladRate);
+      }
+
+      // Tribal personal
+      if(a.tribal){
+        var tribalPay, tribalLabel, tribalRate;
+        if(aidI === cmId && tcModel === 'tc-cm-difference'){
+          tribalRate = TC_RATES.cmDifference.tribalPersonal;  // $28 flat
+          tribalPay  = a.tribal * tribalRate;
+          tribalLabel = 'Personal Tribal ($'+tribalRate+' CM rate)';
+        } else if(aidI === tlId){
+          tribalPay  = tcSlidingTotal(a.tribal, TC_RATES.tribal.tlTier);
+          tribalRate = a.tribal ? tribalPay / a.tribal : 0;
+          tribalLabel = 'Personal Tribal (TL sliding)';
+        } else {
+          // Standard agent (or MM doing personal Tribal — no MM layer in Tribal)
+          tribalPay  = tcSlidingTotal(a.tribal, TC_RATES.tribal.agentTier);
+          tribalRate = a.tribal ? tribalPay / a.tribal : 0;
+          tribalLabel = (aidI === mmId)
+            ? 'Personal Tribal (no MM layer — paid as agent)'
+            : 'Tribal enrollments';
+        }
+        bump(aidI, tribalPay, tribalLabel, a.tribal, tribalRate);
+      }
+
+      // Port-in/out bonus to the enroller
+      if(a.ports){
+        bump(aidI, a.ports * TC_RATES.portInOut, 'Port-in/out bonus', a.ports, TC_RATES.portInOut);
+      }
+
+      // Chargebacks to the enroller
+      if(a.cb){
+        bump(aidI, a.cb/100, 'Chargebacks', 0, 0);
+      }
+    });
+
+    // Layer 2: Tribal TL override (TL keeps the difference between their tier and the agent's tier)
+    if(tlId){
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        if(aidI === tlId)  return;  // not on themselves
+        if(aidI === mmId)  return;  // peers — no override on MM
+        if(aidI === cmId)  return;  // CM is above
+        var a = t.agents[aidStr];
+        if(!a.tribal) return;
+        var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
+        var agentTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.agentTier);
+        var tlTribalRate    = tcTierRate(a.tribal, TC_RATES.tribal.tlTier);
+        var diffPerEnrollment = tlTribalRate - agentTribalRate;
+        if(diffPerEnrollment > 0){
+          bump(tlId, a.tribal * diffPerEnrollment,
+               'TL Tribal override on '+aName+' ($'+diffPerEnrollment+'/each)',
+               a.tribal, diffPerEnrollment);
+        }
+      });
+    }
+
+    // Layer 3: NLAD MM override ($2/each on agent NLAD enrollments)
+    // No MM Tribal override (MM doesn't exist on Tribal).
+    if(mmId){
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        if(aidI === mmId) return;
+        if(aidI === cmId) return;  // CM is above MM
+        if(aidI === tlId) return;  // TL is peer (TL is paid $8 same as agent — MM doesn't override on TL? confirm)
+        var a = t.agents[aidStr];
+        if(!a.nlad) return;
+        var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
+        bump(mmId, a.nlad * TC_RATES.nlad.mmOverridePerAgentEnrollment,
+             'MM NLAD override on '+aName+' ($'+TC_RATES.nlad.mmOverridePerAgentEnrollment+'/each)',
+             a.nlad, TC_RATES.nlad.mmOverridePerAgentEnrollment);
+      });
+    }
+
+    // Layer 4: CM-difference (Tanita) — applies only when tcModel === 'tc-cm-difference'
+    if(tcModel === 'tc-cm-difference' && cmId){
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        if(aidI === cmId) return;  // not on themselves
+        var a = t.agents[aidStr];
+        var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
+
+        // NLAD: $2/each on agent + TL NLAD enrollments (MM has none if MM exists,
+        // since MM gets $10 personal — but CM rate is also $10, so no diff there)
+        if(a.nlad && aidI !== mmId){
+          bump(cmId, a.nlad * TC_RATES.cmDifference.nladOverridePerAgent,
+               'CM NLAD override on '+aName+' ($'+TC_RATES.cmDifference.nladOverridePerAgent+'/each)',
+               a.nlad, TC_RATES.cmDifference.nladOverridePerAgent);
+        }
+
+        // Tribal: $30 flat per enrollment by anyone below (TL or agent)
+        if(a.tribal){
+          bump(cmId, a.tribal * TC_RATES.cmDifference.tribalOverridePerEnrollment,
+               'CM Tribal override on '+aName+' ($'+TC_RATES.cmDifference.tribalOverridePerEnrollment+'/each)',
+               a.tribal, TC_RATES.cmDifference.tribalOverridePerEnrollment);
+        }
+      });
+    }
+  });
+
+  return { perAgent: byAgent, byTeam: byTeam, model:'truconnect-v1', warnings: warnings };
+}
+
+function tcFormatBreakdown(perAgent){
   var out = [];
   Object.keys(perAgent).forEach(function(aid){
     var entry = perAgent[aid];
@@ -8048,7 +8415,9 @@ async function loadFromSupabase(){
           officeManager: a.office_manager === true,
           iboMarkets:    safeJSON(a.ibo_markets, []),
           // Gen Mobile pay model — defaults to 'none' if column doesn't exist
-          cmModel:       a.cm_model || 'none'
+          cmModel:       a.cm_model || 'none',
+          // TruConnect pay model — defaults to 'none' if column doesn't exist
+          tcModel:       a.tc_model || 'none'
         };
       });
       // Auto-derive .category/.depts for every legacy record we just loaded.
@@ -8288,7 +8657,9 @@ async function saveAgentToSupabase(agent){
     ibo_markets:    JSON.stringify(agent.iboMarkets || []),
     // Gen Mobile pay model (cmModel). Stored as a string column. Falls
     // back to legacy save if the column doesn't exist in the schema.
-    cm_model:       agent.cmModel || null
+    cm_model:       agent.cmModel || null,
+    // TruConnect pay model (tcModel). Same fallback behavior.
+    tc_model:       agent.tcModel || null
   };
   // Try the full write first.
   var ok = await sbUpsert('agents', full);
@@ -8296,13 +8667,14 @@ async function saveAgentToSupabase(agent){
   // not-yet-migrated Supabase schema). Retry without the new columns so the
   // agent still saves and we don't lose data on schema lag.
   if(!ok){
-    console.warn('[saveAgentToSupabase] Full save failed (likely unknown columns). Retrying with legacy fields only — cmModel/category/depts/etc will not persist until the schema is migrated.');
+    console.warn('[saveAgentToSupabase] Full save failed (likely unknown columns). Retrying with legacy fields only — cmModel/tcModel/category/depts/etc will not persist until the schema is migrated.');
     var legacy = Object.assign({}, full);
     delete legacy.category;
     delete legacy.depts;
     delete legacy.office_manager;
     delete legacy.ibo_markets;
     delete legacy.cm_model;
+    delete legacy.tc_model;
     await sbUpsert('agents', legacy);
   }
 }
@@ -9640,6 +10012,18 @@ function saveAgentForm(){
         // Owner is editing a non-CM/IBO agent who has a stale cmModel — clear it
         console.log('[saveAgentForm] Clearing stale cmModel="'+a.cmModel+'" because role is no longer CM/IBO');
         a.cmModel = 'none';
+      }
+    }
+
+    // tcModel — TruConnect override style. Same handling as cmModel.
+    var tcModelEl = document.getElementById('aaTCModel');
+    var tcModelRowEl = document.getElementById('aaTCModelRow');
+    if(tcModelEl && tcModelRowEl){
+      if(tcModelRowEl.style.display !== 'none'){
+        a.tcModel = tcModelEl.value || 'none';
+      } else if(isOwner(DB.current) && a.tcModel && a.tcModel !== 'none'){
+        console.log('[saveAgentForm] Clearing stale tcModel="'+a.tcModel+'" because role is no longer CM/IBO');
+        a.tcModel = 'none';
       }
     }
     // Department access — OWNER ONLY can grant. Anyone else editing a
@@ -23559,16 +23943,35 @@ function renderAgentProgramCheckboxes(selectedPrograms){
 
 // Show/hide the CM Override Style row based on currently-selected role.
 // Called whenever the role changes within the modal so the picker
-// appears immediately (not just when re-opening the modal).
+// appears immediately (not just when re-opening the modal). Toggles
+// both the Gen Mobile and TruConnect override style rows.
 function aaToggleCMModelVisibility(){
   var cmRow = document.getElementById('aaCMModelRow');
-  if(!cmRow) return;
+  var tcRow = document.getElementById('aaTCModelRow');
   var viewer = DB.current;
-  if(!isOwner(viewer)){ cmRow.style.display = 'none'; return; }
+  var allowed = isOwner(viewer);
   var roleEl = document.getElementById('aaRole');
   var role = roleEl ? roleEl.value : '';
   var isCMOrIBO = (role === 'Campaign Manager' || role === 'IBO');
-  cmRow.style.display = isCMOrIBO ? 'block' : 'none';
+  if(cmRow) cmRow.style.display = (allowed && isCMOrIBO) ? 'block' : 'none';
+  if(tcRow) tcRow.style.display = (allowed && isCMOrIBO) ? 'block' : 'none';
+}
+
+// Update the help-text/preview when TC Override Style dropdown changes.
+function aaTCModelChanged(){
+  var sel = document.getElementById('aaTCModel');
+  var help = document.getElementById('aaTCModelHelp');
+  if(!sel || !help) return;
+  var v = sel.value || 'none';
+  var color = '#6b7280', icon = '⚪', desc = 'No TC override. Personal pay only at standard agent rates.';
+  if(v === 'tc-cm-difference'){
+    color = '#dc2626'; icon = '💵';
+    desc = '<strong>TC CM Difference (Tanita):</strong> Agents at standard ($8 NLAD, $18/$23 sliding Tribal). TL keeps Tribal tier difference. MM gets $2 NLAD override. I get $10 NLAD personal + $2 override on agent and TL NLAD; $28 Tribal personal + $30 flat override on every Tribal enrollment by anyone below me.';
+  } else if(v === 'tc-cm-consolidated'){
+    color = '#D97706'; icon = '⭐';
+    desc = '<strong>TC CM Consolidated (Juan):</strong> ALL TruConnect activations from any market that lists me as Campaign Manager route 100% to me at $25 flat NLAD and $25 flat Tribal. Port-in/out and chargebacks roll up. Other agents in those markets get $0 from the company.';
+  }
+  help.innerHTML = '<div style="padding:8px 10px;background:'+color+'15;border-left:3px solid '+color+';border-radius:4px;color:var(--brown)"><strong style="color:'+color+'">'+icon+'</strong> '+desc+'</div>';
 }
 
 // Update the help-text/preview when CM Override Style dropdown changes.
@@ -23648,14 +24051,16 @@ function toggleLLFields(){
   var callRow = document.getElementById('aaCanHostCallRow');
   if(callRow) callRow.style.display = isAdmin ? 'block' : 'none';
 
-  // cmModel row — Gen Mobile override style. Show only when:
-  //   1. Viewer is Owner (only Owner can change override style — sensitive comp setting)
-  //   2. Agent's role is Campaign Manager or IBO
-  // Pre-fill the saved value, then call helper to set visibility consistently.
+  // cmModel + tcModel rows — Gen Mobile + TruConnect override styles.
+  // Show only when viewer is Owner AND role is CM/IBO. Independent fields —
+  // same person can have different override styles per campaign.
   var cmSel = document.getElementById('aaCMModel');
   if(cmSel) cmSel.value = a.cmModel || 'none';
+  var tcSel = document.getElementById('aaTCModel');
+  if(tcSel) tcSel.value = a.tcModel || 'none';
   if(typeof aaToggleCMModelVisibility === 'function') aaToggleCMModelVisibility();
   if(typeof aaCMModelChanged === 'function') aaCMModelChanged();
+  if(typeof aaTCModelChanged === 'function') aaTCModelChanged();
 
   // Department access section — OWNER ONLY. Previously this was "anyone
   // who can edit profiles" but that leaked permission-granting power to
