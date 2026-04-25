@@ -1684,6 +1684,20 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
         </label>
       </div>
 
+      <!-- CM/IBO OVERRIDE STYLE (only visible for Campaign Manager / IBO roles) -->
+      <div class="f-field" id="aaCMModelRow" style="display:none;margin-bottom:14px;background:rgba(124,58,237,.05);border:1.5px solid rgba(124,58,237,.25);border-radius:8px;padding:14px">
+        <label class="f-label" style="color:#7c3aed">🌟 Gen Mobile Override Style</label>
+        <div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-bottom:8px;line-height:1.5">This person's override pattern applies automatically to every market that lists them as Campaign Manager. Pick the pattern that matches their compensation agreement.</div>
+        <select id="aaCMModel" class="f-select" onchange="aaCMModelChanged()" style="width:100%">
+          <option value="none">— No override (personal pay only) —</option>
+          <option value="ibo-consolidated">⭐ IBO Consolidated — All market deals route to me at $13 NLAD / sliding Tribal</option>
+          <option value="ibo-tiered">📈 IBO Tiered — Agents flat $8/$20, I keep the difference</option>
+          <option value="cm-difference">💵 CM Difference — Agents standard sliding, I keep max $13/$34 leftover per deal</option>
+          <option value="cm-oklahoma">🌾 CM Oklahoma Hybrid — +$1 NLAD flat, $34 Tribal difference</option>
+        </select>
+        <div id="aaCMModelHelp" style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;line-height:1.5"></div>
+      </div>
+
       <!-- INTERNET CAMPAIGNS — Chuzo & Astound with agent codes -->
       <div id="aaInternetRow" style="display:none;margin-bottom:14px">
         <div class="f-field">
@@ -1899,6 +1913,32 @@ function saveToStorage(){
     localStorage.setItem('wmam_teams',     JSON.stringify(LIFELINE_TEAMS));
     localStorage.setItem('wmam_chanMsgs',  JSON.stringify(CHANNEL_MSGS));
     localStorage.setItem('wmam_teamMsgs',  JSON.stringify(TEAM_MSGS));  } catch(e){ console.warn('Storage save failed:', e); }
+}
+
+// Convenience wrapper used by Markets editor — same end result as
+// saveToStorage but explicit about intent. Also pushes teams to Supabase.
+function saveTeams(){
+  try{ localStorage.setItem('wmam_teams', JSON.stringify(LIFELINE_TEAMS)); }catch(e){}
+  if(typeof saveAppSettingToSupabase === 'function'){
+    try{ saveAppSettingToSupabase('lifeline_teams', LIFELINE_TEAMS); }catch(e){ console.warn('[saveTeams] supabase failed', e); }
+  }
+}
+
+// ── Generic app_settings writer ──────────────────────────────────────
+// Used by saveTeams, saveOnboardData, and other key-value setting writers.
+// Stores arbitrary serializable data under a `key` in the Supabase
+// `app_settings` table. Returns silently on failure (caller should still
+// have written to localStorage as a fallback).
+async function saveAppSettingToSupabase(key, value){
+  if(typeof supaClient === 'undefined' || !supaClient) return;
+  if(!key) return;
+  try{
+    var payload = (typeof value === 'string') ? value : JSON.stringify(value);
+    await supaClient.from('app_settings')
+      .upsert({key: key, value: payload}, {onConflict: 'key'});
+  }catch(e){
+    console.warn('[saveAppSettingToSupabase] '+key+' failed:', e && (e.message||e));
+  }
 }
 
 function loadFromStorage(){
@@ -2667,6 +2707,8 @@ function aaSetCategory(cat){
     // Trigger toggleLLFields so other parts of the form (e.g. sales-only
     // sections like markets/campaign codes) update appropriately.
     if(typeof toggleLLFields === 'function') toggleLLFields();
+    // Show/hide the CM Override Style row when category changes
+    if(typeof aaToggleCMModelVisibility === 'function') aaToggleCMModelVisibility();
   }
 }
 
@@ -2689,7 +2731,8 @@ function aaApplySensitiveLock(locked){
     'aaSubIBO',        // IBO sub-options + markets
     'aaSubOffice',     // office dept checkboxes + Office Manager flag
     'aaDeptAccessRow', // deptAccess grants (already Owner-only elsewhere, belt+suspenders)
-    'aaCanHostCallRow' // can-host-call toggle
+    'aaCanHostCallRow',// can-host-call toggle
+    'aaCMModelRow'     // CM override style — pay-affecting, Owner only
   ];
   blocks.forEach(function(id){
     var el = document.getElementById(id);
@@ -2738,6 +2781,8 @@ function aaSetSubRole(cat, value){
   var roleEl = document.getElementById('aaRole');
   if(roleEl){ roleEl.value = value; }
   if(typeof toggleLLFields === 'function') toggleLLFields();
+  // Show/hide cmModel row based on role
+  if(typeof aaToggleCMModelVisibility === 'function') aaToggleCMModelVisibility();
 }
 
 // Radio-deselect support. Native radios can't be unchecked by clicking
@@ -3189,6 +3234,113 @@ window.hardDeleteAgent = async function(id){
   try{ if(typeof saveToStorage === 'function') saveToStorage(); }catch(e){}
   try{ gotoPanel('agents'); }catch(e){}
   console.log('✓ Agent '+id+' deleted. Reload to confirm.');
+};
+
+// ── Gen Mobile comp engine test helpers ──
+// Run from console to verify the math. Each one builds a synthetic week
+// of enrollments and runs gmCalculateWeek, then logs a readable breakdown.
+// ── Gen Mobile comp engine console test helpers ──
+// Live tests against the production engine. Run from browser console
+// to verify calculations match expected values. Uses temporary CM
+// assignment + restores original state.
+window.gmTestStandard = function(){
+  console.group('🧪 GM Standard model — agent 35 NLAD + 5 Tribal');
+  var team = LIFELINE_TEAMS[0]; if(!team){ console.error('No teams'); console.groupEnd(); return; }
+  var prevCM = team.campaignManager;
+  team.campaignManager = null;  // force standard
+  var rows = [];
+  for(var i=0;i<35;i++) rows.push({agentId:2, isTribal:false, hasEmail:i<10, isBYOD:i<3});
+  for(var j=0;j<5;j++) rows.push({agentId:2, isTribal:true, hasEmail:false, isBYOD:false});
+  var result = gmCalculateWeek(rows);
+  console.log('Expected: agent 35×$11+5×$29+10×$1+3×$5=$555 (no TL/MM since none assigned)');
+  console.log(JSON.stringify(gmFormatBreakdown(result.perAgent), null, 2));
+  team.campaignManager = prevCM;
+  console.groupEnd();
+};
+window.gmTestConsolidated = function(iboId){
+  console.group('🧪 GM Consolidated (IBO) — Juan-style model');
+  if(!iboId){ console.error('Pass an IBO agent id: gmTestConsolidated(iboId)'); console.groupEnd(); return; }
+  var ibo = DB.agents.find(function(a){return a.id===iboId;});
+  if(!ibo){ console.error('Agent '+iboId+' not found'); console.groupEnd(); return; }
+  var prevCmModel = ibo.cmModel;
+  ibo.cmModel = 'ibo-consolidated';
+  // Use any team and assign IBO as CM
+  var team = LIFELINE_TEAMS[0]; var prevCM = team.campaignManager;
+  team.campaignManager = iboId;
+  var rows = [];
+  for(var i=0;i<50;i++) rows.push({agentId:iboId, isTribal:false, hasEmail:false, isBYOD:false});
+  for(var t=0;t<35;t++) rows.push({agentId:iboId, isTribal:true, hasEmail:false, isBYOD:false});
+  var result = gmCalculateWeek(rows);
+  console.log('Expected: IBO 50×$13 + 35×$34 = $650+$1190 = $1840');
+  console.log(JSON.stringify(gmFormatBreakdown(result.perAgent), null, 2));
+  team.campaignManager = prevCM;
+  ibo.cmModel = prevCmModel;
+  console.groupEnd();
+};
+window.gmTestTiered = function(mgrId, agentId){
+  console.group('🧪 GM Tiered Override — Stephanie-style model');
+  if(!mgrId || !agentId){ console.error('Usage: gmTestTiered(managerId, agentId)'); console.groupEnd(); return; }
+  var mgr = DB.agents.find(function(a){return a.id===mgrId;});
+  if(!mgr){ console.error('Manager '+mgrId+' not found'); console.groupEnd(); return; }
+  var prevCmModel = mgr.cmModel;
+  mgr.cmModel = 'ibo-tiered';
+  var team = LIFELINE_TEAMS[0]; var prevCM = team.campaignManager, prevMembers = team.members.slice();
+  team.campaignManager = mgrId;
+  team.members = [mgrId, agentId];
+  var rows = [];
+  for(var i=0;i<5;i++)  rows.push({agentId:agentId, isTribal:true, hasEmail:false, isBYOD:false});
+  for(var j=0;j<26;j++) rows.push({agentId:mgrId,   isTribal:true, hasEmail:false, isBYOD:false});
+  var result = gmCalculateWeek(rows);
+  console.log('Market total 31 → tier 2 ($34)');
+  console.log('Expected: agent 5×$20=$100; manager 26×$34 + 5×$14 = $954');
+  console.log(JSON.stringify(gmFormatBreakdown(result.perAgent), null, 2));
+  team.campaignManager = prevCM; team.members = prevMembers;
+  mgr.cmModel = prevCmModel;
+  console.groupEnd();
+};
+window.gmTestBrandon = function(cmId, agentId){
+  console.group('🧪 GM CM-Difference — Brandon-style model');
+  if(!cmId || !agentId){ console.error('Usage: gmTestBrandon(cmId, agentId)'); console.groupEnd(); return; }
+  var cm = DB.agents.find(function(a){return a.id===cmId;});
+  if(!cm){ console.error('CM '+cmId+' not found'); console.groupEnd(); return; }
+  var prevCmModel = cm.cmModel;
+  cm.cmModel = 'cm-difference';
+  var team = LIFELINE_TEAMS[0]; var prevCM = team.campaignManager, prevMembers = team.members.slice();
+  team.campaignManager = cmId;
+  team.members = [cmId, agentId];
+  var rows = [];
+  for(var i=0;i<10;i++) rows.push({agentId:agentId, isTribal:false, hasEmail:false, isBYOD:false});
+  for(var j=0;j<5;j++)  rows.push({agentId:agentId, isTribal:true, hasEmail:false, isBYOD:false});
+  var result = gmCalculateWeek(rows);
+  console.log('No TL/MM. Agent 10 NLAD t1 + 5 Tribal');
+  console.log('Expected: agent 10×$9 + 5×$24 = $90+$120 = $210');
+  console.log('Brandon: NLAD 10×($13-$9)=$40; Tribal 5×($34-$24)=$50; Total=$90');
+  console.log(JSON.stringify(gmFormatBreakdown(result.perAgent), null, 2));
+  team.campaignManager = prevCM; team.members = prevMembers;
+  cm.cmModel = prevCmModel;
+  console.groupEnd();
+};
+window.gmTestTanita = function(cmId, agentId){
+  console.group('🧪 GM CM-Oklahoma — Tanita-style model');
+  if(!cmId || !agentId){ console.error('Usage: gmTestTanita(cmId, agentId)'); console.groupEnd(); return; }
+  var cm = DB.agents.find(function(a){return a.id===cmId;});
+  if(!cm){ console.error('CM '+cmId+' not found'); console.groupEnd(); return; }
+  var prevCmModel = cm.cmModel;
+  cm.cmModel = 'cm-oklahoma';
+  var team = LIFELINE_TEAMS[0]; var prevCM = team.campaignManager, prevMembers = team.members.slice();
+  team.campaignManager = cmId;
+  team.members = [cmId, agentId];
+  var rows = [];
+  for(var i=0;i<25;i++) rows.push({agentId:agentId, isTribal:false, hasEmail:false, isBYOD:false});
+  for(var j=0;j<28;j++) rows.push({agentId:agentId, isTribal:true, hasEmail:false, isBYOD:false});
+  var result = gmCalculateWeek(rows);
+  console.log('No TL/MM. Agent: 25 NLAD t1 + 28 Tribal t1');
+  console.log('Expected: agent 25×$9 + 28×$29 = $225+$812 = $1037');
+  console.log('Tanita: NLAD 25×$1 + Tribal 28×($34-$29)=$25+$140=$165');
+  console.log(JSON.stringify(gmFormatBreakdown(result.perAgent), null, 2));
+  team.campaignManager = prevCM; team.members = prevMembers;
+  cm.cmModel = prevCmModel;
+  console.groupEnd();
 };
 
 // Called by openEditAgent — populate the new chooser from the agent record
@@ -4191,6 +4343,459 @@ function ppKnownCampaigns(){
     }
   }
   return defaults;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  GEN MOBILE COMMISSION ENGINE — V2 (person-attribute design)
+//
+//  The pay model lives on the Campaign Manager / IBO's agent record as
+//  the `cmModel` field. Markets carry a campaignManager id pointing to
+//  that person. The engine reads the CM's cmModel to decide how each
+//  market calculates. This means assigning a new market to (e.g.) Brandon
+//  automatically inherits his Difference Override — no per-market
+//  configuration needed.
+//
+//  Five cmModel values:
+//   • 'none'              — no override (Standard market — default)
+//   • 'ibo-consolidated'  — Juan: ALL deals route to IBO at IBO rates
+//   • 'ibo-tiered'        — Stephanie: agents flat $8/$20, mgr keeps diff
+//   • 'cm-difference'     — Brandon: agents standard sliding NLAD + flat
+//                            $24 Tribal, CM keeps max(0, $13/$34 − paid)
+//   • 'cm-oklahoma'       — Tanita: agents standard sliding both ways,
+//                            CM gets +$1 NLAD flat + max(0, $34 − paid) Tribal
+//
+//  UNIVERSAL RULE: email + BYOD bonuses go ONLY to whoever personally
+//  enrolled the customer (the row's agentId in raw form, before any
+//  consolidation/routing). For Juan's consolidated markets, since all
+//  deals "become" Juan's enrollments, Juan IS the personal-doer-of-record
+//  on every row that hits him — so he keeps bonuses on every consolidated row.
+// ════════════════════════════════════════════════════════════════════════
+
+// Rate constants. Edit here if comp ever changes — engine reads from these.
+var GM_RATES = {
+  // Default standard agent rates (used in all models that don't override agent rates)
+  standardAgent: {
+    nlad:   { tier1Cap:30, tier1:9,  tier2:11 },   // sliding retroactive
+    tribal: { tier1Cap:30, tier1:29, tier2:34 },   // sliding retroactive
+    emailBonus: 1,
+    byodBonus:  5
+  },
+  // Standard TL/MM overrides (apply to standard, cm-difference, cm-oklahoma markets)
+  standardOverride: {
+    teamLeader:    1,   // $1/each from team agents
+    marketManager: 1    // $1/each from team agents
+  },
+
+  // ibo-consolidated (Juan): all deals route, paid at IBO rates
+  iboConsolidated: {
+    nlad:   { flat: 13 },                          // flat $13
+    tribal: { tier1Cap:30, tier1:29, tier2:34 },   // sliding retroactive
+    emailBonus: 1,
+    byodBonus:  5
+  },
+
+  // ibo-tiered (Stephanie): agents on flat rates, manager keeps diff
+  iboTieredAgent: {
+    nladFlat:   8,
+    tribalFlat: 20
+  },
+  iboTieredManager: {
+    nlad:   { flat: 13 },                          // flat $13 NLAD personal
+    tribal: { tier1Cap:30, tier1:29, tier2:34 },   // slides on MARKET total
+    emailBonus: 1,
+    byodBonus:  5
+  },
+
+  // cm-difference (Brandon): agents standard NLAD sliding, Tribal flat $24
+  cmDifferenceAgent: {
+    nlad:   { tier1Cap:30, tier1:9, tier2:11 },    // standard sliding
+    tribalFlat: 24                                  // FLAT, not sliding
+  },
+  cmDifferenceManager: {
+    nladTarget:   13,
+    tribalTarget: 34,
+    nladPersonal: { flat: 13 },
+    tribalPersonal: { flat: 34 },
+    emailBonus: 1,
+    byodBonus:  5
+  },
+
+  // cm-oklahoma (Tanita): agents standard sliding both, CM gets +$1 NLAD flat + Tribal diff
+  cmOklahomaManager: {
+    nladPerEnrollment: 1,                          // flat $1/each NLAD override
+    tribalTarget:       34,
+    nladPersonal:   { flat: 13 },
+    tribalPersonal: { flat: 34 },
+    emailBonus: 1,
+    byodBonus:  5
+  }
+};
+
+// Look up the cmModel for an agent record. Defaults to 'none'.
+function gmCmModelOf(agent){
+  if(!agent) return 'none';
+  return agent.cmModel || 'none';
+}
+
+// Find the team an agent belongs to. Looks at members + leader/MM/CM/IBO/tieredManager.
+//
+// CRITICAL: Each agent should belong to EXACTLY ONE team in production. If
+// an agent is found in multiple teams (data corruption or admin error), this
+// function returns the first match AND logs a loud warning so the issue can
+// be spotted and fixed before payroll runs. Real-money guardrail.
+function gmAgentTeam(agentId){
+  if(!agentId) return null;
+  var matches = LIFELINE_TEAMS.filter(function(t){
+    if(!t || !t.active) return false;
+    if(Array.isArray(t.members) && t.members.indexOf(agentId)>=0) return true;
+    if(t.leader === agentId) return true;
+    if(t.marketManager === agentId) return true;
+    if(t.campaignManager === agentId) return true;
+    return false;
+  });
+  if(matches.length > 1){
+    var agentName = (DB && DB.agents) ? (DB.agents.find(function(a){return a.id===agentId;})||{}).name : '#'+agentId;
+    var teamNames = matches.map(function(t){return t.name||t.id;}).join(', ');
+    console.warn('[gmAgentTeam] ⚠️ DATA WARNING: Agent "'+agentName+'" (id '+agentId+') is in '+matches.length+' teams: '+teamNames+'. Routing payroll to "'+matches[0].name+'". Fix the team membership in Markets to ensure correct calculations.');
+  }
+  return matches[0] || null;
+}
+
+// Look up the Campaign Manager / IBO assigned to a market. Returns agent or null.
+function gmMarketCM(team){
+  if(!team) return null;
+  if(!team.campaignManager) return null;
+  return DB.agents.find(function(a){return a.id===team.campaignManager;}) || null;
+}
+
+// Apply retroactive sliding tier (1-30 at tier1, 31+ at tier2 — entire count
+// recalculates at tier2 once cap is crossed).
+function gmSlidingTotal(count, tier){
+  if(!count || count<=0) return 0;
+  if(count <= tier.tier1Cap) return count * tier.tier1;
+  return count * tier.tier2;
+}
+
+// Calculate Gen Mobile pay for one week's worth of enrollments.
+//
+// weekRows: array of {
+//   agentId,            // who enrolled it (REQUIRED — number)
+//   isTribal,           // bool
+//   hasEmail,           // bool — agent collected valid email
+//   isBYOD,             // bool — BYOD or SIM-only enrollment
+//   chargebackCents     // NEGATIVE cents (deduction), optional. Positive
+//                       // values are flagged as suspicious.
+// }
+//
+// Returns: { perAgent: {agentId:{amount,breakdown,rows}}, byTeam: ..., warnings: [] }
+function gmCalculateWeek(weekRows){
+  var byAgent = {};
+  var byTeam = {};
+  var warnings = [];
+
+  // ── INPUT VALIDATION (real-money guardrails) ──
+  if(!Array.isArray(weekRows)){
+    console.error('[gmCalculateWeek] FATAL: weekRows is not an array');
+    return { perAgent:{}, byTeam:{}, warnings:['Invalid input: weekRows must be an array'] };
+  }
+  weekRows.forEach(function(r, idx){
+    if(!r || typeof r !== 'object'){
+      warnings.push('Row '+idx+' is not an object — skipped');
+      return;
+    }
+    if(!r.agentId || typeof r.agentId !== 'number'){
+      warnings.push('Row '+idx+' missing or invalid agentId ('+r.agentId+')');
+    }
+    if(r.chargebackCents !== undefined && r.chargebackCents !== null){
+      if(typeof r.chargebackCents !== 'number'){
+        warnings.push('Row '+idx+' chargebackCents not a number: '+r.chargebackCents);
+      } else if(r.chargebackCents > 0){
+        warnings.push('Row '+idx+' has POSITIVE chargebackCents ('+r.chargebackCents+'). Chargebacks must be negative cents (deductions). Treating as 0 — verify your parser.');
+        r.chargebackCents = 0;
+      } else if(r.chargebackCents < -1000000){
+        warnings.push('Row '+idx+' chargebackCents extreme value ('+r.chargebackCents+' cents = $'+(r.chargebackCents/100).toFixed(2)+'). Possible parser error — verify before paying.');
+      }
+    }
+  });
+  if(warnings.length){
+    console.warn('[gmCalculateWeek] ⚠️ '+warnings.length+' input warnings:');
+    warnings.forEach(function(w){ console.warn('  - '+w); });
+  }
+
+  // Helper to credit an agent.
+  function bump(agentId, amount, label, count, rate){
+    if(!byAgent[agentId]) byAgent[agentId] = { amount:0, breakdown:[], rows:0 };
+    byAgent[agentId].amount += amount;
+    byAgent[agentId].breakdown.push({ label:label, count:count, rate:rate, amount:amount });
+    if(count) byAgent[agentId].rows += count;
+  }
+
+  // Pass 1: bucket rows by team and tally counts
+  weekRows.forEach(function(r){
+    if(!r || !r.agentId) return;  // skip invalid rows
+    var team = gmAgentTeam(r.agentId);
+    var teamId = team ? team.id : '__no_team__';
+    if(!byTeam[teamId]){
+      byTeam[teamId] = { team:team, rows:[], nladCount:0, tribalCount:0,
+                         emailCount:0, byodCount:0,
+                         agents:{} };
+    }
+    var t = byTeam[teamId];
+    t.rows.push(r);
+    if(r.isTribal) t.tribalCount++; else t.nladCount++;
+    if(r.hasEmail) t.emailCount++;
+    if(r.isBYOD)   t.byodCount++;
+    if(!t.agents[r.agentId]) t.agents[r.agentId] = {nlad:0,tribal:0,email:0,byod:0,cb:0};
+    var a = t.agents[r.agentId];
+    if(r.isTribal) a.tribal++; else a.nlad++;
+    if(r.hasEmail) a.email++;
+    if(r.isBYOD)   a.byod++;
+    if(r.chargebackCents) a.cb += r.chargebackCents;
+  });
+
+  // Pass 2: per-team calculation, dispatched by the Campaign Manager's cmModel
+  Object.keys(byTeam).forEach(function(teamId){
+    var t = byTeam[teamId];
+    var team = t.team;
+    var cm = gmMarketCM(team);
+    var cmModel = gmCmModelOf(cm);
+
+    // ────────── PATH: ibo-consolidated (Juan) ──────────
+    if(cmModel === 'ibo-consolidated'){
+      var iboId = cm.id;
+      // ALL deals route to the IBO at IBO rates
+      var nladPay = t.nladCount * GM_RATES.iboConsolidated.nlad.flat;
+      var tribalPay = gmSlidingTotal(t.tribalCount, GM_RATES.iboConsolidated.tribal);
+      // Universal bonuses: in consolidated model, IBO is the doer-of-record
+      // for every row that hits him — so he keeps every email/BYOD on the
+      // market's enrollments.
+      var emailPay = t.emailCount * GM_RATES.iboConsolidated.emailBonus;
+      var byodPay  = t.byodCount  * GM_RATES.iboConsolidated.byodBonus;
+      var cbCents = 0;
+      t.rows.forEach(function(r){ if(r.chargebackCents) cbCents += r.chargebackCents; });
+      var marketLabel = team ? (team.city || team.name) : 'market';
+      if(t.nladCount)   bump(iboId, nladPay,    'IBO NLAD ('+marketLabel+' consolidated)',  t.nladCount,   GM_RATES.iboConsolidated.nlad.flat);
+      if(t.tribalCount) bump(iboId, tribalPay,  'IBO Tribal ('+marketLabel+' consolidated)',t.tribalCount, tribalPay/t.tribalCount);
+      if(t.emailCount)  bump(iboId, emailPay,   'Email bonus',                              t.emailCount,  GM_RATES.iboConsolidated.emailBonus);
+      if(t.byodCount)   bump(iboId, byodPay,    'BYOD bonus',                               t.byodCount,   GM_RATES.iboConsolidated.byodBonus);
+      if(cbCents)       bump(iboId, cbCents/100,'Chargebacks',                              0,             0);
+      // Other agents: $0, but record their activity for tracking
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        if(aidI === iboId) return;
+        var a = t.agents[aidStr];
+        bump(aidI, 0, 'Routed to IBO ('+marketLabel+' consolidated)', a.nlad+a.tribal, 0);
+      });
+      return;
+    }
+
+    // ────────── PATH: ibo-tiered (Stephanie) ──────────
+    if(cmModel === 'ibo-tiered'){
+      var mgrId = cm.id;
+      // Manager's Tribal tier determined by MARKET total Tribal
+      var mgrTribalRate = (t.tribalCount <= GM_RATES.iboTieredManager.tribal.tier1Cap)
+        ? GM_RATES.iboTieredManager.tribal.tier1
+        : GM_RATES.iboTieredManager.tribal.tier2;
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        var a = t.agents[aidStr];
+        if(aidI === mgrId){
+          // Manager's PERSONAL enrollments at manager rates
+          var nladPay = a.nlad * GM_RATES.iboTieredManager.nlad.flat;
+          var tribalPay = a.tribal * mgrTribalRate;
+          // Bonuses: only on personal deals (universal rule)
+          var emailPay = a.email * GM_RATES.iboTieredManager.emailBonus;
+          var byodPay  = a.byod  * GM_RATES.iboTieredManager.byodBonus;
+          if(a.nlad)   bump(mgrId, nladPay,   'Personal NLAD',                                            a.nlad,   GM_RATES.iboTieredManager.nlad.flat);
+          if(a.tribal) bump(mgrId, tribalPay, 'Personal Tribal (market tier $'+mgrTribalRate+')',         a.tribal, mgrTribalRate);
+          if(a.email)  bump(mgrId, emailPay,  'Personal Email bonus',                                     a.email,  GM_RATES.iboTieredManager.emailBonus);
+          if(a.byod)   bump(mgrId, byodPay,   'Personal BYOD bonus',                                      a.byod,   GM_RATES.iboTieredManager.byodBonus);
+          if(a.cb)     bump(mgrId, a.cb/100,  'Personal Chargebacks',                                     0,        0);
+        } else {
+          // Agent under tiered manager: flat rates + universal bonuses (per Calvin's confirmation)
+          var nladPay = a.nlad * GM_RATES.iboTieredAgent.nladFlat;
+          var tribalPay = a.tribal * GM_RATES.iboTieredAgent.tribalFlat;
+          var emailPay = a.email * GM_RATES.standardAgent.emailBonus;  // bonus to activator
+          var byodPay  = a.byod  * GM_RATES.standardAgent.byodBonus;
+          if(a.nlad)   bump(aidI, nladPay,   'NLAD enrollments (flat)',   a.nlad,   GM_RATES.iboTieredAgent.nladFlat);
+          if(a.tribal) bump(aidI, tribalPay, 'Tribal enrollments (flat)', a.tribal, GM_RATES.iboTieredAgent.tribalFlat);
+          if(a.email)  bump(aidI, emailPay,  'Email bonus',               a.email,  GM_RATES.standardAgent.emailBonus);
+          if(a.byod)   bump(aidI, byodPay,   'BYOD bonus',                a.byod,   GM_RATES.standardAgent.byodBonus);
+          if(a.cb)     bump(aidI, a.cb/100,  'Chargebacks',               0,        0);
+
+          // Manager keeps the difference between her tier and agent flat — NOT bonuses
+          var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
+          var nladDiff = a.nlad * (GM_RATES.iboTieredManager.nlad.flat - GM_RATES.iboTieredAgent.nladFlat);   // 13-8 = $5
+          var tribalDiff = a.tribal * (mgrTribalRate - GM_RATES.iboTieredAgent.tribalFlat);                   // 29-20=$9 or 34-20=$14
+          if(a.nlad)   bump(mgrId, nladDiff,   'Override on '+aName+' NLAD ($'+(GM_RATES.iboTieredManager.nlad.flat - GM_RATES.iboTieredAgent.nladFlat)+'/each)', a.nlad,   GM_RATES.iboTieredManager.nlad.flat - GM_RATES.iboTieredAgent.nladFlat);
+          if(a.tribal) bump(mgrId, tribalDiff, 'Override on '+aName+' Tribal ($'+(mgrTribalRate - GM_RATES.iboTieredAgent.tribalFlat)+'/each)', a.tribal, mgrTribalRate - GM_RATES.iboTieredAgent.tribalFlat);
+        }
+      });
+      return;
+    }
+
+    // ────────── PATHS WITH STANDARD AGENT BASE ──────────
+    // For 'none' (standard market), 'cm-difference' (Brandon), and
+    // 'cm-oklahoma' (Tanita), agents are paid at standard sliding rates.
+    // The difference between these is what the manager (TL/MM/CM) earns.
+
+    // First: pay agents per their base rates (varies by cmModel for Tribal)
+    Object.keys(t.agents).forEach(function(aidStr){
+      var aidI = parseInt(aidStr);
+      var a = t.agents[aidStr];
+      var nladPay, tribalPay;
+
+      if(cmModel === 'cm-difference'){
+        // Brandon's markets: NLAD sliding standard, Tribal FLAT $24
+        nladPay   = gmSlidingTotal(a.nlad, GM_RATES.cmDifferenceAgent.nlad);
+        tribalPay = a.tribal * GM_RATES.cmDifferenceAgent.tribalFlat;
+      } else {
+        // Standard sliding for both NLAD and Tribal
+        nladPay   = gmSlidingTotal(a.nlad,   GM_RATES.standardAgent.nlad);
+        tribalPay = gmSlidingTotal(a.tribal, GM_RATES.standardAgent.tribal);
+      }
+      // Universal bonuses to activator
+      var emailPay = a.email * GM_RATES.standardAgent.emailBonus;
+      var byodPay  = a.byod  * GM_RATES.standardAgent.byodBonus;
+      if(a.nlad)   bump(aidI, nladPay,   'NLAD enrollments',   a.nlad,   a.nlad   ? nladPay/a.nlad   : 0);
+      if(a.tribal) bump(aidI, tribalPay, 'Tribal enrollments', a.tribal, a.tribal ? tribalPay/a.tribal : 0);
+      if(a.email)  bump(aidI, emailPay,  'Email bonus',        a.email,  GM_RATES.standardAgent.emailBonus);
+      if(a.byod)   bump(aidI, byodPay,   'BYOD bonus',         a.byod,   GM_RATES.standardAgent.byodBonus);
+      if(a.cb)     bump(aidI, a.cb/100,  'Chargebacks',        0,        0);
+    });
+
+    // Layer 2: TL/MM standard overrides ($1/each from team agents — not their own,
+    // and not the Campaign Manager either, since CM is above TL/MM in the hierarchy)
+    var tlId = null, mmId = null, cmId = null;
+    if(team){
+      tlId = team.leader;
+      mmId = team.marketManager;
+      cmId = team.campaignManager;  // skip overrides on CM's own deals
+      // For each agent in the team, count enrollments and award TL/MM.
+      // RULE (verified vs spec): TL and MM are PEERS at the same level.
+      // Both get $1/each on Field Agents below them — neither overrides
+      // on the other, and neither overrides on the Campaign Manager.
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        var a = t.agents[aidStr];
+        var enrollments = a.nlad + a.tribal;
+        if(!enrollments) return;
+        var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
+        // TL: skip enrollments by TL themselves, MM, or CM
+        if(tlId && aidI !== tlId && aidI !== mmId && aidI !== cmId){
+          bump(tlId, enrollments * GM_RATES.standardOverride.teamLeader,
+               'TL override on '+aName,
+               enrollments, GM_RATES.standardOverride.teamLeader);
+        }
+        // MM: skip enrollments by MM themselves, TL, or CM
+        if(mmId && aidI !== mmId && aidI !== tlId && aidI !== cmId){
+          bump(mmId, enrollments * GM_RATES.standardOverride.marketManager,
+               'MM override on '+aName,
+               enrollments, GM_RATES.standardOverride.marketManager);
+        }
+      });
+    }
+
+    // Layer 3: Campaign Manager override (only for cm-difference and cm-oklahoma)
+    if((cmModel === 'cm-difference' || cmModel === 'cm-oklahoma') && cm){
+      cmId = cm.id;
+      // CRITICAL: TL/MM only earn override on agents who are NOT the TL/MM
+      // themselves (Layer 2 enforces this). So the CM's leftover calculation
+      // must compute per-agent whether tl/mm actually got paid for THAT agent's
+      // deals. If MM does their own deals, MM didn't get $1, so the CM's
+      // leftover should be larger ($13 - $9 - 0 - 0 = $4 per deal, not $2).
+      var teamTL = team ? team.leader : null;
+      var teamMM = team ? team.marketManager : null;
+      var hasTL = !!teamTL;
+      var hasMM = !!teamMM && teamMM !== teamTL;  // dedup if same person
+
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        var a = t.agents[aidStr];
+
+        // Per-agent: did TL/MM actually earn override on THIS agent's deals?
+        // TL overrides on people BELOW them: not TL themselves, not MM (above), not CM (above)
+        // MM overrides on people BELOW them: not MM themselves, not CM (above)
+        var tlPaidForThisAgent = (hasTL && aidI !== teamTL && aidI !== teamMM && aidI !== cmId) ? GM_RATES.standardOverride.teamLeader : 0;
+        var mmPaidForThisAgent = (hasMM && aidI !== teamMM && aidI !== cmId) ? GM_RATES.standardOverride.marketManager : 0;
+
+        if(aidI === cmId){
+          // CM's PERSONAL enrollments — pay at full personal rates
+          if(cmModel === 'cm-difference'){
+            var personalNLAD   = a.nlad   * GM_RATES.cmDifferenceManager.nladPersonal.flat;
+            var personalTribal = a.tribal * GM_RATES.cmDifferenceManager.tribalPersonal.flat;
+            // Note: the standard agent payment loop above ALREADY paid this CM
+            // at agent rates (sliding $9/$11 NLAD, flat $24 Tribal). We need
+            // to ADD the difference between personal-rate and agent-rate so
+            // total = personal-rate amount.
+            var alreadyNLAD   = gmSlidingTotal(a.nlad, GM_RATES.cmDifferenceAgent.nlad);
+            var alreadyTribal = a.tribal * GM_RATES.cmDifferenceAgent.tribalFlat;
+            var nladTopUp   = personalNLAD   - alreadyNLAD;
+            var tribalTopUp = personalTribal - alreadyTribal;
+            if(a.nlad)   bump(cmId, nladTopUp,   'Personal NLAD top-up to $'+GM_RATES.cmDifferenceManager.nladPersonal.flat,   a.nlad,   nladTopUp/Math.max(1,a.nlad));
+            if(a.tribal) bump(cmId, tribalTopUp, 'Personal Tribal top-up to $'+GM_RATES.cmDifferenceManager.tribalPersonal.flat,a.tribal, tribalTopUp/Math.max(1,a.tribal));
+          } else {
+            // cm-oklahoma personal
+            var personalNLAD   = a.nlad   * GM_RATES.cmOklahomaManager.nladPersonal.flat;
+            var personalTribal = a.tribal * GM_RATES.cmOklahomaManager.tribalPersonal.flat;
+            var alreadyNLAD   = gmSlidingTotal(a.nlad,   GM_RATES.standardAgent.nlad);
+            var alreadyTribal = gmSlidingTotal(a.tribal, GM_RATES.standardAgent.tribal);
+            var nladTopUp   = personalNLAD   - alreadyNLAD;
+            var tribalTopUp = personalTribal - alreadyTribal;
+            if(a.nlad)   bump(cmId, nladTopUp,   'Personal NLAD top-up to $'+GM_RATES.cmOklahomaManager.nladPersonal.flat,   a.nlad,   nladTopUp/Math.max(1,a.nlad));
+            if(a.tribal) bump(cmId, tribalTopUp, 'Personal Tribal top-up to $'+GM_RATES.cmOklahomaManager.tribalPersonal.flat,a.tribal, tribalTopUp/Math.max(1,a.tribal));
+          }
+        } else {
+          // Other agent's enrollments — calculate CM's override
+          var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
+          if(cmModel === 'cm-difference'){
+            // NLAD: max(0, $13 − agent_paid − tl_paid − mm_paid) per enrollment
+            // Agent-paid rate depends on whether agent is in tier 1 or tier 2 personal count
+            var agentNLADRate = (a.nlad <= GM_RATES.cmDifferenceAgent.nlad.tier1Cap)
+              ? GM_RATES.cmDifferenceAgent.nlad.tier1
+              : GM_RATES.cmDifferenceAgent.nlad.tier2;
+            var nladLeftover = Math.max(0, GM_RATES.cmDifferenceManager.nladTarget - agentNLADRate - tlPaidForThisAgent - mmPaidForThisAgent);
+            var nladOverride = a.nlad * nladLeftover;
+            // Tribal: max(0, $34 − $24 agent − tl − mm) per enrollment
+            var tribalLeftover = Math.max(0, GM_RATES.cmDifferenceManager.tribalTarget - GM_RATES.cmDifferenceAgent.tribalFlat - tlPaidForThisAgent - mmPaidForThisAgent);
+            var tribalOverride = a.tribal * tribalLeftover;
+            if(a.nlad && nladLeftover>0)   bump(cmId, nladOverride,   'CM diff on '+aName+' NLAD ($'+nladLeftover+'/each)',   a.nlad,   nladLeftover);
+            if(a.tribal && tribalLeftover>0) bump(cmId, tribalOverride, 'CM diff on '+aName+' Tribal ($'+tribalLeftover+'/each)', a.tribal, tribalLeftover);
+          } else {
+            // cm-oklahoma: NLAD flat +$1/each, Tribal $34 difference
+            var nladOverride = a.nlad * GM_RATES.cmOklahomaManager.nladPerEnrollment;
+            // Tribal: agent rate depends on agent's personal Tribal count tier
+            var agentTribalRate = (a.tribal <= GM_RATES.standardAgent.tribal.tier1Cap)
+              ? GM_RATES.standardAgent.tribal.tier1
+              : GM_RATES.standardAgent.tribal.tier2;
+            var tribalLeftover = Math.max(0, GM_RATES.cmOklahomaManager.tribalTarget - agentTribalRate - tlPaidForThisAgent - mmPaidForThisAgent);
+            var tribalOverride = a.tribal * tribalLeftover;
+            if(a.nlad)   bump(cmId, nladOverride,   'CM flat $1 on '+aName+' NLAD',                           a.nlad,   GM_RATES.cmOklahomaManager.nladPerEnrollment);
+            if(a.tribal && tribalLeftover>0) bump(cmId, tribalOverride, 'CM diff on '+aName+' Tribal ($'+tribalLeftover+'/each)', a.tribal, tribalLeftover);
+          }
+        }
+      });
+    }
+  });
+
+  return { perAgent: byAgent, byTeam: byTeam, model:'gen-mobile-v2', warnings: warnings };
+}
+
+function gmFormatBreakdown(perAgent){
+  var out = [];
+  Object.keys(perAgent).forEach(function(aid){
+    var entry = perAgent[aid];
+    var agent = DB.agents.find(function(x){return x.id===parseInt(aid);});
+    out.push({
+      agentId: parseInt(aid),
+      agentName: agent ? agent.name : 'Agent #'+aid,
+      total: entry.amount,
+      rows: entry.rows,
+      breakdown: entry.breakdown
+    });
+  });
+  out.sort(function(a,b){ return b.total - a.total; });
+  return out;
 }
 
 // ── Services nested inside a campaign (for Chuzo and any future
@@ -7395,7 +8000,10 @@ async function seedDefaultAgents(){
     var t = LIFELINE_TEAMS[j];
     await supaClient.from('lifeline_teams').upsert({
       id:t.id, name:t.name, city:t.city, state:t.state,
-      color:t.color||'#003594', active:true, leader:t.leader||null
+      color:t.color||'#003594', active:true,
+      leader:t.leader||null,
+      market_manager:t.marketManager||null,
+      campaign_manager:t.campaignManager||null
     }, {onConflict:'id'});
     for(var k=0; k<t.members.length; k++){
       await supaClient.from('team_members').upsert({
@@ -7422,7 +8030,6 @@ async function loadFromSupabase(){
           teamLeaderId: a.team_leader_id||null,
           marketManagerId: a.market_manager_id||null,
           campaignManagerId: a.campaign_manager_id||null,
-          campaignManagerId: a.campaign_manager_id||null,
           active: a.active, sales: a.sales||0,
           monthlySales: safeJSON(a.monthly_sales, []),
           channels: safeJSON(a.channels, []),
@@ -7439,7 +8046,9 @@ async function loadFromSupabase(){
           category:      a.category      || null,
           depts:         safeJSON(a.depts, {}),
           officeManager: a.office_manager === true,
-          iboMarkets:    safeJSON(a.ibo_markets, [])
+          iboMarkets:    safeJSON(a.ibo_markets, []),
+          // Gen Mobile pay model — defaults to 'none' if column doesn't exist
+          cmModel:       a.cm_model || 'none'
         };
       });
       // Auto-derive .category/.depts for every legacy record we just loaded.
@@ -7457,7 +8066,15 @@ async function loadFromSupabase(){
         var members = members_data ? members_data.map(function(m){return m.agent_id;}) : [];
         LIFELINE_TEAMS.push({
           id: t.id, name: t.name, city: t.city, state: t.state,
-          color: t.color||'#003594', active: t.active, leader: t.leader||null,
+          color: t.color||'#003594', active: t.active,
+          leader: t.leader||null,
+          // CRITICAL: load marketManager and campaignManager too.
+          // The Gen Mobile commission engine reads campaignManager →
+          // looks up that agent's cmModel → applies the correct pay model.
+          // Without these fields, every market silently defaults to
+          // Standard model and no CM/IBO overrides ever fire.
+          marketManager:   t.market_manager||null,
+          campaignManager: t.campaign_manager||null,
           members: members
         });
       }
@@ -7531,6 +8148,56 @@ async function loadFromSupabase(){
         if(s.key==='ex_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_INVENTORY        = v;}catch(e){} }
         if(s.key==='ex_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_ACTIVATIONS      = v;}catch(e){} }
         if(s.key==='ex_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_TRANSFERS        = v;}catch(e){} }
+        // ── Markets richer fields (marketManager, campaignManager, payModel) ──
+        // The lifeline_teams TABLE only has limited columns (id, name, color, leader, etc).
+        // The app_settings backup carries the full team object including marketManager
+        // and campaignManager — needed for the comp engine to pick the right pay model.
+        // Merge saved fields onto the in-memory teams loaded from the table.
+        if(s.key==='lifeline_teams' && s.value){
+          try{
+            var savedTeams = JSON.parse(s.value);
+            if(Array.isArray(savedTeams)){
+              savedTeams.forEach(function(saved){
+                if(!saved || !saved.id) return;
+                var existing = LIFELINE_TEAMS.find(function(x){return x.id===saved.id;});
+                if(existing){
+                  // Merge fields that are user-edited via Markets editor.
+                  // (These don't live in the lifeline_teams table — they live in app_settings.)
+                  if(saved.leader !== undefined)          existing.leader          = saved.leader;
+                  if(saved.marketManager !== undefined)   existing.marketManager   = saved.marketManager;
+                  if(saved.campaignManager !== undefined) existing.campaignManager = saved.campaignManager;
+                  if(saved.color !== undefined)           existing.color           = saved.color;
+                  if(saved.name !== undefined)            existing.name            = saved.name;
+                  if(saved.city !== undefined)            existing.city            = saved.city;
+                  if(saved.state !== undefined)           existing.state           = saved.state;
+                  // Strip any legacy fields that sneak in from old saves
+                  delete existing.payModel;
+                  delete existing.iboAgentId;
+                  delete existing.tieredManagerId;
+                } else {
+                  // New team that exists only in app_settings — push it
+                  if(!saved.members) saved.members = [];
+                  if(saved.active === undefined) saved.active = true;
+                  // Strip legacy fields on push
+                  delete saved.payModel;
+                  delete saved.iboAgentId;
+                  delete saved.tieredManagerId;
+                  LIFELINE_TEAMS.push(saved);
+                }
+              });
+            }
+          }catch(e){ console.warn('[load] lifeline_teams:',e); }
+        }
+        // ── Onboarding system stores ──
+        if(s.key==='onboard_templates' && s.value){
+          try{ var v=JSON.parse(s.value); if(v && typeof v==='object') ONBOARD_TEMPLATES = v; }catch(e){ console.warn('[load] onboard_templates:',e); }
+        }
+        if(s.key==='onboard_packages' && s.value){
+          try{ var v=JSON.parse(s.value); if(Array.isArray(v)) ONBOARD_PACKAGES = v; }catch(e){ console.warn('[load] onboard_packages:',e); }
+        }
+        if(s.key==='onboard_assignments' && s.value){
+          try{ var v=JSON.parse(s.value); if(Array.isArray(v)) ONBOARD_ASSIGNMENTS = v; }catch(e){ console.warn('[load] onboard_assignments:',e); }
+        }
       });
       loadProgGoalsFromSupabase(settings);
     }
@@ -7618,20 +8285,24 @@ async function saveAgentToSupabase(agent){
     category:       agent.category || null,
     depts:          JSON.stringify(agent.depts || {}),
     office_manager: agent.officeManager === true,
-    ibo_markets:    JSON.stringify(agent.iboMarkets || [])
+    ibo_markets:    JSON.stringify(agent.iboMarkets || []),
+    // Gen Mobile pay model (cmModel). Stored as a string column. Falls
+    // back to legacy save if the column doesn't exist in the schema.
+    cm_model:       agent.cmModel || null
   };
   // Try the full write first.
-  var res = await sbUpsert('agents', full);
-  // sbUpsert typically throws on error; this extra check is a belt-and-
-  // suspenders in case it returns an error object. If it failed because
-  // of unknown columns, retry without them so the agent still saves.
-  if(res && res.error){
-    console.warn('[saveAgentToSupabase] Full save rejected, retrying without category/depts:', res.error.message || res.error);
+  var ok = await sbUpsert('agents', full);
+  // sbUpsert returns false on any error (including unknown columns from a
+  // not-yet-migrated Supabase schema). Retry without the new columns so the
+  // agent still saves and we don't lose data on schema lag.
+  if(!ok){
+    console.warn('[saveAgentToSupabase] Full save failed (likely unknown columns). Retrying with legacy fields only — cmModel/category/depts/etc will not persist until the schema is migrated.');
     var legacy = Object.assign({}, full);
     delete legacy.category;
     delete legacy.depts;
     delete legacy.office_manager;
     delete legacy.ibo_markets;
+    delete legacy.cm_model;
     await sbUpsert('agents', legacy);
   }
 }
@@ -7640,11 +8311,6 @@ async function deleteAgentFromSupabase(agentId){
   if(!supaClient) return;
   await sbDelete('agents', {id: agentId});
   await sbDelete('team_members', {agent_id: agentId});
-}
-
-async function saveSettingToSupabase(key, value){
-  if(!supaClient) return;
-  await supaClient.from('app_settings').upsert({key:key, value:value}, {onConflict:'key'});
 }
 
 // ══════════════════════════════════════════
@@ -8960,6 +9626,21 @@ function saveAgentForm(){
     var callHostRowEl  = document.getElementById('aaCanHostCallRow');
     if(callHostSaveEl && callHostRowEl && callHostRowEl.style.display!=='none'){
       a.canHostCall = callHostSaveEl.checked;
+    }
+    // cmModel — Gen Mobile override style for Campaign Manager / IBO roles.
+    // If the row is visible, save the selected value. If the row is hidden
+    // (role is not CM/IBO), clear any stale cmModel value to prevent a
+    // demoted CM from triggering their old override style on future markets.
+    var cmModelEl = document.getElementById('aaCMModel');
+    var cmModelRowEl = document.getElementById('aaCMModelRow');
+    if(cmModelEl && cmModelRowEl){
+      if(cmModelRowEl.style.display !== 'none'){
+        a.cmModel = cmModelEl.value || 'none';
+      } else if(isOwner(DB.current) && a.cmModel && a.cmModel !== 'none'){
+        // Owner is editing a non-CM/IBO agent who has a stale cmModel — clear it
+        console.log('[saveAgentForm] Clearing stale cmModel="'+a.cmModel+'" because role is no longer CM/IBO');
+        a.cmModel = 'none';
+      }
     }
     // Department access — OWNER ONLY can grant. Anyone else editing a
     // profile (HR, Onboarding) cannot touch deptAccess flags. This closes
@@ -11015,6 +11696,20 @@ function panelLLTeams() {
               <div>
                 <div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--brown);letter-spacing:1px">${team.name}</div>
                 <div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">${team.city}, ${team.state}</div>
+                ${(function(){
+                  var cm = team.campaignManager ? DB.agents.find(function(a){return a.id===team.campaignManager;}) : null;
+                  if(!cm) return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(107,114,128,.1);color:#6b7280;font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1px;text-transform:uppercase">Standard Pay Model</div>';
+                  var model = cm.cmModel || 'none';
+                  if(model === 'ibo-consolidated')
+                    return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(217,119,6,.15);color:#D97706;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">⭐ IBO Consolidated → '+cm.name+'</div>';
+                  if(model === 'ibo-tiered')
+                    return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(8,145,178,.15);color:#0891b2;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">📈 IBO Tiered → '+cm.name+'</div>';
+                  if(model === 'cm-difference')
+                    return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(124,58,237,.15);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">💵 Difference Override → '+cm.name+'</div>';
+                  if(model === 'cm-oklahoma')
+                    return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(5,150,105,.15);color:#059669;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">🌾 Oklahoma Hybrid → '+cm.name+'</div>';
+                  return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(107,114,128,.1);color:#6b7280;font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1px;text-transform:uppercase">CM: '+cm.name+' (no override)</div>';
+                })()}
               </div>
             </div>
             <div style="display:flex;gap:6px">
@@ -11072,6 +11767,9 @@ function setTeamLeader(teamId, agentId) {
   const team = LIFELINE_TEAMS.find(t => t.id === teamId);
   if (team) {
     team.leader = agentId ? parseInt(agentId) : null;
+    if(typeof saveTeams==='function') saveTeams();
+    if(typeof saveToStorage==='function') saveToStorage();
+    if(typeof syncAllToSupabase==='function') try{ syncAllToSupabase(); }catch(e){}
     gotoPanel('ll-teams');
   }
 }
@@ -11080,6 +11778,9 @@ function setTeamMarketManager(teamId, agentId) {
   const team = LIFELINE_TEAMS.find(t => t.id === teamId);
   if (team) {
     team.marketManager = agentId ? parseInt(agentId) : null;
+    if(typeof saveTeams==='function') saveTeams();
+    if(typeof saveToStorage==='function') saveToStorage();
+    if(typeof syncAllToSupabase==='function') try{ syncAllToSupabase(); }catch(e){}
     gotoPanel('ll-teams');
   }
 }
@@ -11088,6 +11789,9 @@ function setTeamCampaignManager(teamId, agentId) {
   const team = LIFELINE_TEAMS.find(t => t.id === teamId);
   if (team) {
     team.campaignManager = agentId ? parseInt(agentId) : null;
+    if(typeof saveTeams==='function') saveTeams();
+    if(typeof saveToStorage==='function') saveToStorage();
+    if(typeof syncAllToSupabase==='function') try{ syncAllToSupabase(); }catch(e){}
     gotoPanel('ll-teams');
   }
 }
@@ -11165,7 +11869,65 @@ function openEditTeam(teamId) {
   document.getElementById('etCity').value  = team.city;
   document.getElementById('etState').value = team.state;
   document.getElementById('etColor').value = team.color;
+
+  // Helpers to populate dropdowns
+  function fillSelect(sel, filterFn, currentId, prefix){
+    sel.innerHTML = '<option value="">— None —</option>';
+    DB.agents.filter(filterFn)
+      .sort(function(a,b){return (a.name||'').localeCompare(b.name||'');})
+      .forEach(function(a){
+        var opt = document.createElement('option');
+        opt.value = a.id;
+        opt.textContent = (prefix||'') + a.name + ' · ' + (a.role||'');
+        if(currentId === a.id) opt.selected = true;
+        sel.appendChild(opt);
+      });
+  }
+
+  // Team Leader dropdown — anyone active with sales role
+  fillSelect(document.getElementById('etTeamLeader'),
+    function(a){return a.active && (isSalesRole(a) || a.role==='Team Leader');},
+    team.leader);
+
+  // Market Manager dropdown — anyone active in management role
+  fillSelect(document.getElementById('etMarketManager'),
+    function(a){return a.active && (isMgrRole(a) || a.role==='Market Manager' || a.role==='Campaign Manager');},
+    team.marketManager);
+
+  // Campaign Manager / IBO dropdown — show their cmModel as a badge
+  fillSelect(document.getElementById('etCampaignManager'),
+    function(a){return a.active && (a.role==='Campaign Manager' || a.role==='IBO' || a.cmModel);},
+    team.campaignManager);
+
+  etRefreshCMBadge();
   openModal('editTeamModal');
+}
+
+// Show a badge describing the selected CM's override style.
+function etRefreshCMBadge(){
+  var sel = document.getElementById('etCampaignManager');
+  var badge = document.getElementById('etCMBadge');
+  if(!sel || !badge) return;
+  var id = parseInt(sel.value || '0');
+  if(!id){ badge.innerHTML = '<span style="color:var(--muted);font-style:italic">No Campaign Manager assigned. Standard pay model applies.</span>'; return; }
+  var agent = DB.agents.find(function(a){return a.id===id;});
+  if(!agent){ badge.innerHTML = ''; return; }
+  var model = agent.cmModel || 'none';
+  var color = '#6b7280', icon = '⚪', label = 'No Override', desc = 'This person is the Campaign Manager but has no override style set on their profile. They get personal pay only.';
+  if(model === 'ibo-consolidated'){
+    color = '#D97706'; icon = '⭐'; label = 'IBO Consolidated';
+    desc = 'ALL activations in this market route 100% to '+agent.name+' at $13 NLAD flat / $29-$34 sliding Tribal + bonuses. Other agents get $0 from company.';
+  } else if(model === 'ibo-tiered'){
+    color = '#0891b2'; icon = '📈'; label = 'IBO Tiered';
+    desc = 'Agents in this market earn flat $8 NLAD / $20 Tribal. '+agent.name+' keeps the difference at $13 NLAD / $29-$34 market-tier Tribal + own bonuses.';
+  } else if(model === 'cm-difference'){
+    color = '#7c3aed'; icon = '💵'; label = 'CM Difference Override';
+    desc = agent.name+' keeps max(0, $13 − everyone else paid) NLAD and max(0, $34 − everyone else) Tribal per enrollment. Agents earn standard sliding NLAD + flat $24 Tribal.';
+  } else if(model === 'cm-oklahoma'){
+    color = '#059669'; icon = '🌾'; label = 'CM Oklahoma Hybrid';
+    desc = agent.name+' gets +$1 NLAD flat per enrollment. On Tribal, gets max(0, $34 − everyone else paid). Agents earn standard sliding rates.';
+  }
+  badge.innerHTML = '<div style="padding:8px 10px;background:'+color+'15;border-left:3px solid '+color+';border-radius:4px"><strong style="color:'+color+';font-size:.78rem">'+icon+' '+label+'</strong><div style="font-size:.66rem;color:var(--muted);margin-top:2px;line-height:1.4">'+desc+'</div></div>';
 }
 
 function saveEditTeam() {
@@ -11176,6 +11938,20 @@ function saveEditTeam() {
   team.city  = document.getElementById('etCity').value.trim()  || team.city;
   team.state = document.getElementById('etState').value.trim().toUpperCase() || team.state;
   team.color = document.getElementById('etColor').value;
+
+  team.leader          = parseInt((document.getElementById('etTeamLeader')||{value:''}).value) || null;
+  team.marketManager   = parseInt((document.getElementById('etMarketManager')||{value:''}).value) || null;
+  team.campaignManager = parseInt((document.getElementById('etCampaignManager')||{value:''}).value) || null;
+
+  // Clean up legacy fields no longer used (per-market payModel design replaced)
+  delete team.payModel;
+  delete team.iboAgentId;
+  delete team.tieredManagerId;
+
+  // Persist
+  if(typeof saveTeams === 'function'){ try{ saveTeams(); }catch(e){} }
+  if(typeof saveToStorage === 'function'){ try{ saveToStorage(); }catch(e){} }
+
   closeModal('editTeamModal');
   buildNav(DB.current);
   gotoPanel('ll-teams');
@@ -22349,7 +23125,7 @@ function syncAllToSupabase(){
       for(var i=0;i<DB.agents.length;i++) await saveAgentToSupabase(DB.agents[i]);
       for(var j=0;j<LIFELINE_TEAMS.length;j++){
         var t=LIFELINE_TEAMS[j];
-        await supaClient.from('lifeline_teams').upsert({id:t.id,name:t.name,city:t.city,state:t.state,color:t.color||'#003594',active:t.active!==false,leader:t.leader||null},{onConflict:'id'}).catch(function(){});
+        await supaClient.from('lifeline_teams').upsert({id:t.id,name:t.name,city:t.city,state:t.state,color:t.color||'#003594',active:t.active!==false,leader:t.leader||null,market_manager:t.marketManager||null,campaign_manager:t.campaignManager||null},{onConflict:'id'}).catch(function(){});
         if(t.members&&t.members.length){
           await supaClient.from('team_members').delete().eq('team_id',t.id).catch(function(){});
           await supaClient.from('team_members').insert(t.members.map(function(mid){return{team_id:t.id,agent_id:mid};})).catch(function(){});
@@ -22781,6 +23557,43 @@ function renderAgentProgramCheckboxes(selectedPrograms){
   });
 }
 
+// Show/hide the CM Override Style row based on currently-selected role.
+// Called whenever the role changes within the modal so the picker
+// appears immediately (not just when re-opening the modal).
+function aaToggleCMModelVisibility(){
+  var cmRow = document.getElementById('aaCMModelRow');
+  if(!cmRow) return;
+  var viewer = DB.current;
+  if(!isOwner(viewer)){ cmRow.style.display = 'none'; return; }
+  var roleEl = document.getElementById('aaRole');
+  var role = roleEl ? roleEl.value : '';
+  var isCMOrIBO = (role === 'Campaign Manager' || role === 'IBO');
+  cmRow.style.display = isCMOrIBO ? 'block' : 'none';
+}
+
+// Update the help-text/preview when CM Override Style dropdown changes.
+function aaCMModelChanged(){
+  var sel = document.getElementById('aaCMModel');
+  var help = document.getElementById('aaCMModelHelp');
+  if(!sel || !help) return;
+  var v = sel.value || 'none';
+  var color = '#6b7280', icon = '⚪', desc = 'Personal pay only. No override on other agents\' deals.';
+  if(v === 'ibo-consolidated'){
+    color = '#D97706'; icon = '⭐';
+    desc = '<strong>IBO Consolidated:</strong> ALL activations from any market that lists me as Campaign Manager route 100% to me. I get $13 NLAD flat, $29-$34 sliding Tribal, +$1 email, +$5 BYOD. Other agents in those markets receive $0 from the company.';
+  } else if(v === 'ibo-tiered'){
+    color = '#0891b2'; icon = '📈';
+    desc = '<strong>IBO Tiered:</strong> Agents in my markets earn flat $8 NLAD / $20 Tribal. They keep their own bonuses. I get personal $13 NLAD / $29-$34 (sliding on market total) Tribal + my own bonuses, PLUS the difference on every agent enrollment.';
+  } else if(v === 'cm-difference'){
+    color = '#7c3aed'; icon = '💵';
+    desc = '<strong>CM Difference Override:</strong> Agents in my markets earn standard sliding NLAD ($9/$11) and FLAT $24 Tribal. TL/MM get $1/each. I get max(0, $13 − everyone else paid) NLAD and max(0, $34 − everyone else paid) Tribal per enrollment. Personal deals: full $13/$34.';
+  } else if(v === 'cm-oklahoma'){
+    color = '#059669'; icon = '🌾';
+    desc = '<strong>CM Oklahoma Hybrid:</strong> Agents earn standard sliding rates both ways. TL/MM get $1/each. I get a flat +$1 per NLAD enrollment, plus max(0, $34 − everyone else paid) per Tribal. Personal deals: full $13/$34. Used for the Oklahoma markets.';
+  }
+  help.innerHTML = '<div style="padding:8px 10px;background:'+color+'15;border-left:3px solid '+color+';border-radius:4px;color:var(--brown)"><strong style="color:'+color+'">'+icon+'</strong> '+desc+'</div>';
+}
+
 function toggleLLFields(){
   var llChecked  = document.getElementById('aaProgLifeline')  && document.getElementById('aaProgLifeline').checked;
   var intChecked = document.getElementById('aaProgInternet')  && document.getElementById('aaProgInternet').checked;
@@ -22834,6 +23647,15 @@ function toggleLLFields(){
   // canHostCall row
   var callRow = document.getElementById('aaCanHostCallRow');
   if(callRow) callRow.style.display = isAdmin ? 'block' : 'none';
+
+  // cmModel row — Gen Mobile override style. Show only when:
+  //   1. Viewer is Owner (only Owner can change override style — sensitive comp setting)
+  //   2. Agent's role is Campaign Manager or IBO
+  // Pre-fill the saved value, then call helper to set visibility consistently.
+  var cmSel = document.getElementById('aaCMModel');
+  if(cmSel) cmSel.value = a.cmModel || 'none';
+  if(typeof aaToggleCMModelVisibility === 'function') aaToggleCMModelVisibility();
+  if(typeof aaCMModelChanged === 'function') aaCMModelChanged();
 
   // Department access section — OWNER ONLY. Previously this was "anyone
   // who can edit profiles" but that leaked permission-granting power to
@@ -24776,7 +25598,7 @@ setTimeout(initSocialBars, 100);
 
 <!-- EDIT TEAM MODAL -->
 <div class="modal-bg" id="editTeamModal">
-  <div class="modal" style="max-width:440px">
+  <div class="modal" style="max-width:520px;max-height:90vh;overflow-y:auto">
     <button class="modal-x" onclick="closeModal('editTeamModal')">✕</button>
     <div class="modal-title">Edit Market</div>
     <div class="modal-sub">Market / Lifeline Team</div>
@@ -24793,7 +25615,28 @@ setTimeout(initSocialBars, 100);
       <label class="f-label">Team Color</label>
       <input type="color" id="etColor" style="width:48px;height:38px;border:1px solid var(--sand);border-radius:6px;padding:2px">
     </div>
-    <button class="btn-fire" onclick="saveEditTeam()" style="width:100%;justify-content:center;margin-top:8px">Save Changes →</button>
+
+    <!-- TEAM LEADER -->
+    <div class="f-field">
+      <label class="f-label">👥 Team Leader (gets $1/each override)</label>
+      <select id="etTeamLeader" class="f-input"><option value="">— None —</option></select>
+    </div>
+
+    <!-- MARKET MANAGER -->
+    <div class="f-field">
+      <label class="f-label">📍 Market Manager (gets $1/each override)</label>
+      <select id="etMarketManager" class="f-input"><option value="">— None —</option></select>
+    </div>
+
+    <!-- CAMPAIGN MANAGER / IBO -->
+    <div class="f-field" style="background:rgba(124,58,237,.04);border:1px solid rgba(124,58,237,.2);border-radius:8px;padding:14px;margin-top:12px">
+      <label class="f-label" style="color:#7c3aed">🌟 Campaign Manager / IBO</label>
+      <div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-bottom:8px;line-height:1.5">The pay model travels with the person — assigning a Campaign Manager / IBO here makes their override style apply to this market automatically. Configure their override style on their agent profile.</div>
+      <select id="etCampaignManager" class="f-input" onchange="etRefreshCMBadge()"><option value="">— None —</option></select>
+      <div id="etCMBadge" style="margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;line-height:1.5"></div>
+    </div>
+
+    <button class="btn-fire" onclick="saveEditTeam()" style="width:100%;justify-content:center;margin-top:14px">Save Changes →</button>
   </div>
 </div>
 
