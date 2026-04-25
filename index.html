@@ -1721,6 +1721,17 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
         <div id="aaAWModelHelp" style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;line-height:1.5"></div>
       </div>
 
+      <!-- REPORTING CHAIN (Onboarding Dept + Owner only) -->
+      <div class="f-field" id="aaReportingChainRow" style="display:none;margin-bottom:14px;background:rgba(20,83,45,.04);border:1.5px solid rgba(20,83,45,.2);border-radius:8px;padding:14px">
+        <label class="f-label" style="color:#15803d">🌳 Reporting Chain (per campaign)</label>
+        <div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-bottom:10px;line-height:1.5">
+          For each campaign this agent is active on, pick who they report to. This drives inventory visibility, payroll rollups, and dashboard scope. "Top of org" means nobody is above them in this campaign — they sit at the top of their own branch.
+          <br><br>
+          <strong>Multi-parent allowed:</strong> the same person can report to different managers per campaign (e.g., Maria for Gen Mobile, John for TruConnect).
+        </div>
+        <div id="aaReportingChainContainer" style="display:flex;flex-direction:column;gap:10px"></div>
+      </div>
+
       <!-- INTERNET CAMPAIGNS — Chuzo & Astound with agent codes -->
       <div id="aaInternetRow" style="display:none;margin-bottom:14px">
         <div class="f-field">
@@ -2732,6 +2743,7 @@ function aaSetCategory(cat){
     if(typeof toggleLLFields === 'function') toggleLLFields();
     // Show/hide the CM Override Style row when category changes
     if(typeof aaToggleCMModelVisibility === 'function') aaToggleCMModelVisibility();
+    if(typeof aaToggleReportingChainVisibility === 'function') aaToggleReportingChainVisibility();
   }
 }
 
@@ -2757,7 +2769,8 @@ function aaApplySensitiveLock(locked){
     'aaCanHostCallRow',// can-host-call toggle
     'aaCMModelRow',    // GM override style — pay-affecting, Owner only
     'aaTCModelRow',    // TC override style — pay-affecting, Owner only
-    'aaAWModelRow'     // AW override style — pay-affecting, Owner only
+    'aaAWModelRow',    // AW override style — pay-affecting, Owner only
+    'aaReportingChainRow' // reporting chain — visibility-affecting, Owner+Onboarding
   ];
   blocks.forEach(function(id){
     var el = document.getElementById(id);
@@ -2808,6 +2821,8 @@ function aaSetSubRole(cat, value){
   if(typeof toggleLLFields === 'function') toggleLLFields();
   // Show/hide cmModel row based on role
   if(typeof aaToggleCMModelVisibility === 'function') aaToggleCMModelVisibility();
+  // Refresh reporting-chain dropdowns since role-above options change
+  if(typeof aaToggleReportingChainVisibility === 'function') aaToggleReportingChainVisibility();
 }
 
 // Radio-deselect support. Native radios can't be unchecked by clicking
@@ -8194,89 +8209,476 @@ function mmMarkets(user){
   return [];
 }
 
-// IDs of agents who report to this user (direct + indirect)
+// IDs of agents who report to this user (direct + indirect).
+// Walks the reporting chain DOWNWARD through every layer.
+//
+// HIERARCHY:
+//   IBO/Campaign Manager (top)
+//     └ Market Manager (campaignManagerId points up to CM/IBO)
+//        └ Team Leader (marketManagerId points up to MM)
+//           └ Field Agent (teamLeaderId points up to TL, OR
+//                          marketManagerId points directly to MM if no TL)
+//
+// This function is the foundation of inventory visibility, payroll
+// rollups, and any other "everyone in my org" calculation. Treat it
+// as load-bearing — changes here ripple everywhere.
 function agentIdsUnder(user){
   if(!user) return [];
   var ids = [];
+  var seen = {}; seen[user.id] = true;  // prevent cycles
+
+  function addIfNew(id){
+    if(!seen[id]){ seen[id] = true; ids.push(id); }
+  }
+
   var role = user.role;
-  if(role==='Market Manager'){
-    DB.agents.forEach(function(a){
-      if(a.active && a.id!==user.id && a.marketManagerId===user.id) ids.push(a.id);
+
+  if(role === 'Campaign Manager' || role === 'IBO'){
+    // Layer 1: MMs whose campaignManagerId points to me
+    var mmsUnderMe = DB.agents.filter(function(a){
+      return a.active && a.role === 'Market Manager' && a.campaignManagerId === user.id;
     });
-    // Plus agents under TLs that report to this MM
-    var tlsUnderMe = DB.agents.filter(function(a){
-      return a.active && a.role==='Team Leader' && a.marketManagerId===user.id;
-    });
-    tlsUnderMe.forEach(function(tl){
+    mmsUnderMe.forEach(function(mm){ addIfNew(mm.id); });
+    // Layer 2: TLs under those MMs
+    mmsUnderMe.forEach(function(mm){
+      var tlsUnderMM = DB.agents.filter(function(a){
+        return a.active && a.role === 'Team Leader' && a.marketManagerId === mm.id;
+      });
+      tlsUnderMM.forEach(function(tl){
+        addIfNew(tl.id);
+        // Layer 3: agents under those TLs
+        DB.agents.forEach(function(a){
+          if(a.active && a.teamLeaderId === tl.id) addIfNew(a.id);
+        });
+      });
+      // Layer 2b: agents who report directly to MM with no TL
       DB.agents.forEach(function(a){
-        if(a.active && a.teamLeaderId===tl.id && ids.indexOf(a.id)<0) ids.push(a.id);
+        if(a.active && a.marketManagerId === mm.id && !a.teamLeaderId) addIfNew(a.id);
       });
     });
-  } else if(role==='Team Leader'){
+    // Direct reports to CM/IBO with no MM (rare but possible)
     DB.agents.forEach(function(a){
-      if(a.active && a.id!==user.id && a.teamLeaderId===user.id) ids.push(a.id);
+      if(a.active && a.campaignManagerId === user.id && a.role !== 'Market Manager'){
+        addIfNew(a.id);
+      }
     });
-  } else if(role==='Campaign Manager'){
-    // Direct reports first
+
+  } else if(role === 'Market Manager'){
+    // TLs whose marketManagerId points to me
+    var tlsUnderMM2 = DB.agents.filter(function(a){
+      return a.active && a.role === 'Team Leader' && a.marketManagerId === user.id;
+    });
+    tlsUnderMM2.forEach(function(tl){
+      addIfNew(tl.id);
+      DB.agents.forEach(function(a){
+        if(a.active && a.teamLeaderId === tl.id) addIfNew(a.id);
+      });
+    });
+    // Agents who report directly to MM with no TL
     DB.agents.forEach(function(a){
-      if(a.active && a.id!==user.id && a.campaignManagerId===user.id) ids.push(a.id);
+      if(a.active && a.marketManagerId === user.id && !a.teamLeaderId
+         && a.role !== 'Team Leader') addIfNew(a.id);
+    });
+
+  } else if(role === 'Team Leader'){
+    DB.agents.forEach(function(a){
+      if(a.active && a.teamLeaderId === user.id) addIfNew(a.id);
     });
   }
+
+  // Field Agents have no one below them — return empty
   return ids;
 }
 
-// Return every GM_INVENTORY device in this user's scope
-function gmScopedDevices(user){
+// "My org" = me + everyone below me. Used for inventory scoping where
+// the user can see their OWN devices plus anyone they manage.
+function agentIdsInMyOrg(user){
   if(!user) return [];
-  if(isOwner(user) || user.role==='admin' || isInventory(user)) return GM_INVENTORY.slice();
-
-  // Campaign Manager — sees EVERYTHING in their campaign, regardless of market or holder
-  if(user.role==='Campaign Manager'){
-    var myCampaign = cmCampaign(user);
-    // Gen Mobile is the only campaign in GM_INVENTORY
-    if(myCampaign === 'Gen Mobile' || myCampaign === '' || !myCampaign){
-      return GM_INVENTORY.slice();
-    }
-    // Other campaigns — filter by campaign field when those systems come online
-    return GM_INVENTORY.filter(function(d){ return (d.campaign||'Gen Mobile')===myCampaign; });
-  }
-
-  if(user.role==='Market Manager'){
-    var myMarkets = mmMarkets(user);
-    var underIds  = agentIdsUnder(user);
-    return GM_INVENTORY.filter(function(d){
-      var inMyMarket = myMarkets.length && myMarkets.indexOf(d.market)>=0;
-      var mine       = d.mmId===user.id || d.assignedTo===user.id || underIds.indexOf(d.assignedTo)>=0;
-      return inMyMarket || mine;
-    });
-  }
-
-  if(user.role==='Team Leader'){
-    var tlAgentIds = agentIdsUnder(user);
-    tlAgentIds.push(user.id);
-    return GM_INVENTORY.filter(function(d){
-      return tlAgentIds.indexOf(d.assignedTo)>=0;
-    });
-  }
-
-  // Field Agent / Sales Rep — only devices assigned directly to them
-  return GM_INVENTORY.filter(function(d){ return d.assignedTo===user.id; });
+  var ids = agentIdsUnder(user).slice();
+  ids.push(user.id);
+  return ids;
 }
 
-// Return every legacy INVENTORY_DEVICES device in this user's scope
+// Auto-derive a user's reporting chain from LIFELINE_TEAMS when their
+// explicit fields (teamLeaderId / marketManagerId / campaignManagerId)
+// are blank. This is the safety net so blank seed data doesn't break
+// visibility — if a user is in a team and the team has a leader, their
+// effective TL is that leader unless explicitly overridden.
+//
+// ROLE-AWARE: a user only auto-derives fields for managers ABOVE their
+// own role. An MM never auto-derives a teamLeaderId (TL is below MM).
+// A CM/IBO only auto-derives... nothing, since they sit at the top.
+//
+// IMPORTANT: returning auto-derived values with "no data" is fine, but
+// auto-derive must NEVER turn a Field Agent into someone reporting to
+// a TL when Calvin intentionally placed them as a direct MM report.
+// The default for Field Agents is: if teamLeaderId is undefined and
+// marketManagerId IS set explicitly, treat that as "intentional direct
+// MM report — don't auto-fill TL."
+//
+// Returns: { teamLeaderId, marketManagerId, campaignManagerId } — each
+// either the explicit value, or an auto-derived value, or null.
+function reportingChainFor(user){
+  if(!user) return { teamLeaderId:null, marketManagerId:null, campaignManagerId:null };
+  var role = user.role;
+  var out = {
+    teamLeaderId:      user.teamLeaderId      || null,
+    marketManagerId:   user.marketManagerId   || null,
+    campaignManagerId: user.campaignManagerId || null
+  };
+
+  // Normalize: a user is never their own manager
+  if(out.teamLeaderId      === user.id) out.teamLeaderId      = null;
+  if(out.marketManagerId   === user.id) out.marketManagerId   = null;
+  if(out.campaignManagerId === user.id) out.campaignManagerId = null;
+
+  // Role-based auto-derive eligibility:
+  //   CM/IBO    → no auto-derive (they sit at the top)
+  //   MM        → only campaignManagerId can be auto-derived
+  //   TL        → only marketManagerId + campaignManagerId
+  //   Field Agent → all three CAN be auto-derived, but with the "intentional
+  //                 direct MM report" rule: if marketManagerId is explicit
+  //                 and teamLeaderId is undefined (not present on user object
+  //                 at all), don't auto-derive TL.
+  if(role === 'Campaign Manager' || role === 'IBO') return out;
+
+  if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return out;
+  var team = LIFELINE_TEAMS.find(function(t){
+    if(!t || !t.active) return false;
+    return Array.isArray(t.members) && t.members.indexOf(user.id) >= 0;
+  });
+  if(!team) return out;
+
+  // Helper: only set if not already set (preserve explicit values)
+  function maybeSet(field, val){
+    if(out[field]) return;        // already explicit
+    if(val == null) return;        // no team data
+    if(val === user.id) return;    // can't be your own manager
+    out[field] = val;
+  }
+
+  if(role === 'Market Manager'){
+    // MM can only auto-derive a CM above them
+    maybeSet('campaignManagerId', team.campaignManager);
+    return out;
+  }
+
+  if(role === 'Team Leader'){
+    maybeSet('marketManagerId',   team.marketManager);
+    maybeSet('campaignManagerId', team.campaignManager);
+    return out;
+  }
+
+  // Field Agent (or other sales role)
+  // Special rule: if teamLeaderId is explicitly absent AND marketManagerId is
+  // explicitly set on the user, this is a direct MM report. Don't auto-fill
+  // teamLeaderId from the team — it would incorrectly link them to a TL.
+  var hasExplicitMM = (typeof user.marketManagerId === 'number' && user.marketManagerId > 0);
+  var teamLeaderUndefined = (user.teamLeaderId === undefined || user.teamLeaderId === null);
+  if(hasExplicitMM && teamLeaderUndefined){
+    // Intentional direct MM report — leave teamLeaderId null
+    maybeSet('campaignManagerId', team.campaignManager);
+    return out;
+  }
+  // Otherwise (no explicit MM either, or both fields missing), auto-fill all
+  maybeSet('teamLeaderId',      team.leader);
+  maybeSet('marketManagerId',   team.marketManager);
+  maybeSet('campaignManagerId', team.campaignManager);
+  return out;
+}
+
+// Effective IDs for org-chart traversal — uses reportingChainFor to fill
+// in blanks from team membership. This is what visibility logic should
+// use, not raw user.teamLeaderId fields.
+function effectiveOrgFor(user){
+  return reportingChainFor(user);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  PER-CAMPAIGN ORG-CHART WALKER
+//
+//  Each agent has a reportsTo map: { campaignName: parentAgentId | null }.
+//  `null` = top of org for that campaign (no one above them).
+//
+//  When a campaign isn't in the map, we fall back to:
+//    1. Legacy flat fields (teamLeaderId / marketManagerId / campaignManagerId)
+//    2. Team-membership auto-derivation via reportingChainFor
+//
+//  This three-layer resolution is the safety net so old data keeps working
+//  while new onboarding writes precise per-campaign mappings.
+// ════════════════════════════════════════════════════════════════════════
+
+// Resolve the effective parent for a user on a specific campaign.
+// Returns: parent agent ID, or null if user is top-of-org for that campaign,
+// or undefined if no resolution possible (shouldn't happen with valid data).
+function parentForCampaign(user, campaign){
+  if(!user) return null;
+
+  // Layer 0: hard rule — IBO is ALWAYS top-of-org regardless of any data.
+  // CM is top-of-org UNLESS explicitly placed under an IBO via reportsTo.
+  if(user.role === 'IBO') return null;
+
+  // Layer 1: explicit reportsTo map (set by Onboarding Dept)
+  if(user.reportsTo && Object.prototype.hasOwnProperty.call(user.reportsTo, campaign)){
+    var v = user.reportsTo[campaign];
+    // null is a valid value here — means "top of org"
+    if(v === null) return null;
+    if(typeof v === 'number' && v > 0 && v !== user.id){
+      // Validate: parent must exist and be a more-senior role (or IBO).
+      // For CM, only IBO is a valid parent. For MM, IBO/CM. For TL, IBO/CM/MM.
+      var parent = DB.agents.find(function(x){return x.id===v;});
+      if(parent && parent.active){
+        var validParents = {
+          'Campaign Manager': ['IBO'],
+          'Market Manager':   ['IBO','Campaign Manager'],
+          'Team Leader':      ['IBO','Campaign Manager','Market Manager'],
+          'Field Agent':      ['IBO','Campaign Manager','Market Manager','Team Leader'],
+          'Sales Rep':        ['IBO','Campaign Manager','Market Manager','Team Leader']
+        };
+        var allowed = validParents[user.role] || [];
+        if(allowed.indexOf(parent.role) >= 0) return v;
+        // Invalid parent role — fall through to legacy
+        console.warn('[parentForCampaign] Agent '+user.id+' role='+user.role+' has invalid reportsTo['+campaign+']='+v+' (parent role: '+parent.role+'). Falling back to legacy chain.');
+      }
+    }
+    // Anything else (undefined, 0, self-id, missing parent) — fall through
+  }
+
+  // Layer 2: legacy auto-derived chain (uses reportingChainFor under the hood)
+  var chain = reportingChainFor(user);
+  // Pick the first non-null parent in the chain ABOVE this user's role
+  var role = user.role;
+  if(role === 'Field Agent' || (role && !['Team Leader','Market Manager','Campaign Manager','IBO'].includes(role))){
+    return chain.teamLeaderId || chain.marketManagerId || chain.campaignManagerId || null;
+  }
+  if(role === 'Team Leader'){
+    return chain.marketManagerId || chain.campaignManagerId || null;
+  }
+  if(role === 'Market Manager'){
+    return chain.campaignManagerId || null;
+  }
+  // Campaign Manager: top-of-org unless legacy field set them under an IBO.
+  // (Legacy fields don't have an IBO slot, so default null.)
+  return null;
+}
+
+// Walk DOWNWARD from a user through per-campaign parent links.
+// Returns array of agent IDs in this user's org for the given campaign,
+// INCLUDING the user themselves at index 0.
+function agentIdsInMyOrgForCampaign(user, campaign){
+  if(!user) return [];
+  if(!campaign) return agentIdsInMyOrgEffective(user); // fallback to legacy global walker
+  var seen = {}; seen[user.id] = true;
+  var ids = [user.id];
+
+  // Walk: any agent whose parentForCampaign chain leads back to user is in their org
+  // BFS up to a sane depth limit to prevent runaway loops on bad data
+  var MAX_DEPTH = 8;
+  DB.agents.forEach(function(a){
+    if(!a.active || a.id === user.id) return;
+    var cursor = a;
+    var depth = 0;
+    while(cursor && depth < MAX_DEPTH){
+      var parentId = parentForCampaign(cursor, campaign);
+      if(parentId === null) break;       // hit top of cursor's org
+      if(parentId === user.id){
+        if(!seen[a.id]){ seen[a.id] = true; ids.push(a.id); }
+        break;
+      }
+      cursor = DB.agents.find(function(x){return x.id===parentId;});
+      depth++;
+    }
+    if(depth >= MAX_DEPTH){
+      console.warn('[agentIdsInMyOrgForCampaign] cycle or excessive depth detected for agent '+a.id+' on campaign '+campaign);
+    }
+  });
+  return ids;
+}
+
+// Walk DOWN from this user through reporting chains, but use BOTH
+// explicit fields AND auto-derived team-based chains. This is the
+// production-safe version used by inventoryVisibleTo.
+function agentIdsInMyOrgEffective(user){
+  if(!user) return [];
+  var seen = {}; seen[user.id] = true;
+  var ids = [user.id];
+
+  function addIfNew(id){
+    if(!seen[id]){ seen[id] = true; ids.push(id); }
+  }
+
+  // For each potential subordinate, check if their effective chain
+  // points back to me at any level.
+  DB.agents.forEach(function(a){
+    if(!a.active || a.id === user.id) return;
+    var chain = reportingChainFor(a);
+    var role = user.role;
+    var matches = false;
+    if(role === 'Campaign Manager' || role === 'IBO'){
+      // I'm at the top — match anyone whose chain has me as CM
+      if(chain.campaignManagerId === user.id) matches = true;
+      // OR their MM's chain has me as CM (transitive)
+      if(!matches && chain.marketManagerId){
+        var mm = DB.agents.find(function(x){return x.id===chain.marketManagerId;});
+        if(mm){
+          var mmChain = reportingChainFor(mm);
+          if(mmChain.campaignManagerId === user.id) matches = true;
+        }
+      }
+      // OR their TL's chain transitively
+      if(!matches && chain.teamLeaderId){
+        var tl = DB.agents.find(function(x){return x.id===chain.teamLeaderId;});
+        if(tl){
+          var tlChain = reportingChainFor(tl);
+          if(tlChain.campaignManagerId === user.id) matches = true;
+          if(!matches && tlChain.marketManagerId){
+            var tlmm = DB.agents.find(function(x){return x.id===tlChain.marketManagerId;});
+            if(tlmm){
+              var tlmmChain = reportingChainFor(tlmm);
+              if(tlmmChain.campaignManagerId === user.id) matches = true;
+            }
+          }
+        }
+      }
+    } else if(role === 'Market Manager'){
+      if(chain.marketManagerId === user.id) matches = true;
+      if(!matches && chain.teamLeaderId){
+        var tl2 = DB.agents.find(function(x){return x.id===chain.teamLeaderId;});
+        if(tl2){
+          var tl2Chain = reportingChainFor(tl2);
+          if(tl2Chain.marketManagerId === user.id) matches = true;
+        }
+      }
+    } else if(role === 'Team Leader'){
+      if(chain.teamLeaderId === user.id) matches = true;
+    }
+    if(matches) addIfNew(a.id);
+  });
+
+  return ids;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  UNIFIED INVENTORY VISIBILITY — single source of truth for scoping
+//
+//  Determines who a given device "belongs to" for visibility purposes:
+//    1. assignedTo (explicit assignment to a person)
+//    2. mmId (assigned to a market manager but not a specific agent)
+//    3. shipmentRecipientId (auto-derived from shipment recipient name —
+//       per Calvin's rule: unassigned devices belong to whoever received
+//       the shipment until they're transferred down)
+//
+//  Then determines who can SEE that device:
+//    Owner / Admin / Inventory Dept                 → see all
+//    Campaign Manager + IBO                          → everyone in their org
+//    Market Manager                                  → themselves + everyone below
+//    Team Leader                                     → themselves + their agents
+//    Field Agent                                     → only themselves
+//    Anyone else                                     → empty
+//
+//  This is THE function that powers all inventory views. Other functions
+//  (inventorySummary, the dashboard widgets, the drill-down) all read
+//  from this. If there's a bug here, it propagates everywhere — so the
+//  test coverage for this is extensive.
+// ════════════════════════════════════════════════════════════════════════
+
+// Determine the effective "holder" of a device. Returns an agent ID, or
+// null if the device is genuinely unassigned (no recipient, no mm, no
+// assignedTo). This is what visibility uses to decide who sees the device.
+function deviceHolderId(device){
+  if(!device) return null;
+  if(device.assignedTo)          return device.assignedTo;
+  if(device.mmId)                return device.mmId;
+  if(device.shipmentRecipientId) return device.shipmentRecipientId;
+  // Fallback: try to resolve recipient from the "Name" field on the shipment
+  // (added during upload — agent name → DB.agents id lookup). If that lookup
+  // wasn't done at upload, the device is truly unassigned.
+  if(device.recipientId)         return device.recipientId;
+  return null;
+}
+
+// Public API: given a user and a campaign name, return the device list
+// they can see. Replaces the old gmScopedDevices and legacyScopedDevices.
+function inventoryVisibleTo(user, campaign){
+  if(!user) return [];
+
+  // Resolve the device pool from the campaign name
+  var pool = [];
+  if(campaign === 'Gen Mobile')        pool = (typeof GM_INVENTORY !== 'undefined' && Array.isArray(GM_INVENTORY)) ? GM_INVENTORY : [];
+  else if(campaign === 'TruConnect')   pool = (typeof TC_INVENTORY !== 'undefined' && Array.isArray(TC_INVENTORY)) ? TC_INVENTORY : [];
+  else if(campaign === 'Assurance')    pool = (typeof AW_INVENTORY !== 'undefined' && Array.isArray(AW_INVENTORY)) ? AW_INVENTORY : [];
+  else if(campaign === 'Excess')       pool = (typeof EX_INVENTORY !== 'undefined' && Array.isArray(EX_INVENTORY)) ? EX_INVENTORY : [];
+  else if(!campaign){
+    // No campaign specified → all of them combined
+    return inventoryVisibleToAllCampaigns(user);
+  } else {
+    // Unknown campaign — try campaignCfg as a fallback for future programs
+    if(typeof campaignCfg === 'function'){
+      var cfg = campaignCfg(campaign);
+      if(cfg && typeof cfg.inventory === 'function') pool = cfg.inventory() || [];
+    }
+  }
+
+  // Owner / Admin / Inventory Dept → see all
+  if(isOwner(user)) return pool.slice();
+  if(user.role === 'admin') return pool.slice();
+  if(typeof isInventory === 'function' && isInventory(user)) return pool.slice();
+  if(typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(user, 'inv-dashboard')) return pool.slice();
+
+  // Get the IDs of every agent in this user's downstream org for THIS campaign
+  // (per-campaign reporting chains may differ from each other)
+  var orgIds;
+  if(typeof agentIdsInMyOrgForCampaign === 'function'){
+    orgIds = agentIdsInMyOrgForCampaign(user, campaign);
+  } else if(typeof agentIdsInMyOrgEffective === 'function'){
+    orgIds = agentIdsInMyOrgEffective(user);
+  } else {
+    orgIds = [user.id];
+  }
+
+  // Filter the pool: a device is visible if its effective holder is in the user's org
+  return pool.filter(function(d){
+    var holderId = deviceHolderId(d);
+    return holderId !== null && orgIds.indexOf(holderId) >= 0;
+  });
+}
+
+// Helper: union of all-campaign visible inventory for a user
+function inventoryVisibleToAllCampaigns(user){
+  if(!user) return [];
+  var out = [];
+  ['Gen Mobile','TruConnect','Assurance','Excess'].forEach(function(c){
+    inventoryVisibleTo(user, c).forEach(function(d){
+      if(!d.campaign) d.campaign = c;
+      out.push(d);
+    });
+  });
+  return out;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  LEGACY API SHIMS — keep old function names alive so existing call
+//  sites don't break. Each just delegates to the new unified function.
+//  These can be removed once every callsite is updated, but for now
+//  they're a safe migration layer.
+// ════════════════════════════════════════════════════════════════════════
+
+function gmScopedDevices(user){
+  return inventoryVisibleTo(user, 'Gen Mobile');
+}
+
 function legacyScopedDevices(user){
   if(!user) return [];
-  if(isOwner(user) || user.role==='admin' || isInventory(user)) return INVENTORY_DEVICES.slice();
-  // Campaign Manager — see everything in their campaign (matched on device.campaign field)
-  if(user.role==='Campaign Manager'){
-    var myCampaign = cmCampaign(user);
-    if(!myCampaign) return [];
-    return INVENTORY_DEVICES.filter(function(d){ return d.campaign===myCampaign; });
+  if(typeof INVENTORY_DEVICES === 'undefined' || !Array.isArray(INVENTORY_DEVICES)) return [];
+  if(isOwner(user) || user.role==='admin' || (typeof isInventory==='function' && isInventory(user))){
+    return INVENTORY_DEVICES.slice();
   }
-  var underIds = agentIdsUnder(user);
-  underIds.push(user.id);
+  // Org-based filter — match holderId against my org IDs
+  var orgIds = (typeof agentIdsInMyOrgEffective === 'function')
+    ? agentIdsInMyOrgEffective(user)
+    : [user.id];
   return INVENTORY_DEVICES.filter(function(d){
-    return underIds.indexOf(d.holderId)>=0;
+    return orgIds.indexOf(d.holderId) >= 0;
   });
 }
 
@@ -8286,22 +8688,38 @@ function inventorySummary(user){
   var gm = invScopedDevicesAllCampaigns(user);
   var lg = legacyScopedDevices(user);
   var total = gm.length + lg.length;
-  var assigned = gm.filter(function(d){return d.status==='assigned';}).length
-               + lg.filter(function(d){return d.status==='assigned';}).length;
-  var unassigned = gm.filter(function(d){return d.status==='unassigned';}).length
-                 + lg.filter(function(d){return d.status==='uploaded'||d.status==='available';}).length;
+  // Per Calvin's rule: a device with status='uploaded' or 'unassigned' is
+  // considered "available stock" for the recipient until it's transferred
+  // down or marked sold. Sold/activated/expired are separate buckets.
+  function _isAvailableStatus(s){
+    return s === 'unassigned' || s === 'uploaded' || s === 'available' || !s;
+  }
+  function _isAssignedStatus(s){
+    return s === 'assigned';
+  }
+  function _isSoldStatus(d){
+    return d && (d.status === 'sold' || d.soldAt);
+  }
+  var sold       = gm.filter(_isSoldStatus).length + lg.filter(_isSoldStatus).length;
+  var assigned   = gm.filter(function(d){return _isAssignedStatus(d.status);}).length
+                 + lg.filter(function(d){return _isAssignedStatus(d.status);}).length;
+  var unassigned = gm.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length
+                 + lg.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length;
   var activated  = gm.filter(function(d){return d.status==='activated';}).length;
   var expiring5  = gm.filter(function(d){
-    var dy = gmDeviceDaysLeft(d); return dy!==null && dy>=0 && dy<=5;
+    var dy = (typeof gmDeviceDaysLeft === 'function') ? gmDeviceDaysLeft(d) : null;
+    return dy!==null && dy>=0 && dy<=5;
   }).length;
   var expiring10 = gm.filter(function(d){
-    var dy = gmDeviceDaysLeft(d); return dy!==null && dy>=0 && dy<=10;
+    var dy = (typeof gmDeviceDaysLeft === 'function') ? gmDeviceDaysLeft(d) : null;
+    return dy!==null && dy>=0 && dy<=10;
   }).length;
   var expired    = gm.filter(function(d){
-    var dy = gmDeviceDaysLeft(d); return dy!==null && dy<0 && d.status==='assigned';
+    var dy = (typeof gmDeviceDaysLeft === 'function') ? gmDeviceDaysLeft(d) : null;
+    return dy!==null && dy<0 && d.status==='assigned';
   }).length;
   return {
-    total:total, assigned:assigned, unassigned:unassigned, activated:activated,
+    total:total, assigned:assigned, unassigned:unassigned, activated:activated, sold:sold,
     expiring5:expiring5, expiring10:expiring10, expired:expired, gm:gm, legacy:lg
   };
 }
@@ -8330,44 +8748,37 @@ function globalInventoryTotal(){
 // All devices this user can see for ONE specific campaign
 function invScopedDevices(user, campaign){
   if(!user || !campaign) return [];
-  var cfg = campaignCfg(campaign); if(!cfg) return [];
-  var pool = cfg.inventory();
 
-  if(isOwner(user) || user.role==='admin' || isInventory(user) || agentHasDeptAccess(user,'inv-dashboard')){
-    return pool.slice();
+  // Owner / admin / Inventory Dept / dept-grant → see all
+  if(isOwner(user) || user.role==='admin' || isInventory(user)
+     || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(user,'inv-dashboard'))){
+    return inventoryVisibleTo(user, campaign);
   }
 
-  // Campaign Manager — only their assigned campaign
-  if(user.role==='Campaign Manager'){
-    return cmCampaign(user)===campaign ? pool.slice() : [];
+  // Sales agents must be coded on the campaign to see any of its inventory.
+  // Managers (CM/IBO/MM/TL) can see inventory if THEY OR their reports are coded.
+  if(typeof agentCodedOn === 'function'){
+    if(user.role === 'Campaign Manager' || user.role === 'IBO'){
+      // CM/IBO sees as long as anyone in their org is coded on the campaign
+      var myOrg = (typeof agentIdsInMyOrgEffective === 'function')
+        ? agentIdsInMyOrgEffective(user) : [user.id];
+      var anyCoded = myOrg.some(function(aid){
+        var ag = DB.agents.find(function(x){return x.id===aid;});
+        return ag && agentCodedOn(ag, campaign);
+      });
+      if(!anyCoded) return [];
+    } else if(user.role === 'Market Manager'){
+      if(!agentCodedOn(user,campaign)
+         && (typeof mmHasCodedReports !== 'function' || !mmHasCodedReports(user,campaign))) return [];
+    } else if(user.role === 'Team Leader'){
+      if(!agentCodedOn(user,campaign)
+         && (typeof tlHasCodedReports !== 'function' || !tlHasCodedReports(user,campaign))) return [];
+    } else if(typeof isSalesRole === 'function' && isSalesRole(user)){
+      if(!agentCodedOn(user,campaign)) return [];
+    }
   }
 
-  // Market Manager — their markets + their direct/indirect reports
-  if(user.role==='Market Manager'){
-    if(!agentCodedOn(user,campaign) && !mmHasCodedReports(user,campaign)) return [];
-    var myMarkets = mmMarkets(user);
-    var underIds  = agentIdsUnder(user);
-    return pool.filter(function(d){
-      var inMyMarket = myMarkets.length && myMarkets.indexOf(d.market)>=0;
-      var mine       = d.mmId===user.id || d.assignedTo===user.id || underIds.indexOf(d.assignedTo)>=0;
-      return inMyMarket || mine;
-    });
-  }
-
-  // Team Leader — devices held by themselves + agents they lead
-  if(user.role==='Team Leader'){
-    if(!agentCodedOn(user,campaign) && !tlHasCodedReports(user,campaign)) return [];
-    var tlIds = agentIdsUnder(user); tlIds.push(user.id);
-    return pool.filter(function(d){ return tlIds.indexOf(d.assignedTo)>=0; });
-  }
-
-  // Field Agent / Sales Rep — only if coded on this campaign
-  if(isSalesRole(user)){
-    if(!agentCodedOn(user,campaign)) return [];
-    return pool.filter(function(d){ return d.assignedTo===user.id; });
-  }
-
-  return [];
+  return inventoryVisibleTo(user, campaign);
 }
 
 // All devices this user can see across every campaign
@@ -8631,7 +9042,11 @@ async function loadFromSupabase(){
           // TruConnect pay model — defaults to 'none' if column doesn't exist
           tcModel:       a.tc_model || 'none',
           // Assurance Wireless pay model — defaults to 'none' if column doesn't exist
-          awModel:       a.aw_model || 'none'
+          awModel:       a.aw_model || 'none',
+          // Per-campaign reporting chain. Map of {campaignName: parentAgentId | null}.
+          // null means "top of org for this campaign". Defaults to {} so legacy
+          // fields (teamLeaderId/marketManagerId/campaignManagerId) are used.
+          reportsTo:     safeJSON(a.reports_to, {})
         };
       });
       // Auto-derive .category/.depts for every legacy record we just loaded.
@@ -8875,7 +9290,9 @@ async function saveAgentToSupabase(agent){
     // TruConnect pay model (tcModel). Same fallback behavior.
     tc_model:       agent.tcModel || null,
     // Assurance Wireless pay model (awModel). Same fallback behavior.
-    aw_model:       agent.awModel || null
+    aw_model:       agent.awModel || null,
+    // Per-campaign reporting chain. JSONB column. {campaignName: parentId|null}
+    reports_to:     agent.reportsTo || {}
   };
   // Try the full write first.
   var ok = await sbUpsert('agents', full);
@@ -8883,7 +9300,7 @@ async function saveAgentToSupabase(agent){
   // not-yet-migrated Supabase schema). Retry without the new columns so the
   // agent still saves and we don't lose data on schema lag.
   if(!ok){
-    console.warn('[saveAgentToSupabase] Full save failed (likely unknown columns). Retrying with legacy fields only — cmModel/tcModel/awModel/category/depts/etc will not persist until the schema is migrated.');
+    console.warn('[saveAgentToSupabase] Full save failed (likely unknown columns). Retrying with legacy fields only — cmModel/tcModel/awModel/reportsTo/category/depts/etc will not persist until the schema is migrated.');
     var legacy = Object.assign({}, full);
     delete legacy.category;
     delete legacy.depts;
@@ -8892,6 +9309,7 @@ async function saveAgentToSupabase(agent){
     delete legacy.cm_model;
     delete legacy.tc_model;
     delete legacy.aw_model;
+    delete legacy.reports_to;
     await sbUpsert('agents', legacy);
   }
 }
@@ -10254,6 +10672,18 @@ function saveAgentForm(){
         console.log('[saveAgentForm] Clearing stale awModel="'+a.awModel+'" because role is no longer CM/IBO');
         a.awModel = 'none';
       }
+    }
+
+    // Reporting Chain — Owner + Onboarding Dept can save per-campaign parents.
+    // If the row is hidden (editor lacks permission), preserve the existing
+    // reportsTo value untouched. Same defensive pattern as the model selectors.
+    var rcRow = document.getElementById('aaReportingChainRow');
+    if(rcRow && rcRow.style.display !== 'none' && typeof aaReadReportingChain === 'function'){
+      var newChain = aaReadReportingChain();
+      // Merge: preserve campaigns we didn't show dropdowns for (e.g. a TC
+      // value the editor wasn't shown because the agent had no TC code).
+      a.reportsTo = Object.assign({}, a.reportsTo || {}, newChain);
+      console.log('[saveAgentForm] Reporting chain saved for agent '+a.id+':', a.reportsTo);
     }
     // Department access — OWNER ONLY can grant. Anyone else editing a
     // profile (HR, Onboarding) cannot touch deptAccess flags. This closes
@@ -14557,19 +14987,51 @@ function panelBO(){
     } else if(isInv){
       // Inventory dashboard — stock snapshot
       var invMarketCount = (typeof INV_MARKETS !== 'undefined' && Array.isArray(INV_MARKETS)) ? INV_MARKETS.length : 0;
-      var gmStockTotal = 0;
-      try{
-        if(typeof GM_INVENTORY !== 'undefined' && GM_INVENTORY){
-          Object.keys(GM_INVENTORY).forEach(function(k){
-            var row = GM_INVENTORY[k];
-            if(row && typeof row.qty === 'number') gmStockTotal += row.qty;
-          });
-        }
-      }catch(e){}
+
+      // Count devices by status across each campaign. The data shape is
+      // an array of device objects (one row per IMEI), NOT a keyed object
+      // with .qty fields. The old aggregation below was reading the wrong
+      // shape and always returned 0 — which is why Makenzie's "Gen Mobile
+      // Stock" card showed 0 even when 7 devices existed in inventory.
+      function _countByStatus(arr){
+        var t = { total:0, available:0, assigned:0, sold:0, expired:0 };
+        if(!Array.isArray(arr)) return t;
+        arr.forEach(function(d){
+          if(!d) return;
+          t.total++;
+          // Sold beats every other status — a sold device should never
+          // be counted as available even if its status field is stale.
+          if(d.status === 'sold' || d.soldAt){ t.sold++; return; }
+          if(d.status === 'assigned' || d.status === 'activated'){ t.assigned++; return; }
+          if(d.status === 'expired'){ t.expired++; return; }
+          // 'uploaded', 'unassigned', or anything unrecognized → treat as available
+          t.available++;
+        });
+        return t;
+      }
+
+      var gmCounts = _countByStatus(typeof GM_INVENTORY !== 'undefined' ? GM_INVENTORY : []);
+      var tcCounts = _countByStatus(typeof TC_INVENTORY !== 'undefined' ? TC_INVENTORY : []);
+      var awCounts = _countByStatus(typeof AW_INVENTORY !== 'undefined' ? AW_INVENTORY : []);
+
       var pendXferCount = (typeof PENDING_TRANSFERS !== 'undefined' && Array.isArray(PENDING_TRANSFERS)) ? PENDING_TRANSFERS.length : 0;
 
+      // Helper to render a per-campaign stock card with click-through
+      function _campaignStockCard(name, color, counts, panel){
+        return '<div class="bo-stat" style="cursor:pointer;border-left:3px solid '+color+'" onclick="gotoPanel(\''+panel+'\')" title="Click for full breakdown">'
+          +'<div class="bs-label">'+name+' Stock</div>'
+          +'<div class="bs-val" style="color:'+color+'">'+counts.total+'</div>'
+          +'<div class="bs-sub" style="font-size:.62rem">Avail '+counts.available+' · Assigned '+counts.assigned+' · Sold '+counts.sold+'</div>'
+          +'</div>';
+      }
+
       html += '<div class="bo-stats" style="margin-bottom:20px">'
-        +'<div class="bo-stat"><div class="bs-label">Gen Mobile Stock</div><div class="bs-val" style="color:#06b6d4">'+gmStockTotal+'</div><div class="bs-sub">Units on hand</div></div>'
+        + _campaignStockCard('Gen Mobile', '#06b6d4', gmCounts, 'gm-inventory')
+        + _campaignStockCard('TruConnect', '#dc2626', tcCounts, 'tc-inventory')
+        + _campaignStockCard('Assurance',  '#b45309', awCounts, 'aw-inventory')
+        +'</div>';
+
+      html += '<div class="bo-stats" style="margin-bottom:20px">'
         +'<div class="bo-stat"><div class="bs-label">Markets</div><div class="bs-val" style="color:var(--blue)">'+invMarketCount+'</div><div class="bs-sub">Active locations</div></div>'
         +'<div class="bo-stat"><div class="bs-label">Pending Xfers</div><div class="bs-val" style="color:#D97706">'+pendXferCount+'</div><div class="bs-sub">Need approval</div></div>'
         +'</div>';
@@ -24188,6 +24650,141 @@ function aaToggleCMModelVisibility(){
   if(awRow) awRow.style.display = show;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  REPORTING CHAIN UI — Owner + Onboarding Dept can edit per-campaign
+//  parent assignments. Map of campaignName → parentAgentId (or null = top).
+//  Rebuilt every time the modal opens or the agent's role/codes change.
+// ════════════════════════════════════════════════════════════════════════
+
+// Show/hide the Reporting Chain row. Visible to: Owner OR Onboarding Dept.
+function aaToggleReportingChainVisibility(){
+  var row = document.getElementById('aaReportingChainRow');
+  if(!row) return;
+  var viewer = DB.current;
+  if(!viewer){ row.style.display = 'none'; return; }
+  var allowed = isOwner(viewer)
+    || (typeof isOnboarding === 'function' && isOnboarding(viewer))
+    || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(viewer, 'onboarding'));
+  row.style.display = allowed ? 'block' : 'none';
+  if(allowed && typeof aaRefreshReportingChain === 'function') aaRefreshReportingChain();
+}
+
+// Determine which campaigns to show dropdowns for. Currently uses the
+// agent's saved agentCodes — only campaigns where they have a code count.
+// If no codes yet, defaults to showing Gen Mobile / TruConnect / Assurance
+// since onboarding may be configuring codes simultaneously.
+function aaActiveCampaignsForReporting(agentBeingEdited){
+  var defaults = ['Gen Mobile','TruConnect','Assurance'];
+  if(!agentBeingEdited || !agentBeingEdited.agentCodes) return defaults;
+  var codes = agentBeingEdited.agentCodes;
+  var active = [];
+  ['Gen Mobile','TruConnect','Assurance'].forEach(function(c){
+    if(codes[c] && String(codes[c]).trim()) active.push(c);
+  });
+  // Also pick up Internet/ACA carriers if coded
+  ['Chuzo','Astound','ACA'].forEach(function(c){
+    if(codes[c] && String(codes[c]).trim()) active.push(c);
+  });
+  if(active.length === 0) return defaults;
+  return active;
+}
+
+// Returns the agent currently being edited in the modal. We stash the id
+// on the form when openEditAgent runs.
+function aaCurrentAgent(){
+  var idEl = document.getElementById('aaId');
+  if(!idEl) return null;
+  var id = parseInt(idEl.value, 10);
+  if(!id) return null;
+  return DB.agents.find(function(a){return a.id===id;}) || null;
+}
+
+// Build the eligible-parent list for a given role being added/edited and
+// a given campaign. Returns array of {id, name, role, label}.
+// "Top of org" is always added as id=null.
+function aaEligibleParents(roleBeingAdded, campaign){
+  var out = [{id:null, name:'(Top of org — no manager above)', role:'', label:'⬆ Top of org for this campaign'}];
+  if(!Array.isArray(DB.agents)) return out;
+  // Eligible roles ABOVE each role tier:
+  //   Field Agent: any TL, MM, CM, IBO
+  //   Team Leader: any MM, CM, IBO
+  //   Market Manager: any CM, IBO
+  //   Campaign Manager: any IBO (or top-of-org)
+  //   IBO: only top-of-org
+  var allowedAbove = {};
+  if(roleBeingAdded === 'Field Agent' || roleBeingAdded === 'Sales Rep'){
+    allowedAbove = {'Team Leader':true,'Market Manager':true,'Campaign Manager':true,'IBO':true};
+  } else if(roleBeingAdded === 'Team Leader'){
+    allowedAbove = {'Market Manager':true,'Campaign Manager':true,'IBO':true};
+  } else if(roleBeingAdded === 'Market Manager'){
+    allowedAbove = {'Campaign Manager':true,'IBO':true};
+  } else if(roleBeingAdded === 'Campaign Manager'){
+    allowedAbove = {'IBO':true};
+  }
+  // No allowedAbove → IBO or unknown, only top-of-org
+  Object.keys(allowedAbove).length && DB.agents.forEach(function(a){
+    if(!a.active || !allowedAbove[a.role]) return;
+    var label = a.name + ' · ' + a.role;
+    out.push({id:a.id, name:a.name, role:a.role, label:label});
+  });
+  return out;
+}
+
+// Rebuild the dropdowns inside aaReportingChainContainer.
+function aaRefreshReportingChain(){
+  var container = document.getElementById('aaReportingChainContainer');
+  if(!container) return;
+  container.innerHTML = '';
+  var agent = aaCurrentAgent();
+  // For new agents (no aaId), pull role from the form to determine eligibles
+  var roleEl = document.getElementById('aaRole');
+  var roleBeingAdded = roleEl ? roleEl.value : (agent && agent.role) || '';
+  if(!roleBeingAdded){
+    container.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);font-style:italic">Pick a role first to see reporting-chain options.</div>';
+    return;
+  }
+  if(roleBeingAdded === 'IBO'){
+    container.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);padding:8px 10px;background:rgba(217,119,6,.06);border-left:3px solid #D97706;border-radius:4px"><strong>IBOs sit at the top of their own org.</strong> No reporting chain needed — agents/MMs/CMs are placed under them via their own profiles.</div>';
+    return;
+  }
+  var campaigns = aaActiveCampaignsForReporting(agent);
+  campaigns.forEach(function(camp){
+    var saved = (agent && agent.reportsTo && Object.prototype.hasOwnProperty.call(agent.reportsTo, camp))
+      ? agent.reportsTo[camp]
+      : undefined;
+    var eligibles = aaEligibleParents(roleBeingAdded, camp);
+    var rowHtml = '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:white;border:1px solid var(--sand);border-radius:6px">'
+      + '<div style="flex:0 0 110px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;font-weight:700;color:var(--brown)">'+camp+'</div>'
+      + '<select class="aaReportsToSelect" data-campaign="'+camp.replace(/"/g,'&quot;')+'" style="flex:1;padding:6px 8px;border:1px solid var(--sand);border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+    eligibles.forEach(function(p){
+      var val = (p.id===null) ? '__top__' : String(p.id);
+      var sel = '';
+      if(saved === null && p.id === null) sel = ' selected';
+      else if(typeof saved === 'number' && saved === p.id) sel = ' selected';
+      else if(saved === undefined && p.id === null) sel = ' selected';  // default to top-of-org for unset
+      rowHtml += '<option value="'+val+'"'+sel+'>'+p.label.replace(/</g,'&lt;')+'</option>';
+    });
+    rowHtml += '</select></div>';
+    container.insertAdjacentHTML('beforeend', rowHtml);
+  });
+}
+
+// Read the dropdowns and produce a reportsTo map for save.
+function aaReadReportingChain(){
+  var out = {};
+  var selects = document.querySelectorAll('.aaReportsToSelect');
+  selects.forEach(function(sel){
+    var camp = sel.getAttribute('data-campaign');
+    var v = sel.value;
+    if(v === '__top__') out[camp] = null;
+    else {
+      var n = parseInt(v, 10);
+      if(n > 0) out[camp] = n;
+    }
+  });
+  return out;
+}
+
 // Update help-text when AW Override Style dropdown changes.
 function aaAWModelChanged(){
   var sel = document.getElementById('aaAWModel');
@@ -24310,6 +24907,7 @@ function toggleLLFields(){
   if(typeof aaCMModelChanged === 'function') aaCMModelChanged();
   if(typeof aaTCModelChanged === 'function') aaTCModelChanged();
   if(typeof aaAWModelChanged === 'function') aaAWModelChanged();
+  if(typeof aaToggleReportingChainVisibility === 'function') aaToggleReportingChainVisibility();
 
   // Department access section — OWNER ONLY. Previously this was "anyone
   // who can edit profiles" but that leaked permission-granting power to
