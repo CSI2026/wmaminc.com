@@ -1710,6 +1710,17 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
         <div id="aaTCModelHelp" style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;line-height:1.5"></div>
       </div>
 
+      <!-- ASSURANCE OVERRIDE STYLE (only visible for Campaign Manager / IBO roles) -->
+      <div class="f-field" id="aaAWModelRow" style="display:none;margin-bottom:14px;background:rgba(180,83,9,.05);border:1.5px solid rgba(180,83,9,.25);border-radius:8px;padding:14px">
+        <label class="f-label" style="color:#b45309">📡 Assurance Wireless Override Style</label>
+        <div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-bottom:8px;line-height:1.5">Assurance pays a flat $5 per NLAD enrollment to ONE recipient — the Market Manager by default. If you'd like a CM/IBO to receive the $5 instead (Juan's pattern), pick the consolidated option.</div>
+        <select id="aaAWModel" class="f-select" onchange="aaAWModelChanged()" style="width:100%">
+          <option value="none">— No Assurance override (Market Manager gets the $5 by default) —</option>
+          <option value="aw-cm-consolidated">⭐ AW CM Consolidated — Juan's pattern: $5 per market enrollment routes to me</option>
+        </select>
+        <div id="aaAWModelHelp" style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;line-height:1.5"></div>
+      </div>
+
       <!-- INTERNET CAMPAIGNS — Chuzo & Astound with agent codes -->
       <div id="aaInternetRow" style="display:none;margin-bottom:14px">
         <div class="f-field">
@@ -2745,7 +2756,8 @@ function aaApplySensitiveLock(locked){
     'aaDeptAccessRow', // deptAccess grants (already Owner-only elsewhere, belt+suspenders)
     'aaCanHostCallRow',// can-host-call toggle
     'aaCMModelRow',    // GM override style — pay-affecting, Owner only
-    'aaTCModelRow'     // TC override style — pay-affecting, Owner only
+    'aaTCModelRow',    // TC override style — pay-affecting, Owner only
+    'aaAWModelRow'     // AW override style — pay-affecting, Owner only
   ];
   blocks.forEach(function(id){
     var el = document.getElementById(id);
@@ -5149,6 +5161,206 @@ function tcCalculateWeek(weekRows){
 }
 
 function tcFormatBreakdown(perAgent){
+  var out = [];
+  Object.keys(perAgent).forEach(function(aid){
+    var entry = perAgent[aid];
+    var agent = DB.agents.find(function(x){return x.id===parseInt(aid);});
+    out.push({
+      agentId: parseInt(aid),
+      agentName: agent ? agent.name : 'Agent #'+aid,
+      total: entry.amount,
+      rows: entry.rows,
+      breakdown: entry.breakdown
+    });
+  });
+  out.sort(function(a,b){ return b.total - a.total; });
+  return out;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  ASSURANCE WIRELESS COMMISSION ENGINE — V1
+//
+//  Simplest of the three campaigns: NLAD only, flat $5 per enrollment,
+//  paid to exactly ONE person (the manager). Agents earn nothing. The
+//  total per enrollment going out the door is always $5.
+//
+//  Two awModel values (lives on the CM/IBO's agent record):
+//   • 'none'                 — Default: $5 goes to the Market Manager of
+//                              the team. If no MM, $0 paid (and a warning
+//                              is logged, since this is likely a setup
+//                              error — Calvin should know about it).
+//   • 'aw-cm-consolidated'   — Juan's pattern: $5 goes to the CM/IBO
+//                              regardless of MM. CM's "business" handles
+//                              internal payouts privately.
+//
+//  RATES:
+//    Per NLAD enrollment = $5 flat (one recipient)
+//    No sliding, no bonuses, no Tribal program
+//
+//  CHARGEBACKS:
+//    Deducted from whoever was paid the $5 for that enrollment
+//    (matches the audit trail: same person credited, same person debited).
+//
+//  TRIBAL:
+//    Assurance has no Tribal program. If a Tribal row is encountered
+//    the engine logs a warning and pays $0 for it — but does NOT count
+//    it toward NLAD pay either.
+// ════════════════════════════════════════════════════════════════════════
+
+var AW_RATES = {
+  perEnrollment: 5    // Flat $5 per NLAD enrollment, single recipient
+};
+
+// Look up the awModel for an agent. Defaults to 'none'.
+function awCmModelOf(agent){
+  if(!agent) return 'none';
+  return agent.awModel || 'none';
+}
+
+// Look up the team's CM. Returns agent record or null.
+function awMarketCM(team){
+  if(!team || !team.campaignManager) return null;
+  return DB.agents.find(function(a){return a.id===team.campaignManager;}) || null;
+}
+
+// Calculate Assurance pay for one week.
+//
+// weekRows: array of {
+//   agentId,             // who personally enrolled (number, REQUIRED)
+//   isTribal,            // bool — Assurance has no Tribal, so any true
+//                        //         row is ignored with a warning
+//   chargebackCents      // negative cents, optional
+// }
+//
+// Returns: { perAgent, byTeam, warnings }
+function awCalculateWeek(weekRows){
+  var byAgent = {};
+  var byTeam  = {};
+  var warnings = [];
+
+  if(!Array.isArray(weekRows)){
+    console.error('[awCalculateWeek] FATAL: weekRows is not an array');
+    return { perAgent:{}, byTeam:{}, warnings:['Invalid input: weekRows must be an array'] };
+  }
+  weekRows.forEach(function(r, idx){
+    if(!r || typeof r !== 'object'){
+      warnings.push('Row '+idx+' is not an object — skipped');
+      return;
+    }
+    if(!r.agentId || typeof r.agentId !== 'number'){
+      warnings.push('Row '+idx+' missing or invalid agentId ('+r.agentId+')');
+    }
+    if(r.isTribal){
+      warnings.push('Row '+idx+' marked as Tribal — Assurance has no Tribal program. Row will be ignored. Verify your parser/upload.');
+    }
+    if(r.chargebackCents !== undefined && r.chargebackCents !== null){
+      if(typeof r.chargebackCents !== 'number'){
+        warnings.push('Row '+idx+' chargebackCents not a number: '+r.chargebackCents);
+      } else if(r.chargebackCents > 0){
+        warnings.push('Row '+idx+' has POSITIVE chargebackCents ('+r.chargebackCents+'). Chargebacks must be negative cents (deductions). Treating as 0 — verify your parser.');
+        r.chargebackCents = 0;
+      } else if(r.chargebackCents < -1000000){
+        warnings.push('Row '+idx+' chargebackCents extreme value ('+r.chargebackCents+' cents = $'+(r.chargebackCents/100).toFixed(2)+'). Possible parser error — verify before paying.');
+      }
+    }
+  });
+  if(warnings.length){
+    console.warn('[awCalculateWeek] ⚠️ '+warnings.length+' input warnings:');
+    warnings.forEach(function(w){ console.warn('  - '+w); });
+  }
+
+  // Helper: credit an agent.
+  function bump(agentId, amount, label, count, rate){
+    if(!byAgent[agentId]) byAgent[agentId] = { amount:0, breakdown:[], rows:0 };
+    byAgent[agentId].amount += amount;
+    byAgent[agentId].breakdown.push({ label:label, count:count, rate:rate, amount:amount });
+    if(count) byAgent[agentId].rows += count;
+  }
+
+  // Pass 1: bucket rows by team and tally enrollments per agent.
+  // Tribal rows are filtered out here — they don't count toward anything.
+  weekRows.forEach(function(r){
+    if(r.isTribal) return;  // Tribal: not paid, already warned above
+    var team = (typeof gmAgentTeam === 'function') ? gmAgentTeam(r.agentId) : null;
+    var teamId = team ? team.id : '__no_team__';
+    if(!byTeam[teamId]){
+      byTeam[teamId] = { team:team, rows:[], nladCount:0, agents:{} };
+    }
+    var t = byTeam[teamId];
+    t.rows.push(r);
+    t.nladCount++;
+    if(!t.agents[r.agentId]) t.agents[r.agentId] = {nlad:0, cb:0};
+    var a = t.agents[r.agentId];
+    a.nlad++;
+    if(r.chargebackCents) a.cb += r.chargebackCents;
+  });
+
+  // Pass 2: per-team calculation. Determine the single recipient for
+  // each enrollment in this team and pay them $5/each.
+  Object.keys(byTeam).forEach(function(teamId){
+    var t = byTeam[teamId];
+    var team = t.team;
+    var cm = awMarketCM(team);
+    var awModel = awCmModelOf(cm);
+
+    // Determine the single recipient for this team
+    var recipientId = null;
+    var recipientLabel = '';
+
+    if(awModel === 'aw-cm-consolidated'){
+      // Juan-style: $5 goes to the CM regardless of MM
+      recipientId = cm.id;
+      recipientLabel = '(consolidated to '+(cm.name || 'CM')+')';
+    } else if(team && team.marketManager){
+      // Default: $5 goes to the MM
+      recipientId = team.marketManager;
+      recipientLabel = '(to MM)';
+    } else {
+      // No recipient configured — this is a setup error. Pay $0 and warn.
+      var teamLabel = team ? (team.name || team.city || team.id) : 'no-team';
+      var w = 'Team "'+teamLabel+'" has Assurance enrollments but no Market Manager '+
+              'and no consolidated CM configured. $0 paid for these '+t.nladCount+' enrollment(s). '+
+              'Fix the team setup before processing payroll.';
+      warnings.push(w);
+      console.warn('[awCalculateWeek] ⚠️ '+w);
+      // Still record the agents' activity at $0 so they appear in tracking
+      Object.keys(t.agents).forEach(function(aidStr){
+        var aidI = parseInt(aidStr);
+        var a = t.agents[aidStr];
+        bump(aidI, 0, 'No recipient configured for '+teamLabel, a.nlad, 0);
+      });
+      return;
+    }
+
+    // Calculate payment to the recipient
+    var nladPay = t.nladCount * AW_RATES.perEnrollment;
+    // Sum chargebacks across all rows in this team (the recipient bears them)
+    var teamCB = 0;
+    t.rows.forEach(function(r){ if(r.chargebackCents) teamCB += r.chargebackCents; });
+
+    var teamLabel = team ? (team.name || team.city || team.id) : 'team';
+    if(t.nladCount){
+      bump(recipientId, nladPay,
+           'Assurance NLAD '+recipientLabel+' — '+teamLabel,
+           t.nladCount, AW_RATES.perEnrollment);
+    }
+    if(teamCB){
+      bump(recipientId, teamCB/100, 'Assurance Chargebacks — '+teamLabel, 0, 0);
+    }
+
+    // Record agents' enrollment activity at $0 so they show up in tracking
+    Object.keys(t.agents).forEach(function(aidStr){
+      var aidI = parseInt(aidStr);
+      if(aidI === recipientId) return;  // recipient already credited above
+      var a = t.agents[aidStr];
+      bump(aidI, 0, 'Assurance enrollment '+recipientLabel, a.nlad, 0);
+    });
+  });
+
+  return { perAgent: byAgent, byTeam: byTeam, model:'assurance-v1', warnings: warnings };
+}
+
+function awFormatBreakdown(perAgent){
   var out = [];
   Object.keys(perAgent).forEach(function(aid){
     var entry = perAgent[aid];
@@ -8417,7 +8629,9 @@ async function loadFromSupabase(){
           // Gen Mobile pay model — defaults to 'none' if column doesn't exist
           cmModel:       a.cm_model || 'none',
           // TruConnect pay model — defaults to 'none' if column doesn't exist
-          tcModel:       a.tc_model || 'none'
+          tcModel:       a.tc_model || 'none',
+          // Assurance Wireless pay model — defaults to 'none' if column doesn't exist
+          awModel:       a.aw_model || 'none'
         };
       });
       // Auto-derive .category/.depts for every legacy record we just loaded.
@@ -8659,7 +8873,9 @@ async function saveAgentToSupabase(agent){
     // back to legacy save if the column doesn't exist in the schema.
     cm_model:       agent.cmModel || null,
     // TruConnect pay model (tcModel). Same fallback behavior.
-    tc_model:       agent.tcModel || null
+    tc_model:       agent.tcModel || null,
+    // Assurance Wireless pay model (awModel). Same fallback behavior.
+    aw_model:       agent.awModel || null
   };
   // Try the full write first.
   var ok = await sbUpsert('agents', full);
@@ -8667,7 +8883,7 @@ async function saveAgentToSupabase(agent){
   // not-yet-migrated Supabase schema). Retry without the new columns so the
   // agent still saves and we don't lose data on schema lag.
   if(!ok){
-    console.warn('[saveAgentToSupabase] Full save failed (likely unknown columns). Retrying with legacy fields only — cmModel/tcModel/category/depts/etc will not persist until the schema is migrated.');
+    console.warn('[saveAgentToSupabase] Full save failed (likely unknown columns). Retrying with legacy fields only — cmModel/tcModel/awModel/category/depts/etc will not persist until the schema is migrated.');
     var legacy = Object.assign({}, full);
     delete legacy.category;
     delete legacy.depts;
@@ -8675,6 +8891,7 @@ async function saveAgentToSupabase(agent){
     delete legacy.ibo_markets;
     delete legacy.cm_model;
     delete legacy.tc_model;
+    delete legacy.aw_model;
     await sbUpsert('agents', legacy);
   }
 }
@@ -10024,6 +10241,18 @@ function saveAgentForm(){
       } else if(isOwner(DB.current) && a.tcModel && a.tcModel !== 'none'){
         console.log('[saveAgentForm] Clearing stale tcModel="'+a.tcModel+'" because role is no longer CM/IBO');
         a.tcModel = 'none';
+      }
+    }
+
+    // awModel — Assurance Wireless override style. Same handling.
+    var awModelEl = document.getElementById('aaAWModel');
+    var awModelRowEl = document.getElementById('aaAWModelRow');
+    if(awModelEl && awModelRowEl){
+      if(awModelRowEl.style.display !== 'none'){
+        a.awModel = awModelEl.value || 'none';
+      } else if(isOwner(DB.current) && a.awModel && a.awModel !== 'none'){
+        console.log('[saveAgentForm] Clearing stale awModel="'+a.awModel+'" because role is no longer CM/IBO');
+        a.awModel = 'none';
       }
     }
     // Department access — OWNER ONLY can grant. Anyone else editing a
@@ -23941,20 +24170,36 @@ function renderAgentProgramCheckboxes(selectedPrograms){
   });
 }
 
-// Show/hide the CM Override Style row based on currently-selected role.
-// Called whenever the role changes within the modal so the picker
-// appears immediately (not just when re-opening the modal). Toggles
-// both the Gen Mobile and TruConnect override style rows.
+// Show/hide the override-style rows based on currently-selected role.
+// Toggles the Gen Mobile, TruConnect, and Assurance override style rows
+// in lockstep — all three are CM/IBO-only and Owner-only.
 function aaToggleCMModelVisibility(){
   var cmRow = document.getElementById('aaCMModelRow');
   var tcRow = document.getElementById('aaTCModelRow');
+  var awRow = document.getElementById('aaAWModelRow');
   var viewer = DB.current;
   var allowed = isOwner(viewer);
   var roleEl = document.getElementById('aaRole');
   var role = roleEl ? roleEl.value : '';
   var isCMOrIBO = (role === 'Campaign Manager' || role === 'IBO');
-  if(cmRow) cmRow.style.display = (allowed && isCMOrIBO) ? 'block' : 'none';
-  if(tcRow) tcRow.style.display = (allowed && isCMOrIBO) ? 'block' : 'none';
+  var show = (allowed && isCMOrIBO) ? 'block' : 'none';
+  if(cmRow) cmRow.style.display = show;
+  if(tcRow) tcRow.style.display = show;
+  if(awRow) awRow.style.display = show;
+}
+
+// Update help-text when AW Override Style dropdown changes.
+function aaAWModelChanged(){
+  var sel = document.getElementById('aaAWModel');
+  var help = document.getElementById('aaAWModelHelp');
+  if(!sel || !help) return;
+  var v = sel.value || 'none';
+  var color = '#6b7280', icon = '⚪', desc = 'No special routing. Assurance defaults to paying $5/each to the Market Manager of the team.';
+  if(v === 'aw-cm-consolidated'){
+    color = '#D97706'; icon = '⭐';
+    desc = '<strong>AW CM Consolidated (Juan):</strong> Every Assurance enrollment in any market that lists me as Campaign Manager routes $5 to me instead of the MM. I am the "business" — the company pays only me, and I handle internal payouts to my people privately. Chargebacks come out of my pay.';
+  }
+  help.innerHTML = '<div style="padding:8px 10px;background:'+color+'15;border-left:3px solid '+color+';border-radius:4px;color:var(--brown)"><strong style="color:'+color+'">'+icon+'</strong> '+desc+'</div>';
 }
 
 // Update the help-text/preview when TC Override Style dropdown changes.
@@ -24051,16 +24296,20 @@ function toggleLLFields(){
   var callRow = document.getElementById('aaCanHostCallRow');
   if(callRow) callRow.style.display = isAdmin ? 'block' : 'none';
 
-  // cmModel + tcModel rows — Gen Mobile + TruConnect override styles.
-  // Show only when viewer is Owner AND role is CM/IBO. Independent fields —
-  // same person can have different override styles per campaign.
+  // cmModel + tcModel + awModel rows — Gen Mobile, TruConnect, and
+  // Assurance override styles. Show only when viewer is Owner AND role
+  // is CM/IBO. Independent fields — same person can have different
+  // override styles per campaign.
   var cmSel = document.getElementById('aaCMModel');
   if(cmSel) cmSel.value = a.cmModel || 'none';
   var tcSel = document.getElementById('aaTCModel');
   if(tcSel) tcSel.value = a.tcModel || 'none';
+  var awSel = document.getElementById('aaAWModel');
+  if(awSel) awSel.value = a.awModel || 'none';
   if(typeof aaToggleCMModelVisibility === 'function') aaToggleCMModelVisibility();
   if(typeof aaCMModelChanged === 'function') aaCMModelChanged();
   if(typeof aaTCModelChanged === 'function') aaTCModelChanged();
+  if(typeof aaAWModelChanged === 'function') aaAWModelChanged();
 
   // Department access section — OWNER ONLY. Previously this was "anyone
   // who can edit profiles" but that leaked permission-granting power to
