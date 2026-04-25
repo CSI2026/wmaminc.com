@@ -8319,72 +8319,60 @@ function agentIdsInMyOrg(user){
 // Returns: { teamLeaderId, marketManagerId, campaignManagerId } — each
 // either the explicit value, or an auto-derived value, or null.
 function reportingChainFor(user){
-  if(!user) return { teamLeaderId:null, marketManagerId:null, campaignManagerId:null };
-  var role = user.role;
-  var out = {
-    teamLeaderId:      user.teamLeaderId      || null,
-    marketManagerId:   user.marketManagerId   || null,
-    campaignManagerId: user.campaignManagerId || null
-  };
+  try {
+    if(!user) return { teamLeaderId:null, marketManagerId:null, campaignManagerId:null };
+    var role = user.role;
+    var out = {
+      teamLeaderId:      user.teamLeaderId      || null,
+      marketManagerId:   user.marketManagerId   || null,
+      campaignManagerId: user.campaignManagerId || null
+    };
 
-  // Normalize: a user is never their own manager
-  if(out.teamLeaderId      === user.id) out.teamLeaderId      = null;
-  if(out.marketManagerId   === user.id) out.marketManagerId   = null;
-  if(out.campaignManagerId === user.id) out.campaignManagerId = null;
+    if(out.teamLeaderId      === user.id) out.teamLeaderId      = null;
+    if(out.marketManagerId   === user.id) out.marketManagerId   = null;
+    if(out.campaignManagerId === user.id) out.campaignManagerId = null;
 
-  // Role-based auto-derive eligibility:
-  //   CM/IBO    → no auto-derive (they sit at the top)
-  //   MM        → only campaignManagerId can be auto-derived
-  //   TL        → only marketManagerId + campaignManagerId
-  //   Field Agent → all three CAN be auto-derived, but with the "intentional
-  //                 direct MM report" rule: if marketManagerId is explicit
-  //                 and teamLeaderId is undefined (not present on user object
-  //                 at all), don't auto-derive TL.
-  if(role === 'Campaign Manager' || role === 'IBO') return out;
+    if(role === 'Campaign Manager' || role === 'IBO') return out;
 
-  if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return out;
-  var team = LIFELINE_TEAMS.find(function(t){
-    if(!t || !t.active) return false;
-    return Array.isArray(t.members) && t.members.indexOf(user.id) >= 0;
-  });
-  if(!team) return out;
+    if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return out;
+    var team = LIFELINE_TEAMS.find(function(t){
+      if(!t || !t.active) return false;
+      return Array.isArray(t.members) && t.members.indexOf(user.id) >= 0;
+    });
+    if(!team) return out;
 
-  // Helper: only set if not already set (preserve explicit values)
-  function maybeSet(field, val){
-    if(out[field]) return;        // already explicit
-    if(val == null) return;        // no team data
-    if(val === user.id) return;    // can't be your own manager
-    out[field] = val;
-  }
+    function maybeSet(field, val){
+      if(out[field]) return;
+      if(val == null) return;
+      if(val === user.id) return;
+      out[field] = val;
+    }
 
-  if(role === 'Market Manager'){
-    // MM can only auto-derive a CM above them
-    maybeSet('campaignManagerId', team.campaignManager);
-    return out;
-  }
+    if(role === 'Market Manager'){
+      maybeSet('campaignManagerId', team.campaignManager);
+      return out;
+    }
 
-  if(role === 'Team Leader'){
+    if(role === 'Team Leader'){
+      maybeSet('marketManagerId',   team.marketManager);
+      maybeSet('campaignManagerId', team.campaignManager);
+      return out;
+    }
+
+    var hasExplicitMM = (typeof user.marketManagerId === 'number' && user.marketManagerId > 0);
+    var teamLeaderUndefined = (user.teamLeaderId === undefined || user.teamLeaderId === null);
+    if(hasExplicitMM && teamLeaderUndefined){
+      maybeSet('campaignManagerId', team.campaignManager);
+      return out;
+    }
+    maybeSet('teamLeaderId',      team.leader);
     maybeSet('marketManagerId',   team.marketManager);
     maybeSet('campaignManagerId', team.campaignManager);
     return out;
+  } catch(e) {
+    console.warn('[reportingChainFor] failed safely:', e);
+    return { teamLeaderId:null, marketManagerId:null, campaignManagerId:null };
   }
-
-  // Field Agent (or other sales role)
-  // Special rule: if teamLeaderId is explicitly absent AND marketManagerId is
-  // explicitly set on the user, this is a direct MM report. Don't auto-fill
-  // teamLeaderId from the team — it would incorrectly link them to a TL.
-  var hasExplicitMM = (typeof user.marketManagerId === 'number' && user.marketManagerId > 0);
-  var teamLeaderUndefined = (user.teamLeaderId === undefined || user.teamLeaderId === null);
-  if(hasExplicitMM && teamLeaderUndefined){
-    // Intentional direct MM report — leave teamLeaderId null
-    maybeSet('campaignManagerId', team.campaignManager);
-    return out;
-  }
-  // Otherwise (no explicit MM either, or both fields missing), auto-fill all
-  maybeSet('teamLeaderId',      team.leader);
-  maybeSet('marketManagerId',   team.marketManager);
-  maybeSet('campaignManagerId', team.campaignManager);
-  return out;
 }
 
 // Effective IDs for org-chart traversal — uses reportingChainFor to fill
@@ -8412,87 +8400,94 @@ function effectiveOrgFor(user){
 // Returns: parent agent ID, or null if user is top-of-org for that campaign,
 // or undefined if no resolution possible (shouldn't happen with valid data).
 function parentForCampaign(user, campaign){
-  if(!user) return null;
+  try {
+    if(!user) return null;
+    if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return null;
 
-  // Layer 0: hard rule — IBO is ALWAYS top-of-org regardless of any data.
-  // CM is top-of-org UNLESS explicitly placed under an IBO via reportsTo.
-  if(user.role === 'IBO') return null;
+    // Layer 0: hard rule — IBO is ALWAYS top-of-org regardless of any data.
+    if(user.role === 'IBO') return null;
 
-  // Layer 1: explicit reportsTo map (set by Onboarding Dept)
-  if(user.reportsTo && Object.prototype.hasOwnProperty.call(user.reportsTo, campaign)){
-    var v = user.reportsTo[campaign];
-    // null is a valid value here — means "top of org"
-    if(v === null) return null;
-    if(typeof v === 'number' && v > 0 && v !== user.id){
-      // Validate: parent must exist and be a more-senior role (or IBO).
-      // For CM, only IBO is a valid parent. For MM, IBO/CM. For TL, IBO/CM/MM.
-      var parent = DB.agents.find(function(x){return x.id===v;});
-      if(parent && parent.active){
-        var validParents = {
-          'Campaign Manager': ['IBO'],
-          'Market Manager':   ['IBO','Campaign Manager'],
-          'Team Leader':      ['IBO','Campaign Manager','Market Manager'],
-          'Field Agent':      ['IBO','Campaign Manager','Market Manager','Team Leader'],
-          'Sales Rep':        ['IBO','Campaign Manager','Market Manager','Team Leader']
-        };
-        var allowed = validParents[user.role] || [];
-        if(allowed.indexOf(parent.role) >= 0) return v;
-        // Invalid parent role — fall through to legacy
-        console.warn('[parentForCampaign] Agent '+user.id+' role='+user.role+' has invalid reportsTo['+campaign+']='+v+' (parent role: '+parent.role+'). Falling back to legacy chain.');
+    // Layer 1: explicit reportsTo map (set by Onboarding Dept)
+    if(user.reportsTo && Object.prototype.hasOwnProperty.call(user.reportsTo, campaign)){
+      var v = user.reportsTo[campaign];
+      if(v === null) return null;
+      if(typeof v === 'number' && v > 0 && v !== user.id){
+        var parent = DB.agents.find(function(x){return x.id===v;});
+        if(parent && parent.active){
+          var validParents = {
+            'Campaign Manager': ['IBO'],
+            'Market Manager':   ['IBO','Campaign Manager'],
+            'Team Leader':      ['IBO','Campaign Manager','Market Manager'],
+            'Field Agent':      ['IBO','Campaign Manager','Market Manager','Team Leader'],
+            'Sales Rep':        ['IBO','Campaign Manager','Market Manager','Team Leader']
+          };
+          var allowed = validParents[user.role] || [];
+          if(allowed.indexOf(parent.role) >= 0) return v;
+          // Invalid parent role — fall through to legacy
+        }
       }
     }
-    // Anything else (undefined, 0, self-id, missing parent) — fall through
-  }
 
-  // Layer 2: legacy auto-derived chain (uses reportingChainFor under the hood)
-  var chain = reportingChainFor(user);
-  // Pick the first non-null parent in the chain ABOVE this user's role
-  var role = user.role;
-  if(role === 'Field Agent' || (role && !['Team Leader','Market Manager','Campaign Manager','IBO'].includes(role))){
-    return chain.teamLeaderId || chain.marketManagerId || chain.campaignManagerId || null;
+    // Layer 2: legacy auto-derived chain
+    var chain = (typeof reportingChainFor === 'function')
+      ? reportingChainFor(user)
+      : { teamLeaderId:user.teamLeaderId||null, marketManagerId:user.marketManagerId||null, campaignManagerId:user.campaignManagerId||null };
+    var role = user.role;
+    if(role === 'Field Agent' || (role && ['Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(role) < 0)){
+      return chain.teamLeaderId || chain.marketManagerId || chain.campaignManagerId || null;
+    }
+    if(role === 'Team Leader'){
+      return chain.marketManagerId || chain.campaignManagerId || null;
+    }
+    if(role === 'Market Manager'){
+      return chain.campaignManagerId || null;
+    }
+    return null;
+  } catch(e) {
+    console.warn('[parentForCampaign] failed safely for user '+(user&&user.id)+' campaign '+campaign+':', e);
+    return null;
   }
-  if(role === 'Team Leader'){
-    return chain.marketManagerId || chain.campaignManagerId || null;
-  }
-  if(role === 'Market Manager'){
-    return chain.campaignManagerId || null;
-  }
-  // Campaign Manager: top-of-org unless legacy field set them under an IBO.
-  // (Legacy fields don't have an IBO slot, so default null.)
-  return null;
 }
 
 // Walk DOWNWARD from a user through per-campaign parent links.
 // Returns array of agent IDs in this user's org for the given campaign,
 // INCLUDING the user themselves at index 0.
 function agentIdsInMyOrgForCampaign(user, campaign){
-  if(!user) return [];
-  if(!campaign) return agentIdsInMyOrgEffective(user); // fallback to legacy global walker
-  var seen = {}; seen[user.id] = true;
-  var ids = [user.id];
+  try {
+    if(!user) return [];
+    if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return user ? [user.id] : [];
+    if(!campaign){
+      return (typeof agentIdsInMyOrgEffective === 'function')
+        ? agentIdsInMyOrgEffective(user)
+        : [user.id];
+    }
+    var seen = {}; seen[user.id] = true;
+    var ids = [user.id];
 
-  // Walk: any agent whose parentForCampaign chain leads back to user is in their org
-  // BFS up to a sane depth limit to prevent runaway loops on bad data
-  var MAX_DEPTH = 8;
-  DB.agents.forEach(function(a){
-    if(!a.active || a.id === user.id) return;
-    var cursor = a;
-    var depth = 0;
-    while(cursor && depth < MAX_DEPTH){
-      var parentId = parentForCampaign(cursor, campaign);
-      if(parentId === null) break;       // hit top of cursor's org
-      if(parentId === user.id){
-        if(!seen[a.id]){ seen[a.id] = true; ids.push(a.id); }
-        break;
+    var MAX_DEPTH = 8;
+    DB.agents.forEach(function(a){
+      if(!a || !a.active || a.id === user.id) return;
+      var cursor = a;
+      var depth = 0;
+      while(cursor && depth < MAX_DEPTH){
+        var parentId = parentForCampaign(cursor, campaign);
+        if(parentId === null) break;
+        if(parentId === user.id){
+          if(!seen[a.id]){ seen[a.id] = true; ids.push(a.id); }
+          break;
+        }
+        cursor = DB.agents.find(function(x){return x.id===parentId;});
+        depth++;
       }
-      cursor = DB.agents.find(function(x){return x.id===parentId;});
-      depth++;
-    }
-    if(depth >= MAX_DEPTH){
-      console.warn('[agentIdsInMyOrgForCampaign] cycle or excessive depth detected for agent '+a.id+' on campaign '+campaign);
-    }
-  });
-  return ids;
+      if(depth >= MAX_DEPTH){
+        console.warn('[agentIdsInMyOrgForCampaign] cycle or excessive depth detected for agent '+a.id+' on campaign '+campaign);
+      }
+    });
+    return ids;
+  } catch(e) {
+    console.warn('[agentIdsInMyOrgForCampaign] failed safely:', e);
+    return user ? [user.id] : [];
+  }
 }
 
 // Walk DOWN from this user through reporting chains, but use BOTH
@@ -8600,47 +8595,49 @@ function deviceHolderId(device){
 // Public API: given a user and a campaign name, return the device list
 // they can see. Replaces the old gmScopedDevices and legacyScopedDevices.
 function inventoryVisibleTo(user, campaign){
-  if(!user) return [];
+  try {
+    if(!user) return [];
 
-  // Resolve the device pool from the campaign name
-  var pool = [];
-  if(campaign === 'Gen Mobile')        pool = (typeof GM_INVENTORY !== 'undefined' && Array.isArray(GM_INVENTORY)) ? GM_INVENTORY : [];
-  else if(campaign === 'TruConnect')   pool = (typeof TC_INVENTORY !== 'undefined' && Array.isArray(TC_INVENTORY)) ? TC_INVENTORY : [];
-  else if(campaign === 'Assurance')    pool = (typeof AW_INVENTORY !== 'undefined' && Array.isArray(AW_INVENTORY)) ? AW_INVENTORY : [];
-  else if(campaign === 'Excess')       pool = (typeof EX_INVENTORY !== 'undefined' && Array.isArray(EX_INVENTORY)) ? EX_INVENTORY : [];
-  else if(!campaign){
-    // No campaign specified → all of them combined
-    return inventoryVisibleToAllCampaigns(user);
-  } else {
-    // Unknown campaign — try campaignCfg as a fallback for future programs
-    if(typeof campaignCfg === 'function'){
-      var cfg = campaignCfg(campaign);
-      if(cfg && typeof cfg.inventory === 'function') pool = cfg.inventory() || [];
+    // Resolve the device pool from the campaign name
+    var pool = [];
+    if(campaign === 'Gen Mobile')        pool = (typeof GM_INVENTORY !== 'undefined' && Array.isArray(GM_INVENTORY)) ? GM_INVENTORY : [];
+    else if(campaign === 'TruConnect')   pool = (typeof TC_INVENTORY !== 'undefined' && Array.isArray(TC_INVENTORY)) ? TC_INVENTORY : [];
+    else if(campaign === 'Assurance')    pool = (typeof AW_INVENTORY !== 'undefined' && Array.isArray(AW_INVENTORY)) ? AW_INVENTORY : [];
+    else if(campaign === 'Excess')       pool = (typeof EX_INVENTORY !== 'undefined' && Array.isArray(EX_INVENTORY)) ? EX_INVENTORY : [];
+    else if(!campaign){
+      return inventoryVisibleToAllCampaigns(user);
+    } else {
+      if(typeof campaignCfg === 'function'){
+        var cfg = campaignCfg(campaign);
+        if(cfg && typeof cfg.inventory === 'function'){
+          try { pool = cfg.inventory() || []; } catch(e2){ pool = []; }
+        }
+      }
     }
+
+    // Owner / Admin / Inventory Dept → see all
+    if(typeof isOwner === 'function' && isOwner(user)) return pool.slice();
+    if(user.role === 'admin') return pool.slice();
+    if(typeof isInventory === 'function' && isInventory(user)) return pool.slice();
+    if(typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(user, 'inv-dashboard')) return pool.slice();
+
+    var orgIds;
+    if(typeof agentIdsInMyOrgForCampaign === 'function'){
+      orgIds = agentIdsInMyOrgForCampaign(user, campaign);
+    } else if(typeof agentIdsInMyOrgEffective === 'function'){
+      orgIds = agentIdsInMyOrgEffective(user);
+    } else {
+      orgIds = [user.id];
+    }
+
+    return pool.filter(function(d){
+      var holderId = deviceHolderId(d);
+      return holderId !== null && orgIds.indexOf(holderId) >= 0;
+    });
+  } catch(e) {
+    console.warn('[inventoryVisibleTo] failed safely for user '+(user&&user.id)+' campaign '+campaign+':', e);
+    return [];
   }
-
-  // Owner / Admin / Inventory Dept → see all
-  if(isOwner(user)) return pool.slice();
-  if(user.role === 'admin') return pool.slice();
-  if(typeof isInventory === 'function' && isInventory(user)) return pool.slice();
-  if(typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(user, 'inv-dashboard')) return pool.slice();
-
-  // Get the IDs of every agent in this user's downstream org for THIS campaign
-  // (per-campaign reporting chains may differ from each other)
-  var orgIds;
-  if(typeof agentIdsInMyOrgForCampaign === 'function'){
-    orgIds = agentIdsInMyOrgForCampaign(user, campaign);
-  } else if(typeof agentIdsInMyOrgEffective === 'function'){
-    orgIds = agentIdsInMyOrgEffective(user);
-  } else {
-    orgIds = [user.id];
-  }
-
-  // Filter the pool: a device is visible if its effective holder is in the user's org
-  return pool.filter(function(d){
-    var holderId = deviceHolderId(d);
-    return holderId !== null && orgIds.indexOf(holderId) >= 0;
-  });
 }
 
 // Helper: union of all-campaign visible inventory for a user
@@ -24658,15 +24655,21 @@ function aaToggleCMModelVisibility(){
 
 // Show/hide the Reporting Chain row. Visible to: Owner OR Onboarding Dept.
 function aaToggleReportingChainVisibility(){
-  var row = document.getElementById('aaReportingChainRow');
-  if(!row) return;
-  var viewer = DB.current;
-  if(!viewer){ row.style.display = 'none'; return; }
-  var allowed = isOwner(viewer)
-    || (typeof isOnboarding === 'function' && isOnboarding(viewer))
-    || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(viewer, 'onboarding'));
-  row.style.display = allowed ? 'block' : 'none';
-  if(allowed && typeof aaRefreshReportingChain === 'function') aaRefreshReportingChain();
+  try {
+    var row = document.getElementById('aaReportingChainRow');
+    if(!row) return;
+    var viewer = (typeof DB !== 'undefined') ? DB.current : null;
+    if(!viewer){ row.style.display = 'none'; return; }
+    var allowed = (typeof isOwner === 'function' && isOwner(viewer))
+      || (typeof isOnboarding === 'function' && isOnboarding(viewer))
+      || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(viewer, 'onboarding'));
+    row.style.display = allowed ? 'block' : 'none';
+    if(allowed && typeof aaRefreshReportingChain === 'function') aaRefreshReportingChain();
+  } catch(e) {
+    console.warn('[aaToggleReportingChainVisibility] failed safely:', e);
+    var row = document.getElementById('aaReportingChainRow');
+    if(row) row.style.display = 'none';
+  }
 }
 
 // Determine which campaigns to show dropdowns for. Currently uses the
@@ -24732,41 +24735,51 @@ function aaEligibleParents(roleBeingAdded, campaign){
 
 // Rebuild the dropdowns inside aaReportingChainContainer.
 function aaRefreshReportingChain(){
-  var container = document.getElementById('aaReportingChainContainer');
-  if(!container) return;
-  container.innerHTML = '';
-  var agent = aaCurrentAgent();
-  // For new agents (no aaId), pull role from the form to determine eligibles
-  var roleEl = document.getElementById('aaRole');
-  var roleBeingAdded = roleEl ? roleEl.value : (agent && agent.role) || '';
-  if(!roleBeingAdded){
-    container.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);font-style:italic">Pick a role first to see reporting-chain options.</div>';
-    return;
-  }
-  if(roleBeingAdded === 'IBO'){
-    container.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);padding:8px 10px;background:rgba(217,119,6,.06);border-left:3px solid #D97706;border-radius:4px"><strong>IBOs sit at the top of their own org.</strong> No reporting chain needed — agents/MMs/CMs are placed under them via their own profiles.</div>';
-    return;
-  }
-  var campaigns = aaActiveCampaignsForReporting(agent);
-  campaigns.forEach(function(camp){
-    var saved = (agent && agent.reportsTo && Object.prototype.hasOwnProperty.call(agent.reportsTo, camp))
-      ? agent.reportsTo[camp]
-      : undefined;
-    var eligibles = aaEligibleParents(roleBeingAdded, camp);
-    var rowHtml = '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:white;border:1px solid var(--sand);border-radius:6px">'
-      + '<div style="flex:0 0 110px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;font-weight:700;color:var(--brown)">'+camp+'</div>'
-      + '<select class="aaReportsToSelect" data-campaign="'+camp.replace(/"/g,'&quot;')+'" style="flex:1;padding:6px 8px;border:1px solid var(--sand);border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
-    eligibles.forEach(function(p){
-      var val = (p.id===null) ? '__top__' : String(p.id);
-      var sel = '';
-      if(saved === null && p.id === null) sel = ' selected';
-      else if(typeof saved === 'number' && saved === p.id) sel = ' selected';
-      else if(saved === undefined && p.id === null) sel = ' selected';  // default to top-of-org for unset
-      rowHtml += '<option value="'+val+'"'+sel+'>'+p.label.replace(/</g,'&lt;')+'</option>';
+  try {
+    var container = document.getElementById('aaReportingChainContainer');
+    if(!container) return;
+    container.innerHTML = '';
+    if(typeof DB === 'undefined' || !Array.isArray(DB.agents)){
+      container.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);font-style:italic">Agent data not loaded yet.</div>';
+      return;
+    }
+    var agent = aaCurrentAgent();
+    // For new agents (no aaId), pull role from the form to determine eligibles
+    var roleEl = document.getElementById('aaRole');
+    var roleBeingAdded = roleEl ? roleEl.value : (agent && agent.role) || '';
+    if(!roleBeingAdded){
+      container.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);font-style:italic">Pick a role first to see reporting-chain options.</div>';
+      return;
+    }
+    if(roleBeingAdded === 'IBO'){
+      container.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);padding:8px 10px;background:rgba(217,119,6,.06);border-left:3px solid #D97706;border-radius:4px"><strong>IBOs sit at the top of their own org.</strong> No reporting chain needed — agents/MMs/CMs are placed under them via their own profiles.</div>';
+      return;
+    }
+    var campaigns = aaActiveCampaignsForReporting(agent);
+    campaigns.forEach(function(camp){
+      var saved = (agent && agent.reportsTo && Object.prototype.hasOwnProperty.call(agent.reportsTo, camp))
+        ? agent.reportsTo[camp]
+        : undefined;
+      var eligibles = aaEligibleParents(roleBeingAdded, camp);
+      var rowHtml = '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:white;border:1px solid var(--sand);border-radius:6px">'
+        + '<div style="flex:0 0 110px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;font-weight:700;color:var(--brown)">'+camp+'</div>'
+        + '<select class="aaReportsToSelect" data-campaign="'+camp.replace(/"/g,'&quot;')+'" style="flex:1;padding:6px 8px;border:1px solid var(--sand);border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+      eligibles.forEach(function(p){
+        var val = (p.id===null) ? '__top__' : String(p.id);
+        var sel = '';
+        if(saved === null && p.id === null) sel = ' selected';
+        else if(typeof saved === 'number' && saved === p.id) sel = ' selected';
+        else if(saved === undefined && p.id === null) sel = ' selected';
+        rowHtml += '<option value="'+val+'"'+sel+'>'+p.label.replace(/</g,'&lt;')+'</option>';
+      });
+      rowHtml += '</select></div>';
+      container.insertAdjacentHTML('beforeend', rowHtml);
     });
-    rowHtml += '</select></div>';
-    container.insertAdjacentHTML('beforeend', rowHtml);
-  });
+  } catch(e) {
+    console.warn('[aaRefreshReportingChain] failed safely:', e);
+    var container = document.getElementById('aaReportingChainContainer');
+    if(container) container.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:#dc2626">Reporting chain UI temporarily unavailable. The rest of this form will still save correctly.</div>';
+  }
 }
 
 // Read the dropdowns and produce a reportsTo map for save.
