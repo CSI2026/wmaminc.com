@@ -4022,6 +4022,26 @@ var ONBOARD_TEMPLATES   = {};   // override bodies + custom inserts
 var ONBOARD_PACKAGES    = [];   // named bundles
 var ONBOARD_ASSIGNMENTS = [];   // per-agent packets
 
+// ══════════════════════════════════════════════════════════════
+//  STORE — items for sale (buy with USD) or prizes (earn with points)
+//
+//  Two distinct item types — never both:
+//    type='buy'   → USD price, always available until out of stock
+//                   Examples: replacement tents, swag, supplies
+//    type='prize' → points cost, tied to ONE contest with a time window
+//                   Active flag controls visibility outside the window
+//                   Examples: Top Performer Q4 prize, Daily-call streak award
+//
+//  Media (photo, video) is uploaded to Supabase Storage and the public
+//  URL is stored on the item. Owner/admin can upload; everyone can view.
+//
+//  Mutations require Owner OR admin role. Browse/redeem is open to all.
+// ══════════════════════════════════════════════════════════════
+var STORE_ITEMS = [];   // [{id, type:'buy'|'prize', name, description, photoUrl, videoUrl,
+                        //   priceUSD, pointsCost, stock, active, contestName,
+                        //   contestStart, contestEnd, createdBy, createdAt, updatedAt}]
+var STORE_NEXT_ID = 1;
+
 // Preset document library — the 8 standard docs.
 // Each has: id, name, icon, body (with {{TOKENS}} for fill-in fields),
 // and signRequired flag (some docs need a sig, some are just info).
@@ -4282,6 +4302,29 @@ function saveOnboardData(){
     try{ saveAppSettingToSupabase('onboard_packages',    ONBOARD_PACKAGES); }catch(e){}
     try{ saveAppSettingToSupabase('onboard_assignments', ONBOARD_ASSIGNMENTS); }catch(e){}
   }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  STORE PERSISTENCE
+//  STORE_ITEMS lives in app_settings under key 'store_items'.
+//  localStorage is per-user cache; Supabase is multi-user truth.
+// ══════════════════════════════════════════════════════════════
+function saveStore(){
+  try{ localStorage.setItem('wmam_store_items',   JSON.stringify(STORE_ITEMS)); }catch(e){}
+  try{ localStorage.setItem('wmam_store_next_id', String(STORE_NEXT_ID)); }catch(e){}
+  if(typeof saveAppSettingToSupabase === 'function'){
+    try{ saveAppSettingToSupabase('store_items',   STORE_ITEMS); }catch(e){}
+    try{ saveAppSettingToSupabase('store_next_id', STORE_NEXT_ID); }catch(e){}
+  }
+}
+
+function loadStore(){
+  try {
+    var s = localStorage.getItem('wmam_store_items');
+    if(s) STORE_ITEMS = JSON.parse(s) || [];
+    var n = localStorage.getItem('wmam_store_next_id');
+    if(n) STORE_NEXT_ID = parseInt(n, 10) || 1;
+  } catch(e){ console.warn('[loadStore] localStorage:', e); }
 }
 
 // Get the effective template (preset overridden by ONBOARD_TEMPLATES if customized)
@@ -7456,6 +7499,11 @@ function canAccess(u, area){
     case 'meetings':         return !isOfficeRole(u);
     case 'profile':          return !isOfficeRole(u);
 
+    // ── Store: open to everyone (sales, office, IBO, managers) ──
+    // Edit access (add/edit/delete items) is enforced separately via
+    // canEditStore() — checked inside the panel itself.
+    case 'store':            return true;
+
     default:                 return false; // DEFAULT DENY — was 'return true', which was the bug
   }
 }
@@ -9300,6 +9348,13 @@ async function loadFromSupabase(){
         }
         if(s.key==='onboard_assignments' && s.value){
           try{ var v=JSON.parse(s.value); if(Array.isArray(v)) ONBOARD_ASSIGNMENTS = v; }catch(e){ console.warn('[load] onboard_assignments:',e); }
+        }
+        // ── Store stores ──
+        if(s.key==='store_items' && s.value){
+          try{ var v=JSON.parse(s.value); if(Array.isArray(v)) STORE_ITEMS = v; }catch(e){ console.warn('[load] store_items:',e); }
+        }
+        if(s.key==='store_next_id' && s.value){
+          try{ var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n) && n>0) STORE_NEXT_ID = n; }catch(e){ console.warn('[load] store_next_id:',e); }
         }
       });
       loadProgGoalsFromSupabase(settings);
@@ -13358,7 +13413,7 @@ function doLogin(){
   launchBO(found);
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
-  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadCompPlans(); loadOnboardData(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
+  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadCompPlans(); loadOnboardData(); loadStore(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
   // POST-LOGIN LANDING PAGE ROUTING
   // Owner → Owner Control (their actual home)
   // Everyone else → panelBO (the main back-office dashboard)
@@ -13652,6 +13707,9 @@ function buildNav(u){
   if(canAccess(u,'meetings')){
     h += boNavBtn('meetings','📞 Meetings');
   }
+
+  // Store — everyone can browse
+  h += boNavBtn('store','🛍️ Store');
 
   // Settings / Owner Control
   if(canAccess(u,'settings')){
@@ -14825,6 +14883,8 @@ function gotoPanel(id, params){
     'comp-assign-edit':panelCompAssignEdit,
     'comp-acknowledge':panelCompAcknowledge,
     'pattern-assignments':panelPatternAssignments,
+    'store':panelStore,
+    'store-edit':panelStoreEdit,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -25279,6 +25339,462 @@ async function paaSavePattern(agentId, field, value){
   } catch(e) {
     console.warn('[paaSavePattern] failed safely:', e);
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  STORE — catalog browse + Owner/admin editor (Ship A)
+//
+//  Two item types:
+//    • buy   — USD price, always available, paid via credit card later (Ship D)
+//    • prize — points cost, tied to ONE contest with start/end window
+//              Active flag controls visibility outside the window
+//
+//  Permissions:
+//    Browse — everyone (gated by canAccess(u, 'store') which returns true)
+//    Edit — Owner OR admin role only (canEditStore)
+//
+//  Media — photo/video uploads go to Supabase Storage 'store-media' bucket.
+//  Public read so the URL can be served from anywhere; only Owner/admin
+//  can write. URL is stored on the item record.
+// ════════════════════════════════════════════════════════════════════════
+
+function canEditStore(user){
+  try {
+    if(!user) return false;
+    if(typeof isOwner === 'function' && isOwner(user)) return true;
+    if(typeof isAdminRole === 'function' && isAdminRole(user)) return true;
+    return false;
+  } catch(e) {
+    console.warn('[canEditStore] failed safely:', e);
+    return false;
+  }
+}
+
+// Determine if a prize item is currently in its active contest window.
+// Returns:
+//   true  → prize visible (active flag on AND within date window)
+//   false → prize hidden from regular shoppers (Owner/admin still see it
+//           with a "PAUSED" tag in the editor)
+function isPrizeCurrentlyActive(item){
+  if(!item || item.type !== 'prize') return false;
+  if(item.active === false) return false;
+  var now = new Date().toISOString().slice(0,10);  // YYYY-MM-DD
+  if(item.contestStart && now < item.contestStart) return false;
+  if(item.contestEnd && now > item.contestEnd) return false;
+  return true;
+}
+
+// Storefront — read-only grid for everyone
+function panelStore(){
+  try {
+    var u = DB.current;
+    if(!u) return panelHeader('🛍️ Store') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">Sign in to view the store.</div></div>';
+
+    var canEdit = canEditStore(u);
+    var h = panelHeader('🛍️ Store');
+
+    // Action bar
+    if(canEdit){
+      h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">'+STORE_ITEMS.length+' items in store</div>';
+      h += '<button onclick="openStoreEdit(0)" class="btn-fire" style="padding:9px 20px;font-size:.72rem">+ Add New Item</button>';
+      h += '</div>';
+    }
+
+    // Intro
+    h += '<div style="background:linear-gradient(135deg,rgba(124,58,237,.04),rgba(236,72,153,.04));border:1px solid rgba(124,58,237,.15);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.6">';
+    h += '<strong style="color:var(--brown)">🛒 Buy items</strong> are paid for with a credit card.<br>';
+    h += '<strong style="color:var(--brown)">🏆 Prize items</strong> are earned with reward points by hitting performance goals — daily photo audits, joining calls on time, hitting weekly sales targets, and keeping inventory clean. <em>Each contest has a window — once it ends the prize is no longer claimable.</em>';
+    h += '</div>';
+
+    // Filter: split into buy items + active prizes (for everyone), plus inactive prizes (admins only)
+    var buyItems = STORE_ITEMS.filter(function(i){ return i.type === 'buy' && i.active !== false; });
+    var prizeItems = STORE_ITEMS.filter(function(i){ return i.type === 'prize' && isPrizeCurrentlyActive(i); });
+    var inactivePrizes = canEdit ? STORE_ITEMS.filter(function(i){ return i.type === 'prize' && !isPrizeCurrentlyActive(i); }) : [];
+    var inactiveBuy   = canEdit ? STORE_ITEMS.filter(function(i){ return i.type === 'buy' && i.active === false; }) : [];
+
+    if(!STORE_ITEMS.length){
+      h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">🛍️</div><div style="font-size:1rem;margin-bottom:8px">The store is empty.</div>'
+        +(canEdit?'<div style="font-size:.78rem">Click <strong>+ Add New Item</strong> to start adding items.</div>':'<div style="font-size:.78rem">Check back soon — items are coming!</div>')
+        +'</div></div>';
+      return h;
+    }
+
+    // Buy items section
+    if(buyItems.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:var(--brown);margin:18px 0 12px">🛒 Available for Purchase</h3>';
+      h += _storeItemGrid(buyItems, canEdit);
+    }
+
+    // Active prizes section
+    if(prizeItems.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:#BE185D;margin:24px 0 12px">🏆 Earn With Points</h3>';
+      h += _storeItemGrid(prizeItems, canEdit);
+    }
+
+    // Admin-only: inactive items
+    if(inactivePrizes.length || inactiveBuy.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:var(--muted);margin:32px 0 8px;border-top:1px dashed var(--sand);padding-top:18px">⏸ Paused / Inactive Items <span style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;color:var(--muted);font-weight:400;margin-left:8px">(admins only — not visible to regular shoppers)</span></h3>';
+      h += _storeItemGrid(inactivePrizes.concat(inactiveBuy), canEdit, true);
+    }
+
+    return h;
+  } catch(e){
+    console.warn('[panelStore] failed safely:', e);
+    return panelHeader('🛍️ Store') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">The store had a problem loading. Refresh and try again.</div></div>';
+  }
+}
+
+// Build the responsive grid of item cards
+function _storeItemGrid(items, canEdit, isPaused){
+  var h = '<div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(240px, 1fr));gap:18px;margin-bottom:24px">';
+  items.forEach(function(item){
+    h += _storeItemCard(item, canEdit, isPaused);
+  });
+  h += '</div>';
+  return h;
+}
+
+// One item card
+function _storeItemCard(item, canEdit, isPaused){
+  var typeColor = item.type === 'prize' ? '#BE185D' : '#0891b2';
+  var typeBg = item.type === 'prize' ? 'rgba(236,72,153,.08)' : 'rgba(8,145,178,.08)';
+  var typeIcon = item.type === 'prize' ? '🏆' : '🛒';
+  var pausedDim = isPaused ? 'opacity:.6;' : '';
+
+  var media = '';
+  if(item.videoUrl){
+    media = '<video src="'+_escapeAttr(item.videoUrl)+'" controls style="width:100%;height:160px;object-fit:cover;background:#000;border-radius:6px 6px 0 0"></video>';
+  } else if(item.photoUrl){
+    media = '<img src="'+_escapeAttr(item.photoUrl)+'" alt="'+_escapeAttr(item.name)+'" style="width:100%;height:160px;object-fit:cover;background:var(--cream);border-radius:6px 6px 0 0">';
+  } else {
+    media = '<div style="width:100%;height:160px;background:linear-gradient(135deg,'+typeBg+',transparent);display:flex;align-items:center;justify-content:center;font-size:3rem;border-radius:6px 6px 0 0">'+typeIcon+'</div>';
+  }
+
+  var priceTag = '';
+  if(item.type === 'buy'){
+    priceTag = '<div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:#0891b2;letter-spacing:1px">$'+(parseFloat(item.priceUSD)||0).toFixed(2)+'</div>';
+  } else {
+    priceTag = '<div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:#BE185D;letter-spacing:1px">'+(parseInt(item.pointsCost,10)||0)+' <span style="font-size:.7rem;letter-spacing:2px">pts</span></div>';
+  }
+
+  var stockBadge = '';
+  if(typeof item.stock === 'number' && item.stock <= 0){
+    stockBadge = '<span style="background:#fee2e2;color:#991b1b;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:2px 8px;border-radius:3px;font-weight:700;margin-left:auto">Out of Stock</span>';
+  } else if(typeof item.stock === 'number' && item.stock <= 3){
+    stockBadge = '<span style="background:#fef3c7;color:#92400e;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:2px 8px;border-radius:3px;font-weight:700;margin-left:auto">Only '+item.stock+' left</span>';
+  }
+
+  var contestTag = '';
+  if(item.type === 'prize' && item.contestName){
+    contestTag = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;color:#BE185D;font-weight:700;margin-bottom:4px">🏁 '+_escapeHtml(item.contestName)+'</div>';
+    if(item.contestEnd){
+      contestTag += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);margin-bottom:6px">Ends '+_escapeHtml(item.contestEnd)+'</div>';
+    }
+  }
+
+  var pausedTag = '';
+  if(isPaused){
+    pausedTag = '<div style="position:absolute;top:8px;left:8px;background:rgba(0,0,0,.75);color:white;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;padding:3px 10px;border-radius:3px;font-weight:700;z-index:2">⏸ Paused</div>';
+  }
+
+  var editBtn = '';
+  if(canEdit){
+    editBtn = '<button onclick="openStoreEdit('+item.id+')" style="background:rgba(124,58,237,.1);border:1px solid rgba(124,58,237,.3);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer;width:100%;margin-top:8px">✏️ Edit</button>';
+  }
+
+  return '<div style="'+pausedDim+'background:white;border:1px solid var(--sand);border-radius:7px;overflow:hidden;display:flex;flex-direction:column;position:relative;box-shadow:0 1px 2px rgba(0,0,0,.04)">'
+    + pausedTag
+    + media
+    + '<div style="padding:12px 14px;display:flex;flex-direction:column;flex:1">'
+    + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="background:'+typeBg+';color:'+typeColor+';font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1.5px;text-transform:uppercase;padding:2px 8px;border-radius:3px;font-weight:700">'+typeIcon+' '+(item.type==='prize'?'Prize':'Buy')+'</span>'+stockBadge+'</div>'
+    + contestTag
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1rem;font-weight:700;color:var(--brown);margin-bottom:4px;line-height:1.2">'+_escapeHtml(item.name||'Untitled')+'</div>'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);line-height:1.4;margin-bottom:8px;flex:1">'+_escapeHtml(item.description||'')+'</div>'
+    + priceTag
+    + editBtn
+    + '</div></div>';
+}
+
+// Owner/admin: edit / create item
+function panelStoreEdit(){
+  try {
+    var u = DB.current;
+    if(!canEditStore(u)){
+      return panelHeader('🛍️ Store — Edit Item') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">🔒 Owner/admin only.</div></div>';
+    }
+    var editId = window._storeEditingId || 0;
+    var item = (editId > 0) ? STORE_ITEMS.find(function(i){ return i.id === editId; }) : null;
+    var isNew = !item;
+    if(isNew){
+      item = {
+        id:0, type:'buy', name:'', description:'',
+        photoUrl:'', videoUrl:'',
+        priceUSD:0, pointsCost:0, stock:null,
+        active:true,
+        contestName:'', contestStart:'', contestEnd:''
+      };
+    }
+
+    var h = panelHeader(isNew ? '🛍️ New Item' : '🛍️ Edit Item');
+    h += '<div class="bo-card" style="padding:24px;max-width:720px">';
+    h += '<div style="margin-bottom:20px">';
+    h += '<button onclick="gotoPanel(\'store\')" style="background:transparent;border:none;color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;padding:0">← Back to Store</button>';
+    h += '</div>';
+
+    // Type radio
+    h += '<div class="f-field" style="margin-bottom:18px"><label class="f-label">Item Type</label>';
+    h += '<div style="display:flex;gap:12px;margin-top:6px">';
+    h += '<label style="flex:1;cursor:pointer;display:block"><input type="radio" name="seType" value="buy" '+(item.type==='buy'?'checked':'')+' onchange="seToggleType(\'buy\')" style="margin-right:8px"><span style="font-family:Barlow Condensed,sans-serif;font-weight:700">🛒 Buy Item</span><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px">Sold for USD via credit card</div></label>';
+    h += '<label style="flex:1;cursor:pointer;display:block"><input type="radio" name="seType" value="prize" '+(item.type==='prize'?'checked':'')+' onchange="seToggleType(\'prize\')" style="margin-right:8px"><span style="font-family:Barlow Condensed,sans-serif;font-weight:700">🏆 Prize</span><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px">Earned with points during a contest</div></label>';
+    h += '</div></div>';
+
+    // Name
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Name</label><input id="seName" type="text" class="f-input" placeholder="e.g., Replacement Tent" value="'+_escapeAttr(item.name)+'"></div>';
+
+    // Description
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Description</label><textarea id="seDesc" class="f-input" rows="3" placeholder="Item details, dimensions, color, etc.">'+_escapeHtml(item.description)+'</textarea></div>';
+
+    // Photo upload
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Photo</label>';
+    h += '<div id="sePhotoPreview" style="margin-bottom:8px">'+(item.photoUrl?'<img src="'+_escapeAttr(item.photoUrl)+'" style="max-width:240px;max-height:160px;border-radius:6px;border:1px solid var(--sand)">':'<div style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.72rem">No photo yet</div>')+'</div>';
+    h += '<input id="sePhotoFile" type="file" accept="image/*" onchange="seUploadMedia(\'photo\')" style="font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+    h += '<input id="sePhotoUrl" type="hidden" value="'+_escapeAttr(item.photoUrl)+'">';
+    h += '<div id="sePhotoStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px"></div>';
+    h += '</div>';
+
+    // Video upload (optional)
+    h += '<div class="f-field" style="margin-bottom:18px"><label class="f-label">Video <span style="color:var(--muted);font-weight:400;font-size:.7rem">(optional, used instead of photo)</span></label>';
+    h += '<div id="seVideoPreview" style="margin-bottom:8px">'+(item.videoUrl?'<video src="'+_escapeAttr(item.videoUrl)+'" controls style="max-width:240px;max-height:160px;border-radius:6px;border:1px solid var(--sand)"></video>':'<div style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.72rem">No video</div>')+'</div>';
+    h += '<input id="seVideoFile" type="file" accept="video/*" onchange="seUploadMedia(\'video\')" style="font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+    h += '<input id="seVideoUrl" type="hidden" value="'+_escapeAttr(item.videoUrl)+'">';
+    h += '<div id="seVideoStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px"></div>';
+    h += '</div>';
+
+    // Price (buy only)
+    h += '<div class="f-field" id="seBuyFields" style="margin-bottom:14px;display:'+(item.type==='buy'?'block':'none')+'"><label class="f-label">Price (USD)</label><input id="sePriceUSD" type="number" step="0.01" min="0" class="f-input" placeholder="0.00" value="'+(item.priceUSD||'')+'"></div>';
+
+    // Prize fields (prize only)
+    h += '<div id="sePrizeFields" style="display:'+(item.type==='prize'?'block':'none')+'">';
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Points Cost</label><input id="sePointsCost" type="number" min="0" step="1" class="f-input" placeholder="0" value="'+(item.pointsCost||'')+'"></div>';
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Contest Name</label><input id="seContestName" type="text" class="f-input" placeholder="e.g., Q4 Top Performer" value="'+_escapeAttr(item.contestName||'')+'"></div>';
+    h += '<div style="display:flex;gap:12px;margin-bottom:14px">';
+    h += '<div class="f-field" style="flex:1"><label class="f-label">Contest Start</label><input id="seContestStart" type="date" class="f-input" value="'+_escapeAttr(item.contestStart||'')+'"></div>';
+    h += '<div class="f-field" style="flex:1"><label class="f-label">Contest End</label><input id="seContestEnd" type="date" class="f-input" value="'+_escapeAttr(item.contestEnd||'')+'"></div>';
+    h += '</div>';
+    h += '</div>';
+
+    // Stock
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Stock <span style="color:var(--muted);font-weight:400;font-size:.7rem">(leave blank for unlimited)</span></label><input id="seStock" type="number" min="0" step="1" class="f-input" placeholder="∞" value="'+(item.stock!==null && item.stock!==undefined ? item.stock : '')+'"></div>';
+
+    // Active toggle
+    h += '<div class="f-field" style="margin-bottom:18px"><label style="display:flex;align-items:center;cursor:pointer"><input id="seActive" type="checkbox" '+(item.active!==false?'checked':'')+' style="margin-right:8px"><span style="font-family:Barlow Condensed,sans-serif;font-weight:700">Active</span><span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-left:8px">— uncheck to hide from regular shoppers</span></label></div>';
+
+    // Save / Delete
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:24px;border-top:1px solid var(--sand);padding-top:18px">';
+    h += '<button onclick="seSaveItem()" class="btn-fire" style="padding:10px 24px;font-size:.74rem">💾 '+(isNew?'Create Item':'Save Changes')+'</button>';
+    if(!isNew){
+      h += '<button onclick="seDeleteItem('+item.id+')" style="background:rgba(220,38,38,.1);border:1px solid rgba(220,38,38,.3);color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer">🗑️ Delete</button>';
+    }
+    h += '<button onclick="gotoPanel(\'store\')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;margin-left:auto">Cancel</button>';
+    h += '</div>';
+
+    h += '</div>';
+
+    // Stash editing id so save knows which one to update
+    h += '<input type="hidden" id="seEditingId" value="'+editId+'">';
+
+    return h;
+  } catch(e){
+    console.warn('[panelStoreEdit] failed safely:', e);
+    return panelHeader('🛍️ Edit Item') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Editor failed to load. Try again.</div></div>';
+  }
+}
+
+// Open the editor for an item (id=0 for new)
+function openStoreEdit(id){
+  window._storeEditingId = id || 0;
+  gotoPanel('store-edit');
+}
+
+// Toggle buy/prize fields when type radio changes
+function seToggleType(type){
+  try {
+    var buyFields = document.getElementById('seBuyFields');
+    var prizeFields = document.getElementById('sePrizeFields');
+    if(buyFields) buyFields.style.display = (type === 'buy') ? 'block' : 'none';
+    if(prizeFields) prizeFields.style.display = (type === 'prize') ? 'block' : 'none';
+  } catch(e){ console.warn('[seToggleType] failed safely:', e); }
+}
+
+// Upload photo or video to Supabase Storage 'store-media' bucket
+async function seUploadMedia(kind){
+  try {
+    var fileInputId = (kind === 'photo') ? 'sePhotoFile' : 'seVideoFile';
+    var statusId = (kind === 'photo') ? 'sePhotoStatus' : 'seVideoStatus';
+    var urlId = (kind === 'photo') ? 'sePhotoUrl' : 'seVideoUrl';
+    var previewId = (kind === 'photo') ? 'sePhotoPreview' : 'seVideoPreview';
+
+    var fileInput = document.getElementById(fileInputId);
+    var status = document.getElementById(statusId);
+    var urlField = document.getElementById(urlId);
+    var preview = document.getElementById(previewId);
+
+    if(!fileInput || !fileInput.files || !fileInput.files[0]){ return; }
+    var file = fileInput.files[0];
+
+    // Size guard: 10MB photo, 100MB video
+    var maxBytes = (kind === 'photo') ? 10*1024*1024 : 100*1024*1024;
+    if(file.size > maxBytes){
+      var maxLabel = (kind === 'photo') ? '10MB' : '100MB';
+      if(status) status.textContent = 'File too large. Max '+maxLabel+'.';
+      if(status) status.style.color = '#dc2626';
+      return;
+    }
+
+    if(typeof supaClient === 'undefined' || !supaClient){
+      if(status) status.textContent = 'Supabase not connected. Cannot upload.';
+      if(status) status.style.color = '#dc2626';
+      return;
+    }
+
+    if(status) status.textContent = 'Uploading…';
+    if(status) status.style.color = 'var(--muted)';
+
+    // Generate stable filename
+    var ext = (file.name.split('.').pop() || (kind === 'photo' ? 'jpg' : 'mp4')).toLowerCase();
+    var path = 'items/'+Date.now()+'_'+Math.random().toString(36).slice(2,8)+'.'+ext;
+
+    // Upload to bucket
+    var result = await supaClient.storage.from('store-media').upload(path, file, {
+      cacheControl: '3600',
+      upsert: false
+    });
+    if(result.error){
+      console.warn('[seUploadMedia] upload failed:', result.error);
+      if(status) status.textContent = 'Upload failed: '+(result.error.message||'unknown error');
+      if(status) status.style.color = '#dc2626';
+      return;
+    }
+
+    // Get public URL
+    var urlResult = supaClient.storage.from('store-media').getPublicUrl(path);
+    var publicUrl = urlResult && urlResult.data && urlResult.data.publicUrl ? urlResult.data.publicUrl : '';
+    if(!publicUrl){
+      if(status) status.textContent = 'Upload succeeded but URL retrieval failed.';
+      if(status) status.style.color = '#dc2626';
+      return;
+    }
+
+    if(urlField) urlField.value = publicUrl;
+    if(preview){
+      if(kind === 'photo'){
+        preview.innerHTML = '<img src="'+_escapeAttr(publicUrl)+'" style="max-width:240px;max-height:160px;border-radius:6px;border:1px solid var(--sand)">';
+      } else {
+        preview.innerHTML = '<video src="'+_escapeAttr(publicUrl)+'" controls style="max-width:240px;max-height:160px;border-radius:6px;border:1px solid var(--sand)"></video>';
+      }
+    }
+    if(status) status.textContent = '✓ Uploaded';
+    if(status) status.style.color = '#16a34a';
+  } catch(e) {
+    console.warn('[seUploadMedia] failed safely:', e);
+    var status = document.getElementById((kind === 'photo') ? 'sePhotoStatus' : 'seVideoStatus');
+    if(status){ status.textContent = 'Upload error.'; status.style.color = '#dc2626'; }
+  }
+}
+
+// Save item (create or update)
+async function seSaveItem(){
+  try {
+    var u = DB.current;
+    if(!canEditStore(u)){ alert('Permission denied.'); return; }
+
+    var idEl = document.getElementById('seEditingId');
+    var editId = idEl ? parseInt(idEl.value, 10) : 0;
+    var typeRadio = document.querySelector('input[name="seType"]:checked');
+    var type = typeRadio ? typeRadio.value : 'buy';
+    var name = (document.getElementById('seName')||{}).value || '';
+    var desc = (document.getElementById('seDesc')||{}).value || '';
+    var photoUrl = (document.getElementById('sePhotoUrl')||{}).value || '';
+    var videoUrl = (document.getElementById('seVideoUrl')||{}).value || '';
+    var priceUSD = parseFloat((document.getElementById('sePriceUSD')||{}).value) || 0;
+    var pointsCost = parseInt((document.getElementById('sePointsCost')||{}).value, 10) || 0;
+    var contestName = (document.getElementById('seContestName')||{}).value || '';
+    var contestStart = (document.getElementById('seContestStart')||{}).value || '';
+    var contestEnd = (document.getElementById('seContestEnd')||{}).value || '';
+    var stockRaw = (document.getElementById('seStock')||{}).value || '';
+    var stock = stockRaw === '' ? null : (parseInt(stockRaw, 10) || 0);
+    var active = !!(document.getElementById('seActive')||{}).checked;
+
+    if(!name.trim()){ alert('Item name is required.'); return; }
+    if(type === 'buy' && priceUSD <= 0){ alert('Buy items need a price > 0.'); return; }
+    if(type === 'prize' && pointsCost <= 0){ alert('Prize items need a points cost > 0.'); return; }
+    if(type === 'prize' && !contestName.trim()){ alert('Prize items need a contest name.'); return; }
+
+    var now = new Date().toISOString();
+    var rec;
+    if(editId > 0){
+      rec = STORE_ITEMS.find(function(i){ return i.id === editId; });
+      if(!rec){ alert('Item not found.'); return; }
+    } else {
+      rec = { id: STORE_NEXT_ID++, createdBy: u.id, createdAt: now };
+      STORE_ITEMS.push(rec);
+    }
+    rec.type = type;
+    rec.name = name.trim();
+    rec.description = desc.trim();
+    rec.photoUrl = photoUrl;
+    rec.videoUrl = videoUrl;
+    rec.priceUSD = (type === 'buy') ? priceUSD : 0;
+    rec.pointsCost = (type === 'prize') ? pointsCost : 0;
+    rec.contestName = (type === 'prize') ? contestName.trim() : '';
+    rec.contestStart = (type === 'prize') ? contestStart : '';
+    rec.contestEnd = (type === 'prize') ? contestEnd : '';
+    rec.stock = stock;
+    rec.active = active;
+    rec.updatedAt = now;
+    rec.updatedBy = u.id;
+
+    saveStore();
+    console.log('[seSaveItem] saved item '+rec.id+' ('+rec.name+', '+rec.type+')');
+    gotoPanel('store');
+  } catch(e) {
+    console.warn('[seSaveItem] failed safely:', e);
+    alert('Save failed. Try again.');
+  }
+}
+
+// Delete item
+function seDeleteItem(id){
+  try {
+    var u = DB.current;
+    if(!canEditStore(u)){ alert('Permission denied.'); return; }
+    var idx = STORE_ITEMS.findIndex(function(i){ return i.id === id; });
+    if(idx < 0) return;
+    var item = STORE_ITEMS[idx];
+    if(!confirm('Delete "'+item.name+'"? This cannot be undone.')) return;
+    STORE_ITEMS.splice(idx, 1);
+    saveStore();
+    console.log('[seDeleteItem] deleted item '+id);
+    gotoPanel('store');
+  } catch(e) {
+    console.warn('[seDeleteItem] failed safely:', e);
+    alert('Delete failed.');
+  }
+}
+
+// Tiny escape helpers — used to safely render user-entered fields into HTML
+function _escapeHtml(s){
+  if(s == null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function _escapeAttr(s){
+  if(s == null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+    .replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // Update help-text when AW Override Style dropdown changes.
