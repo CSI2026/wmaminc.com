@@ -13499,6 +13499,311 @@ function launchBO(u){
 //  Add a new agent → add their ID to applyPersonalTheme() AND a CSS block
 //  in :root for any new theme name.
 // ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════
+//  LIVECAM — Live Camera Photo Capture Component (Ship A1)
+//
+//  Reusable component for any form that requires live photos and BLOCKS
+//  disk uploads. Used by:
+//    • Daily Photo Audit (Ship A2)
+//    • Inventory Pickup Form (Ship A3)
+//    • Any future form that asks for verified photos
+//
+//  HOW IT WORKS:
+//    1. Tries navigator.mediaDevices.getUserMedia() — opens a live video
+//       stream from webcam (desktop) or back camera (mobile). User clicks
+//       a "Capture" button to freeze the frame as a photo.
+//    2. If getUserMedia is unavailable OR permission denied, falls back to
+//       <input type="file" capture="environment"> — on mobile this forces
+//       the device camera (no gallery access). On desktop this fallback
+//       would allow disk upload, so we DETECT desktop and refuse the
+//       fallback there. Desktop without webcam = no photo possible.
+//
+//  WHAT IT DOES NOT DO:
+//    • Never accepts a generic <input type="file"> from disk
+//    • Never accepts a paste from clipboard
+//    • Never accepts a drag-and-drop file
+//
+//  USAGE:
+//    var slot = liveCamCreateSlot('audit-selfie', {
+//      label: 'Take Selfie',
+//      facing: 'user'  // 'user' = front, 'environment' = back/rear
+//    });
+//    document.getElementById('photoContainer').innerHTML = slot;
+//    liveCamInit('audit-selfie');  // call AFTER the HTML is in the DOM
+//    // Later when submitting:
+//    var dataUrl = liveCamGetData('audit-selfie');  // base64 image or null
+//    var meta    = liveCamGetMeta('audit-selfie');  // {capturedAt, source}
+// ════════════════════════════════════════════════════════════════════════
+
+// Storage for captured photos, keyed by slotId.
+// dataUrl = base64 of the captured image (compressed JPEG)
+// meta    = { capturedAt, source: 'webcam'|'mobile-camera', width, height }
+var _LIVECAM_SLOTS = {};
+
+// Detect if this is likely a desktop (no touch) vs mobile/tablet.
+// Used to decide whether the input-capture fallback is legitimate.
+function _liveCamIsMobile(){
+  try {
+    return (navigator.maxTouchPoints && navigator.maxTouchPoints > 1)
+        || /Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+  } catch(e){ return false; }
+}
+
+// Check whether getUserMedia is available in this browser
+function _liveCamHasGetUserMedia(){
+  return !!(navigator && navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function');
+}
+
+// Build the HTML for a single capture slot. The slot starts collapsed —
+// user clicks "Take Photo" to expand it and start the camera stream.
+// `slotId` should be unique per form. `opts.label` is the button text.
+// `opts.facing` is 'user' (selfie) or 'environment' (rear camera).
+function liveCamCreateSlot(slotId, opts){
+  opts = opts || {};
+  var label = opts.label || 'Take Photo';
+  var facing = (opts.facing === 'user') ? 'user' : 'environment';
+  var safeId = String(slotId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return ''
+    + '<div class="livecam-slot" id="lc-slot-'+safeId+'" data-slot-id="'+safeId+'" data-facing="'+facing+'" '
+    +    'style="border:2px dashed var(--sand);border-radius:8px;padding:14px;background:var(--cream);text-align:center">'
+    +   '<div id="lc-empty-'+safeId+'">'
+    +     '<div style="font-size:2rem;margin-bottom:6px">📷</div>'
+    +     '<button type="button" onclick="liveCamStart(\''+safeId+'\')" '
+    +       'style="background:var(--blue);color:white;border:none;padding:10px 20px;border-radius:5px;'
+    +       'font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;'
+    +       'font-weight:700;cursor:pointer">'+label+'</button>'
+    +     '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-top:8px;letter-spacing:.5px">'
+    +       'Live camera only — no uploads from disk or camera roll'
+    +     '</div>'
+    +   '</div>'
+    +   '<div id="lc-stream-'+safeId+'" style="display:none">'
+    +     '<video id="lc-video-'+safeId+'" autoplay playsinline muted '
+    +       'style="width:100%;max-width:480px;border-radius:6px;background:#000"></video>'
+    +     '<div style="margin-top:10px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">'
+    +       '<button type="button" onclick="liveCamCapture(\''+safeId+'\')" '
+    +         'style="background:#16a34a;color:white;border:none;padding:10px 20px;border-radius:5px;'
+    +         'font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;'
+    +         'font-weight:700;cursor:pointer">📸 Capture</button>'
+    +       '<button type="button" onclick="liveCamCancel(\''+safeId+'\')" '
+    +         'style="background:white;color:var(--brown);border:1px solid var(--sand);padding:10px 16px;border-radius:5px;'
+    +         'font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">Cancel</button>'
+    +     '</div>'
+    +   '</div>'
+    +   '<div id="lc-result-'+safeId+'" style="display:none">'
+    +     '<img id="lc-img-'+safeId+'" style="max-width:100%;max-height:320px;border-radius:6px;border:1px solid var(--sand)">'
+    +     '<div style="margin-top:8px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">'
+    +       '<div id="lc-meta-'+safeId+'" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);align-self:center"></div>'
+    +       '<button type="button" onclick="liveCamRetake(\''+safeId+'\')" '
+    +         'style="background:var(--cream);border:1px solid var(--sand);color:var(--brown);padding:6px 14px;border-radius:5px;'
+    +         'font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">↻ Retake</button>'
+    +     '</div>'
+    +   '</div>'
+    +   '<div id="lc-fallback-'+safeId+'" style="display:none">'
+    +     '<input type="file" accept="image/*" capture="'+facing+'" id="lc-fbinput-'+safeId+'" '
+    +       'onchange="liveCamFallbackHandle(\''+safeId+'\')" '
+    +       'style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;margin-top:8px">'
+    +     '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:#dc2626;margin-top:8px;letter-spacing:.5px">'
+    +       'Webcam unavailable. Phone camera fallback enabled — gallery upload still blocked.'
+    +     '</div>'
+    +   '</div>'
+    +   '<div id="lc-error-'+safeId+'" style="display:none;color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.75rem;margin-top:8px"></div>'
+    + '</div>';
+}
+
+// Open the camera for the named slot. Tries getUserMedia first, falls back
+// to <input capture> on mobile if getUserMedia fails or is denied.
+async function liveCamStart(slotId){
+  var slot = document.getElementById('lc-slot-'+slotId);
+  if(!slot) return;
+  var emptyEl = document.getElementById('lc-empty-'+slotId);
+  var streamEl = document.getElementById('lc-stream-'+slotId);
+  var errorEl = document.getElementById('lc-error-'+slotId);
+  var fallbackEl = document.getElementById('lc-fallback-'+slotId);
+  var facing = slot.getAttribute('data-facing') || 'environment';
+
+  if(errorEl){ errorEl.style.display='none'; errorEl.textContent=''; }
+
+  // Try getUserMedia first (works on both desktop AND mobile)
+  if(_liveCamHasGetUserMedia()){
+    try {
+      var constraints = { video: { facingMode: facing }, audio: false };
+      var stream = await navigator.mediaDevices.getUserMedia(constraints);
+      var video = document.getElementById('lc-video-'+slotId);
+      if(video){
+        video.srcObject = stream;
+        if(_LIVECAM_SLOTS[slotId]) _liveCamStopStream(slotId);  // stop any prior stream
+        _LIVECAM_SLOTS[slotId] = { stream: stream, source: 'webcam' };
+        if(emptyEl) emptyEl.style.display = 'none';
+        if(streamEl) streamEl.style.display = 'block';
+      }
+      return;
+    } catch(e) {
+      console.warn('[liveCamStart] getUserMedia failed for slot '+slotId+':', e && e.message);
+      // fall through to mobile fallback
+    }
+  }
+
+  // Fallback: only valid on mobile. On desktop, refuse — desktop without
+  // webcam means no photo. We will NOT show a disk file picker.
+  if(_liveCamIsMobile()){
+    if(emptyEl) emptyEl.style.display = 'none';
+    if(fallbackEl) fallbackEl.style.display = 'block';
+    return;
+  }
+  if(errorEl){
+    errorEl.style.display = 'block';
+    errorEl.textContent = 'Camera access is required. Allow camera permission in your browser settings, then click Take Photo again.';
+  }
+}
+
+// Capture the current frame from the video stream as a JPEG data URL.
+function liveCamCapture(slotId){
+  try {
+    var video = document.getElementById('lc-video-'+slotId);
+    if(!video || !video.srcObject){ return; }
+    var w = video.videoWidth || 1280;
+    var h = video.videoHeight || 720;
+    var canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    var ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, w, h);
+    var dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+    _liveCamStopStream(slotId);
+    _LIVECAM_SLOTS[slotId] = {
+      dataUrl: dataUrl,
+      capturedAt: new Date().toISOString(),
+      source: 'webcam',
+      width: w,
+      height: h
+    };
+    _liveCamShowResult(slotId);
+  } catch(e) {
+    console.warn('[liveCamCapture] failed for slot '+slotId+':', e);
+    var errorEl = document.getElementById('lc-error-'+slotId);
+    if(errorEl){ errorEl.style.display='block'; errorEl.textContent='Capture failed. Try again.'; }
+  }
+}
+
+// Cancel the live preview without capturing.
+function liveCamCancel(slotId){
+  _liveCamStopStream(slotId);
+  var emptyEl = document.getElementById('lc-empty-'+slotId);
+  var streamEl = document.getElementById('lc-stream-'+slotId);
+  if(streamEl) streamEl.style.display = 'none';
+  if(emptyEl) emptyEl.style.display = 'block';
+}
+
+// Throw away the captured photo and reopen the camera.
+function liveCamRetake(slotId){
+  delete _LIVECAM_SLOTS[slotId];
+  var resultEl = document.getElementById('lc-result-'+slotId);
+  var emptyEl = document.getElementById('lc-empty-'+slotId);
+  if(resultEl) resultEl.style.display = 'none';
+  if(emptyEl) emptyEl.style.display = 'block';
+}
+
+// Handle the mobile fallback file input (only fires on mobile when getUserMedia failed).
+function liveCamFallbackHandle(slotId){
+  try {
+    var input = document.getElementById('lc-fbinput-'+slotId);
+    if(!input || !input.files || !input.files[0]) return;
+    var file = input.files[0];
+    // Block if the file is suspiciously large (>20MB suggests gallery upload, not camera)
+    if(file.size > 20 * 1024 * 1024){
+      var errorEl = document.getElementById('lc-error-'+slotId);
+      if(errorEl){ errorEl.style.display='block'; errorEl.textContent='File too large. Use the camera, not gallery uploads.'; }
+      input.value = '';
+      return;
+    }
+    var reader = new FileReader();
+    reader.onload = function(ev){
+      _LIVECAM_SLOTS[slotId] = {
+        dataUrl: ev.target.result,
+        capturedAt: new Date().toISOString(),
+        source: 'mobile-camera',
+        width: 0, height: 0
+      };
+      var fallbackEl = document.getElementById('lc-fallback-'+slotId);
+      if(fallbackEl) fallbackEl.style.display = 'none';
+      _liveCamShowResult(slotId);
+    };
+    reader.onerror = function(){
+      var errorEl = document.getElementById('lc-error-'+slotId);
+      if(errorEl){ errorEl.style.display='block'; errorEl.textContent='Could not read the photo.'; }
+    };
+    reader.readAsDataURL(file);
+  } catch(e) {
+    console.warn('[liveCamFallbackHandle] failed for slot '+slotId+':', e);
+  }
+}
+
+// Display the captured photo in the result panel.
+function _liveCamShowResult(slotId){
+  var slot = _LIVECAM_SLOTS[slotId];
+  if(!slot || !slot.dataUrl) return;
+  var resultEl = document.getElementById('lc-result-'+slotId);
+  var imgEl = document.getElementById('lc-img-'+slotId);
+  var metaEl = document.getElementById('lc-meta-'+slotId);
+  var streamEl = document.getElementById('lc-stream-'+slotId);
+  var fallbackEl = document.getElementById('lc-fallback-'+slotId);
+  if(imgEl) imgEl.src = slot.dataUrl;
+  if(metaEl){
+    var t = new Date(slot.capturedAt);
+    metaEl.textContent = '✓ Captured ' + t.toLocaleTimeString() + ' (' + slot.source + ')';
+  }
+  if(streamEl) streamEl.style.display = 'none';
+  if(fallbackEl) fallbackEl.style.display = 'none';
+  if(resultEl) resultEl.style.display = 'block';
+}
+
+// Stop the live video stream and release the camera.
+function _liveCamStopStream(slotId){
+  var slot = _LIVECAM_SLOTS[slotId];
+  if(slot && slot.stream){
+    try {
+      slot.stream.getTracks().forEach(function(track){ track.stop(); });
+    } catch(e) { /* ignore */ }
+    delete _LIVECAM_SLOTS[slotId];
+  }
+}
+
+// Public API: get the captured photo as a base64 data URL.
+// Returns null if nothing has been captured yet.
+function liveCamGetData(slotId){
+  var slot = _LIVECAM_SLOTS[slotId];
+  return (slot && slot.dataUrl) ? slot.dataUrl : null;
+}
+
+// Public API: get the metadata (timestamp, source, dimensions) for the capture.
+// Returns null if nothing has been captured yet.
+function liveCamGetMeta(slotId){
+  var slot = _LIVECAM_SLOTS[slotId];
+  if(!slot || !slot.dataUrl) return null;
+  return {
+    capturedAt: slot.capturedAt,
+    source: slot.source,
+    width: slot.width,
+    height: slot.height
+  };
+}
+
+// Public API: clear the slot (e.g., after form submission).
+function liveCamClear(slotId){
+  _liveCamStopStream(slotId);
+  delete _LIVECAM_SLOTS[slotId];
+}
+
+// Cleanup all active streams — call this on panel exit to release cameras.
+function liveCamCleanupAll(){
+  Object.keys(_LIVECAM_SLOTS).forEach(function(slotId){
+    _liveCamStopStream(slotId);
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  END LIVECAM
+// ════════════════════════════════════════════════════════════════════════
+
 function applyPersonalTheme(){
   try {
     var body = document.body;
@@ -14742,6 +15047,10 @@ function gotoPanel(id, params){
   // Stash optional params so child panels (like payroll-week-detail)
   // can read things like weekId without polluting the URL.
   gotoPanel._params = params || null;
+
+  // Release any active camera streams before swapping panels — prevents
+  // the camera light from staying on after the user navigates away.
+  try { if(typeof liveCamCleanupAll === 'function') liveCamCleanupAll(); } catch(e){}
 
   // ── ONBOARDING SIGNATURE GATE ────────────────────────────────────
   // If this user has any pending onboarding packets, force them to the
