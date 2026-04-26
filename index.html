@@ -2143,9 +2143,9 @@ const LINKS = [
   // ── Lifeline — Inventory Pickup (Market Managers ONLY) ──
   { id:'ll-inv-pickup', cat:'Lifeline — Inventory',     prog:'Lifeline', color:'purple',
     ic:'📦', nm:'Inventory Pickup Form',
-    ds:'UPS or FedEx location pickup authorization. Market Managers only — not available to team leaders or field agents.',
+    ds:'Confirm receipt of shipped devices with live photos + barcode scan. Market Managers only.',
     badge:'MARKET MANAGERS ONLY',
-    url:'https://form.jotform.com/250275288526059' },
+    url:'#inventory-pickup', onclick:'gotoPanel(\'inventory-pickup\')' },
 
   // ── Astound ──
   { id:'astound-portal', cat:'Astound — Internet', prog:'Astound', color:'purple',
@@ -7284,6 +7284,44 @@ var INV_BATCH_ID = 1;
 var INV_DELETION_REQUESTS = []; // {id, deviceIds:[], requestedBy, requestedAt, reason, status:'pending'|'approved'|'denied', reviewedBy, reviewedAt}
 var INV_PENDING_ASSIGNMENTS = []; // {id, batchId, devices:[], campaign, type, uploadDate, expiryDate, assignedToId:null, status:'uploaded'|'assigned'}
 
+// ══════════════════════════════════════════════════════════════
+//  SHIP A3 — INVENTORY PICKUP FORM (Market Manager → Makenzie)
+//
+//  Two new arrays power the field-pickup workflow:
+//
+//  INVENTORY_PICKUPS:
+//    Records each Market Manager's pickup submission at UPS/FedEx/etc.
+//    Includes live photos (from LiveCam, no disk uploads), scanned/typed
+//    tracking barcode, quantity received, and the device IDs the MM
+//    claims to have. Per Q2=c, MM trust is enough: devices flip to
+//    `pickupStatus: 'received'` immediately on submission. Makenzie still
+//    sees these in her confirmation queue so she can verify against the
+//    original shipment manifest, but the inventory is usable right away.
+//
+//  INVENTORY_DISCREPANCY_TICKETS:
+//    Generated automatically when an MM submits a PARTIAL pickup (per Q4=a).
+//    E.g., shipment had 50 devices, MM only got 47 — the 3 missing devices
+//    create a ticket Makenzie reviews. She can resolve by marking devices
+//    as truly missing (writes them off), or by waiting for a separate
+//    delivery and confirming receipt later.
+//
+//  ALSO — `makenzieExpiry` is set on devices/batches when Makenzie confirms
+//  receipt. Per Q3=c, this is the ONLY expiration date shown to MMs, TLs,
+//  agents, CMs, IBOs. Owner + Makenzie still see the original CSV expiry
+//  for reference, but everyone else sees only Makenzie's date — locked
+//  once set unless Owner or Makenzie changes it.
+// ══════════════════════════════════════════════════════════════
+var INVENTORY_PICKUPS = [];               // [{id, marketManagerId, marketManagerName, market, campaign, submittedAt,
+                                          //   trackingBarcode, expectedDevices:[ids], receivedDevices:[ids],
+                                          //   missingDevices:[ids], packagePhotos:[base64...], contentsPhotos:[base64...],
+                                          //   notes, status:'pending'|'confirmed'|'discrepancy-resolved',
+                                          //   confirmedBy:null, confirmedAt:null, makenzieExpiry:null}]
+var INVENTORY_DISCREPANCY_TICKETS = [];   // [{id, pickupId, marketManagerId, marketManagerName, missingDevices:[ids],
+                                          //   reason, openedAt, status:'open'|'resolved-found'|'resolved-written-off',
+                                          //   resolvedBy, resolvedAt, resolutionNotes}]
+var PICKUP_NEXT_ID = 1;
+var DISCREPANCY_NEXT_ID = 1;
+
 var CODED_CAMPAIGNS = ['Gen Mobile','TruConnect','Assurance','Excess','Chuzo','Astound','ACA'];
 
 // ── Pending Transfers (awaiting recipient signature + inventory approval) ──
@@ -7507,6 +7545,17 @@ function canAccess(u, area){
     // canEditStore() — checked inside the panel itself.
     case 'store':            return true;
 
+    // ── Ship A3 — Inventory Pickup Form ──
+    // Pickup form: Market Managers + Owner + Onboarding (per Q2 spec).
+    // Confirmation queue + Discrepancy tickets: Owner + Inventory dept (Makenzie).
+    // Each panel ALSO gates internally with canSubmitPickup / canConfirmPickup
+    // for defense in depth.
+    case 'inventory-pickup':
+      return isOwner(u) || u.role === 'Market Manager' || isOnboarding(u);
+    case 'pickup-confirmations':
+    case 'discrepancy-tickets':
+      return isOwner(u) || isInventory(u) || (u.depts && u.depts.inv === true);
+
     default:                 return false; // DEFAULT DENY — was 'return true', which was the bug
   }
 }
@@ -7542,6 +7591,11 @@ function saveInventory(){
     localStorage.setItem('wmam_ex_inventory',   JSON.stringify(EX_INVENTORY));
     localStorage.setItem('wmam_ex_activations', JSON.stringify(EX_ACTIVATIONS));
     localStorage.setItem('wmam_ex_transfers',   JSON.stringify(EX_TRANSFERS));
+    // Ship A3 — Inventory Pickup Form
+    localStorage.setItem('wmam_inv_pickups',          JSON.stringify(INVENTORY_PICKUPS));
+    localStorage.setItem('wmam_inv_discrepancies',    JSON.stringify(INVENTORY_DISCREPANCY_TICKETS));
+    localStorage.setItem('wmam_inv_pickup_nextid',    String(PICKUP_NEXT_ID));
+    localStorage.setItem('wmam_inv_disc_nextid',      String(DISCREPANCY_NEXT_ID));
   }catch(e){ console.warn('Inventory save:',e); }
   saveSupplyInventory();
 
@@ -7586,6 +7640,11 @@ function saveInventory(){
     pushKey('ex_inventory',   EX_INVENTORY);
     pushKey('ex_activations', EX_ACTIVATIONS);
     pushKey('ex_transfers',   EX_TRANSFERS);
+    // Ship A3 — pickups + discrepancy tickets
+    pushKey('inv_pickups',         INVENTORY_PICKUPS);
+    pushKey('inv_discrepancies',   INVENTORY_DISCREPANCY_TICKETS);
+    pushKey('inv_pickup_nextid',   PICKUP_NEXT_ID);
+    pushKey('inv_disc_nextid',     DISCREPANCY_NEXT_ID);
   }
 }
 function loadInventory(){
@@ -7610,6 +7669,11 @@ function loadInventory(){
     var exi=localStorage.getItem('wmam_ex_inventory');   if(exi) EX_INVENTORY=JSON.parse(exi)||[];
     var exa=localStorage.getItem('wmam_ex_activations'); if(exa) EX_ACTIVATIONS=JSON.parse(exa)||[];
     var ext=localStorage.getItem('wmam_ex_transfers');   if(ext) EX_TRANSFERS=JSON.parse(ext)||[];
+    // Ship A3 — pickups + discrepancy tickets
+    var ip=localStorage.getItem('wmam_inv_pickups');       if(ip) INVENTORY_PICKUPS=JSON.parse(ip)||[];
+    var id=localStorage.getItem('wmam_inv_discrepancies'); if(id) INVENTORY_DISCREPANCY_TICKETS=JSON.parse(id)||[];
+    var pn=localStorage.getItem('wmam_inv_pickup_nextid'); if(pn) PICKUP_NEXT_ID=parseInt(pn)||1;
+    var dn=localStorage.getItem('wmam_inv_disc_nextid');   if(dn) DISCREPANCY_NEXT_ID=parseInt(dn)||1;
   }catch(e){ console.warn('Inventory load:',e); }
 }
 
@@ -9309,6 +9373,11 @@ async function loadFromSupabase(){
         if(s.key==='ex_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_INVENTORY        = v;}catch(e){} }
         if(s.key==='ex_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_ACTIVATIONS      = v;}catch(e){} }
         if(s.key==='ex_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_TRANSFERS        = v;}catch(e){} }
+        // Ship A3 — pickup + discrepancy data
+        if(s.key==='inv_pickups'        && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_PICKUPS = v;}catch(e){} }
+        if(s.key==='inv_discrepancies'  && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_DISCREPANCY_TICKETS = v;}catch(e){} }
+        if(s.key==='inv_pickup_nextid'  && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) PICKUP_NEXT_ID = n;}catch(e){} }
+        if(s.key==='inv_disc_nextid'    && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) DISCREPANCY_NEXT_ID = n;}catch(e){} }
         // ── Markets richer fields (marketManager, campaignManager, payModel) ──
         // The lifeline_teams TABLE only has limited columns (id, name, color, leader, etc).
         // The app_settings backup carries the full team object including marketManager
@@ -13901,6 +13970,8 @@ function buildNav(u){
       +boDropBtn('inv-upload','⬆ Upload Devices (Legacy)')
       +boDropBtn('inv-transfer','🔄 Transfer Devices (Legacy)')
       +boDropBtn('inv-requests','📋 Pending Requests')
+      +boDropBtn('pickup-confirmations','📦 Pickup Confirmations')
+      +boDropBtn('discrepancy-tickets','🎫 Discrepancy Tickets')
       +boDropBtn('inv-export','📈 Export to Excel')
       +boDropBtn('supply-mgmt','📦 Supply Management')
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
@@ -15185,6 +15256,9 @@ function gotoPanel(id, params){
     'pattern-assignments':panelPatternAssignments,
     'store':panelStore,
     'store-edit':panelStoreEdit,
+    'inventory-pickup':panelInventoryPickup,
+    'pickup-confirmations':panelPickupConfirmations,
+    'discrepancy-tickets':panelDiscrepancyTickets,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -26255,6 +26329,603 @@ function _escapeAttr(s){
   return String(s)
     .replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
     .replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP A3 — INVENTORY PICKUP FORM (Market Manager → Makenzie confirmation)
+//
+//  WORKFLOW:
+//    1. Makenzie uploads bulk shipment → devices marked status='shipped'
+//       (existing flow, unchanged)
+//    2. Market Manager arrives at UPS/FedEx, opens this form
+//    3. MM scans tracking barcode (or types it), takes live package photos,
+//       confirms which device IDs they received, takes contents photos
+//    4. If MM received fewer devices than expected → discrepancy ticket
+//       auto-created for Makenzie (per Q4=a, partial pickup allowed)
+//    5. Devices flip to status='received' immediately (per Q2=c, MM trust)
+//    6. Pickup record goes into Makenzie's confirmation queue
+//    7. Makenzie reviews → either confirms (sets makenzieExpiry — the ONE
+//       date everyone sees per Q3=c) or resolves discrepancy ticket
+//
+//  PERMISSIONS:
+//    • Pickup form: Market Managers, Owner, Onboarding (NOT TLs/agents)
+//    • Confirmation queue: Owner + anyone with depts.inv (Makenzie)
+//    • makenzieExpiry edit: Owner + Makenzie only (locked otherwise)
+// ════════════════════════════════════════════════════════════════════════
+
+// Can this user submit pickup forms? (MMs, Owner, Onboarding)
+function canSubmitPickup(user){
+  try {
+    if(!user) return false;
+    if(typeof isOwner === 'function' && isOwner(user)) return true;
+    if(user.role === 'Market Manager') return true;
+    if(typeof isOnboarding === 'function' && isOnboarding(user)) return true;
+    return false;
+  } catch(e){ console.warn('[canSubmitPickup] failed safely:', e); return false; }
+}
+
+// Can this user confirm pickups + set expiry? (Owner + Makenzie/inv dept)
+function canConfirmPickup(user){
+  try {
+    if(!user) return false;
+    if(typeof isOwner === 'function' && isOwner(user)) return true;
+    if(typeof isInventory === 'function' && isInventory(user)) return true;
+    if(user.depts && user.depts.inv === true) return true;
+    return false;
+  } catch(e){ console.warn('[canConfirmPickup] failed safely:', e); return false; }
+}
+
+// Get the displayed expiry for a device. Per Q3=c, only Makenzie's date is
+// shown to MMs/TLs/agents/CMs/IBOs. Owner + Makenzie see the original CSV
+// expiry too. This helper centralizes the rule so every panel respects it.
+function inventoryDisplayExpiry(device, viewer){
+  try {
+    if(!device) return null;
+    var canSeeBoth = canConfirmPickup(viewer);
+    if(canSeeBoth){
+      // Owner + Makenzie see both — return Makenzie's if set, else CSV
+      return device.makenzieExpiry || device.expiry || device.expiryDate || null;
+    }
+    // Everyone else: ONLY Makenzie's date. If she hasn't set one yet,
+    // return null (UI shows "Pending confirmation" instead of CSV date).
+    return device.makenzieExpiry || null;
+  } catch(e){ console.warn('[inventoryDisplayExpiry] failed safely:', e); return null; }
+}
+
+// MM Pickup Form panel
+function panelInventoryPickup(){
+  try {
+    var u = DB.current;
+    if(!canSubmitPickup(u)){
+      return panelHeader('📦 Inventory Pickup') +
+        '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Inventory pickup form is for Market Managers, Owner, and Onboarding only.</div></div>';
+    }
+    var h = panelHeader('📦 Inventory Pickup Form');
+    h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.6">';
+    h += '<strong style="color:var(--brown)">When to use this form:</strong> You\'ve just picked up a shipment from UPS, FedEx, or your local pickup point. Confirm what you received here. Live photos are required (no uploads from gallery). If devices are missing, mark them — Makenzie will get a ticket to track them down.';
+    h += '</div>';
+
+    h += '<div class="bo-card" style="padding:24px;max-width:760px">';
+
+    // Campaign + market
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Campaign</label>';
+    h += '<select id="ipCampaign" class="f-input" onchange="ipRefreshExpected()">';
+    h += '<option value="">Select campaign...</option>';
+    h += '<option value="Gen Mobile">Gen Mobile</option>';
+    h += '<option value="TruConnect">TruConnect</option>';
+    h += '<option value="Assurance">Assurance</option>';
+    h += '<option value="Excess">Excess</option>';
+    h += '</select></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Market</label>';
+    h += '<input id="ipMarket" type="text" class="f-input" placeholder="e.g., Dallas-TX" value="'+_escapeAttr(u.team || '')+'"></div>';
+
+    // Tracking barcode — scanner OR manual entry
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Tracking Barcode</label>';
+    h += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">';
+    h += '<input id="ipBarcode" type="text" class="f-input" placeholder="Scan or type tracking number" style="flex:1;min-width:200px">';
+    h += '<button type="button" onclick="ipStartBarcodeScan()" style="background:var(--blue);color:white;border:none;padding:10px 16px;border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">📷 Scan Barcode</button>';
+    h += '</div>';
+    h += '<div id="ipBarcodeStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px"></div>';
+    h += '<div id="ipBarcodeScanArea" style="display:none;margin-top:10px"></div>';
+    h += '</div>';
+
+    // Package photo (live cam, rear-facing)
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">📸 Photo of Package (exterior with shipping label visible) *</label>';
+    h += liveCamCreateSlot('ip-package-cam', { label: '📷 Take Package Photo', facing: 'environment' });
+    h += '</div>';
+
+    // Contents photo (live cam, rear-facing)
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">📸 Photo of Contents (devices unboxed) *</label>';
+    h += liveCamCreateSlot('ip-contents-cam', { label: '📷 Take Contents Photo', facing: 'environment' });
+    h += '</div>';
+
+    // Device list — pull expected devices from the inventory based on campaign+market
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Devices Received</label>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-bottom:8px">Check each device you actually received. Unchecked devices will create a discrepancy ticket for Makenzie.</div>';
+    h += '<div id="ipExpectedList" style="background:var(--cream);border:1px solid var(--sand);border-radius:6px;padding:12px;max-height:280px;overflow-y:auto;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+    h += '<div style="color:var(--muted);text-align:center;padding:20px">Select campaign + market to load expected devices</div>';
+    h += '</div></div>';
+
+    // Notes
+    h += '<div class="f-field" style="margin-bottom:18px"><label class="f-label">Notes <span style="color:var(--muted);font-weight:400;font-size:.7rem">(optional)</span></label>';
+    h += '<textarea id="ipNotes" class="f-input" rows="3" placeholder="Any damage, missing labels, partial counts, etc."></textarea></div>';
+
+    // Submit
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;border-top:1px solid var(--sand);padding-top:18px;margin-top:18px">';
+    h += '<button onclick="ipSubmitPickup()" class="btn-fire" style="padding:12px 24px;font-size:.74rem">📦 Submit Pickup</button>';
+    h += '<button onclick="gotoPanel(\'inv-dashboard\')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:12px 18px;border-radius:5px;cursor:pointer;margin-left:auto">Cancel</button>';
+    h += '</div>';
+    h += '<div id="ipError" style="display:none;margin-top:12px;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem;letter-spacing:1px"></div>';
+
+    h += '</div>';
+    return h;
+  } catch(e){
+    console.warn('[panelInventoryPickup] failed safely:', e);
+    return panelHeader('📦 Inventory Pickup') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Form failed to load. Refresh and try again.</div></div>';
+  }
+}
+
+// Refresh the expected device list when campaign/market changes
+function ipRefreshExpected(){
+  try {
+    var campaign = (document.getElementById('ipCampaign')||{}).value || '';
+    var market = (document.getElementById('ipMarket')||{}).value || '';
+    var listEl = document.getElementById('ipExpectedList');
+    if(!listEl) return;
+    if(!campaign){
+      listEl.innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px">Select campaign + market to load expected devices</div>';
+      return;
+    }
+    // Pull devices that are status='shipped' for this campaign + market
+    var pool = [];
+    if(campaign === 'Gen Mobile') pool = GM_INVENTORY;
+    else if(campaign === 'TruConnect') pool = TC_INVENTORY;
+    else if(campaign === 'Assurance') pool = AW_INVENTORY;
+    else if(campaign === 'Excess') pool = EX_INVENTORY;
+
+    var matchMarket = market.toLowerCase().trim();
+    var expected = pool.filter(function(d){
+      if(!d) return false;
+      var status = d.pickupStatus || d.status || 'shipped';
+      if(status !== 'shipped') return false;
+      if(!matchMarket) return true;
+      var dm = (d.market || d.teamName || '').toLowerCase().trim();
+      return dm.indexOf(matchMarket) >= 0 || matchMarket.indexOf(dm) >= 0;
+    });
+
+    if(!expected.length){
+      listEl.innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px">No pending shipments found for '+_escapeHtml(campaign)+(market?' / '+_escapeHtml(market):'')+'</div>';
+      return;
+    }
+
+    var html = '';
+    expected.forEach(function(d){
+      var label = (d.imei ? 'IMEI '+d.imei : (d.sim ? 'SIM '+d.sim : 'Device #'+d.id))
+        + (d.model ? ' · '+_escapeHtml(d.model) : '');
+      html += '<label style="display:flex;align-items:center;gap:10px;padding:6px 8px;border-bottom:1px solid var(--sand);cursor:pointer">'
+        + '<input type="checkbox" data-device-id="'+d.id+'" checked style="margin:0">'
+        + '<span style="font-family:monospace;font-size:.78rem">'+label+'</span>'
+        + '</label>';
+    });
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);padding:8px 4px 0">'+expected.length+' device'+(expected.length===1?'':'s')+' expected. Uncheck any you did NOT receive.</div>';
+    listEl.innerHTML = html;
+  } catch(e){
+    console.warn('[ipRefreshExpected] failed safely:', e);
+  }
+}
+
+// Open barcode scanner using the BarcodeDetector API.
+// Falls back gracefully — if the browser doesn't support it, the user
+// just types the tracking number into the input field manually.
+async function ipStartBarcodeScan(){
+  try {
+    var statusEl = document.getElementById('ipBarcodeStatus');
+    var scanArea = document.getElementById('ipBarcodeScanArea');
+    if(!scanArea) return;
+
+    // Check support
+    if(typeof BarcodeDetector === 'undefined'){
+      if(statusEl){
+        statusEl.style.color = '#D97706';
+        statusEl.innerHTML = '⚠ Barcode scanner not supported in this browser. Type the tracking number manually above.';
+      }
+      return;
+    }
+
+    // Build a video element for live scanning
+    scanArea.innerHTML = '<video id="ipBarcodeVideo" autoplay playsinline muted style="width:100%;max-width:480px;border-radius:6px;background:#000"></video>'
+      + '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">'
+      + '<button type="button" onclick="ipStopBarcodeScan()" style="background:white;color:var(--brown);border:1px solid var(--sand);padding:8px 14px;border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">Cancel Scan</button>'
+      + '</div>';
+    scanArea.style.display = 'block';
+
+    if(statusEl){
+      statusEl.style.color = 'var(--muted)';
+      statusEl.textContent = 'Hold the barcode in front of the camera...';
+    }
+
+    // Start camera stream
+    var stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    var video = document.getElementById('ipBarcodeVideo');
+    if(!video){ stream.getTracks().forEach(function(t){t.stop();}); return; }
+    video.srcObject = stream;
+    window._ipBarcodeStream = stream;
+
+    var detector = new BarcodeDetector({
+      formats: ['code_128','code_39','ean_13','ean_8','upc_a','upc_e','qr_code','itf']
+    });
+
+    // Poll for barcodes ~3x per second
+    window._ipBarcodeInterval = setInterval(async function(){
+      if(!video.videoWidth) return;
+      try {
+        var codes = await detector.detect(video);
+        if(codes && codes.length){
+          var raw = codes[0].rawValue;
+          var inputEl = document.getElementById('ipBarcode');
+          if(inputEl) inputEl.value = raw;
+          if(statusEl){
+            statusEl.style.color = '#16a34a';
+            statusEl.textContent = '✓ Scanned: '+raw;
+          }
+          ipStopBarcodeScan();
+        }
+      } catch(e){ /* keep trying */ }
+    }, 350);
+  } catch(e){
+    console.warn('[ipStartBarcodeScan] failed safely:', e);
+    var statusEl = document.getElementById('ipBarcodeStatus');
+    if(statusEl){
+      statusEl.style.color = '#dc2626';
+      statusEl.textContent = 'Camera unavailable. Type the tracking number manually above.';
+    }
+    ipStopBarcodeScan();
+  }
+}
+
+function ipStopBarcodeScan(){
+  try {
+    if(window._ipBarcodeInterval){ clearInterval(window._ipBarcodeInterval); delete window._ipBarcodeInterval; }
+    if(window._ipBarcodeStream){
+      window._ipBarcodeStream.getTracks().forEach(function(t){ try{t.stop();}catch(_){} });
+      delete window._ipBarcodeStream;
+    }
+    var scanArea = document.getElementById('ipBarcodeScanArea');
+    if(scanArea){ scanArea.innerHTML = ''; scanArea.style.display = 'none'; }
+  } catch(e){ console.warn('[ipStopBarcodeScan] failed safely:', e); }
+}
+
+// Submit the pickup form
+function ipSubmitPickup(){
+  try {
+    var u = DB.current;
+    if(!canSubmitPickup(u)){ alert('Permission denied.'); return; }
+
+    var campaign = (document.getElementById('ipCampaign')||{}).value || '';
+    var market = (document.getElementById('ipMarket')||{}).value || '';
+    var barcode = (document.getElementById('ipBarcode')||{}).value || '';
+    var notes = (document.getElementById('ipNotes')||{}).value || '';
+
+    var packagePhoto  = (typeof liveCamGetData === 'function') ? liveCamGetData('ip-package-cam')  : null;
+    var contentsPhoto = (typeof liveCamGetData === 'function') ? liveCamGetData('ip-contents-cam') : null;
+    var packageMeta   = (typeof liveCamGetMeta === 'function') ? liveCamGetMeta('ip-package-cam')  : null;
+    var contentsMeta  = (typeof liveCamGetMeta === 'function') ? liveCamGetMeta('ip-contents-cam') : null;
+
+    var errors = [];
+    if(!campaign) errors.push('Select campaign');
+    if(!market.trim()) errors.push('Enter market');
+    if(!packagePhoto) errors.push('Take package photo');
+    if(!contentsPhoto) errors.push('Take contents photo');
+
+    // Read which devices were checked vs unchecked
+    var listEl = document.getElementById('ipExpectedList');
+    var expected = [], received = [], missing = [];
+    if(listEl){
+      var boxes = listEl.querySelectorAll('input[type="checkbox"][data-device-id]');
+      boxes.forEach(function(box){
+        var id = parseInt(box.getAttribute('data-device-id'), 10);
+        if(isNaN(id)) return;
+        expected.push(id);
+        if(box.checked) received.push(id);
+        else missing.push(id);
+      });
+    }
+    if(!expected.length) errors.push('No expected devices loaded — confirm campaign + market');
+
+    if(errors.length){
+      var errEl = document.getElementById('ipError');
+      if(errEl){ errEl.textContent = '⚠ ' + errors.join(' · '); errEl.style.display = 'block'; }
+      return;
+    }
+
+    var now = new Date().toISOString();
+    var pickup = {
+      id: PICKUP_NEXT_ID++,
+      marketManagerId: u.id,
+      marketManagerName: u.name,
+      market: market.trim(),
+      campaign: campaign,
+      submittedAt: now,
+      trackingBarcode: barcode.trim(),
+      expectedDevices: expected,
+      receivedDevices: received,
+      missingDevices: missing,
+      packagePhoto: packagePhoto,
+      contentsPhoto: contentsPhoto,
+      packageMeta: packageMeta,
+      contentsMeta: contentsMeta,
+      notes: notes.trim(),
+      status: 'pending',
+      confirmedBy: null,
+      confirmedAt: null,
+      makenzieExpiry: null
+    };
+    INVENTORY_PICKUPS.unshift(pickup);
+
+    // Per Q2=c: flip received devices to 'received' immediately. MM trust is enough.
+    var pool = (campaign === 'Gen Mobile') ? GM_INVENTORY
+             : (campaign === 'TruConnect') ? TC_INVENTORY
+             : (campaign === 'Assurance') ? AW_INVENTORY
+             : (campaign === 'Excess') ? EX_INVENTORY : [];
+    received.forEach(function(devId){
+      var dev = pool.find(function(d){ return d.id === devId; });
+      if(dev){
+        dev.pickupStatus = 'received';
+        dev.pickedUpBy = u.id;
+        dev.pickedUpAt = now;
+        dev.pickupId = pickup.id;
+      }
+    });
+
+    // Per Q4=a: partial pickup → discrepancy ticket
+    if(missing.length){
+      var ticket = {
+        id: DISCREPANCY_NEXT_ID++,
+        pickupId: pickup.id,
+        marketManagerId: u.id,
+        marketManagerName: u.name,
+        campaign: campaign,
+        market: market.trim(),
+        missingDevices: missing,
+        reason: 'Partial pickup — '+missing.length+' of '+expected.length+' devices missing',
+        openedAt: now,
+        status: 'open',
+        resolvedBy: null,
+        resolvedAt: null,
+        resolutionNotes: ''
+      };
+      INVENTORY_DISCREPANCY_TICKETS.unshift(ticket);
+      console.log('[ipSubmitPickup] discrepancy ticket #'+ticket.id+' opened: '+missing.length+' devices missing');
+    }
+
+    saveInventory();
+    console.log('[ipSubmitPickup] pickup #'+pickup.id+' submitted — '+received.length+' received, '+missing.length+' missing');
+
+    // Notify Makenzie (and any inv dept members) via the standard notification system
+    if(typeof postNotification === 'function'){
+      var recips = (DB.agents || []).filter(function(a){
+        return a.active && (a.id === 1 || (a.depts && a.depts.inv) || a.role === 'admin');
+      }).map(function(a){ return a.id; });
+      try {
+        postNotification({
+          icon: '📦',
+          title: 'Inventory Pickup Submitted — '+u.name,
+          body: u.name+' submitted pickup for '+campaign+' / '+market+'. '+received.length+' received'+(missing.length?', '+missing.length+' missing (discrepancy ticket #'+(DISCREPANCY_NEXT_ID-1)+' created)':'')+'. Confirm in the Pickup Confirmations queue.',
+          fromId: u.id,
+          fromName: u.name,
+          formType: 'inventory-pickup',
+          toIds: recips
+        });
+      } catch(notifErr){ console.warn('[ipSubmitPickup] notify failed:', notifErr); }
+    }
+
+    alert('✓ Pickup submitted!\n\n'+received.length+' device'+(received.length===1?'':'s')+' marked as received.'
+      + (missing.length ? '\n\n⚠ '+missing.length+' device'+(missing.length===1?'':'s')+' marked missing — discrepancy ticket created for Makenzie.' : '')
+      + '\n\nMakenzie will set the expiration date and confirm.');
+    gotoPanel('inv-dashboard');
+  } catch(e){
+    console.warn('[ipSubmitPickup] failed safely:', e);
+    alert('Submit failed. Try again.');
+  }
+}
+
+// Makenzie's confirmation queue panel
+function panelPickupConfirmations(){
+  try {
+    var u = DB.current;
+    if(!canConfirmPickup(u)){
+      return panelHeader('📦 Pickup Confirmations') +
+        '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Pickup confirmations are for Owner and Inventory department only.</div></div>';
+    }
+    var h = panelHeader('📦 Pickup Confirmations');
+
+    var pending = INVENTORY_PICKUPS.filter(function(p){ return p.status === 'pending'; });
+    var confirmed = INVENTORY_PICKUPS.filter(function(p){ return p.status === 'confirmed'; });
+
+    h += '<div style="background:rgba(20,83,45,.06);border:1px solid rgba(20,83,45,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.6">';
+    h += '<strong style="color:var(--brown)">How this works:</strong> Market Managers submit pickups when they receive shipments. Devices flip to "received" immediately on submission (MM trust). Your job is to verify against your shipment manifest, then set the <strong>expiration date</strong> — that\'s the date all field staff will see for these devices going forward.';
+    h += '</div>';
+
+    if(!pending.length && !confirmed.length){
+      h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">📦</div><div style="font-size:1rem">No pickups yet.</div><div style="font-size:.78rem;margin-top:8px">When MMs submit pickups, they\'ll appear here for confirmation.</div></div></div>';
+      return h;
+    }
+
+    if(pending.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:#D97706;margin:18px 0 12px">⏳ Pending Confirmation ('+pending.length+')</h3>';
+      pending.forEach(function(p){ h += _ipPickupCard(p, true); });
+    }
+    if(confirmed.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:#15803d;margin:24px 0 12px">✓ Confirmed ('+confirmed.length+')</h3>';
+      confirmed.slice(0, 10).forEach(function(p){ h += _ipPickupCard(p, false); });
+      if(confirmed.length > 10){
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);text-align:center;padding:12px">Showing the most recent 10 confirmed pickups.</div>';
+      }
+    }
+    return h;
+  } catch(e){
+    console.warn('[panelPickupConfirmations] failed safely:', e);
+    return panelHeader('📦 Pickup Confirmations') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load.</div></div>';
+  }
+}
+
+// Render one pickup card
+function _ipPickupCard(p, allowConfirm){
+  var statusColor = (p.status === 'confirmed') ? '#15803d' : '#D97706';
+  var statusBg    = (p.status === 'confirmed') ? 'rgba(20,83,45,.08)' : 'rgba(217,119,6,.08)';
+  var dateStr = new Date(p.submittedAt).toLocaleString();
+  var h = '<div class="bo-card" style="margin-bottom:14px;padding:18px;border-left:3px solid '+statusColor+'">';
+  h += '<div style="display:flex;justify-content:space-between;align-items:start;flex-wrap:wrap;gap:10px;margin-bottom:10px">';
+  h += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:1.5px;color:var(--brown)">Pickup #'+p.id+' · '+_escapeHtml(p.campaign)+'</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-top:2px">'+_escapeHtml(p.marketManagerName)+' · '+_escapeHtml(p.market)+' · '+dateStr+'</div></div>';
+  h += '<span style="background:'+statusBg+';color:'+statusColor+';font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:4px;font-weight:700">'+p.status+'</span>';
+  h += '</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>Tracking:</strong> '+(p.trackingBarcode?_escapeHtml(p.trackingBarcode):'<em>not provided</em>')+'<br>';
+  h += '<strong>Received:</strong> '+(p.receivedDevices||[]).length+' devices';
+  if((p.missingDevices||[]).length) h += ' · <span style="color:#dc2626"><strong>Missing:</strong> '+p.missingDevices.length+'</span>';
+  h += '<br>';
+  if(p.notes) h += '<strong>Notes:</strong> '+_escapeHtml(p.notes)+'<br>';
+  if(p.makenzieExpiry) h += '<strong>Expiration set:</strong> '+_escapeHtml(p.makenzieExpiry)+'<br>';
+  h += '</div>';
+  // Photos
+  if(p.packagePhoto || p.contentsPhoto){
+    h += '<div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">';
+    if(p.packagePhoto) h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase">Package</div><img src="'+_escapeAttr(p.packagePhoto)+'" style="max-width:200px;max-height:150px;border-radius:5px;border:1px solid var(--sand);margin-top:4px"></div>';
+    if(p.contentsPhoto) h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase">Contents</div><img src="'+_escapeAttr(p.contentsPhoto)+'" style="max-width:200px;max-height:150px;border-radius:5px;border:1px solid var(--sand);margin-top:4px"></div>';
+    h += '</div>';
+  }
+  // Confirmation controls
+  if(allowConfirm && p.status === 'pending'){
+    h += '<div style="border-top:1px solid var(--sand);margin-top:12px;padding-top:12px">';
+    h += '<div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">';
+    h += '<div style="flex:1;min-width:200px"><label style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--brown);font-weight:700">Set Expiration Date</label>';
+    h += '<input id="ipExpiry-'+p.id+'" type="date" class="f-input" style="margin-top:4px;width:100%"></div>';
+    h += '<button onclick="ipConfirmPickup('+p.id+')" class="btn-fire" style="padding:10px 18px;font-size:.72rem">✓ Confirm + Set Expiry</button>';
+    h += '</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-top:6px">This date will be the ONE date shown to all field staff. Owner and you can change it later if needed.</div>';
+    h += '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+// Makenzie confirms pickup + sets expiry
+function ipConfirmPickup(pickupId){
+  try {
+    var u = DB.current;
+    if(!canConfirmPickup(u)){ alert('Permission denied.'); return; }
+    var pickup = INVENTORY_PICKUPS.find(function(p){ return p.id === pickupId; });
+    if(!pickup){ alert('Pickup not found.'); return; }
+    var dateInput = document.getElementById('ipExpiry-'+pickupId);
+    var expiryDate = dateInput ? dateInput.value : '';
+    if(!expiryDate){ alert('Set an expiration date first.'); return; }
+
+    var now = new Date().toISOString();
+    pickup.status = 'confirmed';
+    pickup.confirmedBy = u.id;
+    pickup.confirmedAt = now;
+    pickup.makenzieExpiry = expiryDate;
+
+    // Apply makenzieExpiry to every device in this pickup
+    var pool = (pickup.campaign === 'Gen Mobile') ? GM_INVENTORY
+             : (pickup.campaign === 'TruConnect') ? TC_INVENTORY
+             : (pickup.campaign === 'Assurance') ? AW_INVENTORY
+             : (pickup.campaign === 'Excess') ? EX_INVENTORY : [];
+    (pickup.receivedDevices || []).forEach(function(devId){
+      var dev = pool.find(function(d){ return d.id === devId; });
+      if(dev){ dev.makenzieExpiry = expiryDate; }
+    });
+
+    saveInventory();
+    console.log('[ipConfirmPickup] pickup #'+pickup.id+' confirmed; expiry set to '+expiryDate);
+    alert('✓ Pickup #'+pickup.id+' confirmed.\nExpiration ('+expiryDate+') applied to '+pickup.receivedDevices.length+' device'+(pickup.receivedDevices.length===1?'':'s')+'.');
+    gotoPanel('pickup-confirmations');
+  } catch(e){
+    console.warn('[ipConfirmPickup] failed safely:', e);
+    alert('Confirmation failed.');
+  }
+}
+
+// Discrepancy ticket queue (Makenzie + Owner)
+function panelDiscrepancyTickets(){
+  try {
+    var u = DB.current;
+    if(!canConfirmPickup(u)){
+      return panelHeader('🎫 Inventory Discrepancies') +
+        '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Restricted to Owner and Inventory department.</div></div>';
+    }
+    var h = panelHeader('🎫 Inventory Discrepancies');
+    var open = INVENTORY_DISCREPANCY_TICKETS.filter(function(t){ return t.status === 'open'; });
+    var resolved = INVENTORY_DISCREPANCY_TICKETS.filter(function(t){ return t.status !== 'open'; });
+
+    h += '<div style="background:rgba(220,38,38,.06);border:1px solid rgba(220,38,38,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.6">';
+    h += '<strong style="color:var(--brown)">When tickets open:</strong> An MM submitted a partial pickup — some devices weren\'t in the package. Resolve by either marking devices as <strong>found</strong> (waiting for separate delivery) or <strong>written off</strong> (truly lost).';
+    h += '</div>';
+
+    if(!open.length && !resolved.length){
+      h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">✅</div><div style="font-size:1rem">No discrepancies. All pickups have matched.</div></div></div>';
+      return h;
+    }
+
+    if(open.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:#dc2626;margin:18px 0 12px">⚠ Open Tickets ('+open.length+')</h3>';
+      open.forEach(function(t){ h += _ipDiscrepancyCard(t, true); });
+    }
+    if(resolved.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:var(--muted);margin:24px 0 12px">📁 Resolved ('+resolved.length+')</h3>';
+      resolved.slice(0, 10).forEach(function(t){ h += _ipDiscrepancyCard(t, false); });
+    }
+    return h;
+  } catch(e){
+    console.warn('[panelDiscrepancyTickets] failed safely:', e);
+    return panelHeader('🎫 Inventory Discrepancies') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load.</div></div>';
+  }
+}
+
+function _ipDiscrepancyCard(t, allowResolve){
+  var statusColor = (t.status === 'open') ? '#dc2626' : '#15803d';
+  var dateStr = new Date(t.openedAt).toLocaleString();
+  var h = '<div class="bo-card" style="margin-bottom:14px;padding:18px;border-left:3px solid '+statusColor+'">';
+  h += '<div style="display:flex;justify-content:space-between;align-items:start;flex-wrap:wrap;gap:10px;margin-bottom:10px">';
+  h += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:1.5px;color:var(--brown)">Ticket #'+t.id+' · Pickup #'+t.pickupId+'</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">'+_escapeHtml(t.marketManagerName)+' · '+_escapeHtml(t.campaign)+' / '+_escapeHtml(t.market)+' · '+dateStr+'</div></div>';
+  h += '<span style="background:'+statusColor+'15;color:'+statusColor+';font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:4px;font-weight:700">'+t.status+'</span>';
+  h += '</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>'+t.missingDevices.length+'</strong> device'+(t.missingDevices.length===1?'':'s')+' missing<br>';
+  h += '<strong>Reason:</strong> '+_escapeHtml(t.reason)+'<br>';
+  if(t.resolutionNotes) h += '<strong>Resolution:</strong> '+_escapeHtml(t.resolutionNotes)+'<br>';
+  h += '</div>';
+  if(allowResolve && t.status === 'open'){
+    h += '<div style="border-top:1px solid var(--sand);margin-top:12px;padding-top:12px;display:flex;gap:8px;flex-wrap:wrap">';
+    h += '<button onclick="ipResolveDiscrepancy('+t.id+',\'resolved-found\')" style="background:#15803d;color:white;border:none;padding:8px 14px;border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">✓ Mark Found</button>';
+    h += '<button onclick="ipResolveDiscrepancy('+t.id+',\'resolved-written-off\')" style="background:#dc2626;color:white;border:none;padding:8px 14px;border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">✗ Write Off</button>';
+    h += '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+function ipResolveDiscrepancy(ticketId, resolution){
+  try {
+    var u = DB.current;
+    if(!canConfirmPickup(u)){ alert('Permission denied.'); return; }
+    var t = INVENTORY_DISCREPANCY_TICKETS.find(function(x){ return x.id === ticketId; });
+    if(!t){ alert('Ticket not found.'); return; }
+    var notes = prompt('Resolution notes (optional):') || '';
+    t.status = resolution;
+    t.resolvedBy = u.id;
+    t.resolvedAt = new Date().toISOString();
+    t.resolutionNotes = notes.trim();
+    saveInventory();
+    console.log('[ipResolveDiscrepancy] ticket #'+t.id+' → '+resolution);
+    gotoPanel('discrepancy-tickets');
+  } catch(e){
+    console.warn('[ipResolveDiscrepancy] failed safely:', e);
+    alert('Resolution failed.');
+  }
 }
 
 // Update help-text when AW Override Style dropdown changes.
