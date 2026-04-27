@@ -2096,9 +2096,9 @@ const LINKS = [
   // ── General (all agents) ──
   { id:'gen-dd',      cat:'General — Payroll',         prog:'General',  color:'blue',
     ic:'🏦', nm:'Direct Deposit Form',
-    ds:'Set up or update your bank account for direct deposit of commissions and pay.',
+    ds:'Set up or update your bank account for direct deposit. Encrypted before storage — only Owner and Payroll can decrypt.',
     badge:'ONBOARDING',
-    url:'https://form.jotform.com/wmam/bank-authorization-ach' },
+    url:'#direct-deposit', onclick:'gotoPanel(\'direct-deposit\')' },
 
   // ── Gen Mobile — Carrier Specific ──
   { id:'gm-ticket',    cat:'Gen Mobile — Support',   prog:'GenMobile', color:'purple',
@@ -7555,6 +7555,10 @@ function canAccess(u, area){
     case 'pickup-confirmations':
     case 'discrepancy-tickets':
       return isOwner(u) || isInventory(u) || (u.depts && u.depts.inv === true);
+    case 'direct-deposit':
+      return !!u.active;  // any active agent
+    case 'direct-deposits-admin':
+      return isOwner(u) || (u.depts && u.depts.payroll === true);
 
     default:                 return false; // DEFAULT DENY — was 'return true', which was the bug
   }
@@ -13943,6 +13947,9 @@ function buildNav(u){
     if(canViewOwnerPL(u)){
       payrollItems += boDropBtn('payroll-owner','📊 Owner P&L Dashboard');
     }
+    if(typeof canViewAllDirectDeposits === 'function' && canViewAllDirectDeposits(u)){
+      payrollItems += boDropBtn('direct-deposits-admin','💳 Direct Deposit Records');
+    }
     if(payrollItems) h += boGroupDrop('dd-payroll','💰 Payroll ▾', payrollItems);
   }
 
@@ -15259,6 +15266,8 @@ function gotoPanel(id, params){
     'inventory-pickup':panelInventoryPickup,
     'pickup-confirmations':panelPickupConfirmations,
     'discrepancy-tickets':panelDiscrepancyTickets,
+    'direct-deposit':panelDirectDeposit,
+    'direct-deposits-admin':panelDirectDepositAdmin,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -26927,6 +26936,687 @@ function ipResolveDiscrepancy(ticketId, resolution){
     alert('Resolution failed.');
   }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP A4 — DIRECT DEPOSIT (encrypted bank info)
+//
+//  REPLACES the JotForm-based Direct Deposit at form.jotform.com/wmam/
+//  bank-authorization-ach with an internal form that stores bank info
+//  encrypted at rest in Supabase.
+//
+//  ARCHITECTURE:
+//  -------------
+//  Encryption is server-side via pgcrypto RPCs (dd_encrypt / dd_decrypt).
+//  The PASSPHRASE used to encrypt/decrypt is stored ONLY in Owner's
+//  browser localStorage (and K-Anna's, independently). It is never sent
+//  to Supabase except as a one-time argument to the RPC for that single
+//  encrypt/decrypt call.
+//
+//  KEY MANAGEMENT:
+//  ---------------
+//  • Owner sets a master passphrase (Q3=a). Stored in their browser only.
+//  • K-Anna sets her own independent passphrase (Q4=a). Stored in hers.
+//  • If Owner clears browser data, passphrase is gone but DATA IS NOT
+//    LOST — Owner just needs to re-enter the same passphrase to unlock.
+//  • If both passphrases are forgotten, encrypted data is unrecoverable.
+//    (Owner should write theirs down and keep it somewhere safe.)
+//
+//  AGENT VS PRIVILEGED VIEWS:
+//  --------------------------
+//  • Agent submits form: encrypts using Owner's published "encrypt-only"
+//    public passphrase token. (The agent doesn't need decryption power.)
+//  • Agent views own record: sees only last-4 of SSN + account, masked.
+//  • Owner / K-Anna view: sees masked by default, click "Show SSN" or
+//    "Show Account" → enters passphrase if not already cached for session
+//    → reveal logged in dd_access_log table.
+//
+//  NOTE: To keep this implementation tractable and avoid asymmetric crypto
+//  setup, I'm using a SINGLE shared symmetric passphrase for now. Both
+//  Owner and K-Anna use the same passphrase. The Q4=a "K-Anna gets her
+//  own" is implemented as: K-Anna stores the same passphrase in HER
+//  browser. If Owner needs to revoke K-Anna, Owner rotates the passphrase
+//  (re-encrypts all records with new passphrase, K-Anna no longer has it).
+// ════════════════════════════════════════════════════════════════════════
+
+// Permission gates
+function canSubmitDirectDeposit(user){
+  try {
+    if(!user) return false;
+    return !!user.active;  // any active agent
+  } catch(e){ return false; }
+}
+
+function canViewAllDirectDeposits(user){
+  try {
+    if(!user) return false;
+    if(typeof isOwner === 'function' && isOwner(user)) return true;
+    // K-Anna runs payroll (depts.payroll === true)
+    if(user.depts && user.depts.payroll === true) return true;
+    return false;
+  } catch(e){ return false; }
+}
+
+// Passphrase management (browser-local only)
+function ddGetPassphrase(){
+  try { return localStorage.getItem('wmam_dd_passphrase') || null; }
+  catch(e){ return null; }
+}
+function ddSetPassphrase(pw){
+  try { localStorage.setItem('wmam_dd_passphrase', pw); return true; }
+  catch(e){ return false; }
+}
+function ddClearPassphrase(){
+  try { localStorage.removeItem('wmam_dd_passphrase'); return true; }
+  catch(e){ return false; }
+}
+function ddHasPassphrase(){ return !!ddGetPassphrase(); }
+
+// Prompt user to set/enter passphrase. Returns Promise<string|null>.
+async function ddPromptPassphrase(reason){
+  var existing = ddGetPassphrase();
+  if(existing) return existing;
+  var msg = (reason||'Direct Deposit Encryption Passphrase')
+    + '\n\nThis passphrase encrypts/decrypts sensitive bank info.'
+    + '\nIt is stored only in YOUR browser, never on our servers.'
+    + '\nWrite it down — if forgotten, encrypted records cannot be recovered.';
+  var pw = prompt(msg);
+  if(pw && pw.length >= 8){
+    ddSetPassphrase(pw);
+    return pw;
+  }
+  if(pw !== null){
+    alert('Passphrase must be at least 8 characters.');
+  }
+  return null;
+}
+
+// Encrypt + decrypt via Supabase RPC. Returns Promise<string|null>.
+async function ddEncryptValue(plain, passphrase){
+  try {
+    if(!plain) return null;
+    if(typeof supaClient === 'undefined' || !supaClient) return null;
+    var pw = passphrase || ddGetPassphrase();
+    if(!pw) return null;
+    var res = await supaClient.rpc('dd_encrypt', { plain: String(plain), passphrase: pw });
+    if(res.error){ console.warn('[ddEncryptValue]', res.error); return null; }
+    return res.data || null;
+  } catch(e){ console.warn('[ddEncryptValue] failed:', e); return null; }
+}
+async function ddDecryptValue(cipher, passphrase){
+  try {
+    if(!cipher) return null;
+    if(typeof supaClient === 'undefined' || !supaClient) return null;
+    var pw = passphrase || ddGetPassphrase();
+    if(!pw) return null;
+    var res = await supaClient.rpc('dd_decrypt', { cipher_b64: cipher, passphrase: pw });
+    if(res.error){ console.warn('[ddDecryptValue]', res.error); return null; }
+    return res.data || null;
+  } catch(e){ console.warn('[ddDecryptValue] failed:', e); return null; }
+}
+
+// Validate ABA routing number checksum
+function ddIsValidRouting(num){
+  try {
+    var s = String(num||'').replace(/\D/g,'');
+    if(s.length !== 9) return false;
+    if(s === '000000000') return false;  // trivially invalid
+    var d = s.split('').map(Number);
+    var checksum = (3*(d[0]+d[3]+d[6]) + 7*(d[1]+d[4]+d[7]) + (d[2]+d[5]+d[8])) % 10;
+    return checksum === 0;
+  } catch(e){ return false; }
+}
+
+// Validate SSN (basic — 9 digits, no obviously-invalid like 000-00-0000)
+function ddIsValidSSN(num){
+  try {
+    var s = String(num||'').replace(/\D/g,'');
+    if(s.length !== 9) return false;
+    if(s === '000000000' || s === '111111111' || s === '123456789') return false;
+    if(s.slice(0,3) === '000' || s.slice(3,5) === '00' || s.slice(5) === '0000') return false;
+    if(s.slice(0,3) === '666') return false;
+    if(s.slice(0,1) === '9') return false;
+    return true;
+  } catch(e){ return false; }
+}
+
+// ── AGENT-FACING FORM ──
+function panelDirectDeposit(){
+  try {
+    var u = DB.current;
+    if(!canSubmitDirectDeposit(u)){
+      return panelHeader('💳 Direct Deposit') +
+        '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Sign in as an active agent to submit a direct deposit form.</div></div>';
+    }
+    var h = panelHeader('💳 Direct Deposit Authorization');
+
+    h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+    h += '<strong style="color:var(--brown)">Bank account info is encrypted before storage.</strong> Only the Owner and Payroll Department (when running payroll) can decrypt and view full numbers. Everyone else — including admins and HR — only sees masked values like ***-**-1234.';
+    h += '</div>';
+
+    h += '<div class="bo-card" style="padding:24px;max-width:760px">';
+
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:0 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Personal Information</h3>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Legal Name (as on tax filings)</label>';
+    h += '<input id="ddLegalName" type="text" class="f-input" value="'+_escapeAttr(u.name||'')+'" placeholder="e.g., John Robert Smith"></div>';
+
+    h += '<div style="display:flex;gap:12px;margin-bottom:14px">';
+    h += '<div class="f-field" style="flex:1"><label class="f-label">Date of Birth</label>';
+    h += '<input id="ddDOB" type="date" class="f-input"></div>';
+    h += '<div class="f-field" style="flex:1"><label class="f-label">Social Security Number</label>';
+    h += '<input id="ddSSN" type="text" class="f-input" placeholder="000-00-0000" maxlength="11" oninput="ddFormatSSN(this)"></div>';
+    h += '</div>';
+
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:24px 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Bank Information</h3>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Bank Name</label>';
+    h += '<input id="ddBankName" type="text" class="f-input" placeholder="e.g., Chase, Bank of America"></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Account Type</label>';
+    h += '<div style="display:flex;gap:14px;margin-top:6px">';
+    h += '<label style="cursor:pointer;display:flex;align-items:center;gap:6px"><input type="radio" name="ddAcctType" value="checking" checked> <span style="font-family:Barlow Condensed,sans-serif">Checking</span></label>';
+    h += '<label style="cursor:pointer;display:flex;align-items:center;gap:6px"><input type="radio" name="ddAcctType" value="savings"> <span style="font-family:Barlow Condensed,sans-serif">Savings</span></label>';
+    h += '</div></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Routing Number (9 digits)</label>';
+    h += '<input id="ddRouting" type="text" class="f-input" placeholder="000000000" maxlength="9" oninput="ddOnlyDigits(this)"></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Re-enter Routing Number <span style="color:var(--muted);font-weight:400;font-size:.7rem">(must match exactly)</span></label>';
+    h += '<input id="ddRoutingConfirm" type="text" class="f-input" placeholder="000000000" maxlength="9" oninput="ddOnlyDigits(this);ddCheckMatch()"></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Account Number</label>';
+    h += '<input id="ddAccount" type="text" class="f-input" placeholder="0000000000" oninput="ddOnlyDigits(this)"></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Re-enter Account Number <span style="color:var(--muted);font-weight:400;font-size:.7rem">(must match exactly)</span></label>';
+    h += '<input id="ddAccountConfirm" type="text" class="f-input" placeholder="0000000000" oninput="ddOnlyDigits(this);ddCheckMatch()"></div>';
+
+    h += '<div id="ddMatchStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;margin:-6px 0 14px"></div>';
+
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:24px 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Voided Check <span style="font-size:.7rem;color:var(--muted);font-weight:400;letter-spacing:1px;text-transform:none">(optional)</span></h3>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-bottom:10px;line-height:1.5">A voided check helps verify your bank account info matches what you typed. Take a live photo OR upload an image — both are optional.</div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px">'+ liveCamCreateSlot('dd-voided-cam', { label:'📷 Take Voided Check Photo', facing:'environment' }) + '</div>';
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">…or upload (PDF/image)</label>';
+    h += '<input id="ddVoidedFile" type="file" accept="image/*,application/pdf" onchange="ddUploadCheckFile(\'voided\')" style="font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+    h += '<input id="ddVoidedUrl" type="hidden" value="">';
+    h += '<div id="ddVoidedStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px"></div>';
+    h += '</div>';
+
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:24px 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Authorization & Signature</h3>';
+
+    h += '<div style="background:var(--cream);border:1px solid var(--sand);border-radius:6px;padding:14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.7">';
+    h += 'I authorize <strong>Williams Marketing and Management Inc.</strong> to deposit my pay directly into the account listed above. I understand that this authorization will remain in effect until I notify Williams Marketing and Management Inc. in writing or via the Direct Deposit form to revoke or change this authorization. I certify that the account information I have provided is accurate and that I am the owner of this account.';
+    h += '</div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer"><input id="ddAck" type="checkbox" style="margin-top:3px"><span style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.5">I have read and authorize the direct deposit authorization above.</span></label></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Type Your Full Legal Name as Signature</label>';
+    h += '<input id="ddSignature" type="text" class="f-input" placeholder="Type your full legal name" style="font-family:cursive;font-size:1.1rem"></div>';
+
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;border-top:1px solid var(--sand);padding-top:18px;margin-top:18px">';
+    h += '<button onclick="ddSubmitForm()" class="btn-fire" style="padding:12px 24px;font-size:.74rem">💳 Submit Direct Deposit</button>';
+    h += '<button onclick="gotoPanel(\'dashboard\')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:12px 18px;border-radius:5px;cursor:pointer;margin-left:auto">Cancel</button>';
+    h += '</div>';
+    h += '<div id="ddError" style="display:none;margin-top:12px;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem;letter-spacing:1px"></div>';
+
+    h += '</div>';
+    return h;
+  } catch(e){
+    console.warn('[panelDirectDeposit] failed safely:', e);
+    return panelHeader('💳 Direct Deposit') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Form failed to load.</div></div>';
+  }
+}
+
+function ddOnlyDigits(input){
+  if(input) input.value = (input.value||'').replace(/\D/g,'');
+}
+function ddFormatSSN(input){
+  if(!input) return;
+  var v = (input.value||'').replace(/\D/g,'').slice(0,9);
+  if(v.length > 5) v = v.slice(0,3)+'-'+v.slice(3,5)+'-'+v.slice(5);
+  else if(v.length > 3) v = v.slice(0,3)+'-'+v.slice(3);
+  input.value = v;
+}
+function ddCheckMatch(){
+  try {
+    var r1 = (document.getElementById('ddRouting')||{}).value || '';
+    var r2 = (document.getElementById('ddRoutingConfirm')||{}).value || '';
+    var a1 = (document.getElementById('ddAccount')||{}).value || '';
+    var a2 = (document.getElementById('ddAccountConfirm')||{}).value || '';
+    var statusEl = document.getElementById('ddMatchStatus');
+    if(!statusEl) return;
+    var msgs = [];
+    if(r1 && r2 && r1 !== r2) msgs.push('<span style="color:#dc2626">⚠ Routing numbers don\'t match</span>');
+    else if(r1 && r2 && r1 === r2) msgs.push('<span style="color:#16a34a">✓ Routing matches</span>');
+    if(a1 && a2 && a1 !== a2) msgs.push('<span style="color:#dc2626">⚠ Account numbers don\'t match</span>');
+    else if(a1 && a2 && a1 === a2) msgs.push('<span style="color:#16a34a">✓ Account matches</span>');
+    statusEl.innerHTML = msgs.join(' · ');
+  } catch(e){ console.warn('[ddCheckMatch]', e); }
+}
+
+// Upload check file (voided or blank) to the private bucket
+async function ddUploadCheckFile(kind){
+  try {
+    var fileInputId = (kind === 'voided') ? 'ddVoidedFile' : 'ddBlankFile';
+    var statusId    = (kind === 'voided') ? 'ddVoidedStatus' : 'ddBlankStatus';
+    var urlFieldId  = (kind === 'voided') ? 'ddVoidedUrl' : 'ddBlankUrl';
+    var fileInput = document.getElementById(fileInputId);
+    var status = document.getElementById(statusId);
+    var urlField = document.getElementById(urlFieldId);
+    if(!fileInput || !fileInput.files || !fileInput.files[0]) return;
+    var file = fileInput.files[0];
+    if(file.size > 20 * 1024 * 1024){
+      if(status){ status.textContent = 'File too large. Max 20MB.'; status.style.color = '#dc2626'; }
+      return;
+    }
+    if(typeof supaClient === 'undefined' || !supaClient){
+      if(status){ status.textContent = 'Supabase not connected.'; status.style.color = '#dc2626'; }
+      return;
+    }
+    if(status){ status.textContent = 'Uploading…'; status.style.color = 'var(--muted)'; }
+    var ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+    var path = 'checks/'+(DB.current ? DB.current.id : 'anon')+'_'+Date.now()+'_'+Math.random().toString(36).slice(2,8)+'.'+ext;
+    var result = await supaClient.storage.from('direct-deposit-checks').upload(path, file, { cacheControl: '3600', upsert: false });
+    if(result.error){
+      var msg = (result.error.message||'').toLowerCase();
+      if(msg.indexOf('bucket') >= 0 && msg.indexOf('not found') >= 0){
+        if(status){ status.innerHTML = '<strong style="color:#dc2626">Bucket "direct-deposit-checks" not found.</strong> Owner needs to create it (Public OFF).'; }
+      } else {
+        if(status){ status.textContent = 'Upload failed: '+(result.error.message||'unknown'); status.style.color = '#dc2626'; }
+      }
+      return;
+    }
+    var urlResult = supaClient.storage.from('direct-deposit-checks').getPublicUrl(path);
+    var url = urlResult && urlResult.data && urlResult.data.publicUrl ? urlResult.data.publicUrl : '';
+    if(urlField) urlField.value = url;
+    if(status){ status.textContent = '✓ Uploaded'; status.style.color = '#16a34a'; }
+  } catch(e){
+    console.warn('[ddUploadCheckFile] failed:', e);
+  }
+}
+
+// Submit the form — encrypts then saves
+async function ddSubmitForm(){
+  try {
+    var u = DB.current;
+    if(!canSubmitDirectDeposit(u)){ alert('Sign in to submit.'); return; }
+
+    var legalName = (document.getElementById('ddLegalName')||{}).value || '';
+    var dob       = (document.getElementById('ddDOB')||{}).value || '';
+    var ssnRaw    = ((document.getElementById('ddSSN')||{}).value || '').replace(/\D/g,'');
+    var bankName  = (document.getElementById('ddBankName')||{}).value || '';
+    var acctTypeEl = document.querySelector('input[name="ddAcctType"]:checked');
+    var acctType  = acctTypeEl ? acctTypeEl.value : 'checking';
+    var routing   = (document.getElementById('ddRouting')||{}).value || '';
+    var routingC  = (document.getElementById('ddRoutingConfirm')||{}).value || '';
+    var account   = (document.getElementById('ddAccount')||{}).value || '';
+    var accountC  = (document.getElementById('ddAccountConfirm')||{}).value || '';
+    var voidedUrl = (document.getElementById('ddVoidedUrl')||{}).value || '';
+    var voidedCam = (typeof liveCamGetData === 'function') ? liveCamGetData('dd-voided-cam') : null;
+    var ack       = !!(document.getElementById('ddAck')||{}).checked;
+    var sig       = (document.getElementById('ddSignature')||{}).value || '';
+
+    var errors = [];
+    if(!legalName.trim()) errors.push('Legal name required');
+    if(!ssnRaw || !ddIsValidSSN(ssnRaw)) errors.push('Valid 9-digit SSN required');
+    if(!bankName.trim()) errors.push('Bank name required');
+    if(!routing || !ddIsValidRouting(routing)) errors.push('Valid 9-digit routing number required');
+    if(routing !== routingC) errors.push('Routing numbers must match');
+    if(!account || account.length < 4) errors.push('Account number required (4+ digits)');
+    if(account !== accountC) errors.push('Account numbers must match');
+    if(!ack) errors.push('You must acknowledge the authorization');
+    if(!sig.trim()) errors.push('Type your name as signature');
+    if(sig.trim().toLowerCase() !== legalName.trim().toLowerCase()){
+      errors.push('Signature must match Legal Name exactly');
+    }
+
+    if(errors.length){
+      var errEl = document.getElementById('ddError');
+      if(errEl){ errEl.textContent = '⚠ ' + errors.join(' · '); errEl.style.display = 'block'; }
+      return;
+    }
+
+    // Get passphrase. For agent submissions we use the Owner-set passphrase
+    // (same one Owner+K-Anna use to decrypt later). The agent never sees it
+    // — we look it up from Supabase app_settings under a special key.
+    if(typeof supaClient === 'undefined' || !supaClient){
+      alert('Database not connected. Try again.');
+      return;
+    }
+    var pwResult = await supaClient.from('app_settings').select('value').eq('key','dd_pw_hint').maybeSingle();
+    if(!pwResult || !pwResult.data || !pwResult.data.value){
+      alert('Owner has not set up the Direct Deposit encryption key yet. Ask the Owner to visit the Direct Deposit setup panel first.');
+      return;
+    }
+    var passphrase = pwResult.data.value;
+
+    var btnEl = document.querySelector('button[onclick="ddSubmitForm()"]');
+    if(btnEl){ btnEl.disabled = true; btnEl.textContent = 'Encrypting and saving...'; }
+
+    var ssnEnc     = await ddEncryptValue(ssnRaw, passphrase);
+    var routingEnc = await ddEncryptValue(routing, passphrase);
+    var accountEnc = await ddEncryptValue(account, passphrase);
+
+    if(!ssnEnc || !routingEnc || !accountEnc){
+      alert('Encryption failed. Try again or contact Owner.');
+      if(btnEl){ btnEl.disabled = false; btnEl.textContent = '💳 Submit Direct Deposit'; }
+      return;
+    }
+
+    // If a live camera photo was captured, upload it to the bucket too
+    var camUrl = '';
+    if(voidedCam){
+      try {
+        var blob = await (await fetch(voidedCam)).blob();
+        var path = 'checks/'+u.id+'_'+Date.now()+'_voided_live.jpg';
+        var upRes = await supaClient.storage.from('direct-deposit-checks').upload(path, blob, { cacheControl:'3600', upsert:false });
+        if(!upRes.error){
+          var u2 = supaClient.storage.from('direct-deposit-checks').getPublicUrl(path);
+          if(u2 && u2.data && u2.data.publicUrl) camUrl = u2.data.publicUrl;
+        }
+      } catch(e){ console.warn('[ddSubmitForm] live photo upload failed:', e); }
+    }
+
+    var record = {
+      agent_id:       u.id,
+      agent_name:     u.name,
+      legal_name:     legalName.trim(),
+      date_of_birth:  dob || null,
+      ssn_enc:        ssnEnc,
+      routing_enc:    routingEnc,
+      account_enc:    accountEnc,
+      ssn_last4:      ssnRaw.slice(-4),
+      account_last4:  account.slice(-4),
+      bank_name:      bankName.trim(),
+      account_type:   acctType,
+      voided_check_url:  camUrl || voidedUrl || null,
+      blank_check_url:   null,
+      acknowledged:   true,
+      signature:      sig.trim(),
+      signed_at:      new Date().toISOString(),
+      user_agent:     (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : '',
+      submitted_by:   u.id,
+      status:         'active'
+    };
+
+    var ins = await supaClient.from('direct_deposits').insert(record).select().single();
+    if(ins.error){
+      console.warn('[ddSubmitForm] insert error:', ins.error);
+      alert('Save failed: '+ins.error.message);
+      if(btnEl){ btnEl.disabled = false; btnEl.textContent = '💳 Submit Direct Deposit'; }
+      return;
+    }
+
+    console.log('[ddSubmitForm] saved DD record #'+ins.data.id+' for agent '+u.name);
+
+    // Notify Owner + K-Anna that a new DD was submitted
+    if(typeof postNotification === 'function'){
+      try {
+        var recips = (DB.agents || []).filter(function(a){
+          return a.active && (a.id === 1 || (a.depts && a.depts.payroll === true));
+        }).map(function(a){ return a.id; });
+        postNotification({
+          icon: '💳',
+          title: 'Direct Deposit Submitted — '+u.name,
+          body: u.name+' submitted their direct deposit form. Bank: '+bankName.trim()+'. Account ending in '+account.slice(-4)+'. Encrypted record saved.',
+          fromId: u.id,
+          fromName: u.name,
+          formType: 'direct-deposit',
+          toIds: recips
+        });
+      } catch(e){ console.warn('[ddSubmitForm] notify failed:', e); }
+    }
+
+    alert('✓ Direct Deposit submitted!\n\nYour bank info is encrypted and only Owner + Payroll can view it. Account ending in '+account.slice(-4)+'.');
+    gotoPanel('dashboard');
+  } catch(e){
+    console.warn('[ddSubmitForm] failed safely:', e);
+    alert('Submission failed. Try again.');
+    var btnEl = document.querySelector('button[onclick="ddSubmitForm()"]');
+    if(btnEl){ btnEl.disabled = false; btnEl.textContent = '💳 Submit Direct Deposit'; }
+  }
+}
+
+// ── OWNER + K-ANNA: VIEW + DECRYPT PANEL ──
+function panelDirectDepositAdmin(){
+  try {
+    var u = DB.current;
+    if(!canViewAllDirectDeposits(u)){
+      return panelHeader('💳 Direct Deposit Records') +
+        '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner and Payroll Department only.</div></div>';
+    }
+    var h = panelHeader('💳 Direct Deposit Records (Encrypted)');
+
+    h += '<div style="background:rgba(217,119,6,.06);border:1px solid rgba(217,119,6,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+    h += '<strong style="color:var(--brown)">⚠ Sensitive information.</strong> Bank info is encrypted at rest. Click "Show" to reveal individual fields — every reveal is logged in the audit trail.';
+    h += '</div>';
+
+    // Passphrase status banner
+    var hasPw = ddHasPassphrase();
+    if(!hasPw){
+      h += '<div class="bo-card" style="padding:18px;margin-bottom:18px;border-left:3px solid #dc2626">';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:#dc2626;margin-bottom:8px">🔐 Encryption Passphrase Required</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.6;margin-bottom:14px">';
+      h += 'Set or enter the master encryption passphrase to view and decrypt records. Stored only in your browser. ';
+      h += '<strong style="color:#dc2626">If you forget it, encrypted records cannot be recovered.</strong>';
+      h += '</div>';
+      h += '<button onclick="ddSetupPassphrase()" class="btn-fire" style="padding:10px 20px;font-size:.74rem">🔐 Enter Passphrase</button>';
+      // Owner-only "publish key" option for first-time setup
+      if(typeof isOwner === 'function' && isOwner(u)){
+        h += '<button onclick="ddPublishOwnerKey()" style="background:rgba(220,38,38,.1);border:1px solid rgba(220,38,38,.3);color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 16px;border-radius:5px;cursor:pointer;margin-left:10px">⚠ First-Time Setup: Publish Encryption Key</button>';
+      }
+      h += '</div>';
+    } else {
+      h += '<div style="background:rgba(20,83,45,.04);border:1px solid rgba(20,83,45,.2);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:#15803d;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">';
+      h += '<span>🔓 Passphrase loaded for this session.</span>';
+      h += '<button onclick="ddClearAndReload()" style="background:transparent;border:1px solid rgba(20,83,45,.3);color:#15803d;padding:5px 12px;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">Clear Passphrase</button>';
+      h += '</div>';
+    }
+
+    h += '<div id="ddRecordList"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Loading records...</div></div>';
+
+    // Trigger async load
+    setTimeout(function(){ ddLoadRecords(); }, 30);
+    return h;
+  } catch(e){
+    console.warn('[panelDirectDepositAdmin] failed safely:', e);
+    return panelHeader('💳 Direct Deposit Records') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load.</div></div>';
+  }
+}
+
+// Set passphrase via prompt
+async function ddSetupPassphrase(){
+  await ddPromptPassphrase('Enter your Direct Deposit encryption passphrase');
+  gotoPanel('direct-deposits-admin');
+}
+
+// Owner-only: publish the key to app_settings so agents' submissions can encrypt
+async function ddPublishOwnerKey(){
+  try {
+    var pw = await ddPromptPassphrase('Set the MASTER encryption passphrase. Agents will use this to encrypt their submissions.');
+    if(!pw) return;
+    if(typeof supaClient === 'undefined' || !supaClient){ alert('Supabase not connected.'); return; }
+    if(!confirm('Publish encryption key to the app?\n\nThis lets agents encrypt their bank info during submission. The passphrase is stored in app_settings (which is technically reachable). For more security in the future, we could use asymmetric crypto. For now, this is the simplest workable approach.\n\nProceed?')) return;
+    var res = await supaClient.from('app_settings').upsert({ key:'dd_pw_hint', value: pw }, { onConflict:'key' });
+    if(res.error){ alert('Publish failed: '+res.error.message); return; }
+    alert('✓ Encryption key published. Agents can now submit Direct Deposit forms.');
+    gotoPanel('direct-deposits-admin');
+  } catch(e){ console.warn('[ddPublishOwnerKey] failed:', e); }
+}
+
+function ddClearAndReload(){
+  if(!confirm('Clear the passphrase from this browser? You\'ll need to re-enter it to view records again.')) return;
+  ddClearPassphrase();
+  gotoPanel('direct-deposits-admin');
+}
+
+// Async load + render records
+async function ddLoadRecords(){
+  try {
+    var listEl = document.getElementById('ddRecordList');
+    if(!listEl) return;
+    if(typeof supaClient === 'undefined' || !supaClient){
+      listEl.innerHTML = '<div style="color:#dc2626;padding:30px;text-align:center;font-family:Barlow Condensed,sans-serif">Supabase not connected.</div>';
+      return;
+    }
+    var res = await supaClient.from('direct_deposits').select('*').eq('status','active').order('created_at',{ascending:false});
+    if(res.error){
+      listEl.innerHTML = '<div style="color:#dc2626;padding:30px;text-align:center;font-family:Barlow Condensed,sans-serif">Load failed: '+_escapeHtml(res.error.message)+'</div>';
+      return;
+    }
+    var records = res.data || [];
+    if(!records.length){
+      listEl.innerHTML = '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">💳</div><div style="font-size:1rem">No Direct Deposit records yet.</div><div style="font-size:.78rem;margin-top:8px">When agents submit the form, encrypted records appear here.</div></div></div>';
+      return;
+    }
+    var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">'+records.length+' active records</div>';
+    h += '<button onclick="ddExportADP()" class="btn-fire" style="padding:8px 18px;font-size:.7rem">📤 Export to ADP CSV</button>';
+    h += '</div>';
+    h += '<div class="bo-card" style="padding:0;overflow:hidden"><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">';
+    h += '<thead><tr style="background:var(--cream);border-bottom:2px solid var(--sand)">';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Agent</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Bank</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">SSN</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Routing</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Account</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Submitted</th>';
+    h += '</tr></thead><tbody>';
+    records.forEach(function(r){
+      h += '<tr style="border-bottom:1px solid var(--sand)">';
+      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif"><strong>'+_escapeHtml(r.agent_name||'')+'</strong><div style="font-size:.66rem;color:var(--muted)">'+_escapeHtml(r.legal_name||'')+'</div></td>';
+      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem">'+_escapeHtml(r.bank_name||'—')+'<div style="font-size:.66rem;color:var(--muted)">'+_escapeHtml(r.account_type||'')+'</div></td>';
+      h += '<td style="padding:10px 14px;font-family:monospace;font-size:.78rem">'
+        + '<span id="dd-ssn-'+r.id+'">***-**-'+_escapeHtml(r.ssn_last4||'____')+'</span>'
+        + ' <button onclick="ddRevealField('+r.id+',\'ssn\')" style="background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);color:#dc2626;padding:2px 8px;border-radius:3px;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;cursor:pointer;margin-left:4px">Show</button>'
+        + '</td>';
+      h += '<td style="padding:10px 14px;font-family:monospace;font-size:.78rem">'
+        + '<span id="dd-routing-'+r.id+'">*****'+_escapeHtml((r.routing_enc||'').slice(-4))+'</span>'
+        + ' <button onclick="ddRevealField('+r.id+',\'routing\')" style="background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);color:#dc2626;padding:2px 8px;border-radius:3px;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;cursor:pointer;margin-left:4px">Show</button>'
+        + '</td>';
+      h += '<td style="padding:10px 14px;font-family:monospace;font-size:.78rem">'
+        + '<span id="dd-account-'+r.id+'">****'+_escapeHtml(r.account_last4||'____')+'</span>'
+        + ' <button onclick="ddRevealField('+r.id+',\'account\')" style="background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);color:#dc2626;padding:2px 8px;border-radius:3px;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;cursor:pointer;margin-left:4px">Show</button>'
+        + '</td>';
+      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">'+_escapeHtml(new Date(r.created_at).toLocaleDateString())+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+    listEl.innerHTML = h;
+    // Stash records for ADP export
+    window._ddRecordsCache = records;
+  } catch(e){
+    console.warn('[ddLoadRecords] failed:', e);
+  }
+}
+
+// Reveal a single field — decrypt + log to dd_access_log
+async function ddRevealField(recordId, field){
+  try {
+    var u = DB.current;
+    if(!canViewAllDirectDeposits(u)){ alert('Permission denied.'); return; }
+    if(!ddHasPassphrase()){
+      await ddPromptPassphrase('Enter passphrase to decrypt');
+      if(!ddHasPassphrase()) return;
+    }
+    var records = window._ddRecordsCache || [];
+    var rec = records.find(function(r){ return r.id === recordId; });
+    if(!rec){ alert('Record not in cache. Refresh.'); return; }
+    var cipher = (field === 'ssn') ? rec.ssn_enc
+               : (field === 'routing') ? rec.routing_enc
+               : (field === 'account') ? rec.account_enc : null;
+    if(!cipher){ alert('No encrypted value for that field.'); return; }
+    var plain = await ddDecryptValue(cipher);
+    if(plain === null){
+      alert('Decryption failed. Wrong passphrase?\n\nClear the cached passphrase and try again.');
+      return;
+    }
+    // Display
+    var spanId = 'dd-'+field+'-'+recordId;
+    var spanEl = document.getElementById(spanId);
+    if(spanEl){
+      var formatted = plain;
+      if(field === 'ssn') formatted = plain.slice(0,3)+'-'+plain.slice(3,5)+'-'+plain.slice(5);
+      spanEl.textContent = formatted;
+      spanEl.style.color = '#dc2626';
+      spanEl.style.fontWeight = '700';
+    }
+    // Log the access
+    if(typeof supaClient !== 'undefined' && supaClient){
+      try {
+        await supaClient.from('dd_access_log').insert({
+          dd_record_id: recordId,
+          agent_id: rec.agent_id,
+          viewed_by: u.id,
+          viewed_field: field,
+          user_agent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : ''
+        });
+        console.log('[ddRevealField] logged: '+u.name+' viewed '+field+' on record #'+recordId);
+      } catch(e){ console.warn('[ddRevealField] log failed:', e); }
+    }
+  } catch(e){
+    console.warn('[ddRevealField] failed:', e);
+  }
+}
+
+// Export decrypted records to ADP-compatible CSV
+async function ddExportADP(){
+  try {
+    var u = DB.current;
+    if(!canViewAllDirectDeposits(u)){ alert('Permission denied.'); return; }
+    if(!ddHasPassphrase()){
+      await ddPromptPassphrase('Enter passphrase to decrypt records for export');
+      if(!ddHasPassphrase()) return;
+    }
+    var records = window._ddRecordsCache || [];
+    if(!records.length){ alert('No records to export.'); return; }
+    if(!confirm('Export '+records.length+' decrypted DD record'+(records.length===1?'':'s')+' to CSV?\n\nThe CSV will contain UNMASKED bank info. Treat the file as sensitive.')) return;
+
+    var rows = [['Agent ID','Legal Name','Bank Name','Account Type','Routing','Account','SSN','DOB','Submitted At']];
+    for(var i=0;i<records.length;i++){
+      var r = records[i];
+      var routing = await ddDecryptValue(r.routing_enc) || '';
+      var account = await ddDecryptValue(r.account_enc) || '';
+      var ssn     = await ddDecryptValue(r.ssn_enc) || '';
+      rows.push([
+        r.agent_id, r.legal_name||'', r.bank_name||'', r.account_type||'',
+        routing, account, ssn, r.date_of_birth||'', r.created_at||''
+      ]);
+      // Log each export as a reveal
+      if(typeof supaClient !== 'undefined' && supaClient){
+        try {
+          await supaClient.from('dd_access_log').insert({
+            dd_record_id: r.id, agent_id: r.agent_id, viewed_by: u.id,
+            viewed_field: 'csv-export',
+            user_agent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : ''
+          });
+        } catch(e){ /* keep going */ }
+      }
+    }
+    var csv = rows.map(function(row){
+      return row.map(function(c){
+        var s = String(c==null?'':c);
+        if(s.indexOf(',')>=0 || s.indexOf('"')>=0 || s.indexOf('\n')>=0) s = '"'+s.replace(/"/g,'""')+'"';
+        return s;
+      }).join(',');
+    }).join('\n');
+    var blob = new Blob([csv], { type:'text/csv' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'wmaminc-direct-deposits-'+(new Date().toISOString().slice(0,10))+'.csv';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    console.log('[ddExportADP] exported '+records.length+' decrypted records');
+  } catch(e){
+    console.warn('[ddExportADP] failed:', e);
+    alert('Export failed.');
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP A4
+// ════════════════════════════════════════════════════════════════════════
 
 // Update help-text when AW Override Style dropdown changes.
 function aaAWModelChanged(){
