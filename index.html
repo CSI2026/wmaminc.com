@@ -9320,8 +9320,19 @@ async function sbUpsert(table, data, conflictCol){
   try{
     var opts = conflictCol ? {onConflict: conflictCol} : {onConflict:'id'};
     var result = await supaClient.from(table).upsert(data, opts);
-    return !(result && result.error);
-  } catch(e){ console.warn('sbUpsert error:', e); return false; }
+    if(result && result.error){
+      // ── LOUD diagnostic — silent failures here have caused real bugs.
+      // Surface the exact reason in the console so the user can see it.
+      console.warn('[sbUpsert] FAILED for table='+table+': code='+(result.error.code||'?')+' message='+(result.error.message||'(no message)'));
+      try { window._lastSbError = result.error; } catch(e){}
+      return false;
+    }
+    return true;
+  } catch(e){
+    console.warn('sbUpsert exception:', e);
+    try { window._lastSbError = e; } catch(_){}
+    return false;
+  }
 }
 
 async function sbInsert(table, data){
@@ -9732,7 +9743,10 @@ function safeJSON(val, fallback){
 
 // ── Save agent to Supabase ──
 async function saveAgentToSupabase(agent){
-  if(!supaClient) { saveToStorage(); return; }
+  if(!supaClient) { saveToStorage(); return false; }
+  // ── LOUD diagnostic. When password updates aren't sticking, we need
+  //    to see the EXACT password string that's about to be written. ──
+  try { console.log('[saveAgentToSupabase] agent #'+agent.id+' name="'+agent.name+'" username="'+agent.username+'" password.length='+(agent.password?String(agent.password).length:0)); } catch(e){}
   var full = {
     id: agent.id, name: agent.name, username: agent.username, password: agent.password,
     role: agent.role, email: agent.email||'',
@@ -9784,7 +9798,17 @@ async function saveAgentToSupabase(agent){
     delete legacy.tc_model;
     delete legacy.aw_model;
     delete legacy.reports_to;
-    await sbUpsert('agents', legacy);
+    var retryOk = await sbUpsert('agents', legacy);
+    if(!retryOk){
+      console.error('[saveAgentToSupabase] BOTH full AND legacy upsert FAILED for agent #'+agent.id+'. Username/password did NOT persist to Supabase. Last error:', window._lastSbError);
+      return false;
+    } else {
+      console.log('[saveAgentToSupabase] ✓ Saved (legacy fallback) agent #'+agent.id);
+      return true;
+    }
+  } else {
+    console.log('[saveAgentToSupabase] ✓ Saved (full schema) agent #'+agent.id);
+    return true;
   }
 }
 
@@ -11273,7 +11297,18 @@ function saveAgentForm(){
     // Make sure category/depts are sane (run migration in case fields are missing)
     if(typeof migrateAgentCategory === 'function') migrateAgentCategory(savedAgent);
 
-    saveAgentToSupabase(savedAgent);
+    saveAgentToSupabase(savedAgent).then(function(success){
+      if(success === false){
+        console.error('[saveAgentForm] ⚠ Supabase save FAILED for agent #'+savedAgent.id+'. Check console for [sbUpsert] error message. Local copy was updated but the change will NOT be visible to other devices or after page reload.');
+        try {
+          alert('⚠ Save partially failed.\n\nThe local copy was updated but Supabase rejected the write. The agent will NOT be able to log in with the new password from another device until this is fixed.\n\nOpen browser dev tools (F12) → Console tab to see the exact reason. Most common causes:\n\n• Supabase column missing (schema needs migration)\n• Network blip — try again\n• RLS policy blocking the write\n\nLast error:\n'+(window._lastSbError && window._lastSbError.message ? window._lastSbError.message : 'unknown — see console'));
+        } catch(_){}
+      } else {
+        console.log('[saveAgentForm] ✓ Agent #'+savedAgent.id+' fully persisted to Supabase');
+      }
+    }).catch(function(err){
+      console.error('[saveAgentForm] saveAgentToSupabase threw:', err);
+    });
     // Notify if agent was coded — post to national channel
     if(savedAgent.agentCodes){
       var activeCodes = CODED_CAMPAIGNS.filter(function(c){return savedAgent.agentCodes[c]&&savedAgent.agentCodes[c].trim();});
