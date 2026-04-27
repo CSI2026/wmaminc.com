@@ -7355,6 +7355,29 @@ var TRAINING_COMPLETIONS = [];  // [{id, sessionId, agentId, agentName, complete
 var TRAINING_NEXT_ID = 1;
 var COMPLETION_NEXT_ID = 1;
 
+// ══════════════════════════════════════════════════════════════
+//  SHIP A8 — MARKETS ROSTER (admin-defined market list + org tree)
+//
+//  Replaces the hardcoded LIFELINE_TEAMS approach for the application
+//  form's market dropdown. Owner manages markets through Markets Admin
+//  panel; the public application form reads from this array on render.
+//
+//  Each market record has:
+//    name           — display name (e.g., "Dallas-B")
+//    cmId, mmId     — Campaign Manager / Market Manager (single each, optional)
+//    iboId          — IBO (single, optional — alternate to MM)
+//    tlIds          — array of Team Leader IDs (multi, optional)
+//    notes          — free-text Owner notes
+//    active         — whether market shows in dropdown for new applications
+//
+//  ORG TREE WALK (used by application notification routing):
+//    Selected TL → MM → CM    (or)    IBO → CM
+//  Only entities that exist in the chain get notified. Gaps don't break
+//  the walk — we just skip and notify whoever's there.
+// ══════════════════════════════════════════════════════════════
+var MARKETS = [];           // [{id, name, cmId, mmId, iboId, tlIds:[], notes, active, createdAt, updatedAt}]
+var MARKET_NEXT_ID = 1;
+
 var CODED_CAMPAIGNS = ['Gen Mobile','TruConnect','Assurance','Excess','Chuzo','Astound','ACA'];
 
 // ── Pending Transfers (awaiting recipient signature + inventory approval) ──
@@ -7606,6 +7629,8 @@ function canAccess(u, area){
       return canSubmitTicket(u, 'TruConnect');
     case 'carrier-tickets':
       return canViewAllTickets(u);
+    case 'markets-admin':
+      return isOwner(u);
 
     default:                 return false; // DEFAULT DENY — was 'return true', which was the bug
   }
@@ -7661,6 +7686,9 @@ function saveInventory(){
     // Ship A5 — Carrier tickets
     localStorage.setItem('wmam_carrier_tickets',      JSON.stringify(CARRIER_TICKETS));
     localStorage.setItem('wmam_ticket_nextid',        String(TICKET_NEXT_ID));
+    // Ship A8 — Markets roster
+    localStorage.setItem('wmam_markets',              JSON.stringify(MARKETS));
+    localStorage.setItem('wmam_market_nextid',        String(MARKET_NEXT_ID));
   }catch(e){ console.warn('Inventory save:',e); }
   saveSupplyInventory();
 
@@ -7724,6 +7752,9 @@ function saveInventory(){
     // Ship A5 — Carrier tickets
     pushKey('carrier_tickets',      CARRIER_TICKETS);
     pushKey('ticket_nextid',        TICKET_NEXT_ID);
+    // Ship A8 — Markets roster
+    pushKey('markets',              MARKETS);
+    pushKey('market_nextid',        MARKET_NEXT_ID);
   }
 }
 function loadInventory(){
@@ -7767,6 +7798,9 @@ function loadInventory(){
     // Ship A5 — Carrier tickets
     var ct=localStorage.getItem('wmam_carrier_tickets');       if(ct) CARRIER_TICKETS=JSON.parse(ct)||[];
     var tk=localStorage.getItem('wmam_ticket_nextid');         if(tk) TICKET_NEXT_ID=parseInt(tk)||1;
+    // Ship A8 — Markets roster
+    var mk=localStorage.getItem('wmam_markets');               if(mk) MARKETS=JSON.parse(mk)||[];
+    var mn=localStorage.getItem('wmam_market_nextid');         if(mn) MARKET_NEXT_ID=parseInt(mn)||1;
   }catch(e){ console.warn('Inventory load:',e); }
 }
 
@@ -9485,6 +9519,9 @@ async function loadFromSupabase(){
         // Ship A5 — Carrier tickets
         if(s.key==='carrier_tickets'      && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) CARRIER_TICKETS = v;}catch(e){} }
         if(s.key==='ticket_nextid'        && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) TICKET_NEXT_ID = n;}catch(e){} }
+        // Ship A8 — Markets roster
+        if(s.key==='markets'              && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) MARKETS = v;}catch(e){} }
+        if(s.key==='market_nextid'        && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) MARKET_NEXT_ID = n;}catch(e){} }
         // ── Markets richer fields (marketManager, campaignManager, payModel) ──
         // The lifeline_teams TABLE only has limited columns (id, name, color, leader, etc).
         // The app_settings backup carries the full team object including marketManager
@@ -13600,6 +13637,8 @@ function doLogout(){
 
 function openApplicationForm(){
   openModal('applicationModal');
+  // Populate market dropdown from the live MARKETS roster (Ship A9)
+  try { if(typeof appPopulateMarkets === 'function') setTimeout(appPopulateMarkets, 30); } catch(e){}
 }
 
 
@@ -14135,6 +14174,7 @@ function buildNav(u){
     var manageDrop = boDropBtn('agents','👤 Agents')
       +boDropBtn('applications','📋 Applications')
       +boDropBtn('ll-teams','📍 LL Teams')
+      +(canAccess(u,'markets-admin') ? boDropBtn('markets-admin','🗺️ Markets Roster') : '')
       +boDropBtn('reports','📊 Reports')
       +(canAccess(u,'agent-codes')   ? boDropBtn('agent-codes','🔑 Agent Codes')    : '')
       +(canAccess(u,'goal-settings') ? boDropBtn('goal-settings','🎯 Goals')         : '')
@@ -15387,6 +15427,7 @@ function gotoPanel(id, params){
     'gm-ticket':panelGmTicket,
     'tc-ticket':panelTcTicket,
     'carrier-tickets':panelCarrierTickets,
+    'markets-admin':panelMarketsAdmin,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -29641,6 +29682,460 @@ function tkSetStatus(ticketId, newStatus){
 //  END SHIP A5
 // ════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP A8 — MARKETS ADMIN PANEL
+//
+//  Owner manages the market roster + per-market org tree (CM/MM/IBO/TLs).
+//  The application form (Ship A9) reads from this list automatically — no
+//  code changes needed when Owner adds, edits, or deletes a market.
+// ════════════════════════════════════════════════════════════════════════
+
+// Permission gates
+function canManageMarkets(user){
+  try {
+    if(!user) return false;
+    if(typeof isOwner === 'function' && isOwner(user)) return true;
+    return false;  // Owner-only — markets are org-shaping decisions
+  } catch(e){ return false; }
+}
+
+// Active markets only — for application form dropdown
+function marketActiveList(){
+  try {
+    return (MARKETS||[]).filter(function(m){ return m && m.active !== false; })
+      .sort(function(a,b){ return (a.name||'').localeCompare(b.name||''); });
+  } catch(e){ return []; }
+}
+
+function marketGetById(id){
+  try {
+    var n = parseInt(id, 10);
+    return (MARKETS||[]).find(function(m){ return m.id === n; }) || null;
+  } catch(e){ return null; }
+}
+
+// Resolve the org tree for a market. Returns array of {id, name, role}
+// for the selected TL (if any), MM, CM, IBO — only entities that exist.
+// Used by application form to show what chain will be notified, AND by
+// the notification dispatcher itself.
+//
+// Calvin's rule: if a TL is selected, notify TL → MM → CM (or skip MM if
+// none) → IBO if present. If no TL exists in the market, notify MM/IBO/CM.
+function marketResolveTree(marketId, selectedTlId){
+  try {
+    var m = marketGetById(marketId);
+    if(!m) return [];
+    var chain = [];
+    function pushById(id, source){
+      if(!id) return;
+      var a = (DB.agents||[]).find(function(x){ return x.id === id; });
+      if(a && a.active){
+        chain.push({ id: a.id, name: a.name, role: a.role, source: source });
+      }
+    }
+    // Selected TL (if any) — agent picked them on the form
+    if(selectedTlId && (m.tlIds||[]).indexOf(parseInt(selectedTlId,10)) >= 0){
+      pushById(parseInt(selectedTlId,10), 'tl');
+    }
+    pushById(m.mmId,  'mm');
+    pushById(m.iboId, 'ibo');
+    pushById(m.cmId,  'cm');
+    // Dedupe by id (in case e.g. CM is also acting as MM)
+    var seen = {};
+    return chain.filter(function(c){
+      if(seen[c.id]) return false;
+      seen[c.id] = true;
+      return true;
+    });
+  } catch(e){ console.warn('[marketResolveTree] failed safely:', e); return []; }
+}
+
+// Office staff for application notifications: Owner + HR + Onboarding
+// (per Calvin's "office staff regardless of market" spec, default option c)
+function marketOfficeStaffIds(){
+  try {
+    return (DB.agents||[]).filter(function(a){
+      if(!a || !a.active) return false;
+      if(a.id === 1) return true;  // Owner
+      if(typeof isHR === 'function' && isHR(a)) return true;
+      if(typeof isOnboarding === 'function' && isOnboarding(a)) return true;
+      return false;
+    }).map(function(a){ return a.id; });
+  } catch(e){ return []; }
+}
+
+// ── PANEL: MARKETS ADMIN ──
+function panelMarketsAdmin(){
+  try {
+    var u = DB.current;
+    if(!canManageMarkets(u)){
+      return panelHeader('🗺️ Markets Roster') +
+        '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Markets management is Owner-only. These assignments shape application routing and the org tree.</div></div>';
+    }
+    var h = panelHeader('🗺️ Markets Roster');
+
+    h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+    h += '<strong>What this is:</strong> The master list of markets used by the public application form, the inventory pickup form, and team rosters. Add, edit, or deactivate markets here. Each market can have one CM, one MM (or one IBO instead), and any number of Team Leaders — only the people you assign get notified about new applicants for that market.';
+    h += '</div>';
+
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">'+(MARKETS||[]).length+' market'+((MARKETS||[]).length===1?'':'s')+' total · '+marketActiveList().length+' active</div>';
+    h += '<button onclick="marketEdit(0)" class="btn-fire" style="padding:10px 20px;font-size:.74rem">+ Add Market</button>';
+    h += '</div>';
+
+    if(!(MARKETS||[]).length){
+      h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">🗺️</div><div style="font-size:1rem">No markets yet.</div><div style="font-size:.78rem;margin-top:8px">Click + Add Market to create your first one.</div></div></div>';
+      return h;
+    }
+
+    var sorted = (MARKETS||[]).slice().sort(function(a,b){
+      if(a.active === false && b.active !== false) return 1;
+      if(b.active === false && a.active !== false) return -1;
+      return (a.name||'').localeCompare(b.name||'');
+    });
+    h += '<div class="bo-card" style="padding:0;overflow:hidden"><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">';
+    h += '<thead><tr style="background:var(--cream);border-bottom:2px solid var(--sand)">';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Market</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">CM</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">MM / IBO</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">TLs</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Status</th>';
+    h += '<th style="padding:12px 14px;text-align:right;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Actions</th>';
+    h += '</tr></thead><tbody>';
+
+    sorted.forEach(function(m){
+      var cm = m.cmId  ? (DB.agents||[]).find(function(a){ return a.id === m.cmId; })  : null;
+      var mm = m.mmId  ? (DB.agents||[]).find(function(a){ return a.id === m.mmId; })  : null;
+      var ibo= m.iboId ? (DB.agents||[]).find(function(a){ return a.id === m.iboId; }) : null;
+      var tlNames = (m.tlIds||[]).map(function(id){
+        var t = (DB.agents||[]).find(function(a){ return a.id === id; });
+        return t ? t.name : null;
+      }).filter(Boolean);
+      var isActive = m.active !== false;
+      var rowOpacity = isActive ? '1' : '0.55';
+      h += '<tr style="border-bottom:1px solid var(--sand);opacity:'+rowOpacity+'">';
+      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif"><strong>'+_escapeHtml(m.name||'—')+'</strong></td>';
+      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+(cm?_escapeHtml(cm.name):'<span style="color:var(--muted);font-style:italic">none</span>')+'</td>';
+      var midCol = mm ? _escapeHtml(mm.name)+' <span style="color:var(--muted);font-size:.66rem">(MM)</span>'
+                 : ibo ? _escapeHtml(ibo.name)+' <span style="color:var(--muted);font-size:.66rem">(IBO)</span>'
+                 : '<span style="color:var(--muted);font-style:italic">none</span>';
+      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+midCol+'</td>';
+      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown)">'+(tlNames.length ? _escapeHtml(tlNames.join(', ')) : '<span style="color:var(--muted);font-style:italic">none</span>')+'</td>';
+      h += '<td style="padding:10px 14px"><span style="background:'+(isActive?'rgba(20,83,45,.1);color:#15803d':'rgba(115,115,115,.12);color:var(--muted)')+';font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:4px;font-weight:700">'+(isActive?'active':'inactive')+'</span></td>';
+      h += '<td style="padding:10px 14px;text-align:right">';
+      h += '<button onclick="marketEdit('+m.id+')" style="background:var(--blue);color:white;border:none;padding:5px 12px;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;margin-right:4px">Edit</button>';
+      h += '<button onclick="marketToggleActive('+m.id+')" style="background:white;color:var(--brown);border:1px solid var(--sand);padding:5px 12px;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">'+(isActive?'Deactivate':'Activate')+'</button>';
+      h += '</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+    return h;
+  } catch(e){
+    console.warn('[panelMarketsAdmin] failed safely:', e);
+    return panelHeader('🗺️ Markets Roster') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load.</div></div>';
+  }
+}
+
+// Edit/create modal (reuses the existing modal pattern)
+function marketEdit(id){
+  try {
+    var u = DB.current;
+    if(!canManageMarkets(u)){ alert('Permission denied.'); return; }
+    var m = id ? marketGetById(id) : null;
+    var isNew = !m;
+    if(!m) m = { id: 0, name:'', cmId:null, mmId:null, iboId:null, tlIds:[], notes:'', active:true };
+
+    // Populate dropdown options from active agents grouped by role
+    function agentOptions(roleFilter, selectedId){
+      var pool = (DB.agents||[]).filter(function(a){
+        if(!a.active) return false;
+        if(roleFilter === 'cm') return a.role === 'Campaign Manager';
+        if(roleFilter === 'mm') return a.role === 'Market Manager';
+        if(roleFilter === 'ibo') return a.role === 'IBO';
+        if(roleFilter === 'tl') return a.role === 'Team Leader';
+        return false;
+      }).sort(function(a,b){ return a.name.localeCompare(b.name); });
+      var html = '<option value="">— none —</option>';
+      pool.forEach(function(a){
+        html += '<option value="'+a.id+'"'+(selectedId===a.id?' selected':'')+'>'+_escapeHtml(a.name)+'</option>';
+      });
+      return html;
+    }
+
+    var h = '';
+    h += '<div id="marketEditModal" style="position:fixed;inset:0;z-index:5000;background:rgba(0,0,0,0.5);display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto" onclick="if(event.target===this)marketEditCancel()">';
+    h += '<div style="background:white;border-radius:10px;max-width:680px;width:100%;padding:0;box-shadow:0 20px 60px rgba(0,0,0,.3)" onclick="event.stopPropagation()">';
+    h += '<div style="background:var(--brown);color:white;padding:14px 20px;border-radius:10px 10px 0 0;display:flex;justify-content:space-between;align-items:center">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px">'+(isNew?'+ Add Market':'Edit Market')+'</div>';
+    h += '<button onclick="marketEditCancel()" style="background:transparent;border:none;color:white;font-size:1.4rem;cursor:pointer;padding:0;line-height:1">&times;</button>';
+    h += '</div>';
+    h += '<div style="padding:20px 24px">';
+
+    h += '<input type="hidden" id="meId" value="'+m.id+'">';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Market Name</label>';
+    h += '<input id="meName" type="text" class="f-input" value="'+_escapeAttr(m.name)+'" placeholder="e.g., Dallas-B, Houston-1, OKC-North"></div>';
+
+    h += '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px">';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Campaign Manager (CM)</label>';
+    h += '<select id="meCmId" class="f-input">'+agentOptions('cm', m.cmId)+'</select></div>';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Market Manager (MM)</label>';
+    h += '<select id="meMmId" class="f-input">'+agentOptions('mm', m.mmId)+'</select></div>';
+    h += '</div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">IBO <span style="color:var(--muted);font-weight:400;font-size:.7rem">(alternate to MM if no Market Manager)</span></label>';
+    h += '<select id="meIboId" class="f-input">'+agentOptions('ibo', m.iboId)+'</select></div>';
+
+    // TL multi-select (using checkboxes for clarity)
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Team Leaders <span style="color:var(--muted);font-weight:400;font-size:.7rem">(check all assigned to this market)</span></label>';
+    h += '<div style="background:var(--cream);border:1px solid var(--sand);border-radius:6px;padding:10px;max-height:200px;overflow-y:auto">';
+    var tlPool = (DB.agents||[]).filter(function(a){ return a.active && a.role === 'Team Leader'; })
+      .sort(function(a,b){ return a.name.localeCompare(b.name); });
+    if(!tlPool.length){
+      h += '<div style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem;padding:8px;font-style:italic">No active Team Leaders to assign yet.</div>';
+    } else {
+      tlPool.forEach(function(a){
+        var checked = (m.tlIds||[]).indexOf(a.id) >= 0;
+        h += '<label style="display:flex;align-items:center;gap:8px;padding:6px 4px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><input type="checkbox" name="meTl" value="'+a.id+'"'+(checked?' checked':'')+'> '+_escapeHtml(a.name)+'</label>';
+      });
+    }
+    h += '</div></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Notes <span style="color:var(--muted);font-weight:400;font-size:.7rem">(internal, not shown to applicants)</span></label>';
+    h += '<textarea id="meNotes" class="f-input" rows="2">'+_escapeHtml(m.notes||'')+'</textarea></div>';
+
+    h += '<div class="f-field" style="margin-bottom:18px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="meActive" type="checkbox"'+(m.active!==false?' checked':'')+'> <span style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown)">Active <span style="color:var(--muted);font-size:.7rem">(uncheck to hide from application form without deleting)</span></span></label></div>';
+
+    h += '<div style="display:flex;gap:10px;border-top:1px solid var(--sand);padding-top:14px">';
+    h += '<button onclick="marketEditSave()" class="btn-fire" style="padding:10px 20px;font-size:.74rem">'+(isNew?'Create Market':'Save Changes')+'</button>';
+    if(!isNew){
+      h += '<button onclick="marketDelete('+m.id+')" style="background:white;color:#dc2626;border:1px solid #dc2626;padding:10px 16px;border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">Delete</button>';
+    }
+    h += '<button onclick="marketEditCancel()" style="background:white;color:var(--brown);border:1px solid var(--sand);padding:10px 16px;border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;margin-left:auto">Cancel</button>';
+    h += '</div>';
+    h += '<div id="meError" style="display:none;margin-top:10px;color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.78rem"></div>';
+
+    h += '</div></div></div>';
+
+    var existing = document.getElementById('marketEditModal');
+    if(existing) existing.remove();
+    var div = document.createElement('div');
+    div.innerHTML = h;
+    document.body.appendChild(div.firstChild);
+  } catch(e){
+    console.warn('[marketEdit] failed:', e);
+    alert('Edit failed.');
+  }
+}
+
+function marketEditCancel(){
+  var el = document.getElementById('marketEditModal');
+  if(el) el.remove();
+}
+
+function marketEditSave(){
+  try {
+    var u = DB.current;
+    if(!canManageMarkets(u)){ alert('Permission denied.'); return; }
+    var id = parseInt((document.getElementById('meId')||{}).value, 10) || 0;
+    var name = ((document.getElementById('meName')||{}).value||'').trim();
+    var cmId = parseInt((document.getElementById('meCmId')||{}).value, 10) || null;
+    var mmId = parseInt((document.getElementById('meMmId')||{}).value, 10) || null;
+    var iboId = parseInt((document.getElementById('meIboId')||{}).value, 10) || null;
+    var notes = ((document.getElementById('meNotes')||{}).value||'').trim();
+    var active = !!(document.getElementById('meActive')||{}).checked;
+    var tlIds = [];
+    document.querySelectorAll('input[name="meTl"]:checked').forEach(function(cb){
+      var n = parseInt(cb.value, 10);
+      if(!isNaN(n)) tlIds.push(n);
+    });
+
+    var errEl = document.getElementById('meError');
+    if(!name){
+      if(errEl){ errEl.textContent = '⚠ Market name is required.'; errEl.style.display = 'block'; }
+      return;
+    }
+    // Duplicate name check (ignoring this record if editing)
+    var dupe = (MARKETS||[]).find(function(m){ return m.id !== id && (m.name||'').toLowerCase() === name.toLowerCase(); });
+    if(dupe){
+      if(errEl){ errEl.textContent = '⚠ A market with that name already exists.'; errEl.style.display = 'block'; }
+      return;
+    }
+
+    var now = new Date().toISOString();
+    if(id){
+      var m = marketGetById(id);
+      if(!m){ alert('Market not found.'); return; }
+      m.name = name; m.cmId = cmId; m.mmId = mmId; m.iboId = iboId; m.tlIds = tlIds;
+      m.notes = notes; m.active = active; m.updatedAt = now;
+      console.log('[marketEditSave] updated market #'+m.id+': '+name);
+    } else {
+      var rec = {
+        id: MARKET_NEXT_ID++,
+        name: name, cmId: cmId, mmId: mmId, iboId: iboId,
+        tlIds: tlIds, notes: notes, active: active,
+        createdAt: now, updatedAt: now
+      };
+      MARKETS.push(rec);
+      console.log('[marketEditSave] created market #'+rec.id+': '+name);
+    }
+    saveInventory();
+    marketEditCancel();
+    gotoPanel('markets-admin');
+  } catch(e){
+    console.warn('[marketEditSave] failed:', e);
+    alert('Save failed.');
+  }
+}
+
+function marketToggleActive(id){
+  try {
+    var u = DB.current;
+    if(!canManageMarkets(u)){ alert('Permission denied.'); return; }
+    var m = marketGetById(id);
+    if(!m){ alert('Market not found.'); return; }
+    m.active = (m.active === false) ? true : false;
+    m.updatedAt = new Date().toISOString();
+    saveInventory();
+    console.log('[marketToggleActive] market #'+m.id+' → '+(m.active?'active':'inactive'));
+    gotoPanel('markets-admin');
+  } catch(e){ console.warn('[marketToggleActive] failed:', e); }
+}
+
+function marketDelete(id){
+  try {
+    var u = DB.current;
+    if(!canManageMarkets(u)){ alert('Permission denied.'); return; }
+    var m = marketGetById(id);
+    if(!m) return;
+    if(!confirm('Permanently delete market "'+m.name+'"?\n\nThis cannot be undone. Existing applications referencing this market will keep their reference but the market won\'t appear in the dropdown anymore. To preserve history, consider DEACTIVATING instead.')) return;
+    var idx = MARKETS.findIndex(function(x){ return x.id === id; });
+    if(idx >= 0) MARKETS.splice(idx, 1);
+    saveInventory();
+    console.log('[marketDelete] removed market #'+id);
+    marketEditCancel();
+    gotoPanel('markets-admin');
+  } catch(e){ console.warn('[marketDelete] failed:', e); }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP A8
+// ════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP A9 — APPLICATION FORM WIRING
+//
+//  Public-facing application modal already exists. We're rewiring it to:
+//   1) Read from the MARKETS roster on open (auto-syncs with admin panel)
+//   2) Show TL dropdown when the picked market has TLs
+//   3) On submit, route notifications to the org tree + office staff
+//   4) Drop the national-channel broadcast (replaced with targeted)
+//
+//  The notification chain is computed by marketResolveTree() — see Ship A8.
+// ════════════════════════════════════════════════════════════════════════
+
+// Called when application modal opens — populates market dropdown
+function appPopulateMarkets(){
+  try {
+    var sel = document.getElementById('app-market');
+    if(!sel) return;
+    var current = sel.value || '';
+    var markets = marketActiveList();
+    var html = '<option value="">-- Select Desired Market --</option>';
+    if(!markets.length){
+      html += '<option value="" disabled>No markets configured yet — please contact us directly</option>';
+    } else {
+      markets.forEach(function(m){
+        var sel = (current === String(m.id)) ? ' selected' : '';
+        html += '<option value="'+m.id+'"'+sel+'>'+_escapeHtml(m.name)+'</option>';
+      });
+    }
+    sel.innerHTML = html;
+    // Re-attach change handler
+    sel.onchange = appOnMarketChange;
+  } catch(e){ console.warn('[appPopulateMarkets] failed safely:', e); }
+}
+
+// When applicant picks a market, show the TL dropdown if that market has TLs
+function appOnMarketChange(){
+  try {
+    var marketId = parseInt((document.getElementById('app-market')||{}).value, 10);
+    var tlRow = document.getElementById('app-tl-row');
+    var tlSel = document.getElementById('app-tl');
+    if(!tlRow || !tlSel){
+      // Row doesn't exist yet — inject it dynamically right after the market row
+      var marketRow = document.getElementById('app-market');
+      if(!marketRow) return;
+      var marketParent = marketRow.parentElement;
+      if(!marketParent) return;
+      var newRow = document.createElement('div');
+      newRow.id = 'app-tl-row';
+      newRow.style.cssText = 'margin-bottom:14px;display:none';
+      newRow.innerHTML = '<label style="display:block;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#555;font-family:Arial,sans-serif;margin-bottom:8px">Preferred Team Leader <span style="font-weight:300;text-transform:none;letter-spacing:0;font-size:.8em">— optional, leave blank if no preference</span></label>'
+        + '<select id="app-tl" style="width:100%;padding:10px 12px;border:2px solid #ddd;border-radius:6px;font-size:14px;font-family:Arial,sans-serif;color:#111;background:#fff;box-sizing:border-box"><option value="">— No preference —</option></select>';
+      marketParent.parentElement.insertBefore(newRow, marketParent.nextSibling);
+      tlRow = newRow;
+      tlSel = document.getElementById('app-tl');
+    }
+    if(!marketId){ tlRow.style.display='none'; return; }
+    var m = marketGetById(marketId);
+    if(!m){ tlRow.style.display='none'; return; }
+    var tls = (m.tlIds||[]).map(function(id){
+      return (DB.agents||[]).find(function(a){ return a.id === id && a.active; });
+    }).filter(Boolean);
+    if(!tls.length){ tlRow.style.display='none'; tlSel.innerHTML='<option value="">— No preference —</option>'; return; }
+    var html = '<option value="">— No preference —</option>';
+    tls.forEach(function(t){
+      html += '<option value="'+t.id+'">'+_escapeHtml(t.name)+'</option>';
+    });
+    tlSel.innerHTML = html;
+    tlRow.style.display = 'block';
+  } catch(e){ console.warn('[appOnMarketChange] failed safely:', e); }
+}
+
+// Notify the org tree + office staff after an application submission.
+// Returns the count of recipients reached. Does NOT throw — every step is
+// wrapped so a notification failure can't break the submission flow.
+function appNotifyChain(applicant, marketId, selectedTlId){
+  try {
+    var tree = (typeof marketResolveTree === 'function') ? marketResolveTree(marketId, selectedTlId) : [];
+    var officeIds = (typeof marketOfficeStaffIds === 'function') ? marketOfficeStaffIds() : [];
+    // Combine + dedupe
+    var allIds = {};
+    tree.forEach(function(t){ allIds[t.id] = true; });
+    officeIds.forEach(function(id){ allIds[id] = true; });
+    var recipients = Object.keys(allIds).map(function(k){ return parseInt(k,10); });
+    if(!recipients.length) return 0;
+
+    var market = marketGetById(marketId);
+    var marketName = market ? market.name : 'unspecified market';
+    var chainLabels = tree.map(function(t){ return t.role+': '+t.name; }).join(' · ');
+
+    if(typeof postNotification === 'function'){
+      try {
+        postNotification({
+          icon: '📝',
+          title: 'New Application — '+applicant.fn+' '+applicant.ln,
+          body: applicant.fn+' '+applicant.ln+' applied for '+(applicant.position||'Field Agent')+' in '+marketName+'.\nPhone: '+applicant.phone+'\nEmail: '+applicant.email
+            + (chainLabels ? '\nMarket chain: '+chainLabels : '\nNo market chain assigned yet.'),
+          fromId: 0,
+          fromName: 'Application System',
+          formType: 'new-application',
+          toIds: recipients
+        });
+      } catch(e){ console.warn('[appNotifyChain] postNotification failed:', e); }
+    }
+    return recipients.length;
+  } catch(e){
+    console.warn('[appNotifyChain] failed safely:', e);
+    return 0;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP A9
+// ════════════════════════════════════════════════════════════════════════
+
 // Update help-text when AW Override Style dropdown changes.
 function aaAWModelChanged(){
   var sel = document.getElementById('aaAWModel');
@@ -31479,24 +31974,47 @@ function submitApplication(){
     return;
   }
 
-  // Log to channel
+  // Collect fields
   var fn = (document.getElementById('app-fn')||{value:''}).value.trim();
   var ln = (document.getElementById('app-ln')||{value:''}).value.trim();
   var ph = (document.getElementById('app-phone')||{value:''}).value.trim();
   var em = (document.getElementById('app-email')||{value:''}).value.trim();
   var pos= (document.getElementById('app-position')||{value:''}).value;
+  var marketIdRaw = (document.getElementById('app-market')||{value:''}).value;
+  var marketId = parseInt(marketIdRaw, 10) || null;
+  var tlIdRaw = (document.getElementById('app-tl')||{value:''}).value;
+  var tlId = parseInt(tlIdRaw, 10) || null;
 
-  if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
-  CHANNEL_MSGS['national'].unshift({
-    id:channelMsgNextId++, from:'Application System', role:'System', init:'AP',
-    time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
-    type:'announcement',
-    text:'\uD83D\uDCCB NEW APPLICATION \u2014 '+fn+' '+ln+' | '+pos+' | '+ph+' | '+em,
-    photo:null
-  });
-  saveToStorage();
+  // ── Ship A9: Route notifications to market chain + office staff ──
+  var market = (typeof marketGetById === 'function' && marketId) ? marketGetById(marketId) : null;
+  var marketName = market ? market.name : '(no market selected)';
+  var notifyCount = 0;
+  if(typeof appNotifyChain === 'function'){
+    notifyCount = appNotifyChain(
+      { fn:fn, ln:ln, phone:ph, email:em, position:pos },
+      marketId, tlId
+    );
+  }
 
-  alert('\u2713 Application submitted! We will review your application and reach out within 1\u20132 business days.\n\nThank you for your interest in WMAMinc.!');
+  // Fallback to legacy national channel broadcast ONLY if no recipients
+  // were found via the chain (e.g., no markets configured yet).
+  if(notifyCount === 0){
+    if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
+    CHANNEL_MSGS['national'].unshift({
+      id:channelMsgNextId++, from:'Application System', role:'System', init:'AP',
+      time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
+      type:'announcement',
+      text:'\uD83D\uDCCB NEW APPLICATION (no market chain configured) \u2014 '+fn+' '+ln+' | '+pos+' | '+ph+' | '+em+' | Market: '+marketName,
+      photo:null
+    });
+    saveToStorage();
+    console.log('[submitApplication] no chain — fell back to national channel broadcast');
+  } else {
+    console.log('[submitApplication] notified '+notifyCount+' recipient(s) for '+fn+' '+ln+' / '+marketName);
+    saveToStorage();
+  }
+
+  alert('\u2713 Application submitted! We will review your application and reach out within 1\u20132 business days.\n\nThank you for your interest in Williams Marketing and Management Inc.!');
   closeModal('applicationModal');
 }
 
