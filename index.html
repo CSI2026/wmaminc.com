@@ -3852,6 +3852,16 @@ function pushNotification(opts){
   return n;
 }
 
+// ── postNotification: alias for pushNotification ──
+// Ten different ships (A3 inv pickup, A4 direct deposit, A5 carrier tickets,
+// A6 training, A6.1 RADID, A7 upload form, A7.5 BG auth, A9 application
+// form) all called postNotification() expecting it to exist. It never did.
+// So those notification flows have been silently failing this whole time.
+// This thin alias fixes all of them at once. Ship A12.3.
+function postNotification(opts){
+  return pushNotification(opts);
+}
+
 function getNotifRecipients(agentId){
   var agent = DB.agents.find(function(a){return a.id===agentId;});
   if(!agent) return [];
@@ -11732,8 +11742,20 @@ function panelNotifications(){
       +'<div style="font-family:Barlow Condensed,sans-serif;font-size:1rem;font-weight:700;color:var(--black)">'+n.title+'</div>'
       +(isUnread?'<span style="background:var(--red);color:white;font-family:Barlow Condensed,sans-serif;font-size:.52rem;letter-spacing:1px;padding:2px 7px;border-radius:100px">NEW</span>':'')
       +'</div>'
-      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.5;margin-bottom:8px">'+n.body+'</div>'
-      +'<div style="display:flex;align-items:center;justify-content:space-between">'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.5;margin-bottom:8px;white-space:pre-line">'+n.body+'</div>';
+
+    // ── Ship A12.3: Convert-to-Agent action button ──
+    // Renders on application notifications when the viewer can edit agents.
+    var canConvert = (typeof canEditAgentProfiles === 'function')
+      ? canEditAgentProfiles(u) : (isOwner(u) || (u.depts && (u.depts.hr||u.depts.onboarding)));
+    if(n.formType === 'new-application' && n.data && n.data.kind === 'application' && canConvert){
+      h += '<div style="margin-bottom:8px">'
+        +'<button onclick="convertApplicationToAgent('+n.id+')" style="background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">➕ Convert to Agent</button>'
+        +'<span style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted);margin-left:10px;font-style:italic">Opens Add Person form pre-filled with this application</span>'
+        +'</div>';
+    }
+
+    h += '<div style="display:flex;align-items:center;justify-content:space-between">'
       +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);letter-spacing:1px">'+ts+' &nbsp;·&nbsp; From: '+n.fromName+'</div>'
       +(isUnread?'<button onclick="markNotifRead('+n.id+',DB.current);gotoPanel(this.dataset.p)" data-p="notifications" style="background:none;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;padding:4px 12px;border-radius:100px;cursor:pointer">Mark Read</button>':'<span style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:#22c55e">✓ Read</span>')
       +'</div>'
@@ -30481,23 +30503,45 @@ function appNotifyChain(applicant, marketId, selectedTlId){
     var recipients = Object.keys(allIds).map(function(k){ return parseInt(k,10); });
     if(!recipients.length) return 0;
 
-    var market = marketGetById(marketId);
+    var market = (typeof marketGetById === 'function') ? marketGetById(marketId) : null;
     var marketName = market ? market.name : 'unspecified market';
     var chainLabels = tree.map(function(t){ return t.role+': '+t.name; }).join(' · ');
 
-    if(typeof postNotification === 'function'){
+    // ── Ship A12.3: Use the REAL pushNotification function. The original
+    //    Ship A9 code called a non-existent postNotification(), so all
+    //    application notifications silently no-op'd. Now they actually fire.
+    //    We also stash structured applicant data on the notification (n.data)
+    //    so the Convert-to-Agent button can pre-fill the new Add Person modal
+    //    without having to parse it back out of the body text.
+    if(typeof pushNotification === 'function'){
       try {
-        postNotification({
-          icon: '📝',
-          title: 'New Application — '+applicant.fn+' '+applicant.ln,
-          body: applicant.fn+' '+applicant.ln+' applied for '+(applicant.position||'Field Agent')+' in '+marketName+'.\nPhone: '+applicant.phone+'\nEmail: '+applicant.email
-            + (chainLabels ? '\nMarket chain: '+chainLabels : '\nNo market chain assigned yet.'),
-          fromId: 0,
+        var n = pushNotification({
+          type:    'info',
+          icon:    '📝',
+          title:   'New Application — '+applicant.fn+' '+applicant.ln,
+          body:    applicant.fn+' '+applicant.ln+' applied for '+(applicant.position||'Field Agent')+' in '+marketName+'.\nPhone: '+applicant.phone+'\nEmail: '+applicant.email
+                  + (chainLabels ? '\nMarket chain: '+chainLabels : '\nNo market chain assigned yet.'),
+          fromId:   0,
           fromName: 'Application System',
           formType: 'new-application',
-          toIds: recipients
+          toIds:    recipients
         });
-      } catch(e){ console.warn('[appNotifyChain] postNotification failed:', e); }
+        // Attach payload AFTER push so the post-process saves it too.
+        if(n){
+          n.data = {
+            kind:       'application',
+            fn:         applicant.fn,
+            ln:         applicant.ln,
+            phone:      applicant.phone,
+            email:      applicant.email,
+            position:   applicant.position || 'Field Agent',
+            marketId:   marketId || null,
+            marketName: marketName,
+            tlId:       selectedTlId || null
+          };
+          if(typeof saveNotifications === 'function') saveNotifications();
+        }
+      } catch(e){ console.warn('[appNotifyChain] pushNotification failed:', e); }
     }
     return recipients.length;
   } catch(e){
@@ -31025,6 +31069,105 @@ window.openEditAgent = openEditPerson;
 
 // ════════════════════════════════════════════════════════════════════════
 //  END SHIP A12
+// ════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP A12.3 — CONVERT APPLICATION TO AGENT
+//
+//  Click "Convert to Agent" on a new-application notification → opens the
+//  Add Person modal pre-filled with everything from the application.
+//  Onboarding/HR sets the password and reviews; one-click create.
+// ════════════════════════════════════════════════════════════════════════
+function convertApplicationToAgent(notifId){
+  try {
+    var n = (WMAM_NOTIFICATIONS||[]).find(function(x){ return x.id === notifId; });
+    if(!n){ alert('Notification not found.'); return; }
+    if(!n.data || n.data.kind !== 'application'){
+      alert('This notification doesn\'t have application data attached.');
+      return;
+    }
+    if(!canEditAgentProfiles(DB.current)){
+      alert('Only Owner, HR, or Onboarding can convert applications.');
+      return;
+    }
+    var d = n.data;
+
+    // Map the applicant's "Desired Position" to a role tab
+    var roleTab = 'Field Agent';  // safe default
+    var pos = (d.position || '').toLowerCase();
+    if(pos.indexOf('team leader') >= 0)        roleTab = 'Team Leader';
+    else if(pos.indexOf('market manager') >= 0) roleTab = 'Market Manager';
+    else if(pos.indexOf('campaign manager') >= 0) roleTab = 'Campaign Manager';
+    else if(pos.indexOf('ibo') >= 0)           roleTab = 'IBO';
+    // Anything else (Field Agent, Sales Agent, etc.) stays as Field Agent.
+
+    // Open fresh, then prefill
+    openAddPerson();
+
+    // Wait a beat for the modal to render before stuffing values
+    setTimeout(function(){
+      try {
+        // Identity
+        var fullName = ((d.fn||'') + ' ' + (d.ln||'')).trim();
+        var nameEl  = document.getElementById('apName');
+        var emailEl = document.getElementById('apEmail');
+        var phoneEl = document.getElementById('apPhone');
+        if(nameEl)  nameEl.value  = fullName;
+        if(emailEl) emailEl.value = d.email || '';
+        if(phoneEl) phoneEl.value = d.phone || '';
+
+        // Pick the role tab — this also reveals the rest of the form
+        if(typeof apPickRole === 'function') apPickRole(roleTab);
+
+        // Auto-derive username from name (only if user hasn't typed one)
+        if(typeof apMaybeAutoFillUsername === 'function') apMaybeAutoFillUsername();
+
+        // Pre-select the market in the placement dropdown (if applicable)
+        // Need another beat because apPickRole renders placement async.
+        setTimeout(function(){
+          try {
+            if(d.marketId){
+              var marketSel = document.getElementById('apMarket');
+              if(marketSel){
+                marketSel.value = 'market-' + d.marketId;
+              }
+              // For multi-market roles (CM/MM/IBO), pre-check the market
+              if(['Market Manager','Campaign Manager','IBO'].indexOf(roleTab) >= 0){
+                var key = 'market-' + d.marketId;
+                if(!Array.isArray(window._apStaging.iboMarkets)) window._apStaging.iboMarkets = [];
+                if(window._apStaging.iboMarkets.indexOf(key) < 0){
+                  window._apStaging.iboMarkets.push(key);
+                  if(typeof apRenderMarketMultiList === 'function') apRenderMarketMultiList();
+                }
+              }
+            }
+            // Pre-select the TL parent (if applicable) for Field Agent / TL
+            if(d.tlId && (roleTab === 'Field Agent' || roleTab === 'Team Leader')){
+              var tlSel = document.getElementById('apParentTL');
+              if(tlSel) tlSel.value = String(d.tlId);
+            }
+          } catch(inner){ console.warn('[convertApplicationToAgent] placement prefill failed:', inner); }
+        }, 80);
+
+        // Update the modal title so reviewer knows context
+        var titleEl = document.getElementById('apTitle');
+        var subEl   = document.getElementById('apSubtitle');
+        if(titleEl) titleEl.textContent = 'Convert Application — ' + fullName;
+        if(subEl)   subEl.textContent   = 'Review details from the application, set a password, save.';
+      } catch(e){ console.warn('[convertApplicationToAgent] prefill failed:', e); }
+    }, 50);
+
+    // Mark notification as read since we acted on it
+    try {
+      if(typeof markNotifRead === 'function') markNotifRead(notifId, DB.current);
+    } catch(e){}
+  } catch(e){
+    console.error('[convertApplicationToAgent] failed:', e);
+    alert('Conversion failed. See console.');
+  }
+}
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP A12.3
 // ════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════
