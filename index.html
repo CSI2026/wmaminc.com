@@ -7597,6 +7597,9 @@ function canAccess(u, area){
       return isOwner(u) || isOnboarding(u) || ['Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(u.role) >= 0;
     case 'pending-code-approvals':
       return isOwner(u) || isOnboarding(u);
+    case 'onboard-upload':
+    case 'bg-auth':
+      return !!u.active;
 
     default:                 return false; // DEFAULT DENY — was 'return true', which was the bug
   }
@@ -7643,6 +7646,12 @@ function saveInventory(){
     localStorage.setItem('wmam_training_completions', JSON.stringify(TRAINING_COMPLETIONS));
     localStorage.setItem('wmam_training_nextid',      String(TRAINING_NEXT_ID));
     localStorage.setItem('wmam_completion_nextid',    String(COMPLETION_NEXT_ID));
+    // Ship A7 — Onboarding uploads
+    localStorage.setItem('wmam_upload_submissions',   JSON.stringify(UPLOAD_SUBMISSIONS));
+    localStorage.setItem('wmam_upload_nextid',        String(UPLOAD_NEXT_ID));
+    // Ship A7.5 — BG authorizations
+    localStorage.setItem('wmam_bg_authorizations',    JSON.stringify(BG_AUTHORIZATIONS));
+    localStorage.setItem('wmam_bg_nextid',            String(BG_NEXT_ID));
   }catch(e){ console.warn('Inventory save:',e); }
   saveSupplyInventory();
 
@@ -7697,6 +7706,12 @@ function saveInventory(){
     pushKey('training_completions', TRAINING_COMPLETIONS);
     pushKey('training_nextid',      TRAINING_NEXT_ID);
     pushKey('completion_nextid',    COMPLETION_NEXT_ID);
+    // Ship A7 — Onboarding uploads
+    pushKey('upload_submissions',   UPLOAD_SUBMISSIONS);
+    pushKey('upload_nextid',        UPLOAD_NEXT_ID);
+    // Ship A7.5 — BG authorizations
+    pushKey('bg_authorizations',    BG_AUTHORIZATIONS);
+    pushKey('bg_nextid',            BG_NEXT_ID);
   }
 }
 function loadInventory(){
@@ -7731,6 +7746,12 @@ function loadInventory(){
     var tc=localStorage.getItem('wmam_training_completions');  if(tc) TRAINING_COMPLETIONS=JSON.parse(tc)||[];
     var tn=localStorage.getItem('wmam_training_nextid');       if(tn) TRAINING_NEXT_ID=parseInt(tn)||1;
     var cn=localStorage.getItem('wmam_completion_nextid');     if(cn) COMPLETION_NEXT_ID=parseInt(cn)||1;
+    // Ship A7 — Onboarding uploads
+    var us=localStorage.getItem('wmam_upload_submissions');    if(us) UPLOAD_SUBMISSIONS=JSON.parse(us)||[];
+    var un=localStorage.getItem('wmam_upload_nextid');         if(un) UPLOAD_NEXT_ID=parseInt(un)||1;
+    // Ship A7.5 — BG authorizations
+    var ba=localStorage.getItem('wmam_bg_authorizations');     if(ba) BG_AUTHORIZATIONS=JSON.parse(ba)||[];
+    var bn=localStorage.getItem('wmam_bg_nextid');             if(bn) BG_NEXT_ID=parseInt(bn)||1;
   }catch(e){ console.warn('Inventory load:',e); }
 }
 
@@ -9440,6 +9461,12 @@ async function loadFromSupabase(){
         if(s.key==='training_completions' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TRAINING_COMPLETIONS = v;}catch(e){} }
         if(s.key==='training_nextid'      && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) TRAINING_NEXT_ID = n;}catch(e){} }
         if(s.key==='completion_nextid'    && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) COMPLETION_NEXT_ID = n;}catch(e){} }
+        // Ship A7 — Onboarding uploads
+        if(s.key==='upload_submissions'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) UPLOAD_SUBMISSIONS = v;}catch(e){} }
+        if(s.key==='upload_nextid'        && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) UPLOAD_NEXT_ID = n;}catch(e){} }
+        // Ship A7.5 — BG authorizations
+        if(s.key==='bg_authorizations'    && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) BG_AUTHORIZATIONS = v;}catch(e){} }
+        if(s.key==='bg_nextid'            && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) BG_NEXT_ID = n;}catch(e){} }
         // ── Markets richer fields (marketManager, campaignManager, payModel) ──
         // The lifeline_teams TABLE only has limited columns (id, name, color, leader, etc).
         // The app_settings backup carries the full team object including marketManager
@@ -15336,6 +15363,8 @@ function gotoPanel(id, params){
     'training-schedule':panelTrainingSchedule,
     'training-complete':panelTrainingComplete,
     'pending-code-approvals':panelPendingCodeApprovals,
+    'onboard-upload':panelOnboardUpload,
+    'bg-auth':panelBgAuth,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -28470,6 +28499,640 @@ function tcReject(completionId){
 
 // ════════════════════════════════════════════════════════════════════════
 //  END SHIP A6
+// ════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP A7 — ONBOARDING UPLOAD FORM
+//
+//  Replaces JotForm at form.jotform.com/wmam/LLUploads. Agent submits all
+//  required onboarding documents in one place: identity, address, RADID,
+//  SSN, photos of driver's license + badge + selfie. Data flows directly
+//  into the agent's onboarding packet for review.
+//
+//  NOT REPLICATED FROM JOTFORM (per Calvin's spec):
+//    • "Area Mgr / Team Lead" dropdown — auto-derived from training records
+//    • "Is your manager assisting you?" — irrelevant operationally
+//
+//  ENCRYPTION:
+//    SSN is encrypted via the same pgcrypto setup as Ship A4 (Direct
+//    Deposit). Re-uses the master passphrase published by Owner. If the
+//    Owner hasn't published a passphrase yet, the form blocks submission
+//    with a clear message.
+//
+//  MANAGER ATTRIBUTION:
+//    Calvin's words: "the mm or the tl would have done the scheduled
+//    training or training complete. thats how we know who they belong
+//    too." — so we look up the most recent training session for this
+//    agent and read the scheduledById / completedById to determine TL/MM.
+// ════════════════════════════════════════════════════════════════════════
+
+// Programs offered. Multi-select on the form.
+var UPLOAD_PROGRAM_GROUPS = {
+  'Lifeline': ['Assurance Wireless','Gen Mobile','TruConnect','Excess Telecom'],
+  'Internet': ['Chuzo (No BG Required)','Saraplus (BG/DT Required)','Spectrum (BG Required)','Astound'],
+  'ACA': ['Custom ACA Link ($45)','ACA Enrollment Program']
+};
+
+// Programs that DO NOT require BG. Used by the BG form to hide itself or
+// display a "not required" notice.
+var UPLOAD_NO_BG_PROGRAMS = ['Chuzo (No BG Required)'];
+
+var UPLOAD_SUBMISSIONS = [];   // [{id, agentId, agentName, submittedAt, ...payload}]
+var UPLOAD_NEXT_ID = 1;
+
+// Agent can submit if active. Form auto-populates from their profile.
+function canSubmitUpload(user){
+  try {
+    if(!user) return false;
+    return !!user.active;
+  } catch(e){ return false; }
+}
+
+// Owner / K-Anna / Onboarding view all uploads
+function canViewAllUploads(user){
+  try {
+    if(!user) return false;
+    if(typeof isOwner === 'function' && isOwner(user)) return true;
+    if(typeof isOnboarding === 'function' && isOnboarding(user)) return true;
+    return false;
+  } catch(e){ return false; }
+}
+
+// Resolve the agent's manager (TL/MM) from training records. Most recent
+// training session OR completion wins. Returns { tlId, tlName, mmId, mmName }
+// or empty if no training record exists yet.
+function uploadAttributedManager(agentId){
+  try {
+    var sessions = (TRAINING_SESSIONS||[]).filter(function(s){ return s.agentId === agentId; });
+    var completions = (TRAINING_COMPLETIONS||[]).filter(function(c){ return c.agentId === agentId; });
+    // Prefer completion (more recent in workflow). Fall back to scheduled session.
+    var latestC = completions.sort(function(a,b){ return new Date(b.completedAt) - new Date(a.completedAt); })[0];
+    var latestS = sessions.sort(function(a,b){ return new Date(b.createdAt) - new Date(a.createdAt); })[0];
+    var managerId = null, managerName = null, managerRole = null;
+    if(latestC){ managerId = latestC.completedById; managerName = latestC.completedByName; }
+    else if(latestS){ managerId = latestS.scheduledById; managerName = latestS.scheduledByName; }
+    if(managerId){
+      var m = (DB.agents||[]).find(function(a){ return a.id === managerId; });
+      if(m) managerRole = m.role;
+    }
+    var result = { managerId: managerId, managerName: managerName || null, managerRole: managerRole || null };
+    // Backstop: if no training, use legacy team-leader + market-manager from profile
+    if(!result.managerId){
+      var agent = (DB.agents||[]).find(function(a){ return a.id === agentId; });
+      if(agent){
+        if(agent.teamLeaderId){
+          var tl = (DB.agents||[]).find(function(a){ return a.id === agent.teamLeaderId; });
+          if(tl){ result.managerId = tl.id; result.managerName = tl.name; result.managerRole = tl.role; }
+        } else if(agent.marketManagerId){
+          var mm = (DB.agents||[]).find(function(a){ return a.id === agent.marketManagerId; });
+          if(mm){ result.managerId = mm.id; result.managerName = mm.name; result.managerRole = mm.role; }
+        }
+      }
+    }
+    return result;
+  } catch(e){
+    console.warn('[uploadAttributedManager] failed safely:', e);
+    return { managerId: null, managerName: null, managerRole: null };
+  }
+}
+
+// ── PANEL: ONBOARDING UPLOAD FORM ──
+function panelOnboardUpload(){
+  try {
+    var u = DB.current;
+    if(!canSubmitUpload(u)){
+      return panelHeader('📤 Onboarding Uploads') +
+        '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Sign in as an active agent to complete your onboarding uploads.</div></div>';
+    }
+    var attrib = uploadAttributedManager(u.id);
+    var nameParts = (u.name || '').split(' ');
+    var firstName = nameParts[0] || '';
+    var lastName = nameParts.length > 1 ? nameParts[nameParts.length-1] : '';
+    var middleName = nameParts.length > 2 ? nameParts.slice(1,-1).join(' ') : '';
+
+    var h = panelHeader('📤 Onboarding Uploads — All Required Docs');
+
+    h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+    h += '<strong>What this is:</strong> Submit all required documents and information to complete onboarding. Sensitive fields (SSN, photos) are encrypted before storage. Your manager attribution is auto-detected from your training records — no need to pick a manager.';
+    h += '</div>';
+
+    if(attrib.managerName){
+      h += '<div style="background:white;border:1px solid var(--sand);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">';
+      h += '👤 <strong>Your manager on file:</strong> '+_escapeHtml(attrib.managerName)+(attrib.managerRole?' ('+_escapeHtml(attrib.managerRole)+')':'');
+      h += '</div>';
+    } else {
+      h += '<div style="background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#92400e">';
+      h += '⚠ No manager on record yet. You should have completed scheduled training before this form. Contact Onboarding if you got here without training.';
+      h += '</div>';
+    }
+
+    h += '<div class="bo-card" style="padding:24px;max-width:820px">';
+
+    // Identity
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:0 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Identity</h3>';
+
+    h += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px">';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">First Name</label>';
+    h += '<input id="upFirst" type="text" class="f-input" value="'+_escapeAttr(firstName)+'"></div>';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Middle Name <span style="color:var(--muted);font-weight:400;font-size:.7rem">(if any)</span></label>';
+    h += '<input id="upMiddle" type="text" class="f-input" value="'+_escapeAttr(middleName)+'"></div>';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Last Name</label>';
+    h += '<input id="upLast" type="text" class="f-input" value="'+_escapeAttr(lastName)+'"></div>';
+    h += '</div>';
+
+    h += '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px">';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Date of Birth</label>';
+    h += '<input id="upDOB" type="date" class="f-input"></div>';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Social Security Number <span style="color:#dc2626;font-weight:700;font-size:.7rem">(encrypted before storage)</span></label>';
+    h += '<input id="upSSN" type="text" class="f-input" placeholder="000-00-0000" maxlength="11" oninput="ddFormatSSN(this)"></div>';
+    h += '</div>';
+
+    // Contact
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:24px 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Contact</h3>';
+
+    h += '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px">';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Wireless Phone</label>';
+    h += '<input id="upPhone" type="tel" class="f-input" placeholder="(555) 555-5555" value="'+_escapeAttr(u.phone||'')+'"></div>';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Primary Email <span style="color:var(--muted);font-weight:400;font-size:.7rem">(where carrier codes get sent)</span></label>';
+    h += '<input id="upEmail" type="email" class="f-input" placeholder="you@example.com" value="'+_escapeAttr(u.email||'')+'"></div>';
+    h += '</div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">RADID Email <span style="color:var(--muted);font-weight:400;font-size:.7rem">(same email used to register your RADID)</span></label>';
+    h += '<input id="upRadidEmail" type="email" class="f-input" placeholder="you@example.com"></div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">RADID Number <span style="color:var(--muted);font-weight:400;font-size:.7rem">(9-char alphanumeric, A-Z + 0-9)</span></label>';
+    h += '<input id="upRadid" type="text" class="f-input" placeholder="AB12CD34X" maxlength="9" style="font-family:monospace;letter-spacing:2px;text-transform:uppercase" oninput="tsFormatRadid(this)">';
+    h += '<div id="upRadidStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;margin-top:4px"></div>';
+    h += '</div>';
+
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:24px 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Address</h3>';
+
+    h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Street Address</label>';
+    h += '<input id="upAddr1" type="text" class="f-input" placeholder="1234 Main St"></div>';
+    h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Apt / Unit <span style="color:var(--muted);font-weight:400;font-size:.7rem">(optional)</span></label>';
+    h += '<input id="upAddr2" type="text" class="f-input" placeholder="Apt 5B"></div>';
+    h += '<div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px;margin-bottom:14px">';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">City</label>';
+    h += '<input id="upCity" type="text" class="f-input"></div>';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">State</label>';
+    h += '<input id="upState" type="text" class="f-input" maxlength="2" placeholder="TX" style="text-transform:uppercase"></div>';
+    h += '<div class="f-field" style="margin:0"><label class="f-label">ZIP</label>';
+    h += '<input id="upZip" type="text" class="f-input" maxlength="10" placeholder="75080"></div>';
+    h += '</div>';
+
+    // Programs
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:24px 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Programs to Code For</h3>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-bottom:10px">Check every program you intend to enroll customers under. The list expands as you select program groups below.</div>';
+
+    var groupKeys = Object.keys(UPLOAD_PROGRAM_GROUPS);
+    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Program Groups</label>';
+    h += '<div style="display:flex;gap:14px;margin-top:6px;flex-wrap:wrap">';
+    groupKeys.forEach(function(g){
+      h += '<label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-family:Barlow Condensed,sans-serif;font-weight:700"><input type="checkbox" name="upGroup" value="'+_escapeAttr(g)+'" onchange="upRefreshSubprograms()"> '+_escapeHtml(g)+'</label>';
+    });
+    h += '</div></div>';
+
+    h += '<div id="upSubprogramArea" style="margin-top:8px"></div>';
+
+    // Identity Documents
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:24px 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Identity Documents</h3>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-bottom:10px">Take live photos OR upload existing files. All four are required.</div>';
+
+    h += '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:14px">';
+
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Front of Driver\'s License / State ID <span style="color:var(--muted);font-weight:400;font-size:.7rem">(all corners visible)</span></label>';
+    h += liveCamCreateSlot('up-id-front-cam', { label:'📷 Take ID Front', facing:'environment' });
+    h += '<div style="margin-top:6px"><label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">…or upload: <input id="upIdFrontFile" type="file" accept="image/*,application/pdf" onchange="upUploadDoc(\'id-front\')" style="font-size:.74rem"></label>';
+    h += '<input id="upIdFrontUrl" type="hidden" value="">';
+    h += '<div id="upIdFrontStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px"></div></div>';
+    h += '</div>';
+
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Back of Driver\'s License / State ID</label>';
+    h += liveCamCreateSlot('up-id-back-cam', { label:'📷 Take ID Back', facing:'environment' });
+    h += '<div style="margin-top:6px"><label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">…or upload: <input id="upIdBackFile" type="file" accept="image/*,application/pdf" onchange="upUploadDoc(\'id-back\')" style="font-size:.74rem"></label>';
+    h += '<input id="upIdBackUrl" type="hidden" value="">';
+    h += '<div id="upIdBackStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px"></div></div>';
+    h += '</div>';
+
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Badge Photo <span style="color:var(--muted);font-weight:400;font-size:.7rem">(no filters or hats)</span></label>';
+    h += liveCamCreateSlot('up-badge-cam', { label:'📷 Take Badge Photo', facing:'user' });
+    h += '<div style="margin-top:6px"><label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">…or upload: <input id="upBadgeFile" type="file" accept="image/*" onchange="upUploadDoc(\'badge\')" style="font-size:.74rem"></label>';
+    h += '<input id="upBadgeUrl" type="hidden" value="">';
+    h += '<div id="upBadgeStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px"></div></div>';
+    h += '</div>';
+
+    h += '<div class="f-field" style="margin:0"><label class="f-label">Selfie with ID Under Chin</label>';
+    h += liveCamCreateSlot('up-selfie-cam', { label:'📷 Take Selfie', facing:'user' });
+    h += '<div style="margin-top:6px"><label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">…or upload: <input id="upSelfieFile" type="file" accept="image/*" onchange="upUploadDoc(\'selfie\')" style="font-size:.74rem"></label>';
+    h += '<input id="upSelfieUrl" type="hidden" value="">';
+    h += '<div id="upSelfieStatus" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px"></div></div>';
+    h += '</div>';
+
+    h += '</div>';  // grid
+
+    // Signature
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin:24px 0 16px;border-bottom:2px solid var(--sand);padding-bottom:8px">Acknowledgment & Signature</h3>';
+    h += '<div style="background:var(--cream);border:1px solid var(--sand);border-radius:6px;padding:14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+    h += 'I certify that all information and documents I have submitted are accurate, current, and belong to me. I authorize <strong>Williams Marketing and Management Inc.</strong> to use this information for the purpose of agent onboarding, code submission to partner organizations, and program eligibility verification.';
+    h += '</div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer"><input id="upAck" type="checkbox" style="margin-top:3px"><span style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.5">I have read and authorize the certification above.</span></label></div>';
+
+    h += '<div class="f-field" style="margin-bottom:18px"><label class="f-label">Type Your Full Legal Name as Signature</label>';
+    h += '<input id="upSignature" type="text" class="f-input" placeholder="Type your full legal name" style="font-family:cursive;font-size:1.1rem"></div>';
+
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;border-top:1px solid var(--sand);padding-top:18px">';
+    h += '<button onclick="upSubmitForm()" class="btn-fire" style="padding:12px 24px;font-size:.74rem">📤 Submit Onboarding Uploads</button>';
+    h += '<button onclick="gotoPanel(\'dashboard\')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:12px 18px;border-radius:5px;cursor:pointer;margin-left:auto">Cancel</button>';
+    h += '</div>';
+    h += '<div id="upError" style="display:none;margin-top:12px;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem"></div>';
+    h += '</div>';
+    return h;
+  } catch(e){
+    console.warn('[panelOnboardUpload] failed safely:', e);
+    return panelHeader('📤 Onboarding Uploads') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Form failed to load.</div></div>';
+  }
+}
+
+// Refresh subprogram checkboxes when group selection changes
+function upRefreshSubprograms(){
+  try {
+    var area = document.getElementById('upSubprogramArea');
+    if(!area) return;
+    var selected = [];
+    document.querySelectorAll('input[name="upGroup"]:checked').forEach(function(cb){ selected.push(cb.value); });
+    if(!selected.length){
+      area.innerHTML = '<div style="color:var(--muted);font-style:italic;font-family:Barlow Condensed,sans-serif;font-size:.78rem;padding:10px 0">Select one or more program groups above to choose specific programs.</div>';
+      return;
+    }
+    var html = '';
+    selected.forEach(function(g){
+      var subs = UPLOAD_PROGRAM_GROUPS[g] || [];
+      html += '<div style="margin-bottom:10px;padding:10px 14px;background:var(--cream);border:1px solid var(--sand);border-radius:6px">';
+      html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--brown);font-weight:700;margin-bottom:6px">'+_escapeHtml(g)+'</div>';
+      html += '<div style="display:flex;flex-wrap:wrap;gap:8px">';
+      subs.forEach(function(s){
+        html += '<label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;padding:4px 10px;border:1px solid var(--sand);border-radius:4px;background:white"><input type="checkbox" name="upProgram" value="'+_escapeAttr(s)+'" data-group="'+_escapeAttr(g)+'"> '+_escapeHtml(s)+'</label>';
+      });
+      html += '</div></div>';
+    });
+    area.innerHTML = html;
+  } catch(e){ console.warn('[upRefreshSubprograms] failed safely:', e); }
+}
+
+// Handle file upload (PDF or image) for ID/badge/selfie
+async function upUploadDoc(kind){
+  try {
+    var fileMap = {
+      'id-front': { fileId:'upIdFrontFile', urlId:'upIdFrontUrl', statusId:'upIdFrontStatus' },
+      'id-back':  { fileId:'upIdBackFile',  urlId:'upIdBackUrl',  statusId:'upIdBackStatus' },
+      'badge':    { fileId:'upBadgeFile',   urlId:'upBadgeUrl',   statusId:'upBadgeStatus' },
+      'selfie':   { fileId:'upSelfieFile',  urlId:'upSelfieUrl',  statusId:'upSelfieStatus' }
+    };
+    var ids = fileMap[kind];
+    if(!ids) return;
+    var fileInput = document.getElementById(ids.fileId);
+    var status = document.getElementById(ids.statusId);
+    var urlField = document.getElementById(ids.urlId);
+    if(!fileInput || !fileInput.files || !fileInput.files[0]) return;
+    var file = fileInput.files[0];
+    if(file.size > 20*1024*1024){
+      if(status){ status.textContent = 'File too large. Max 20MB.'; status.style.color = '#dc2626'; }
+      return;
+    }
+    if(typeof supaClient === 'undefined' || !supaClient){
+      if(status){ status.textContent = 'Supabase not connected.'; status.style.color = '#dc2626'; }
+      return;
+    }
+    if(status){ status.textContent = 'Uploading…'; status.style.color = 'var(--muted)'; }
+    var ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+    var path = 'uploads/'+(DB.current ? DB.current.id : 'anon')+'_'+Date.now()+'_'+kind+'.'+ext;
+    var result = await supaClient.storage.from('onboard-uploads').upload(path, file, { cacheControl:'3600', upsert:false });
+    if(result.error){
+      var msg = (result.error.message||'').toLowerCase();
+      if(msg.indexOf('bucket') >= 0 && msg.indexOf('not found') >= 0){
+        if(status){ status.innerHTML = '<strong style="color:#dc2626">Bucket "onboard-uploads" not found.</strong> Owner needs to create it (Public OFF).'; }
+      } else {
+        if(status){ status.textContent = 'Upload failed: '+(result.error.message||'unknown'); status.style.color = '#dc2626'; }
+      }
+      return;
+    }
+    var urlResult = supaClient.storage.from('onboard-uploads').getPublicUrl(path);
+    var url = urlResult && urlResult.data && urlResult.data.publicUrl ? urlResult.data.publicUrl : '';
+    if(urlField) urlField.value = url;
+    if(status){ status.textContent = '✓ Uploaded'; status.style.color = '#16a34a'; }
+  } catch(e){
+    console.warn('[upUploadDoc] failed safely:', e);
+  }
+}
+
+// Submit the form
+async function upSubmitForm(){
+  try {
+    var u = DB.current;
+    if(!canSubmitUpload(u)){ alert('Sign in to submit.'); return; }
+
+    var first = ((document.getElementById('upFirst')||{}).value||'').trim();
+    var middle = ((document.getElementById('upMiddle')||{}).value||'').trim();
+    var last = ((document.getElementById('upLast')||{}).value||'').trim();
+    var dob = (document.getElementById('upDOB')||{}).value || '';
+    var ssn = ((document.getElementById('upSSN')||{}).value||'').replace(/\D/g,'');
+    var phone = ((document.getElementById('upPhone')||{}).value||'').trim();
+    var email = ((document.getElementById('upEmail')||{}).value||'').trim();
+    var radidEmail = ((document.getElementById('upRadidEmail')||{}).value||'').trim();
+    var radid = ((document.getElementById('upRadid')||{}).value||'').toUpperCase().trim();
+    var addr1 = ((document.getElementById('upAddr1')||{}).value||'').trim();
+    var addr2 = ((document.getElementById('upAddr2')||{}).value||'').trim();
+    var city = ((document.getElementById('upCity')||{}).value||'').trim();
+    var state = ((document.getElementById('upState')||{}).value||'').toUpperCase().trim();
+    var zip = ((document.getElementById('upZip')||{}).value||'').trim();
+    var ack = !!(document.getElementById('upAck')||{}).checked;
+    var sig = ((document.getElementById('upSignature')||{}).value||'').trim();
+
+    var groups = [];
+    document.querySelectorAll('input[name="upGroup"]:checked').forEach(function(cb){ groups.push(cb.value); });
+    var programs = [];
+    document.querySelectorAll('input[name="upProgram"]:checked').forEach(function(cb){ programs.push(cb.value); });
+
+    // Doc URLs (file upload OR live cam)
+    var idFrontFile = (document.getElementById('upIdFrontUrl')||{}).value || '';
+    var idBackFile  = (document.getElementById('upIdBackUrl')||{}).value || '';
+    var badgeFile   = (document.getElementById('upBadgeUrl')||{}).value || '';
+    var selfieFile  = (document.getElementById('upSelfieUrl')||{}).value || '';
+    var idFrontCam  = (typeof liveCamGetData === 'function') ? liveCamGetData('up-id-front-cam') : null;
+    var idBackCam   = (typeof liveCamGetData === 'function') ? liveCamGetData('up-id-back-cam')  : null;
+    var badgeCam    = (typeof liveCamGetData === 'function') ? liveCamGetData('up-badge-cam')    : null;
+    var selfieCam   = (typeof liveCamGetData === 'function') ? liveCamGetData('up-selfie-cam')   : null;
+
+    var errors = [];
+    if(!first) errors.push('First name required');
+    if(!last) errors.push('Last name required');
+    if(!dob) errors.push('Date of birth required');
+    if(!ssn || !ddIsValidSSN(ssn)) errors.push('Valid 9-digit SSN required');
+    if(!phone) errors.push('Phone required');
+    if(!email) errors.push('Email required');
+    if(!radidEmail) errors.push('RADID email required');
+    if(!radid || !radidIsValid(radid)) errors.push('RADID required: 9 chars, A-Z and 0-9 only');
+    if(!addr1 || !city || !state || !zip) errors.push('Complete address required');
+    if(!groups.length) errors.push('Select at least one program group');
+    if(!programs.length) errors.push('Select at least one specific program');
+    if(!idFrontFile && !idFrontCam) errors.push('ID front required');
+    if(!idBackFile && !idBackCam) errors.push('ID back required');
+    if(!badgeFile && !badgeCam) errors.push('Badge photo required');
+    if(!selfieFile && !selfieCam) errors.push('Selfie required');
+    if(!ack) errors.push('You must acknowledge the certification');
+    if(!sig) errors.push('Type your name as signature');
+    var fullExpected = (first+' '+(middle?middle+' ':'')+last).trim().toLowerCase();
+    if(sig.toLowerCase() !== fullExpected){
+      errors.push('Signature must match your full name (first'+(middle?' middle':'')+' last)');
+    }
+
+    if(errors.length){
+      var errEl = document.getElementById('upError');
+      if(errEl){ errEl.textContent = '⚠ ' + errors.join(' · '); errEl.style.display = 'block'; }
+      return;
+    }
+
+    if(typeof supaClient === 'undefined' || !supaClient){ alert('Database not connected.'); return; }
+
+    // Get encryption passphrase from app_settings (Owner published it)
+    var pwResult = await supaClient.from('app_settings').select('value').eq('key','dd_pw_hint').maybeSingle();
+    if(!pwResult || !pwResult.data || !pwResult.data.value){
+      alert('Owner has not published the encryption key yet. They need to do this once via the Direct Deposit panel before agents can submit onboarding uploads with SSN.');
+      return;
+    }
+    var passphrase = pwResult.data.value;
+
+    var btnEl = document.querySelector('button[onclick="upSubmitForm()"]');
+    if(btnEl){ btnEl.disabled = true; btnEl.textContent = 'Encrypting and saving...'; }
+
+    var ssnEnc = await ddEncryptValue(ssn, passphrase);
+    if(!ssnEnc){
+      alert('SSN encryption failed. Try again or contact Owner.');
+      if(btnEl){ btnEl.disabled = false; btnEl.textContent = '📤 Submit Onboarding Uploads'; }
+      return;
+    }
+
+    // Resolve manager attribution from training records (Calvin's spec)
+    var attrib = uploadAttributedManager(u.id);
+
+    var record = {
+      id: UPLOAD_NEXT_ID++,
+      agentId: u.id,
+      agentName: u.name,
+      submittedAt: new Date().toISOString(),
+      // Identity (not encrypted — non-sensitive)
+      firstName: first, middleName: middle, lastName: last,
+      dob: dob,
+      // Encrypted SSN
+      ssnEnc: ssnEnc, ssnLast4: ssn.slice(-4),
+      // Contact
+      phone: phone, email: email, radidEmail: radidEmail, radid: radid,
+      // Address
+      address1: addr1, address2: addr2, city: city, state: state, zip: zip,
+      // Programs
+      programGroups: groups, programs: programs,
+      // Document URLs (live cam dataURLs OR uploaded file URLs)
+      idFrontUrl: idFrontFile || idFrontCam,
+      idBackUrl:  idBackFile  || idBackCam,
+      badgeUrl:   badgeFile   || badgeCam,
+      selfieUrl:  selfieFile  || selfieCam,
+      // Provenance: tells reviewer if photo was live or upload
+      idFrontSource: idFrontCam ? 'live-cam' : 'upload',
+      idBackSource:  idBackCam  ? 'live-cam' : 'upload',
+      badgeSource:   badgeCam   ? 'live-cam' : 'upload',
+      selfieSource:  selfieCam  ? 'live-cam' : 'upload',
+      // Manager attribution (auto-derived, not from a dropdown)
+      managerId: attrib.managerId,
+      managerName: attrib.managerName,
+      managerRole: attrib.managerRole,
+      // Acknowledgment
+      acknowledged: true,
+      signature: sig,
+      signedAt: new Date().toISOString(),
+      userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : '',
+      status: 'submitted'
+    };
+    UPLOAD_SUBMISSIONS.unshift(record);
+    saveInventory();
+    console.log('[upSubmitForm] upload #'+record.id+' submitted by '+u.name+' (manager: '+(record.managerName||'none')+')');
+
+    // Notify Onboarding + Owner
+    if(typeof postNotification === 'function'){
+      try {
+        var recips = (DB.agents||[]).filter(function(a){
+          return a.active && (a.id === 1 || (a.depts && a.depts.onboarding === true) || a.role === 'Onboarding');
+        }).map(function(a){ return a.id; });
+        postNotification({
+          icon: '📤',
+          title: 'Onboarding Uploads Submitted — '+u.name,
+          body: u.name+' submitted onboarding uploads ('+programs.length+' program(s) selected: '+programs.join(', ')+'). Manager on file: '+(record.managerName||'(none)')+'. Review pending.',
+          fromId: u.id, fromName: u.name,
+          formType: 'onboarding-upload',
+          toIds: recips
+        });
+      } catch(e){ /* ignore */ }
+    }
+
+    alert('✓ Onboarding uploads submitted!\n\nYour information is encrypted and stored. Onboarding will review and contact you about next steps (BG check, contracts, etc.).');
+    gotoPanel('dashboard');
+  } catch(e){
+    console.warn('[upSubmitForm] failed:', e);
+    alert('Submission failed.');
+    var btnEl = document.querySelector('button[onclick="upSubmitForm()"]');
+    if(btnEl){ btnEl.disabled = false; btnEl.textContent = '📤 Submit Onboarding Uploads'; }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP A7
+// ════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP A7.5 — BACKGROUND CHECK AUTHORIZATION FORM
+//
+//  Standalone signed permission slip. Generic language (no specific
+//  carrier names — per Calvin: "we have many companys we do biz with that
+//  allow us to use bg as far back as 90 days so keep it generic").
+//
+//  NOT for employment — for contractor coding eligibility with partners.
+//
+//  Submitted records flow into the agent's onboarding packet alongside
+//  the Upload Form (Ship A7) and Direct Deposit (Ship A4). Required for
+//  every program EXCEPT Chuzo (No BG Required).
+// ════════════════════════════════════════════════════════════════════════
+
+var BG_AUTHORIZATIONS = [];   // [{id, agentId, agentName, signedAt, signature, ack, userAgent, status}]
+var BG_NEXT_ID = 1;
+
+function panelBgAuth(){
+  try {
+    var u = DB.current;
+    if(!canSubmitUpload(u)){
+      return panelHeader('📋 Background Check Authorization') +
+        '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Sign in as an active agent.</div></div>';
+    }
+    // Already submitted recently? Show status instead of duplicate form.
+    var existing = (BG_AUTHORIZATIONS||[]).find(function(b){
+      if(b.agentId !== u.id) return false;
+      var days = (Date.now() - new Date(b.signedAt).getTime()) / (1000*60*60*24);
+      return days < 90;  // Calvin's note: BGs valid up to 90 days
+    });
+    var h = panelHeader('📋 Background Check Authorization');
+
+    h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+    h += '<strong>What this is:</strong> Your written permission for Williams Marketing and Management Inc. to run a background check on you and share results with our partner organizations so they can decide whether to issue you enrollment codes. This is NOT for employment — you are a 1099 contractor, and your contract with us is independent of partner coding decisions.';
+    h += '</div>';
+
+    if(existing){
+      var dStr = new Date(existing.signedAt).toLocaleString();
+      h += '<div class="bo-card" style="padding:24px;border-left:3px solid #15803d">';
+      h += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">';
+      h += '<span style="font-size:1.6rem">✅</span>';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;letter-spacing:1.5px;color:#15803d">Authorization on File</div>';
+      h += '</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown);line-height:1.6">';
+      h += 'You signed your background check authorization on <strong>'+_escapeHtml(dStr)+'</strong>. This authorization is valid for 90 days.';
+      h += '</div>';
+      h += '<div style="margin-top:14px"><button onclick="bgRevoke('+existing.id+')" style="background:white;color:#dc2626;border:1px solid #dc2626;padding:8px 16px;border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">Revoke and Re-sign</button></div>';
+      h += '</div>';
+      return h;
+    }
+
+    h += '<div class="bo-card" style="padding:24px;max-width:760px">';
+
+    // Authorization paragraph (per Calvin's spec: keep generic, no carrier names)
+    h += '<div style="background:var(--cream);border:1px solid var(--sand);border-radius:6px;padding:18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.7">';
+    h += '<strong style="display:block;margin-bottom:8px;font-size:.95rem">Authorization for Background Check</strong>';
+    h += 'I authorize <strong>Williams Marketing and Management Inc.</strong> to obtain a background check on me and to share the results with our partner organizations for the purpose of evaluating my eligibility to be coded as an enrollment agent under their program requirements.<br><br>';
+    h += 'I understand this is <strong>not a hiring decision</strong> and that my contractor relationship with Williams Marketing and Management Inc. is independent of any partner\'s coding decisions.<br><br>';
+    h += 'I understand that the background check may include, but is not limited to: criminal history records, identity verification, and other public records that our partners may require to evaluate program eligibility. I confirm that I have had the opportunity to ask questions and raise concerns about the background check process before signing.';
+    h += '</div>';
+
+    h += '<div class="f-field" style="margin-bottom:14px"><label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer"><input id="bgAck" type="checkbox" style="margin-top:3px"><span style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown);line-height:1.5">I have read and understood the authorization above. I give my permission for Williams Marketing and Management Inc. to obtain a background check and share the results with partner organizations.</span></label></div>';
+
+    h += '<div class="f-field" style="margin-bottom:18px"><label class="f-label">Type Your Full Legal Name as Signature</label>';
+    h += '<input id="bgSignature" type="text" class="f-input" placeholder="Type your full legal name" style="font-family:cursive;font-size:1.1rem"></div>';
+
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;border-top:1px solid var(--sand);padding-top:18px">';
+    h += '<button onclick="bgSubmitAuth()" class="btn-fire" style="padding:12px 24px;font-size:.74rem">📋 Submit BG Authorization</button>';
+    h += '<button onclick="gotoPanel(\'dashboard\')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:12px 18px;border-radius:5px;cursor:pointer;margin-left:auto">Cancel</button>';
+    h += '</div>';
+    h += '<div id="bgError" style="display:none;margin-top:12px;color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.8rem"></div>';
+    h += '</div>';
+    return h;
+  } catch(e){
+    console.warn('[panelBgAuth] failed safely:', e);
+    return panelHeader('📋 Background Check Authorization') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Form failed to load.</div></div>';
+  }
+}
+
+function bgSubmitAuth(){
+  try {
+    var u = DB.current;
+    if(!canSubmitUpload(u)){ alert('Sign in to submit.'); return; }
+    var ack = !!(document.getElementById('bgAck')||{}).checked;
+    var sig = ((document.getElementById('bgSignature')||{}).value||'').trim();
+    var errors = [];
+    if(!ack) errors.push('You must acknowledge the authorization');
+    if(!sig) errors.push('Type your name as signature');
+    if(sig && u.name && sig.toLowerCase() !== u.name.toLowerCase()){
+      errors.push('Signature must match your full legal name (' + u.name + ')');
+    }
+    if(errors.length){
+      var errEl = document.getElementById('bgError');
+      if(errEl){ errEl.textContent = '⚠ ' + errors.join(' · '); errEl.style.display = 'block'; }
+      return;
+    }
+    var record = {
+      id: BG_NEXT_ID++,
+      agentId: u.id,
+      agentName: u.name,
+      acknowledged: true,
+      signature: sig,
+      signedAt: new Date().toISOString(),
+      userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : '',
+      status: 'active'
+    };
+    BG_AUTHORIZATIONS.unshift(record);
+    saveInventory();
+    console.log('[bgSubmitAuth] BG auth #'+record.id+' signed by '+u.name);
+
+    if(typeof postNotification === 'function'){
+      try {
+        var recips = (DB.agents||[]).filter(function(a){
+          return a.active && (a.id === 1 || (a.depts && a.depts.onboarding === true) || a.role === 'Onboarding');
+        }).map(function(a){ return a.id; });
+        postNotification({
+          icon: '📋',
+          title: 'BG Authorization Signed — '+u.name,
+          body: u.name+' signed their background check authorization. Valid for 90 days.',
+          fromId: u.id, fromName: u.name,
+          formType: 'bg-auth',
+          toIds: recips
+        });
+      } catch(e){ /* ignore */ }
+    }
+    alert('✓ Authorization signed.\n\nValid for 90 days. Onboarding can now run your background check on behalf of partner organizations.');
+    gotoPanel('dashboard');
+  } catch(e){
+    console.warn('[bgSubmitAuth] failed:', e);
+    alert('Submit failed.');
+  }
+}
+
+function bgRevoke(authId){
+  try {
+    if(!confirm('Revoke your existing background check authorization?\n\nYou\'ll need to re-sign before any partner can run a new check.')) return;
+    var rec = BG_AUTHORIZATIONS.find(function(b){ return b.id === authId; });
+    if(rec){ rec.status = 'revoked'; rec.revokedAt = new Date().toISOString(); }
+    saveInventory();
+    gotoPanel('bg-auth');
+  } catch(e){ console.warn('[bgRevoke] failed:', e); }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP A7.5
 // ════════════════════════════════════════════════════════════════════════
 
 // Update help-text when AW Override Style dropdown changes.
