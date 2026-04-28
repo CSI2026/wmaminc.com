@@ -7726,6 +7726,17 @@ var INV_BATCH_ID = 1;
 var INV_DELETION_REQUESTS = []; // {id, deviceIds:[], requestedBy, requestedAt, reason, status:'pending'|'approved'|'denied', reviewedBy, reviewedAt}
 var INV_PENDING_ASSIGNMENTS = []; // {id, batchId, devices:[], campaign, type, uploadDate, expiryDate, assignedToId:null, status:'uploaded'|'assigned'}
 
+// ── Ship 4: Generic sold-report storage ──
+// One row per activation/sale across all carriers. Records WHO sold WHAT
+// to WHOM and WHEN. Distinct from payroll (which is about $$ owed) and
+// inventory (which is about device location). Powers the unified IMEI
+// search + chain-of-custody timeline.
+//   {id, carrier, imei, sim, msisdn, model, soldAt, agentId, agentCode,
+//    agentName, market, customerName, orderNumber, source:'manual'|'payroll'|'gm-activation',
+//    uploadBatchId, uploadedBy, uploadedAt, raw:{} }
+var SOLD_REPORTS = [];
+var SOLD_REPORT_BATCHES = []; // {id, carrier, periodStart, periodEnd, uploadedBy, uploadedAt, source, count}
+
 // ══════════════════════════════════════════════════════════════
 //  SHIP A3 — INVENTORY PICKUP FORM (Market Manager → Makenzie)
 //
@@ -8003,6 +8014,14 @@ function canAccess(u, area){
     case 'inv-export':
     case 'supply-mgmt':      return isInventory(u)  || hasGrant('inv-dashboard') || hasGrant('inventory');
 
+    // ── Ship 4: IMEI search & sold-report ──
+    // Owner, Inventory Dept, Onboarding Dept can use the unified IMEI/SIM
+    // search + chain-of-custody viewer. Onboarding gets access because they
+    // often field "where did this device go" questions during agent setup.
+    case 'imei-search':
+    case 'sold-reports':
+      return isOwner(u) || isInventory(u) || isOnboarding(u);
+
     // ── TL and above ──
     case 'myteam':           return isMgr || isTL;
     case 'recruit-tracker':  return isMgr || isTL || isOnboarding(u) || hasGrant('onboarding');
@@ -8133,6 +8152,9 @@ function saveInventory(){
     // Ship A8 — Markets roster
     localStorage.setItem('wmam_markets',              JSON.stringify(MARKETS));
     localStorage.setItem('wmam_market_nextid',        String(MARKET_NEXT_ID));
+    // Ship 4 — Sold-report unified store
+    localStorage.setItem('wmam_sold_reports',         JSON.stringify(SOLD_REPORTS));
+    localStorage.setItem('wmam_sold_report_batches',  JSON.stringify(SOLD_REPORT_BATCHES));
   }catch(e){ console.warn('Inventory save:',e); }
   saveSupplyInventory();
 
@@ -8245,6 +8267,9 @@ function loadInventory(){
     // Ship A8 — Markets roster
     var mk=localStorage.getItem('wmam_markets');               if(mk) MARKETS=JSON.parse(mk)||[];
     var mn=localStorage.getItem('wmam_market_nextid');         if(mn) MARKET_NEXT_ID=parseInt(mn)||1;
+    // Ship 4 — Sold reports
+    var sr=localStorage.getItem('wmam_sold_reports');          if(sr) SOLD_REPORTS=JSON.parse(sr)||[];
+    var sb=localStorage.getItem('wmam_sold_report_batches');   if(sb) SOLD_REPORT_BATCHES=JSON.parse(sb)||[];
   }catch(e){ console.warn('Inventory load:',e); }
 }
 
@@ -14649,6 +14674,12 @@ function buildNav(u){
     if(typeof canApproveCodes === 'function' && canApproveCodes(u)){
       obItems += boDropBtn('pending-code-approvals','🎓 Pending Code Approvals');
     }
+    // Ship 4 — IMEI Search for Onboarding (only show here if they don't already
+    // have it via the Inventory dropdown — Owner/Inventory dept get the same
+    // panel via the Inventory menu).
+    if(canAccess(u, 'imei-search') && !canAccess(u, 'inventory')){
+      obItems += boDropBtn('imei-search','🔍 IMEI / SIM Search');
+    }
     h += boGroupDrop('dd-onboarding','📋 Onboarding ▾', obItems);
   }
 
@@ -14665,6 +14696,9 @@ function buildNav(u){
       +boDropBtn('carrier-tickets','⚡ Carrier Tickets (Priority)')
       +boDropBtn('inv-export','📈 Export to Excel')
       +boDropBtn('supply-mgmt','📦 Supply Management')
+      +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>'
+      +boDropBtn('imei-search','🔍 IMEI / SIM Search')
+      +boDropBtn('sold-reports','💵 Sold Reports')
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
     activeCampaigns().forEach(function(c){
       var cfg = campaignCfg(c);
@@ -15966,6 +16000,8 @@ function gotoPanel(id, params){
     'carrier-tickets':panelCarrierTickets,
     'markets-admin':panelMarketsAdmin,
     'my-profile':panelMyProfile,
+    'imei-search':panelImeiSearch,
+    'sold-reports':panelSoldReports,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -18924,7 +18960,20 @@ function ppFinalizeWeek(weekId){
   w.finalizedAt = new Date().toISOString();
   w.finalizedBy = DB.current.id;
   savePayrollWeeks();
-  alert('✓ Week finalized.');
+  // ── Ship 4: auto-derive sold reports from this finalized week ──
+  // Mines IMEIs from chargeback rows (every carrier reports them) and
+  // per-order details (TruConnect supplies these). Idempotent — safe to
+  // run multiple times.
+  var derived = 0;
+  if(typeof srDeriveFromPayrollWeek === 'function'){
+    try { derived = srDeriveFromPayrollWeek(w); }
+    catch(e){ console.warn('[ppFinalizeWeek] sold-report derive failed:', e); }
+  }
+  if(derived > 0){
+    alert('✓ Week finalized.\n\n📦 Auto-imported '+derived+' sold-report record(s) from this week. Search for any IMEI from this period in the IMEI/SIM Search panel.');
+  } else {
+    alert('✓ Week finalized.');
+  }
   gotoPanel('payroll-week-detail',{weekId:weekId});
 }
 
@@ -31457,6 +31506,645 @@ async function myProfileChangePassword(){
 
 // ════════════════════════════════════════════════════════════════════════
 //  END SHIP A12.1
+// ════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP 4 — Sold-report ingestion + IMEI/SIM search + chain-of-custody
+//
+//  Three connected features:
+//    1. Sold-report ingestion (manual + auto-derived from payroll uploads)
+//    2. Unified IMEI/SIM search across inventory, sold reports, chargebacks
+//    3. Chain-of-custody timeline view per device
+//
+//  Access: Owner + Inventory + Onboarding (per Calvin's spec).
+//  Storage: SOLD_REPORTS array (defined near INVENTORY_DEVICES).
+// ════════════════════════════════════════════════════════════════════════
+
+// ── Generate a unique sold-report ID ──
+function _srNewId(){
+  return 'sr-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
+}
+
+// ── Normalize an IMEI for comparison ──
+// Strip non-digits, return as a string. Empty string if invalid.
+// Per Q4: EXACT match only — we trim whitespace and surrounding non-digit
+// junk but don't try to "fuzzy match" partial IMEIs. 14 or 15 digit IMEIs
+// are accepted as-is. Anything else is treated as a non-IMEI search term.
+function srNormalizeImei(s){
+  if(!s) return '';
+  var digits = String(s).replace(/[^0-9]/g, '');
+  return digits;
+}
+
+// ── Add a sold-report entry ──
+// Idempotent on (carrier, imei, soldAt) — won't duplicate if the same
+// activation gets parsed twice (which happens when a payroll upload is
+// re-imported). Returns the NEW entry on insert, or null if it was a
+// duplicate (existing entry was found). Callers can count returned non-
+// nulls to know how many records were truly added.
+function srAddSoldReport(rec){
+  if(!rec || !rec.carrier) return null;
+  var imeiNorm = srNormalizeImei(rec.imei);
+  // De-dup
+  if(imeiNorm){
+    var existing = SOLD_REPORTS.find(function(r){
+      return r.carrier === rec.carrier
+          && srNormalizeImei(r.imei) === imeiNorm
+          && (r.soldAt || '') === (rec.soldAt || '');
+    });
+    if(existing) return null;
+  }
+  var entry = {
+    id:            _srNewId(),
+    carrier:       rec.carrier,
+    imei:          rec.imei || '',
+    sim:           rec.sim || '',
+    msisdn:        rec.msisdn || '',  // phone number assigned to the SIM
+    model:         rec.model || '',
+    soldAt:        rec.soldAt || new Date().toISOString().slice(0,10),
+    agentId:       rec.agentId || null,
+    agentCode:     rec.agentCode || '',
+    agentName:     rec.agentName || '',
+    market:        rec.market || '',
+    customerName:  rec.customerName || '',
+    orderNumber:   rec.orderNumber || '',
+    source:        rec.source || 'manual',
+    uploadBatchId: rec.uploadBatchId || null,
+    uploadedBy:    rec.uploadedBy || null,
+    uploadedAt:    new Date().toISOString(),
+    raw:           rec.raw || {}
+  };
+  SOLD_REPORTS.push(entry);
+  return entry;
+}
+
+// ── UNIFIED IMEI/SIM SEARCH ──
+// Returns everywhere a given IMEI/SIM/order/phone has been seen.
+// Returns shape: {
+//   query: original input,
+//   found: bool,
+//   inventory: [GM/AW/TC/EX/INVENTORY_DEVICES rows that match],
+//   soldReports: [SOLD_REPORTS entries that match],
+//   chargebacks: [{weekId, weekCarrier, agentCode, agentName, ...cb}],
+//   chainOfCustody: [merged timeline]
+// }
+function srSearch(rawQuery){
+  var query = (rawQuery || '').trim();
+  if(!query) return { query:query, found:false, inventory:[], soldReports:[], chargebacks:[], chainOfCustody:[] };
+
+  // Try as IMEI first (digits-only normalized)
+  var imeiNorm = srNormalizeImei(query);
+  // We also let the user type a SIM, MSISDN, or order number — those won't
+  // necessarily be 14-15 digits. Search both fields below regardless of
+  // whether the input looks like an IMEI.
+
+  var result = {
+    query:          query,
+    found:          false,
+    inventory:      [],
+    soldReports:    [],
+    chargebacks:    [],
+    chainOfCustody: []
+  };
+
+  // ── Inventory pools ──
+  // Search across every inventory pool that exists in the system.
+  function pushInvHits(pool, poolName){
+    if(!Array.isArray(pool)) return;
+    pool.forEach(function(d){
+      if(!d) return;
+      var dImei = srNormalizeImei(d.imei);
+      var dSim  = String(d.sim || '').replace(/[^0-9A-Za-z]/g, '');
+      var qSim  = String(query).replace(/[^0-9A-Za-z]/g, '');
+      // EXACT IMEI match per Q4. SIM and order# also exact (case-insensitive).
+      var hit = false;
+      if(imeiNorm && dImei && dImei === imeiNorm) hit = true;
+      else if(qSim && dSim && dSim === qSim) hit = true;
+      else if(d.orderNumber && String(d.orderNumber).toLowerCase() === query.toLowerCase()) hit = true;
+      else if(d.msisdn && srNormalizeImei(d.msisdn) === imeiNorm && imeiNorm) hit = true;
+      if(hit){
+        result.inventory.push(Object.assign({ _pool: poolName }, d));
+      }
+    });
+  }
+  if(typeof INVENTORY_DEVICES !== 'undefined') pushInvHits(INVENTORY_DEVICES, 'INVENTORY_DEVICES');
+  if(typeof GM_INVENTORY      !== 'undefined') pushInvHits(GM_INVENTORY,      'GM_INVENTORY');
+  if(typeof TC_INVENTORY      !== 'undefined') pushInvHits(TC_INVENTORY,      'TC_INVENTORY');
+  if(typeof AW_INVENTORY      !== 'undefined') pushInvHits(AW_INVENTORY,      'AW_INVENTORY');
+  if(typeof EX_INVENTORY      !== 'undefined') pushInvHits(EX_INVENTORY,      'EX_INVENTORY');
+
+  // ── Sold-report pool ──
+  SOLD_REPORTS.forEach(function(sr){
+    var sImei = srNormalizeImei(sr.imei);
+    var sSim  = String(sr.sim || '').replace(/[^0-9A-Za-z]/g, '');
+    var qSim  = String(query).replace(/[^0-9A-Za-z]/g, '');
+    var hit = false;
+    if(imeiNorm && sImei && sImei === imeiNorm) hit = true;
+    else if(qSim && sSim && sSim === qSim) hit = true;
+    else if(sr.orderNumber && String(sr.orderNumber).toLowerCase() === query.toLowerCase()) hit = true;
+    else if(sr.msisdn && srNormalizeImei(sr.msisdn) === imeiNorm && imeiNorm) hit = true;
+    if(hit) result.soldReports.push(sr);
+  });
+
+  // ── Chargebacks pool (across all carrier payroll weeks) ──
+  // Search PAYROLL_WEEKS rows which include chargeback objects with imei.
+  if(typeof PAYROLL_WEEKS !== 'undefined' && Array.isArray(PAYROLL_WEEKS)){
+    PAYROLL_WEEKS.forEach(function(w){
+      (w.rows || []).forEach(function(r){
+        (r.chargebacks || []).forEach(function(cb){
+          var cbImei = srNormalizeImei(cb.imei);
+          if(imeiNorm && cbImei && cbImei === imeiNorm){
+            result.chargebacks.push({
+              weekId:     w.id,
+              weekCarrier:w.carrier,
+              periodStart:w.periodStart,
+              periodEnd:  w.periodEnd,
+              agentId:    r.agentId,
+              agentCode:  r.agentCode,
+              agentName:  r.agentName,
+              date:       cb.date,
+              order:      cb.order,
+              model:      cb.model,
+              imei:       cb.imei,
+              type:       cb.type,
+              amount:     cb.amount  // cents
+            });
+          }
+        });
+      });
+    });
+  }
+
+  result.found = result.inventory.length > 0 || result.soldReports.length > 0 || result.chargebacks.length > 0;
+  result.chainOfCustody = srBuildChainOfCustody(result);
+  return result;
+}
+
+// ── Build a unified chain-of-custody timeline ──
+// Merges: device received-from-carrier events, transfer events, sale events,
+// chargeback events. Sorted oldest-to-newest.
+function srBuildChainOfCustody(searchResult){
+  var events = [];
+  // Inventory: received + assignments + activations (from device's own chainOfCustody if present)
+  searchResult.inventory.forEach(function(d){
+    // Received event
+    if(d.uploadDate || d.soDate || d.uploadedAt){
+      events.push({
+        ts:    d.uploadDate || d.soDate || d.uploadedAt,
+        type:  'received',
+        label: '📦 Received from carrier',
+        detail: 'Pool: '+(d._pool||'INVENTORY')+(d.batchId?' · Batch '+d.batchId:'')+(d.boxNumber?' · Box '+d.boxNumber:'')+(d.trackingNumber?' · Tracking '+d.trackingNumber:'')
+      });
+    }
+    // Assignment
+    if(d.assignedAt){
+      events.push({
+        ts:    d.assignedAt,
+        type:  'assigned',
+        label: '👤 Assigned to '+(d.assignedToName||'agent #'+d.assignedTo),
+        detail: 'Status: '+(d.status||'assigned')
+      });
+    }
+    // Activation
+    if(d.activatedAt){
+      events.push({
+        ts:    d.activatedAt,
+        type:  'activated',
+        label: '✅ Activated',
+        detail: 'By: '+(d.activatedBy||'(unknown)')+(d.devCost?' · Cost cents: '+d.devCost:'')
+      });
+    }
+    // Embedded chain-of-custody from GM_INVENTORY etc.
+    if(Array.isArray(d.chainOfCustody)){
+      d.chainOfCustody.forEach(function(c){
+        events.push({
+          ts:    c.at || c.date,
+          type:  c.type || 'transfer',
+          label: '🔄 '+(c.type||'transfer')+': '+(c.fromName||c.from||'?')+' → '+(c.toName||c.to||'?'),
+          detail: ''
+        });
+      });
+    }
+  });
+  // Sold-report events
+  searchResult.soldReports.forEach(function(sr){
+    events.push({
+      ts:    sr.soldAt,
+      type:  'sold',
+      label: '💵 Sold '+(sr.carrier?'('+sr.carrier+') ':'')+'by '+(sr.agentName||sr.agentCode||'(unknown agent)'),
+      detail: (sr.customerName?'Customer: '+sr.customerName+' · ':'')+(sr.orderNumber?'Order '+sr.orderNumber+' · ':'')+(sr.market?'Market: '+sr.market:'')+(sr.source?' · Source: '+sr.source:'')
+    });
+  });
+  // Chargeback events
+  searchResult.chargebacks.forEach(function(cb){
+    events.push({
+      ts:    cb.date,
+      type:  'chargeback',
+      label: '🔻 Chargeback ('+cb.weekCarrier+') — '+(cb.type||'upsell')+' $'+(Math.abs(cb.amount/100)).toFixed(2),
+      detail: 'Order '+(cb.order||'')+' · Agent '+(cb.agentName||cb.agentCode)+' · '+(cb.model||'')
+    });
+  });
+  // Sort oldest to newest, fall back to string compare for non-ISO dates
+  events.sort(function(a,b){
+    var ta = a.ts ? new Date(a.ts).getTime() : 0;
+    var tb = b.ts ? new Date(b.ts).getTime() : 0;
+    if(isNaN(ta)) ta = 0;
+    if(isNaN(tb)) tb = 0;
+    return ta - tb;
+  });
+  return events;
+}
+
+// ── AUTO-DERIVE sold reports from a freshly-finalized payroll week ──
+// Called from ppFinalizeWeek (we'll wire this in next).
+// Mines the payroll week's chargeback rows for IMEIs (chargebacks include
+// IMEI by carrier convention) and, for TruConnect's per-order details, also
+// pulls the sold IMEIs out of details[].
+function srDeriveFromPayrollWeek(week){
+  if(!week || !week.rows) return 0;
+  var added = 0;
+  var batchId = 'batch-' + week.id;
+  var batch = {
+    id:          batchId,
+    carrier:     week.carrier,
+    periodStart: week.periodStart,
+    periodEnd:   week.periodEnd,
+    uploadedBy:  week.finalizedBy || week.uploadedBy,
+    uploadedAt:  new Date().toISOString(),
+    source:      'payroll',
+    count:       0
+  };
+  (week.rows || []).forEach(function(r){
+    // From per-order detail (TruConnect carries this)
+    if(Array.isArray(r.details)){
+      r.details.forEach(function(d){
+        if(!d.imei) return;  // some carriers don't supply IMEIs in their reports — that's fine
+        var entry = srAddSoldReport({
+          carrier:       week.carrier,
+          imei:          d.imei,
+          sim:           d.sim || '',
+          msisdn:        d.msisdn || d.phone || '',
+          model:         d.model || '',
+          soldAt:        d.date || d.activationDate || week.periodEnd,
+          agentId:       r.agentId,
+          agentCode:     r.agentCode,
+          agentName:     r.agentName,
+          market:        r.market || r.teamName || '',
+          customerName:  d.customer || d.customerName || '',
+          orderNumber:   d.order || d.orderNumber || '',
+          source:        'payroll',
+          uploadBatchId: batchId,
+          uploadedBy:    batch.uploadedBy,
+          raw:           d
+        });
+        if(entry) added++;
+      });
+    }
+    // From chargebacks (every carrier reports IMEI on chargebacks)
+    (r.chargebacks || []).forEach(function(cb){
+      if(!cb.imei) return;
+      var entry = srAddSoldReport({
+        carrier:       week.carrier,
+        imei:          cb.imei,
+        model:         cb.model || '',
+        soldAt:        cb.date || week.periodStart,
+        agentId:       r.agentId,
+        agentCode:     r.agentCode,
+        agentName:     r.agentName,
+        market:        r.market || r.teamName || '',
+        orderNumber:   cb.order || '',
+        source:        'payroll-chargeback',
+        uploadBatchId: batchId,
+        uploadedBy:    batch.uploadedBy,
+        raw:           cb
+      });
+      if(entry) added++;
+    });
+  });
+  if(added > 0){
+    batch.count = added;
+    SOLD_REPORT_BATCHES.push(batch);
+    saveInventory();
+    console.log('[srDeriveFromPayrollWeek] auto-imported '+added+' sold-report entries from '+week.carrier+' '+week.periodStart+' → '+week.periodEnd);
+  }
+  return added;
+}
+
+// ── MANUAL SOLD REPORT IMPORT ──
+// Parses a pasted CSV/TSV table with header row, picks columns by name.
+// Accepts variants: "IMEI"/"imei", "SIM"/"ICCID", "MSISDN"/"phone",
+// "Order"/"order#", "Customer"/"customer name", "Date"/"sold date".
+function srParseManualPaste(text, defaultCarrier){
+  if(!text || !text.trim()) return { rows:[], errors:['No text supplied'] };
+  var lines = text.split(/\r?\n/).filter(function(l){ return l.trim(); });
+  if(lines.length < 2) return { rows:[], errors:['Need at least a header row + one data row'] };
+  // Detect delimiter — tab if any line has tabs, else comma
+  var delim = lines[0].indexOf('\t') >= 0 ? '\t' : ',';
+  var headers = lines[0].split(delim).map(function(h){ return h.trim().toLowerCase(); });
+  // Column resolver
+  function findCol(){
+    for(var i=0;i<arguments.length;i++){
+      var idx = headers.indexOf(arguments[i].toLowerCase());
+      if(idx >= 0) return idx;
+    }
+    return -1;
+  }
+  var idxImei     = findCol('imei','imei #','device imei','device id');
+  var idxSim      = findCol('sim','iccid','sim #');
+  var idxMsisdn   = findCol('msisdn','phone','phone#','phone number','telephone');
+  var idxModel    = findCol('model','device','device model','phone model');
+  var idxDate     = findCol('date','sold date','activation date','sold at');
+  var idxAgent    = findCol('agent','agent code','rep','rep code','agent id');
+  var idxOrder    = findCol('order','order#','order number','order id','transaction');
+  var idxCustomer = findCol('customer','customer name','client name','name');
+  var idxMarket   = findCol('market','team','distributor','location');
+  var idxCarrier  = findCol('carrier','program');
+
+  var rows = [];
+  var errors = [];
+  for(var i=1;i<lines.length;i++){
+    var cells = lines[i].split(delim).map(function(c){ return c.trim(); });
+    var imei = idxImei >= 0 ? cells[idxImei] : '';
+    if(!imei){ continue; }  // skip rows without an IMEI silently
+    var carrier = (idxCarrier >= 0 && cells[idxCarrier]) ? cells[idxCarrier] : (defaultCarrier || 'Unknown');
+    rows.push({
+      carrier:      carrier,
+      imei:         imei,
+      sim:          idxSim    >= 0 ? cells[idxSim]    : '',
+      msisdn:       idxMsisdn >= 0 ? cells[idxMsisdn] : '',
+      model:        idxModel  >= 0 ? cells[idxModel]  : '',
+      soldAt:       idxDate   >= 0 ? cells[idxDate]   : '',
+      agentCode:    idxAgent  >= 0 ? cells[idxAgent]  : '',
+      orderNumber:  idxOrder  >= 0 ? cells[idxOrder]  : '',
+      customerName: idxCustomer >= 0 ? cells[idxCustomer] : '',
+      market:       idxMarket >= 0 ? cells[idxMarket] : ''
+    });
+  }
+  return { rows:rows, errors:errors, headers:headers };
+}
+
+// Apply parsed manual rows: resolve agent by code, store as sold reports.
+function srImportManualRows(rows, carrier, uploadedBy){
+  if(!Array.isArray(rows) || !rows.length) return 0;
+  var batchId = 'manual-' + Date.now();
+  var added = 0;
+  rows.forEach(function(r){
+    // Resolve agent by code
+    var agent = null;
+    if(r.agentCode){
+      agent = (DB.agents || []).find(function(a){
+        var codes = a.agentCodes || {};
+        return Object.values(codes).some(function(c){ return String(c).trim() === String(r.agentCode).trim(); });
+      });
+    }
+    var entry = srAddSoldReport({
+      carrier:       carrier || r.carrier || 'Unknown',
+      imei:          r.imei,
+      sim:           r.sim,
+      msisdn:        r.msisdn,
+      model:         r.model,
+      soldAt:        r.soldAt,
+      agentId:       agent ? agent.id : null,
+      agentCode:     r.agentCode,
+      agentName:     agent ? agent.name : '',
+      market:        r.market,
+      customerName:  r.customerName,
+      orderNumber:   r.orderNumber,
+      source:        'manual',
+      uploadBatchId: batchId,
+      uploadedBy:    uploadedBy,
+      raw:           r
+    });
+    if(entry) added++;
+  });
+  SOLD_REPORT_BATCHES.push({
+    id: batchId,
+    carrier: carrier || 'Mixed',
+    periodStart: '',
+    periodEnd: '',
+    uploadedBy: uploadedBy,
+    uploadedAt: new Date().toISOString(),
+    source: 'manual',
+    count: added
+  });
+  saveInventory();
+  return added;
+}
+
+// ── PANEL: IMEI SEARCH ──
+function panelImeiSearch(){
+  var u = DB.current;
+  if(!canAccess(u, 'imei-search')){
+    return panelHeader('🔍 IMEI / SIM Search') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Restricted to Owner, Inventory, and Onboarding.</div></div>';
+  }
+  var h = panelHeader('🔍 IMEI / SIM / Order Search');
+  h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong style="color:var(--brown)">Type an exact IMEI, SIM, MSISDN (phone#), or order number.</strong> The portal searches across every inventory pool, every sold-report (manual + auto-derived from payroll), and every chargeback record. The chain-of-custody timeline shows where the device has been from receipt to sale.';
+  h += '</div>';
+  h += '<div class="bo-card" style="margin-bottom:18px"><div style="padding:18px">';
+  h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">';
+  h += '<input type="text" id="imeiSearchInput" class="f-input" placeholder="Paste an IMEI, SIM, phone#, or order#" style="flex:1;min-width:280px;font-family:monospace;font-size:.9rem" onkeydown="if(event.key===\'Enter\')imeiDoSearch()">';
+  h += '<button onclick="imeiDoSearch()" class="btn-fire" style="padding:11px 24px">🔍 Search</button>';
+  h += '<button onclick="document.getElementById(\'imeiSearchInput\').value=\'\';document.getElementById(\'imeiSearchResults\').innerHTML=\'\';" style="padding:11px 18px;background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Clear</button>';
+  h += '</div></div></div>';
+  h += '<div id="imeiSearchResults"></div>';
+  // Stats card
+  var statsLines = [
+    '📦 Inventory pools: ' + ((INVENTORY_DEVICES||[]).length + (typeof GM_INVENTORY!=='undefined'?GM_INVENTORY.length:0) + (typeof TC_INVENTORY!=='undefined'?TC_INVENTORY.length:0) + (typeof AW_INVENTORY!=='undefined'?AW_INVENTORY.length:0) + (typeof EX_INVENTORY!=='undefined'?EX_INVENTORY.length:0)) + ' devices',
+    '💵 Sold reports: ' + (SOLD_REPORTS||[]).length + ' entries (' + (SOLD_REPORT_BATCHES||[]).length + ' batches)',
+    '🔻 Chargeback records: ' + (typeof PAYROLL_WEEKS !== 'undefined' ? PAYROLL_WEEKS.reduce(function(s,w){return s+(w.rows||[]).reduce(function(s2,r){return s2+(r.chargebacks||[]).length;},0);},0) : 0) + ' records'
+  ];
+  h += '<div class="bo-card" style="margin-top:18px"><div class="bo-card-head"><div class="bo-card-title">📊 Search index coverage</div></div>';
+  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.8">';
+  statsLines.forEach(function(l){ h += '<div>'+l+'</div>'; });
+  h += '<div style="margin-top:10px"><a href="javascript:void(0)" onclick="gotoPanel(\'sold-reports\')" style="color:var(--blue);font-weight:700">→ Manage sold reports</a></div>';
+  h += '</div></div>';
+  return h;
+}
+
+function imeiDoSearch(){
+  var q = (document.getElementById('imeiSearchInput')||{value:''}).value.trim();
+  if(!q){ alert('Enter an IMEI, SIM, MSISDN, or order number to search.'); return; }
+  var result = srSearch(q);
+  var resBox = document.getElementById('imeiSearchResults');
+  if(!resBox) return;
+  if(!result.found){
+    resBox.innerHTML = '<div class="bo-card"><div style="padding:30px;text-align:center;font-family:Barlow Condensed,sans-serif;color:var(--muted)">'
+      + '<div style="font-size:2rem;margin-bottom:10px">❓</div>'
+      + 'No matches found for <strong>'+_escapeHtml(q)+'</strong> across inventory, sold reports, or chargebacks.'
+      + '</div></div>';
+    return;
+  }
+  var h = '';
+
+  // Summary line
+  h += '<div class="bo-card" style="margin-bottom:14px;border-left:4px solid var(--blue)"><div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
+  h += '<div style="font-size:.7rem;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase">Searched for</div>';
+  h += '<div style="font-family:monospace;font-size:1.1rem;color:var(--brown);font-weight:700;margin:4px 0 8px">'+_escapeHtml(q)+'</div>';
+  h += '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:.82rem">';
+  h += '<span>📦 <strong>'+result.inventory.length+'</strong> inventory hit'+(result.inventory.length!==1?'s':'')+'</span>';
+  h += '<span>💵 <strong>'+result.soldReports.length+'</strong> sold-report hit'+(result.soldReports.length!==1?'s':'')+'</span>';
+  h += '<span>🔻 <strong>'+result.chargebacks.length+'</strong> chargeback hit'+(result.chargebacks.length!==1?'s':'')+'</span>';
+  h += '</div></div></div>';
+
+  // Chain-of-custody timeline
+  if(result.chainOfCustody.length){
+    h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">🕒 Chain of Custody</div></div>';
+    h += '<div style="padding:18px">';
+    result.chainOfCustody.forEach(function(ev, idx){
+      var date = ev.ts ? new Date(ev.ts).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}) : '(no date)';
+      if(date === 'Invalid Date') date = String(ev.ts);
+      h += '<div style="display:flex;gap:12px;padding:8px 0;border-bottom:'+(idx<result.chainOfCustody.length-1?'1px solid var(--border)':'none')+'">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);letter-spacing:1px;min-width:130px;flex-shrink:0">'+_escapeHtml(date)+'</div>';
+      h += '<div style="flex:1;font-family:Barlow Condensed,sans-serif"><div style="font-size:.86rem;color:var(--brown);font-weight:700">'+_escapeHtml(ev.label)+'</div>';
+      if(ev.detail){ h += '<div style="font-size:.74rem;color:var(--muted);margin-top:2px">'+_escapeHtml(ev.detail)+'</div>'; }
+      h += '</div></div>';
+    });
+    h += '</div></div>';
+  }
+
+  // Inventory hits table
+  if(result.inventory.length){
+    h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">📦 Inventory Records ('+result.inventory.length+')</div></div>';
+    h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.8rem">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border)">';
+    ['Pool','IMEI','SIM','Model','Status','Market','Assigned To'].forEach(function(c){
+      h += '<th style="text-align:left;padding:8px 10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">'+c+'</th>';
+    });
+    h += '</tr></thead><tbody>';
+    result.inventory.forEach(function(d){
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:7px 10px;font-size:.7rem;color:var(--muted)">'+_escapeHtml(d._pool||'')+'</td>';
+      h += '<td style="padding:7px 10px;font-family:monospace;font-size:.78rem">'+_escapeHtml(d.imei||'')+'</td>';
+      h += '<td style="padding:7px 10px;font-family:monospace;font-size:.74rem">'+_escapeHtml(d.sim||'—')+'</td>';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(d.model||'—')+'</td>';
+      h += '<td style="padding:7px 10px"><span style="display:inline-block;padding:2px 8px;border-radius:10px;background:rgba(0,53,148,.08);color:var(--blue);font-size:.66rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">'+_escapeHtml(d.status||'unknown')+'</span></td>';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(d.market||'—')+'</td>';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(d.assignedToName || (d.assignedTo ? '#'+d.assignedTo : '—'))+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // Sold-report hits
+  if(result.soldReports.length){
+    h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">💵 Sold-Report Hits ('+result.soldReports.length+')</div></div>';
+    h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.8rem">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border)">';
+    ['Date','Carrier','Agent','IMEI','Customer','Order','Source'].forEach(function(c){
+      h += '<th style="text-align:left;padding:8px 10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">'+c+'</th>';
+    });
+    h += '</tr></thead><tbody>';
+    result.soldReports.forEach(function(sr){
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:7px 10px;font-size:.74rem">'+_escapeHtml(sr.soldAt||'—')+'</td>';
+      h += '<td style="padding:7px 10px"><strong>'+_escapeHtml(sr.carrier||'—')+'</strong></td>';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(sr.agentName||sr.agentCode||'—')+'</td>';
+      h += '<td style="padding:7px 10px;font-family:monospace;font-size:.76rem">'+_escapeHtml(sr.imei||'—')+'</td>';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(sr.customerName||'—')+'</td>';
+      h += '<td style="padding:7px 10px;font-family:monospace;font-size:.74rem">'+_escapeHtml(sr.orderNumber||'—')+'</td>';
+      h += '<td style="padding:7px 10px;font-size:.7rem;color:var(--muted)">'+_escapeHtml(sr.source||'—')+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // Chargeback hits
+  if(result.chargebacks.length){
+    h += '<div class="bo-card" style="margin-bottom:14px;border-left:4px solid #991B1B"><div class="bo-card-head"><div class="bo-card-title" style="color:#991B1B">🔻 Chargebacks ('+result.chargebacks.length+')</div></div>';
+    h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.8rem">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border)">';
+    ['Date','Carrier','Agent','Type','Order','Amount'].forEach(function(c){
+      h += '<th style="text-align:left;padding:8px 10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">'+c+'</th>';
+    });
+    h += '</tr></thead><tbody>';
+    result.chargebacks.forEach(function(cb){
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:7px 10px;font-size:.74rem">'+_escapeHtml(cb.date||'—')+'</td>';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(cb.weekCarrier||'—')+'</td>';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(cb.agentName||cb.agentCode||'—')+'</td>';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(cb.type||'—')+'</td>';
+      h += '<td style="padding:7px 10px;font-family:monospace;font-size:.74rem">'+_escapeHtml(cb.order||'—')+'</td>';
+      h += '<td style="padding:7px 10px;color:#991B1B;font-weight:700">$'+(Math.abs((cb.amount||0)/100)).toFixed(2)+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  resBox.innerHTML = h;
+}
+
+// ── PANEL: SOLD REPORTS HUB (manual upload + batch list) ──
+function panelSoldReports(){
+  var u = DB.current;
+  if(!canAccess(u, 'sold-reports')){
+    return panelHeader('💵 Sold Reports') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Restricted.</div></div>';
+  }
+  var h = panelHeader('💵 Sold Reports');
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>What this is:</strong> Every activation/sale tracked across all carriers. Auto-imported when you finalize a payroll week. Manually upload here for carriers that don\'t supply IMEIs in their reports.';
+  h += '</div>';
+
+  // Manual upload card
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">📥 Manual Sold-Report Upload</div></div>';
+  h += '<div style="padding:18px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:10px;line-height:1.5">Paste a CSV or TSV with a header row. Columns we recognize: <strong>imei, sim, msisdn (phone), model, date, agent (code), order, customer, market, carrier</strong>. Rows without IMEIs are skipped.</div>';
+  h += '<div style="display:grid;grid-template-columns:1fr 220px;gap:12px;align-items:start">';
+  h += '<textarea id="srPasteArea" class="f-textarea" style="width:100%;min-height:160px;font-family:monospace;font-size:.78rem" placeholder="IMEI,SIM,Model,Date,Agent,Order,Customer\n123456789012345,1234ABCD,Galaxy A05,2026-04-20,JC100,8933612,Jane Doe"></textarea>';
+  h += '<div>';
+  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Default Carrier</label>';
+  h += '<select id="srPasteCarrier" class="f-input"><option value="">— pick one —</option><option>Gen Mobile</option><option>TruConnect</option><option>Assurance Wireless</option><option>Excess Telecom</option><option>Astound</option><option>Spectrum</option><option>Chuzo</option><option>ACA Marketplace</option><option>Other</option></select></div>';
+  h += '<button onclick="srImportFromPaste()" class="btn-fire" style="width:100%;padding:11px;font-size:.78rem">⬆ Import Rows</button>';
+  h += '</div></div></div></div>';
+
+  // Recent batches
+  var batches = (SOLD_REPORT_BATCHES||[]).slice().sort(function(a,b){ return (b.uploadedAt||'').localeCompare(a.uploadedAt||''); });
+  if(batches.length){
+    h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">📚 Recent Batches</div></div>';
+    h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.8rem">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border)">';
+    ['Uploaded','Carrier','Period','Source','Count'].forEach(function(c){
+      h += '<th style="text-align:left;padding:8px 10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">'+c+'</th>';
+    });
+    h += '</tr></thead><tbody>';
+    batches.slice(0, 30).forEach(function(b){
+      var when = b.uploadedAt ? new Date(b.uploadedAt).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}) : '—';
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:7px 10px">'+_escapeHtml(when)+'</td>';
+      h += '<td style="padding:7px 10px"><strong>'+_escapeHtml(b.carrier||'—')+'</strong></td>';
+      h += '<td style="padding:7px 10px;font-size:.74rem">'+_escapeHtml((b.periodStart||'')+(b.periodStart?' → ':'')+(b.periodEnd||'') || '—')+'</td>';
+      h += '<td style="padding:7px 10px"><span style="display:inline-block;padding:2px 8px;border-radius:10px;background:'+(b.source==='manual'?'rgba(124,58,237,.12)':'rgba(8,145,178,.12)')+';color:'+(b.source==='manual'?'#7c3aed':'#0891b2')+';font-size:.66rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">'+_escapeHtml(b.source||'?')+'</span></td>';
+      h += '<td style="padding:7px 10px;font-weight:700">'+(b.count||0)+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+  return h;
+}
+
+function srImportFromPaste(){
+  var u = DB.current;
+  if(!canAccess(u, 'sold-reports')){ alert('Permission denied.'); return; }
+  var text = (document.getElementById('srPasteArea')||{value:''}).value;
+  var carrier = (document.getElementById('srPasteCarrier')||{value:''}).value;
+  if(!text.trim()){ alert('Paste some rows first.'); return; }
+  if(!carrier){ alert('Pick a default carrier first.'); return; }
+  var parsed = srParseManualPaste(text, carrier);
+  if(!parsed.rows.length){
+    alert('No rows with IMEIs found. Make sure your header row includes "imei" and that data rows have an IMEI column populated.');
+    return;
+  }
+  if(!confirm('Import '+parsed.rows.length+' sold-report row(s) for '+carrier+'?')) return;
+  var added = srImportManualRows(parsed.rows, carrier, u.id);
+  alert('✓ '+added+' row(s) imported.');
+  document.getElementById('srPasteArea').value = '';
+  gotoPanel('sold-reports');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP 4
 // ════════════════════════════════════════════════════════════════════════
 
 // Update help-text when AW Override Style dropdown changes.
