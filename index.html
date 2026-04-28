@@ -3781,6 +3781,17 @@ function loadNotifications(){
   Object.keys(AUDIT_STATUS).forEach(function(k){
     if(AUDIT_STATUS[k] && AUDIT_STATUS[k].date !== today) AUDIT_STATUS[k] = {date:today,submitted:false};
   });
+  // ── Ship A12.4: pull from Supabase + subscribe to realtime updates ──
+  // loadNotificationsFromSupabase merges remote rows over the local copy.
+  // subscribeToNotificationsRealtime opens a websocket so future inserts
+  // appear within ~50ms across all logged-in devices.
+  if(typeof loadNotificationsFromSupabase === 'function'){
+    loadNotificationsFromSupabase().then(function(){
+      if(typeof subscribeToNotificationsRealtime === 'function'){
+        subscribeToNotificationsRealtime();
+      }
+    });
+  }
 }
 
 function saveNotifications(){
@@ -3814,20 +3825,171 @@ function markNotifRead(notifId, u){
   if(!n.read) n.read=[];
   if(n.read.indexOf(u.id)<0) n.read.push(u.id);
   saveNotifications();
+  // Ship A12.4: sync read state to Supabase so other devices see it as read too
+  _notifPushReadState(n);
 }
 
 function markAllRead(u){
+  var changed = [];
   getMyNotifications(u).forEach(function(n){
     if(!n.read) n.read=[];
-    if(n.read.indexOf(u.id)<0) n.read.push(u.id);
+    if(n.read.indexOf(u.id)<0){
+      n.read.push(u.id);
+      changed.push(n);
+    }
   });
   saveNotifications();
   renderNotifBell();
+  // Ship A12.4: batch-push read-state changes to Supabase
+  changed.forEach(_notifPushReadState);
+}
+
+// Sync just the read_by column for this notification to Supabase. Cheaper
+// than re-uploading the whole row each time someone reads it.
+async function _notifPushReadState(n){
+  try {
+    if(typeof supaClient === 'undefined' || !supaClient) return;
+    if(!n || !n.id) return;
+    var result = await supaClient.from('notifications').update({ read_by: n.read || [] }).eq('id', n.id);
+    if(result && result.error){
+      console.warn('[_notifPushReadState] update failed for #'+n.id+': '+result.error.message);
+    }
+  } catch(e){ console.warn('[_notifPushReadState] exception:', e); }
+}
+
+// ── Load notifications from Supabase ──
+// Called once on login/page-load. Merges Supabase truth with whatever
+// localStorage already had — Supabase wins on conflict (more recent), but
+// purely local notifications (from before Ship A12.4) are preserved.
+async function loadNotificationsFromSupabase(){
+  try {
+    if(typeof supaClient === 'undefined' || !supaClient) return;
+    var result = await supaClient.from('notifications').select('*').order('ts', { ascending: false }).limit(500);
+    if(result.error){
+      // Common case: table doesn't exist yet (Calvin hasn't run the SQL).
+      // Fall back silently to local-only mode.
+      if((result.error.code||'') === '42P01' || (result.error.message||'').toLowerCase().indexOf('does not exist') >= 0){
+        console.warn('[loadNotificationsFromSupabase] notifications table does not exist yet. Run supabase_notifications_table.sql to enable multi-device sync. Falling back to local-only.');
+      } else {
+        console.warn('[loadNotificationsFromSupabase] failed:', result.error.message);
+      }
+      return;
+    }
+    if(!result.data || !Array.isArray(result.data)){ return; }
+    // Merge: index local by ID, overlay Supabase rows on top
+    var byId = {};
+    WMAM_NOTIFICATIONS.forEach(function(n){ byId[n.id] = n; });
+    result.data.forEach(function(row){
+      var n = {
+        id:        row.id,
+        type:      row.type || 'info',
+        title:     row.title,
+        body:      row.body || '',
+        icon:      row.icon || 'bell',
+        fromId:    row.from_id,
+        fromName:  row.from_name || 'System',
+        formType:  row.form_type,
+        toIds:     row.to_ids   || [],
+        toRoles:   row.to_roles || [],
+        data:      row.data,
+        read:      row.read_by  || [],
+        ts:        row.ts || new Date().toISOString()
+      };
+      byId[n.id] = n;  // Supabase wins on conflict
+    });
+    // Re-sort by ts descending so newest is at top
+    WMAM_NOTIFICATIONS = Object.keys(byId).map(function(k){ return byId[k]; })
+      .sort(function(a,b){ return new Date(b.ts) - new Date(a.ts); })
+      .slice(0, 500);
+    saveNotifications();
+    if(typeof renderNotifBell === 'function') renderNotifBell();
+    console.log('[loadNotificationsFromSupabase] loaded '+result.data.length+' notification(s) from Supabase');
+  } catch(e){ console.warn('[loadNotificationsFromSupabase] exception:', e); }
+}
+
+// ── Realtime subscription ──
+// Subscribes to INSERT and UPDATE events on the notifications table so
+// new notifications appear instantly across devices without polling.
+// Stores the subscription handle on window so we can avoid duplicate
+// subscriptions on re-login.
+function subscribeToNotificationsRealtime(){
+  try {
+    if(typeof supaClient === 'undefined' || !supaClient) return;
+    // Idempotent — drop any existing subscription first
+    if(window._notifChannel){
+      try { supaClient.removeChannel(window._notifChannel); } catch(e){}
+      window._notifChannel = null;
+    }
+    var channel = supaClient.channel('notifications-realtime');
+    channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, function(payload){
+      try {
+        var row = payload.new;
+        if(!row || !row.id) return;
+        // Skip if we already have this one (we just inserted it ourselves)
+        var exists = WMAM_NOTIFICATIONS.find(function(n){ return n.id === row.id; });
+        if(exists) return;
+        var n = {
+          id:        row.id,
+          type:      row.type || 'info',
+          title:     row.title,
+          body:      row.body || '',
+          icon:      row.icon || 'bell',
+          fromId:    row.from_id,
+          fromName:  row.from_name || 'System',
+          formType:  row.form_type,
+          toIds:     row.to_ids   || [],
+          toRoles:   row.to_roles || [],
+          data:      row.data,
+          read:      row.read_by  || [],
+          ts:        row.ts || new Date().toISOString()
+        };
+        WMAM_NOTIFICATIONS.unshift(n);
+        if(WMAM_NOTIFICATIONS.length > 500) WMAM_NOTIFICATIONS = WMAM_NOTIFICATIONS.slice(0, 500);
+        saveNotifications();
+        if(typeof renderNotifBell === 'function') renderNotifBell();
+        // Re-render notifications panel if it's currently open
+        if(window._currentPanelId === 'notifications' && typeof gotoPanel === 'function'){
+          gotoPanel('notifications');
+        }
+        console.log('[realtime] new notification #'+n.id+': '+n.title);
+      } catch(e){ console.warn('[realtime INSERT] handler failed:', e); }
+    });
+    channel.on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'notifications' }, function(payload){
+      try {
+        var row = payload.new;
+        if(!row || !row.id) return;
+        var existing = WMAM_NOTIFICATIONS.find(function(n){ return n.id === row.id; });
+        if(existing){
+          // Update read state from server
+          existing.read = row.read_by || [];
+          saveNotifications();
+          if(typeof renderNotifBell === 'function') renderNotifBell();
+        }
+      } catch(e){ console.warn('[realtime UPDATE] handler failed:', e); }
+    });
+    channel.subscribe(function(status){
+      if(status === 'SUBSCRIBED'){
+        console.log('[realtime] notifications channel subscribed — multi-device sync active');
+      } else if(status === 'CHANNEL_ERROR' || status === 'TIMED_OUT'){
+        console.warn('[realtime] notifications channel status:', status);
+      }
+    });
+    window._notifChannel = channel;
+  } catch(e){ console.warn('[subscribeToNotificationsRealtime] failed:', e); }
+}
+
+// ── Generate a collision-free notification ID ──
+// Used to be NOTIF_NEXT_ID++ which is per-browser. Two devices submitting
+// simultaneously would collide. Switching to timestamp + small random
+// suffix keeps IDs sortable and globally unique. Bigint-safe.
+function _notifNewId(){
+  // 13-digit ms timestamp + 3 random digits = 16-digit number, fits in JS number
+  return Date.now() * 1000 + Math.floor(Math.random() * 1000);
 }
 
 function pushNotification(opts){
   var n = {
-    id: NOTIF_NEXT_ID++,
+    id: _notifNewId(),
     type: opts.type||'info',
     title: opts.title||'Notification',
     body: opts.body||'',
@@ -3841,15 +4003,49 @@ function pushNotification(opts){
     read: []
   };
   // Always route to owner + admins
-  DB.agents.filter(function(a){ return isOwner(a)||a.role==='admin'; }).forEach(function(a){
-    if(n.toIds.indexOf(a.id)<0) n.toIds.push(a.id);
-  });
+  if(typeof DB !== 'undefined' && DB.agents){
+    DB.agents.filter(function(a){ return isOwner(a)||a.role==='admin'; }).forEach(function(a){
+      if(n.toIds.indexOf(a.id)<0) n.toIds.push(a.id);
+    });
+  }
   if(n.toRoles.indexOf('admin')<0) n.toRoles.push('admin');
   WMAM_NOTIFICATIONS.unshift(n);
   if(WMAM_NOTIFICATIONS.length > 500) WMAM_NOTIFICATIONS = WMAM_NOTIFICATIONS.slice(0,500);
   saveNotifications();
   renderNotifBell();
+  // ── Ship A12.4: push to Supabase so other devices receive it ──
+  // Fire-and-forget — local copy already saved above, so a Supabase failure
+  // doesn't block the user. The next page load will sync from Supabase
+  // truth.  Realtime subscribers see the insert within ~50ms.
+  _notifPushToSupabase(n);
   return n;
+}
+
+// Push a single notification to the Supabase 'notifications' table.
+// Best-effort; failures are logged but never block.
+async function _notifPushToSupabase(n){
+  try {
+    if(typeof supaClient === 'undefined' || !supaClient) return;
+    var row = {
+      id:        n.id,
+      type:      n.type,
+      title:     n.title,
+      body:      n.body,
+      icon:      n.icon,
+      from_id:   n.fromId,
+      from_name: n.fromName,
+      form_type: n.formType,
+      to_ids:    n.toIds || [],
+      to_roles:  n.toRoles || [],
+      data:      n.data || {},
+      read_by:   n.read || [],
+      ts:        n.ts
+    };
+    var result = await supaClient.from('notifications').insert(row);
+    if(result && result.error){
+      console.warn('[_notifPushToSupabase] insert failed for #'+n.id+': '+result.error.message);
+    }
+  } catch(e){ console.warn('[_notifPushToSupabase] exception:', e); }
 }
 
 // ── postNotification: alias for pushNotification ──
