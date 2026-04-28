@@ -7737,6 +7737,64 @@ var INV_PENDING_ASSIGNMENTS = []; // {id, batchId, devices:[], campaign, type, u
 var SOLD_REPORTS = [];
 var SOLD_REPORT_BATCHES = []; // {id, carrier, periodStart, periodEnd, uploadedBy, uploadedAt, source, count}
 
+// ════════════════════════════════════════════════════════════════════════
+// SHIP B — POINTS ENGINE
+//
+// POINTS_LEDGER: append-only record of every point event.
+//   {id, agentId, agentName, ts, date (YYYY-MM-DD), amount (signed int),
+//    category:'sales'|'audit'|'call'|'inventory'|'redeem'|'adjust',
+//    rule:'sales-30+'|'audit-on-time'|'audit-late'|'audit-missed-w-sales'|
+//         'call-on-time'|'call-missed'|'inv-zero-expired'|'inv-has-expired'|
+//         'redemption'|'manual-adjust',
+//    label, period (week:'2026-W17' or day:'2026-04-27'),
+//    refId (sourceObj id if applicable), notes}
+//
+// POINTS_BALANCES: running per-agent total.
+//   {agentId, agentName, total, lastUpdated}
+// 
+// Last-batch tracking so we don't double-process days.
+//   POINTS_LAST_BATCH_DATE: ISO date string of the most recent day fully processed.
+//   POINTS_LAST_BATCH_AT:   ISO timestamp of when that run happened.
+// 
+// Effective start date per Calvin: May 1, 2026.  Days before that
+// produce zero events even if data exists.
+// ════════════════════════════════════════════════════════════════════════
+var POINTS_LEDGER = [];
+var POINTS_BALANCES = [];          // [{agentId, agentName, total, lastUpdated}]
+var POINTS_LAST_BATCH_DATE = '';   // 'YYYY-MM-DD' of most recent day processed
+var POINTS_LAST_BATCH_AT = '';     // ISO timestamp
+var POINTS_NEXT_ID = 1;
+var POINTS_START_DATE = '2026-05-01';  // No points awarded for events before this date
+
+// ── Call scheduling + attendance ──
+// CALL_SCHEDULES: recurring or one-off scheduled calls.
+//   {id, name, dayOfWeek (0=Sun..6=Sat), timeCST ('HH:MM'), durationMin,
+//    awardsPoints (bool), requiredFor:{programs:[], roles:[]}, active}
+// CALL_ATTENDANCE: log of who joined which scheduled call.
+//   {id, scheduleId, agentId, agentName, joinedAt (ISO), date (YYYY-MM-DD),
+//    minutesLate (negative if early), graded (bool — set true after batch processes it)}
+var CALL_SCHEDULES = [];
+var CALL_ATTENDANCE = [];
+var CALL_SCHEDULE_NEXT_ID = 1;
+var CALL_ATTENDANCE_NEXT_ID = 1;
+// Default seed: National Call every Monday at 9:00 AM CST.
+// This is what Calvin specified as the credit-bearing call.
+function _ensureDefaultCallSchedule(){
+  if(!Array.isArray(CALL_SCHEDULES) || !CALL_SCHEDULES.length){
+    CALL_SCHEDULES = [{
+      id: CALL_SCHEDULE_NEXT_ID++,
+      name: 'National Lifeline Call',
+      dayOfWeek: 1, // Monday
+      timeCST: '09:00',
+      durationMin: 60,
+      awardsPoints: true,
+      requiredFor: { programs: ['Lifeline'], roles: ['Field Agent','Team Leader','Market Manager','Campaign Manager'] },
+      active: true,
+      notes: 'Mandatory Monday national call. Joining on time = +1 pt, missing = -1 pt.'
+    }];
+  }
+}
+
 // ══════════════════════════════════════════════════════════════
 //  SHIP A3 — INVENTORY PICKUP FORM (Market Manager → Makenzie)
 //
@@ -8022,6 +8080,17 @@ function canAccess(u, area){
     case 'sold-reports':
       return isOwner(u) || isInventory(u) || isOnboarding(u);
 
+    // ── Ship B: Points engine ──
+    // Every active agent sees their own balance + history.
+    // team-points: any active agent (panel internally filters to self+team).
+    // owner-points + call-schedule-admin: Owner only.
+    case 'my-points':
+    case 'team-points':
+      return !!u.active;
+    case 'owner-points':
+    case 'call-schedule-admin':
+      return isOwner(u);
+
     // ── TL and above ──
     case 'myteam':           return isMgr || isTL;
     case 'recruit-tracker':  return isMgr || isTL || isOnboarding(u) || hasGrant('onboarding');
@@ -8155,6 +8224,16 @@ function saveInventory(){
     // Ship 4 — Sold-report unified store
     localStorage.setItem('wmam_sold_reports',         JSON.stringify(SOLD_REPORTS));
     localStorage.setItem('wmam_sold_report_batches',  JSON.stringify(SOLD_REPORT_BATCHES));
+    // Ship B — Points engine
+    localStorage.setItem('wmam_points_ledger',        JSON.stringify(POINTS_LEDGER));
+    localStorage.setItem('wmam_points_balances',      JSON.stringify(POINTS_BALANCES));
+    localStorage.setItem('wmam_points_last_batch_date', POINTS_LAST_BATCH_DATE || '');
+    localStorage.setItem('wmam_points_last_batch_at',   POINTS_LAST_BATCH_AT || '');
+    localStorage.setItem('wmam_points_next_id',       String(POINTS_NEXT_ID));
+    localStorage.setItem('wmam_call_schedules',       JSON.stringify(CALL_SCHEDULES));
+    localStorage.setItem('wmam_call_attendance',      JSON.stringify(CALL_ATTENDANCE));
+    localStorage.setItem('wmam_call_schedule_nextid', String(CALL_SCHEDULE_NEXT_ID));
+    localStorage.setItem('wmam_call_attendance_nextid', String(CALL_ATTENDANCE_NEXT_ID));
   }catch(e){ console.warn('Inventory save:',e); }
   saveSupplyInventory();
 
@@ -8270,6 +8349,17 @@ function loadInventory(){
     // Ship 4 — Sold reports
     var sr=localStorage.getItem('wmam_sold_reports');          if(sr) SOLD_REPORTS=JSON.parse(sr)||[];
     var sb=localStorage.getItem('wmam_sold_report_batches');   if(sb) SOLD_REPORT_BATCHES=JSON.parse(sb)||[];
+    // Ship B — Points engine
+    var pl=localStorage.getItem('wmam_points_ledger');         if(pl) POINTS_LEDGER=JSON.parse(pl)||[];
+    var pb=localStorage.getItem('wmam_points_balances');       if(pb) POINTS_BALANCES=JSON.parse(pb)||[];
+    var plbd=localStorage.getItem('wmam_points_last_batch_date'); if(plbd) POINTS_LAST_BATCH_DATE=plbd;
+    var plba=localStorage.getItem('wmam_points_last_batch_at');   if(plba) POINTS_LAST_BATCH_AT=plba;
+    var pni=localStorage.getItem('wmam_points_next_id');       if(pni) POINTS_NEXT_ID=parseInt(pni)||1;
+    var cs=localStorage.getItem('wmam_call_schedules');        if(cs) CALL_SCHEDULES=JSON.parse(cs)||[];
+    var ca=localStorage.getItem('wmam_call_attendance');       if(ca) CALL_ATTENDANCE=JSON.parse(ca)||[];
+    var csn=localStorage.getItem('wmam_call_schedule_nextid'); if(csn) CALL_SCHEDULE_NEXT_ID=parseInt(csn)||1;
+    var can=localStorage.getItem('wmam_call_attendance_nextid'); if(can) CALL_ATTENDANCE_NEXT_ID=parseInt(can)||1;
+    _ensureDefaultCallSchedule();
   }catch(e){ console.warn('Inventory load:',e); }
 }
 
@@ -10595,7 +10685,10 @@ function finalizeAudit(data){
 
   // Mark audit status green for this agent today
   var today2 = new Date().toISOString().slice(0,10);
-  AUDIT_STATUS[data.agentId] = {date: today2, submitted: true};
+  var nowIso = new Date().toISOString();
+  // Ship B: capture timestamp + raw submittedAt (HH:MM string from form) so
+  // the points batch can decide on-time vs late based on 9am CST cutoff.
+  AUDIT_STATUS[data.agentId] = { date: today2, submitted: true, submittedAt: nowIso, submittedAtLocal: data.submittedAt || '' };
   saveNotifications();
 
   // Push in-app notification to TL, MM, CM, Admin, Owner
@@ -14180,6 +14273,8 @@ function doLogin(){
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
   loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadCompPlans(); loadOnboardData(); loadStore(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
+  // Ship B: auto-run points batch on login (idempotent, no-op before 9am CST)
+  setTimeout(function(){ try { if(typeof pointsMaybeAutoRun === 'function') pointsMaybeAutoRun(); } catch(e){} }, 1500);
   // POST-LOGIN LANDING PAGE ROUTING
   // Owner → Owner Control (their actual home)
   // Everyone else → panelBO (the main back-office dashboard)
@@ -14681,6 +14776,27 @@ function buildNav(u){
       obItems += boDropBtn('imei-search','🔍 IMEI / SIM Search');
     }
     h += boGroupDrop('dd-onboarding','📋 Onboarding ▾', obItems);
+  }
+
+  // ── Ship B: Points dropdown ──
+  // Every active user gets My Points + (if they have anyone reporting to
+  // them) Team Points. Owner additionally gets the global dashboard and
+  // call schedule admin. Skip the whole dropdown for inactive accounts.
+  if(u && u.active){
+    var ptsItems = boDropBtn('my-points','🏆 My Points');
+    // Show Team Points only if they actually have someone under them
+    if(typeof pointsAgentsViewableBy === 'function'){
+      try {
+        var visible = pointsAgentsViewableBy(u);
+        if(visible.length > 1) ptsItems += boDropBtn('team-points','👥 Team Points');
+      } catch(e){}
+    }
+    if(isOwner(u)){
+      ptsItems += '<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>'
+                + boDropBtn('owner-points','📊 Owner Dashboard')
+                + boDropBtn('call-schedule-admin','📞 Call Schedule');
+    }
+    h += boGroupDrop('dd-points','🏆 Points ▾', ptsItems);
   }
 
   // Inventory Portal
@@ -16002,6 +16118,10 @@ function gotoPanel(id, params){
     'my-profile':panelMyProfile,
     'imei-search':panelImeiSearch,
     'sold-reports':panelSoldReports,
+    'my-points':panelMyPoints,
+    'team-points':panelTeamPoints,
+    'owner-points':panelOwnerPoints,
+    'call-schedule-admin':panelCallScheduleAdmin,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -32147,6 +32267,807 @@ function srImportFromPaste(){
 //  END SHIP 4
 // ════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP B — POINTS ENGINE
+//
+//  Rules (per Calvin's spec):
+//    • Sales (weekly): 30+ activations = +10pts, each above 30 = +1pt each
+//    • Audit (per day):
+//        - Submitted before 9am CST = +2
+//        - Submitted between 9am and end of day = +1
+//        - Missed on a day with sales = -2
+//        - Missed on a day with no sales = 0
+//    • National Call (Mondays 9am CST, Lifeline FA/TL/MM/CM):
+//        - Joined on time = +1
+//        - Missed = -1
+//    • Inventory (daily): 0 expired = +3, has expired = -5
+//    • Floor at 0; events before May 1 2026 ignored.
+//
+//  Data: POINTS_LEDGER (append-only events), POINTS_BALANCES (running totals).
+//  Batch: runs daily at 9am CST when first user logs in after that time.
+// ════════════════════════════════════════════════════════════════════════
+
+// ── DATE / TIME helpers (CST = America/Chicago, no DST surprises) ──
+// Supabase stores UTC; agents are in CST. We convert by subtracting 6h.
+// (CST = UTC-6, CDT = UTC-5; for points purposes we use CST year-round
+// to keep the 9am cutoff consistent rather than swing with daylight time.)
+function _pointsCstNow(){
+  // Returns a Date object adjusted so its UTC fields read as CST wall time.
+  var d = new Date();
+  d.setMinutes(d.getMinutes() - (d.getTimezoneOffset() + 360));  // shift to CST
+  return d;
+}
+function _pointsCstDateStr(d){
+  // YYYY-MM-DD in CST
+  d = d || _pointsCstNow();
+  return d.toISOString().slice(0,10);
+}
+function _pointsCstHour(d){
+  d = d || _pointsCstNow();
+  return d.getUTCHours();  // After _pointsCstNow shift, UTC hour IS CST hour
+}
+function _pointsCstMinute(d){
+  d = d || _pointsCstNow();
+  return d.getUTCMinutes();
+}
+function _pointsIsoToCst(iso){
+  // Convert an ISO timestamp string to a Date positioned at CST wall time
+  if(!iso) return null;
+  var d = new Date(iso);
+  if(isNaN(d.getTime())) return null;
+  d.setMinutes(d.getMinutes() - (d.getTimezoneOffset() + 360));
+  return d;
+}
+// Given a YYYY-MM-DD string, return ISO week label like "2026-W18"
+function _pointsWeekLabel(dateStr){
+  if(!dateStr) return '';
+  var d = new Date(dateStr + 'T12:00:00Z');  // noon UTC to avoid edge issues
+  // ISO week calculation
+  var dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  var yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  var weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return d.getUTCFullYear() + '-W' + String(weekNo).padStart(2, '0');
+}
+// "Yesterday" CST as YYYY-MM-DD
+function _pointsYesterdayCst(){
+  var d = _pointsCstNow();
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0,10);
+}
+// Day of week (0=Sun..6=Sat) in CST for a given YYYY-MM-DD
+function _pointsDowCst(dateStr){
+  var d = new Date(dateStr + 'T12:00:00Z');
+  // Subtract CST offset to get the local Day-of-week in CST
+  d.setMinutes(d.getMinutes() - (d.getTimezoneOffset() + 360));
+  return d.getUTCDay();
+}
+
+// ── ID gen ──
+function _pointsNewId(){ return POINTS_NEXT_ID++; }
+
+// ── Append a ledger entry + update balance ──
+// Always go through this — it keeps the ledger and balances in sync,
+// honors the May 1 floor, and floors final balance at 0.
+function pointsAddEvent(opts){
+  if(!opts || typeof opts.amount !== 'number' || !opts.agentId) return null;
+  // Honor start date: skip events for days before May 1, 2026
+  var eventDate = opts.date || _pointsCstDateStr();
+  if(eventDate < POINTS_START_DATE){
+    return null;
+  }
+  var agent = (DB.agents||[]).find(function(a){ return a.id === opts.agentId; });
+  if(!agent) return null;
+  var entry = {
+    id: _pointsNewId(),
+    agentId: opts.agentId,
+    agentName: agent.name,
+    ts: opts.ts || new Date().toISOString(),
+    date: eventDate,
+    amount: opts.amount,
+    category: opts.category || 'adjust',
+    rule: opts.rule || '',
+    label: opts.label || '',
+    period: opts.period || '',
+    refId: opts.refId || null,
+    notes: opts.notes || ''
+  };
+  POINTS_LEDGER.push(entry);
+  // Update balance, floor at 0
+  var bal = POINTS_BALANCES.find(function(b){ return b.agentId === opts.agentId; });
+  if(!bal){
+    bal = { agentId: opts.agentId, agentName: agent.name, total: 0, lastUpdated: entry.ts };
+    POINTS_BALANCES.push(bal);
+  }
+  bal.total = Math.max(0, (bal.total || 0) + opts.amount);
+  bal.agentName = agent.name;  // refresh in case of rename
+  bal.lastUpdated = entry.ts;
+  return entry;
+}
+
+// Get balance for an agent (always returns a number, 0 if no ledger yet)
+function pointsBalance(agentId){
+  var bal = POINTS_BALANCES.find(function(b){ return b.agentId === agentId; });
+  return bal ? bal.total : 0;
+}
+
+// ── Idempotency: has this rule already fired for (agent, date, rule)? ──
+function pointsAlreadyAwarded(agentId, date, rule){
+  return POINTS_LEDGER.some(function(e){
+    return e.agentId === agentId && e.date === date && e.rule === rule;
+  });
+}
+function pointsAlreadyAwardedPeriod(agentId, period, rule){
+  return POINTS_LEDGER.some(function(e){
+    return e.agentId === agentId && e.period === period && e.rule === rule;
+  });
+}
+
+// ── Did agent X have any sales on day Y? ──
+// Pulls from GM_ACTIVATIONS, TC_ACTIVATIONS, AW_ACTIVATIONS, EX_ACTIVATIONS.
+function pointsAgentHadSalesOn(agentId, dateStr){
+  function check(pool){
+    if(!Array.isArray(pool)) return false;
+    return pool.some(function(a){
+      return a && a.agentId === agentId && (a.activationDate||'').slice(0,10) === dateStr;
+    });
+  }
+  if(typeof GM_ACTIVATIONS !== 'undefined' && check(GM_ACTIVATIONS)) return true;
+  if(typeof TC_ACTIVATIONS !== 'undefined' && check(TC_ACTIVATIONS)) return true;
+  if(typeof AW_ACTIVATIONS !== 'undefined' && check(AW_ACTIVATIONS)) return true;
+  if(typeof EX_ACTIVATIONS !== 'undefined' && check(EX_ACTIVATIONS)) return true;
+  return false;
+}
+
+// ── Activations count for agent in a given week (Mon-Sun) ──
+function pointsAgentActivationsInWeek(agentId, weekLabel){
+  // weekLabel is e.g. "2026-W18". We need to expand to date range.
+  // Compute Monday and Sunday of that ISO week.
+  var parts = (weekLabel||'').split('-W');
+  if(parts.length !== 2) return 0;
+  var year = parseInt(parts[0],10), week = parseInt(parts[1],10);
+  // Jan 4 is always in week 1 — find Monday of week 1, then add (week-1)*7
+  var jan4 = new Date(Date.UTC(year, 0, 4));
+  var jan4Dow = jan4.getUTCDay() || 7;
+  var mon1 = new Date(jan4); mon1.setUTCDate(jan4.getUTCDate() - (jan4Dow - 1));
+  var weekStart = new Date(mon1); weekStart.setUTCDate(mon1.getUTCDate() + (week - 1) * 7);
+  var weekEnd = new Date(weekStart); weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
+  var startStr = weekStart.toISOString().slice(0,10);
+  var endStr = weekEnd.toISOString().slice(0,10);
+  function count(pool){
+    if(!Array.isArray(pool)) return 0;
+    var n = 0;
+    pool.forEach(function(a){
+      if(!a || a.agentId !== agentId) return;
+      var d = (a.activationDate||'').slice(0,10);
+      if(d >= startStr && d <= endStr) n++;
+    });
+    return n;
+  }
+  var total = 0;
+  if(typeof GM_ACTIVATIONS !== 'undefined') total += count(GM_ACTIVATIONS);
+  if(typeof TC_ACTIVATIONS !== 'undefined') total += count(TC_ACTIVATIONS);
+  if(typeof AW_ACTIVATIONS !== 'undefined') total += count(AW_ACTIVATIONS);
+  if(typeof EX_ACTIVATIONS !== 'undefined') total += count(EX_ACTIVATIONS);
+  return total;
+}
+
+// ── Does agent X currently have any expired devices in inventory? ──
+function pointsAgentHasExpiredInventory(agentId){
+  function check(pool){
+    if(!Array.isArray(pool)) return false;
+    var now = Date.now();
+    return pool.some(function(d){
+      if(!d || d.assignedTo !== agentId) return false;
+      // Status is the cleanest signal; otherwise check expiry timestamps
+      if(d.status === 'expired' || d.status === 'lost') return true;
+      var exp = d.agentExpiresAt || d.tlExpiresAt || d.mmExpiresAt;
+      if(!exp) return false;
+      var expTs = new Date(exp).getTime();
+      if(isNaN(expTs)) return false;
+      // Expired = past expiration AND not yet activated
+      if(d.status === 'activated') return false;
+      return expTs < now;
+    });
+  }
+  if(typeof GM_INVENTORY !== 'undefined' && check(GM_INVENTORY)) return true;
+  if(typeof TC_INVENTORY !== 'undefined' && check(TC_INVENTORY)) return true;
+  if(typeof AW_INVENTORY !== 'undefined' && check(AW_INVENTORY)) return true;
+  if(typeof EX_INVENTORY !== 'undefined' && check(EX_INVENTORY)) return true;
+  // Also check unified inventory (Ship 3)
+  if(typeof INVENTORY_DEVICES !== 'undefined' && check(INVENTORY_DEVICES)) return true;
+  return false;
+}
+
+// ── Does agent X have ANY assigned (non-activated, non-sold) inventory? ──
+// Used so we don't penalize agents who have NO inventory at all (a brand
+// new hire shouldn't get -5 just because they have nothing assigned).
+function pointsAgentHasAnyInventory(agentId){
+  function check(pool){
+    if(!Array.isArray(pool)) return false;
+    return pool.some(function(d){
+      return d && d.assignedTo === agentId && d.status !== 'activated' && d.status !== 'sold' && d.status !== 'lost';
+    });
+  }
+  if(typeof GM_INVENTORY !== 'undefined' && check(GM_INVENTORY)) return true;
+  if(typeof TC_INVENTORY !== 'undefined' && check(TC_INVENTORY)) return true;
+  if(typeof AW_INVENTORY !== 'undefined' && check(AW_INVENTORY)) return true;
+  if(typeof EX_INVENTORY !== 'undefined' && check(EX_INVENTORY)) return true;
+  if(typeof INVENTORY_DEVICES !== 'undefined' && check(INVENTORY_DEVICES)) return true;
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// CALCULATORS — each one fires for a specific day. Idempotent.
+// ─────────────────────────────────────────────────────────────────────
+
+// Award sales points for the WEEK ending on Sunday at the given dateStr.
+// Only fires if dateStr is a Sunday.
+function pointsAwardSalesForWeek(weekLabel){
+  // Compute Sunday-of-week as the event date (so the May 1 start-date check
+  // is based on the week being graded, not whenever the batch happens to run).
+  var parts = (weekLabel||'').split('-W');
+  if(parts.length !== 2) return;
+  var year = parseInt(parts[0],10), week = parseInt(parts[1],10);
+  var jan4 = new Date(Date.UTC(year, 0, 4));
+  var jan4Dow = jan4.getUTCDay() || 7;
+  var mon1 = new Date(jan4); mon1.setUTCDate(jan4.getUTCDate() - (jan4Dow - 1));
+  var weekStart = new Date(mon1); weekStart.setUTCDate(mon1.getUTCDate() + (week - 1) * 7);
+  var weekEnd = new Date(weekStart); weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
+  var weekEndStr = weekEnd.toISOString().slice(0,10);
+  // For every Lifeline-program sales agent, count their week's activations
+  (DB.agents||[]).forEach(function(a){
+    if(!a.active) return;
+    if(['Field Agent','Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(a.role) < 0) return;
+    if(pointsAlreadyAwardedPeriod(a.id, weekLabel, 'sales-30+')) return;
+    var n = pointsAgentActivationsInWeek(a.id, weekLabel);
+    if(n < 30) return;  // Below threshold — no points (no penalty either)
+    var amt = 10 + (n - 30);  // +10 for hitting 30, +1 per additional
+    pointsAddEvent({
+      agentId: a.id,
+      amount: amt,
+      category: 'sales',
+      rule: 'sales-30+',
+      label: 'Weekly sales — '+n+' activations (10 base + '+(n-30)+' bonus)',
+      period: weekLabel,
+      date: weekEndStr   // Sunday of the week being graded — start-date floor check uses this
+    });
+  });
+}
+
+// Award audit points for the given date. Looks at ALL agents who should
+// have audited that day. Uses AUDIT_STATUS for "did they submit" and
+// looks at submittedAt timestamp for "before 9am CST" check.
+function pointsAwardAuditForDay(dateStr){
+  // For each Lifeline-program field-facing role, evaluate audit status
+  (DB.agents||[]).forEach(function(a){
+    if(!a.active) return;
+    var roles = ['Field Agent','Team Leader','Market Manager','Campaign Manager','IBO'];
+    if(roles.indexOf(a.role) < 0) return;
+    // Idempotency
+    if(pointsAlreadyAwarded(a.id, dateStr, 'audit-on-time')) return;
+    if(pointsAlreadyAwarded(a.id, dateStr, 'audit-late')) return;
+    if(pointsAlreadyAwarded(a.id, dateStr, 'audit-missed-w-sales')) return;
+    var status = AUDIT_STATUS[a.id];
+    var submitted = !!(status && status.submitted && status.date === dateStr);
+    if(submitted){
+      // On time = before 9am CST
+      var subTs = status.submittedAt;
+      var cstTime = _pointsIsoToCst(subTs);
+      var isOnTime = false;
+      if(cstTime){
+        var hr = cstTime.getUTCHours();
+        var mn = cstTime.getUTCMinutes();
+        isOnTime = (hr < 9) || (hr === 9 && mn === 0);  // strictly before 9:01am
+      }
+      if(isOnTime){
+        pointsAddEvent({ agentId:a.id, amount:+2, category:'audit', rule:'audit-on-time',
+          label:'Daily audit on time (before 9am CST)', date:dateStr });
+      } else {
+        pointsAddEvent({ agentId:a.id, amount:+1, category:'audit', rule:'audit-late',
+          label:'Daily audit submitted late', date:dateStr });
+      }
+    } else {
+      // Missed — penalty only if they had sales that day (otherwise no work, no penalty)
+      if(pointsAgentHadSalesOn(a.id, dateStr)){
+        pointsAddEvent({ agentId:a.id, amount:-2, category:'audit', rule:'audit-missed-w-sales',
+          label:'Missed daily audit on a day with sales', date:dateStr });
+      }
+      // Else: no event recorded (clean ledger)
+    }
+  });
+}
+
+// Award call points for a given date. For each scheduled call that hit
+// awardsPoints && was on this day, look at attendance.
+function pointsAwardCallsForDay(dateStr){
+  var dow = _pointsDowCst(dateStr);
+  CALL_SCHEDULES.forEach(function(sched){
+    if(!sched || !sched.active || !sched.awardsPoints) return;
+    if(sched.dayOfWeek !== dow) return;
+    var requiredRoles = (sched.requiredFor && sched.requiredFor.roles) || [];
+    var requiredProgs = (sched.requiredFor && sched.requiredFor.programs) || [];
+    (DB.agents||[]).forEach(function(a){
+      if(!a.active) return;
+      // Role filter
+      if(requiredRoles.length && requiredRoles.indexOf(a.role) < 0) return;
+      // Program filter (agent must have at least one matching program)
+      if(requiredProgs.length){
+        var aProgs = a.programs || (a.program ? [a.program] : []);
+        var hasMatch = aProgs.some(function(p){ return requiredProgs.indexOf(p) >= 0; });
+        if(!hasMatch) return;
+      }
+      var ruleOnTime = 'call-on-time-'+sched.id;
+      var ruleMissed = 'call-missed-'+sched.id;
+      if(pointsAlreadyAwarded(a.id, dateStr, ruleOnTime)) return;
+      if(pointsAlreadyAwarded(a.id, dateStr, ruleMissed)) return;
+      // Find attendance record for this agent + schedule + date
+      var attended = CALL_ATTENDANCE.find(function(r){
+        return r.scheduleId === sched.id && r.agentId === a.id && r.date === dateStr;
+      });
+      if(attended){
+        // Calculate on-time: minutesLate <= 5 counts as on time (small grace)
+        var onTime = (attended.minutesLate || 0) <= 5;
+        if(onTime){
+          pointsAddEvent({ agentId:a.id, amount:+1, category:'call', rule:ruleOnTime,
+            label:'Joined "'+sched.name+'" on time', date:dateStr, refId:attended.id });
+        } else {
+          // Late: per spec, only on-time = +1, missed = -1, no neutral. We
+          // treat 5min+ late as missed for purposes of points.
+          pointsAddEvent({ agentId:a.id, amount:-1, category:'call', rule:ruleMissed,
+            label:'Joined "'+sched.name+'" '+attended.minutesLate+'min late (counts as missed)', date:dateStr, refId:attended.id });
+        }
+      } else {
+        pointsAddEvent({ agentId:a.id, amount:-1, category:'call', rule:ruleMissed,
+          label:'Missed "'+sched.name+'"', date:dateStr });
+      }
+    });
+  });
+}
+
+// Award inventory points for the day.
+function pointsAwardInventoryForDay(dateStr){
+  (DB.agents||[]).forEach(function(a){
+    if(!a.active) return;
+    if(['Field Agent','Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(a.role) < 0) return;
+    if(pointsAlreadyAwarded(a.id, dateStr, 'inv-zero-expired')) return;
+    if(pointsAlreadyAwarded(a.id, dateStr, 'inv-has-expired')) return;
+    // Skip if they have no assigned inventory at all
+    if(!pointsAgentHasAnyInventory(a.id)) return;
+    if(pointsAgentHasExpiredInventory(a.id)){
+      pointsAddEvent({ agentId:a.id, amount:-5, category:'inventory', rule:'inv-has-expired',
+        label:'Has expired devices in inventory', date:dateStr });
+    } else {
+      pointsAddEvent({ agentId:a.id, amount:+3, category:'inventory', rule:'inv-zero-expired',
+        label:'Zero expired devices', date:dateStr });
+    }
+  });
+}
+
+// ── DAILY BATCH ──
+// Process every day from POINTS_LAST_BATCH_DATE+1 up through "yesterday"
+// (CST). Won't run more than once per day.
+function pointsRunDailyBatch(){
+  try {
+    var yesterday = _pointsYesterdayCst();
+    var lastDone = POINTS_LAST_BATCH_DATE || '';
+    // If we've already processed yesterday or later, nothing to do
+    if(lastDone >= yesterday) return { ran:0, skipped:'already current' };
+
+    // Build list of days to process
+    var startDateStr = lastDone ? _pointsAddDays(lastDone, 1) : POINTS_START_DATE;
+    if(startDateStr < POINTS_START_DATE) startDateStr = POINTS_START_DATE;
+
+    var processed = 0;
+    var weeksProcessed = {};
+    var d = startDateStr;
+    while(d <= yesterday){
+      pointsAwardAuditForDay(d);
+      pointsAwardCallsForDay(d);
+      pointsAwardInventoryForDay(d);
+      // If d is a Sunday, also award sales for the week ending on this Sunday
+      if(_pointsDowCst(d) === 0){
+        var wk = _pointsWeekLabel(d);
+        if(!weeksProcessed[wk]){
+          pointsAwardSalesForWeek(wk);
+          weeksProcessed[wk] = true;
+        }
+      }
+      processed++;
+      d = _pointsAddDays(d, 1);
+    }
+    POINTS_LAST_BATCH_DATE = yesterday;
+    POINTS_LAST_BATCH_AT = new Date().toISOString();
+    saveInventory();
+    console.log('[pointsRunDailyBatch] processed '+processed+' day(s) ending '+yesterday);
+    return { ran: processed, throughDate: yesterday };
+  } catch(e){
+    console.error('[pointsRunDailyBatch] failed:', e);
+    return { ran:0, error: String(e) };
+  }
+}
+
+function _pointsAddDays(dateStr, n){
+  var d = new Date(dateStr + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0,10);
+}
+
+// ── Auto-run trigger: called on every login. If it's after 9am CST and
+//    we haven't processed yesterday yet, run the batch. ──
+function pointsMaybeAutoRun(){
+  try {
+    var hr = _pointsCstHour();
+    if(hr < 9) return;  // Before 9am CST — wait
+    var yesterday = _pointsYesterdayCst();
+    if(POINTS_LAST_BATCH_DATE >= yesterday) return;  // Already done
+    var result = pointsRunDailyBatch();
+    if(result && result.ran > 0){
+      console.log('[pointsMaybeAutoRun] auto-batch processed '+result.ran+' day(s).');
+    }
+  } catch(e){ console.warn('[pointsMaybeAutoRun] failed safely:', e); }
+}
+
+// ── Manual trigger for the Owner (from the points dashboard) ──
+function pointsRunBatchNow(){
+  if(!isOwner(DB.current)){ alert('Owner only.'); return; }
+  if(!confirm('Run the daily points batch now?\n\nThis processes all unprocessed days through yesterday. Already-processed days are skipped (idempotent).')) return;
+  var result = pointsRunDailyBatch();
+  if(result.ran > 0){
+    alert('✓ Processed '+result.ran+' day(s) through '+result.throughDate+'.\n\nReload the page to see updated balances.');
+  } else if(result.skipped){
+    alert('Already current — no days to process.');
+  } else if(result.error){
+    alert('Batch failed: '+result.error);
+  }
+  if(typeof renderCurrentPanel === 'function'){
+    setTimeout(function(){ gotoPanel(window._currentPanelId || 'my-points'); }, 500);
+  }
+}
+
+// ── ATTENDANCE LOGGING (called from joinCall hook) ──
+// Match the joining room name to a scheduled call. If we find a match
+// and we're within ±30 minutes of the scheduled start, log attendance.
+function pointsLogCallJoin(roomId, roomName, user){
+  if(!user || !user.id) return;
+  var nameLc = String(roomName||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+  // Look for a scheduled call whose name matches
+  var sched = CALL_SCHEDULES.find(function(s){
+    if(!s || !s.active) return false;
+    var sNameLc = String(s.name||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    return sNameLc === nameLc || nameLc.indexOf(sNameLc) >= 0 || sNameLc.indexOf(nameLc) >= 0;
+  });
+  // Also check by room id keywords (e.g. "national" room → National Call)
+  if(!sched){
+    var idLc = String(roomId||'').toLowerCase();
+    if(idLc.indexOf('national') >= 0){
+      sched = CALL_SCHEDULES.find(function(s){
+        return s.active && /national/i.test(s.name);
+      });
+    }
+  }
+  if(!sched) return;  // Not a scheduled call — no attendance log
+  var now = _pointsCstNow();
+  var dateStr = _pointsCstDateStr(now);
+  // Only log if it's the right day of week (otherwise this isn't the
+  // scheduled occurrence — could be a manual room with same name)
+  if(_pointsDowCst(dateStr) !== sched.dayOfWeek) return;
+  // Calculate minutesLate
+  var schedHour = parseInt((sched.timeCST||'09:00').split(':')[0],10) || 0;
+  var schedMin  = parseInt((sched.timeCST||'09:00').split(':')[1],10) || 0;
+  var nowHour = now.getUTCHours();
+  var nowMin  = now.getUTCMinutes();
+  var minutesLate = (nowHour - schedHour) * 60 + (nowMin - schedMin);
+  // Within ±60 min window — anything outside is treated as a non-scheduled join
+  if(Math.abs(minutesLate) > 60) return;
+  // Idempotency: don't log twice for same agent+sched+date
+  var existing = CALL_ATTENDANCE.find(function(r){
+    return r.scheduleId === sched.id && r.agentId === user.id && r.date === dateStr;
+  });
+  if(existing){
+    // Update only if this join is earlier (use the earliest)
+    if(minutesLate < (existing.minutesLate || 0)){
+      existing.minutesLate = minutesLate;
+      existing.joinedAt = new Date().toISOString();
+      saveInventory();
+    }
+    return;
+  }
+  CALL_ATTENDANCE.push({
+    id: CALL_ATTENDANCE_NEXT_ID++,
+    scheduleId: sched.id,
+    agentId: user.id,
+    agentName: user.name,
+    joinedAt: new Date().toISOString(),
+    date: dateStr,
+    minutesLate: minutesLate,
+    graded: false
+  });
+  saveInventory();
+  console.log('[pointsLogCallJoin] logged attendance: '+user.name+' joined "'+sched.name+'" '+(minutesLate<=0?(Math.abs(minutesLate)+'min early'):(minutesLate+'min late')));
+}
+
+// ── Manual point adjustment (Owner only) ──
+function pointsAdjust(agentId, amount, reason){
+  if(!isOwner(DB.current)){ alert('Owner only.'); return null; }
+  var n = parseInt(amount,10);
+  if(isNaN(n) || n === 0){ alert('Enter a non-zero number.'); return null; }
+  var entry = pointsAddEvent({
+    agentId: agentId,
+    amount: n,
+    category: 'adjust',
+    rule: 'manual-adjust',
+    label: 'Manual adjustment by Owner: '+(reason||'(no reason given)'),
+    date: _pointsCstDateStr(),
+    notes: reason || ''
+  });
+  if(entry){
+    saveInventory();
+    return entry;
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// PERMISSION HELPERS (visibility per Q2 = self + team)
+// ─────────────────────────────────────────────────────────────────────
+function pointsCanViewAgent(viewer, agentId){
+  if(!viewer) return false;
+  if(isOwner(viewer)) return true;
+  if(viewer.id === agentId) return true;
+  // TLs see their FAs; MMs see their TLs+FAs; CMs see their MMs+TLs+FAs
+  // We use the existing reportsTo / direct manager fields.
+  var subject = (DB.agents||[]).find(function(a){ return a.id === agentId; });
+  if(!subject) return false;
+  // Check if viewer is in subject's chain of command
+  if(subject.teamLeaderId === viewer.id) return true;
+  if(subject.marketManagerId === viewer.id) return true;
+  if(subject.campaignManagerId === viewer.id) return true;
+  // For CMs, also check market-based ownership (Ship A8 markets)
+  if(viewer.role === 'Campaign Manager' && Array.isArray(viewer.iboMarkets) && subject.team){
+    if(viewer.iboMarkets.indexOf(subject.team) >= 0) return true;
+  }
+  return false;
+}
+
+// Get the list of agent IDs that the viewer can see points for
+function pointsAgentsViewableBy(viewer){
+  if(!viewer) return [];
+  if(isOwner(viewer)) return (DB.agents||[]).filter(function(a){ return a.active; }).map(function(a){ return a.id; });
+  // Self + people who report (transitively) to viewer
+  var visible = [viewer.id];
+  (DB.agents||[]).forEach(function(a){
+    if(!a.active) return;
+    if(a.id === viewer.id) return;
+    if(pointsCanViewAgent(viewer, a.id)) visible.push(a.id);
+  });
+  return visible;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// PANELS
+// ─────────────────────────────────────────────────────────────────────
+
+function panelMyPoints(){
+  var u = DB.current;
+  if(!u) return panelHeader('🏆 My Points') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Sign in to view your points.</div></div>';
+  var bal = pointsBalance(u.id);
+  var myEvents = POINTS_LEDGER.filter(function(e){ return e.agentId === u.id; }).slice().reverse().slice(0, 50);
+  var h = panelHeader('🏆 My Points');
+
+  // Big balance card
+  h += '<div style="background:linear-gradient(135deg,#003594,#0891b2);color:white;border-radius:12px;padding:24px;margin-bottom:20px;text-align:center">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;letter-spacing:2px;text-transform:uppercase;opacity:.85">Current Balance</div>';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:4.5rem;line-height:1;margin:6px 0;letter-spacing:2px">'+bal+'</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;opacity:.9">'+(bal===1?'point':'points')+' available to spend</div>';
+  // CTA to redemption (Ship C will wire this)
+  h += '<div style="margin-top:14px"><button onclick="gotoPanel(\'store\')" style="background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:2px;text-transform:uppercase;padding:10px 22px;border-radius:6px;cursor:pointer;font-weight:700">🛒 Redeem in Store →</button></div>';
+  h += '</div>';
+
+  // How it works
+  h += '<div class="bo-card" style="margin-bottom:20px"><div class="bo-card-head"><div class="bo-card-title">How points work</div></div><div style="padding:16px 20px;font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown);line-height:1.7">';
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
+  h += '<div><strong>📊 Sales (weekly):</strong> 30+ activations = +10 pts. Each activation above 30 = +1 each.</div>';
+  h += '<div><strong>📸 Daily Audit:</strong> Before 9am CST = +2. After 9am = +1. Missed (with sales) = −2.</div>';
+  h += '<div><strong>📞 National Call (Mon 9am):</strong> On time = +1. Missed = −1.</div>';
+  h += '<div><strong>📦 Inventory:</strong> Zero expired devices = +3. Has expired = −5.</div>';
+  h += '</div>';
+  h += '<div style="margin-top:10px;font-size:.72rem;color:var(--muted);font-style:italic">Points run nightly after 9am CST. Balance never goes below zero.</div>';
+  h += '</div></div>';
+
+  // Recent activity
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Recent activity</div></div>';
+  if(!myEvents.length){
+    h += '<div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No activity yet. Points start accruing on May 1, 2026.</div>';
+  } else {
+    h += '<div style="padding:14px 20px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.84rem">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border)"><th style="text-align:left;padding:7px 6px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Date</th><th style="text-align:left;padding:7px 6px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Event</th><th style="text-align:right;padding:7px 6px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Points</th></tr></thead><tbody>';
+    myEvents.forEach(function(e){
+      var color = e.amount > 0 ? '#16a34a' : (e.amount < 0 ? '#dc2626' : 'var(--muted)');
+      var sign = e.amount > 0 ? '+' : '';
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:7px 6px;font-size:.78rem">'+_escapeHtml(e.date||'—')+'</td>';
+      h += '<td style="padding:7px 6px">'+_escapeHtml(e.label||e.rule||'—')+'</td>';
+      h += '<td style="padding:7px 6px;text-align:right;color:'+color+';font-weight:700">'+sign+e.amount+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+function panelTeamPoints(){
+  var u = DB.current;
+  if(!u) return panelHeader('🏆 Team Points') + '<div class="bo-card"><div style="padding:40px;text-align:center">Sign in.</div></div>';
+  var visibleIds = pointsAgentsViewableBy(u);
+  if(visibleIds.length <= 1){
+    return panelHeader('🏆 Team Points') + '<div class="bo-card"><div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No team members under you yet.</div></div>';
+  }
+  var h = panelHeader('🏆 Team Points Leaderboard');
+  // Build leaderboard rows
+  var rows = visibleIds.map(function(id){
+    var a = (DB.agents||[]).find(function(x){ return x.id === id; });
+    if(!a) return null;
+    return { id:id, name:a.name, role:a.role, balance:pointsBalance(id) };
+  }).filter(Boolean);
+  rows.sort(function(a,b){ return b.balance - a.balance; });
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Standings ('+rows.length+')</div></div>';
+  h += '<div style="padding:14px 20px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+  h += '<thead><tr style="border-bottom:2px solid var(--border)"><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Rank</th><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Name</th><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Role</th><th style="text-align:right;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Points</th></tr></thead><tbody>';
+  rows.forEach(function(r, idx){
+    var medal = idx===0?'🥇':(idx===1?'🥈':(idx===2?'🥉':'#'+(idx+1)));
+    var isMe = r.id === u.id;
+    h += '<tr style="border-bottom:1px solid var(--border);'+(isMe?'background:rgba(0,53,148,.05)':'')+'">';
+    h += '<td style="padding:8px;font-size:.95rem">'+medal+'</td>';
+    h += '<td style="padding:8px;font-weight:'+(isMe?'700':'400')+'">'+_escapeHtml(r.name)+(isMe?' <span style="font-size:.65rem;color:var(--blue);letter-spacing:1px">YOU</span>':'')+'</td>';
+    h += '<td style="padding:8px;font-size:.78rem;color:var(--muted)">'+_escapeHtml(r.role||'—')+'</td>';
+    h += '<td style="padding:8px;text-align:right;font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--blue)">'+r.balance+'</td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+function panelOwnerPoints(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('🏆 Points Dashboard') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">🔒 Owner only.</div></div>';
+  }
+  var h = panelHeader('🏆 Points Dashboard (Owner)');
+  // Action row
+  h += '<div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center">';
+  h += '<button onclick="pointsRunBatchNow()" class="btn-fire" style="padding:10px 18px;background:#0891b2;border-color:#0891b2">⚡ Run batch now</button>';
+  h += '<button onclick="gotoPanel(\'call-schedule-admin\')" style="padding:10px 18px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">📞 Call Schedule</button>';
+  h += '<div style="margin-left:auto;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted)">Last batch: <strong style="color:var(--brown)">'+(POINTS_LAST_BATCH_DATE||'never')+'</strong></div>';
+  h += '</div>';
+  // Top stats
+  var totalEvents = POINTS_LEDGER.length;
+  var totalAwarded = POINTS_LEDGER.filter(function(e){return e.amount>0;}).reduce(function(s,e){return s+e.amount;},0);
+  var totalDeducted = POINTS_LEDGER.filter(function(e){return e.amount<0;}).reduce(function(s,e){return s+Math.abs(e.amount);},0);
+  h += '<div class="bo-stats" style="margin-bottom:20px">';
+  h += '<div class="bo-stat"><div class="bs-label">Ledger Events</div><div class="bs-val" style="color:var(--blue)">'+totalEvents+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Total Awarded</div><div class="bs-val" style="color:#16a34a">+'+totalAwarded+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Total Deducted</div><div class="bs-val" style="color:#dc2626">−'+totalDeducted+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Active Balances</div><div class="bs-val" style="color:var(--brown)">'+POINTS_BALANCES.filter(function(b){return b.total>0;}).length+'</div></div>';
+  h += '</div>';
+  // All-agent leaderboard
+  var rows = (DB.agents||[]).filter(function(a){return a.active;}).map(function(a){
+    return { id:a.id, name:a.name, role:a.role, balance:pointsBalance(a.id) };
+  });
+  rows.sort(function(a,b){ return b.balance - a.balance; });
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">All agents</div></div>';
+  h += '<div style="padding:14px 20px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+  h += '<thead><tr style="border-bottom:2px solid var(--border)"><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Rank</th><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Name</th><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Role</th><th style="text-align:right;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Points</th><th style="text-align:right;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Adjust</th></tr></thead><tbody>';
+  rows.forEach(function(r, idx){
+    h += '<tr style="border-bottom:1px solid var(--border)">';
+    h += '<td style="padding:8px;font-size:.85rem;color:var(--muted)">'+(idx+1)+'</td>';
+    h += '<td style="padding:8px"><strong>'+_escapeHtml(r.name)+'</strong></td>';
+    h += '<td style="padding:8px;font-size:.78rem;color:var(--muted)">'+_escapeHtml(r.role||'—')+'</td>';
+    h += '<td style="padding:8px;text-align:right;font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--blue)">'+r.balance+'</td>';
+    h += '<td style="padding:8px;text-align:right"><button onclick="pointsPromptAdjust('+r.id+')" style="background:none;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:4px 10px;border-radius:4px;cursor:pointer">Adjust</button></td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+function pointsPromptAdjust(agentId){
+  var a = (DB.agents||[]).find(function(x){ return x.id === agentId; });
+  if(!a){ alert('Agent not found.'); return; }
+  var amtStr = prompt('Adjust points for '+a.name+' (current: '+pointsBalance(agentId)+').\n\nEnter a signed integer (e.g. +5 or -10):');
+  if(amtStr === null) return;
+  var amt = parseInt(amtStr,10);
+  if(isNaN(amt) || amt === 0){ alert('Enter a non-zero number.'); return; }
+  var reason = prompt('Reason for the adjustment? (will be logged on '+a.name+'\'s ledger)');
+  if(reason === null) return;
+  var entry = pointsAdjust(agentId, amt, reason);
+  if(entry){
+    alert('✓ Adjusted by '+(amt>0?'+':'')+amt+'. New balance: '+pointsBalance(agentId));
+    if(typeof gotoPanel === 'function') gotoPanel('owner-points');
+  }
+}
+
+// ── CALL SCHEDULE ADMIN (Owner) ──
+function panelCallScheduleAdmin(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('📞 Call Schedule') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">🔒 Owner only.</div></div>';
+  }
+  var h = panelHeader('📞 Call Schedule Admin');
+  h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += 'Calls marked "Awards Points" automatically award +1 (on time) or −1 (missed) to agents matching the role/program filters. Wed/Fri team calls can exist here without awarding points if you toggle that off.';
+  h += '</div>';
+  h += '<div style="margin-bottom:14px"><button onclick="callScheduleAdd()" class="btn-fire" style="padding:10px 18px">+ Add Schedule</button></div>';
+  h += '<div class="bo-card"><div style="padding:14px 20px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.84rem">';
+  h += '<thead><tr style="border-bottom:2px solid var(--border)"><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Name</th><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Day</th><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Time CST</th><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Awards</th><th style="text-align:left;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">For</th><th style="text-align:right;padding:8px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Active</th><th></th></tr></thead><tbody>';
+  var dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  CALL_SCHEDULES.forEach(function(s){
+    h += '<tr style="border-bottom:1px solid var(--border)">';
+    h += '<td style="padding:8px"><strong>'+_escapeHtml(s.name||'—')+'</strong></td>';
+    h += '<td style="padding:8px">'+dayNames[s.dayOfWeek]+'</td>';
+    h += '<td style="padding:8px;font-family:monospace">'+_escapeHtml(s.timeCST||'—')+'</td>';
+    h += '<td style="padding:8px">'+(s.awardsPoints?'<span style="color:#16a34a;font-weight:700">✓ Yes</span>':'<span style="color:var(--muted)">No</span>')+'</td>';
+    var forStr = ((s.requiredFor||{}).programs||[]).join(', ') + (s.requiredFor && s.requiredFor.roles && s.requiredFor.roles.length ? ' — '+(s.requiredFor.roles.join(', ')) : '');
+    h += '<td style="padding:8px;font-size:.74rem;color:var(--muted)">'+_escapeHtml(forStr||'—')+'</td>';
+    h += '<td style="padding:8px;text-align:right">'+(s.active?'✅':'⏸')+'</td>';
+    h += '<td style="padding:8px;text-align:right"><button onclick="callScheduleEdit('+s.id+')" style="background:none;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:4px 10px;border-radius:4px;cursor:pointer;margin-right:4px">Edit</button>';
+    h += '<button onclick="callScheduleDelete('+s.id+')" style="background:none;border:1px solid #dc2626;color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:4px 10px;border-radius:4px;cursor:pointer">Del</button></td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+function callScheduleAdd(){
+  var name = prompt('Name (e.g. "National Lifeline Call"):');
+  if(!name) return;
+  var dayStr = prompt('Day of week (0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat):');
+  var dow = parseInt(dayStr,10);
+  if(isNaN(dow) || dow < 0 || dow > 6){ alert('Invalid day.'); return; }
+  var time = prompt('Time in CST (HH:MM 24-hour, e.g. 09:00):');
+  if(!/^\d{2}:\d{2}$/.test(time||'')){ alert('Invalid time format.'); return; }
+  var awards = confirm('Awards points? (OK = yes, Cancel = no)');
+  CALL_SCHEDULES.push({
+    id: CALL_SCHEDULE_NEXT_ID++,
+    name: name,
+    dayOfWeek: dow,
+    timeCST: time,
+    durationMin: 60,
+    awardsPoints: awards,
+    requiredFor: { programs: ['Lifeline'], roles: ['Field Agent','Team Leader','Market Manager','Campaign Manager'] },
+    active: true
+  });
+  saveInventory();
+  if(typeof gotoPanel === 'function') gotoPanel('call-schedule-admin');
+}
+
+function callScheduleEdit(id){
+  var s = CALL_SCHEDULES.find(function(x){return x.id===id;});
+  if(!s) return;
+  var name = prompt('Name:', s.name);
+  if(name === null) return;
+  s.name = name;
+  var time = prompt('Time CST (HH:MM):', s.timeCST);
+  if(time && /^\d{2}:\d{2}$/.test(time)) s.timeCST = time;
+  s.awardsPoints = confirm('Awards points? (OK = yes, Cancel = no)\n\nCurrent: '+(s.awardsPoints?'YES':'NO'));
+  s.active = confirm('Active? (OK = yes, Cancel = no)\n\nCurrent: '+(s.active?'YES':'NO'));
+  saveInventory();
+  if(typeof gotoPanel === 'function') gotoPanel('call-schedule-admin');
+}
+
+function callScheduleDelete(id){
+  var s = CALL_SCHEDULES.find(function(x){return x.id===id;});
+  if(!s) return;
+  if(!confirm('Delete schedule "'+s.name+'"?\n\nExisting attendance records and ledger events are kept; only the schedule is removed.')) return;
+  CALL_SCHEDULES = CALL_SCHEDULES.filter(function(x){ return x.id !== id; });
+  saveInventory();
+  if(typeof gotoPanel === 'function') gotoPanel('call-schedule-admin');
+}
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP B
+// ════════════════════════════════════════════════════════════════════════
+
 // Update help-text when AW Override Style dropdown changes.
 function aaAWModelChanged(){
   var sel = document.getElementById('aaAWModel');
@@ -32550,6 +33471,16 @@ async function joinCall(chId,chName){
     return;
   }
   console.log('[joinCall] launching as id='+u.id+' name="'+u.name+'" room='+chId);
+  // ── Ship B: log attendance for any scheduled call this matches ──
+  // We match scheduled calls by name (case-insensitive, partial). This
+  // covers "national-call", "national-lifeline-call", "national" → the
+  // National Lifeline Call schedule. Joining a non-scheduled room (e.g. a
+  // user-created huddle) is a no-op for points.
+  try {
+    if(typeof pointsLogCallJoin === 'function'){
+      pointsLogCallJoin(chId, chName, u);
+    }
+  } catch(e){ console.warn('[joinCall] pointsLogCallJoin failed safely:', e); }
   // ── UNIFIED WAITING ROOM ──
   // Per Calvin's request (2026-04-21), every team call should show our
   // custom waiting room first — music, participant list, branding — not
