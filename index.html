@@ -8526,6 +8526,9 @@ function canAccess(u, area){
     // My Orders — Square purchases history (any active user)
     case 'my-orders':
       return !!u.active;
+    // Waiting Room Music — Owner only
+    case 'wr-music':
+      return isOwner(u);
 
     // ── TL and above ──
     case 'myteam':           return isMgr || isTL;
@@ -8676,6 +8679,11 @@ function saveInventory(){
     // Square purchases
     localStorage.setItem('wmam_purchases',            JSON.stringify(PURCHASES));
     localStorage.setItem('wmam_purchase_nextid',      String(PURCHASE_NEXT_ID));
+    // Waiting room music — Owner-controlled, syncs across devices via Supabase
+    localStorage.setItem('wmam_wr_mode',              WR_MODE);
+    localStorage.setItem('wmam_wr_stream_id',         WR_STREAM_ID || '');
+    localStorage.setItem('wmam_wr_stream_url',        WR_STREAM_URL || '');
+    localStorage.setItem('wmam_wr_stream_name',       WR_STREAM_NAME || '');
     // Phase 3 — Operating costs
     localStorage.setItem('wmam_operating_costs',      JSON.stringify(OPERATING_COSTS));
     localStorage.setItem('wmam_op_cost_nextid',       String(OP_COST_NEXT_ID));
@@ -8810,6 +8818,11 @@ function loadInventory(){
     // Square purchases
     var pu=localStorage.getItem('wmam_purchases');             if(pu) PURCHASES=JSON.parse(pu)||[];
     var pun=localStorage.getItem('wmam_purchase_nextid');      if(pun) PURCHASE_NEXT_ID=parseInt(pun)||1;
+    // Waiting room music settings
+    var wrm = localStorage.getItem('wmam_wr_mode');            if(wrm === 'mp3' || wrm === 'stream') WR_MODE = wrm;
+    var wrsi = localStorage.getItem('wmam_wr_stream_id');      if(wrsi) WR_STREAM_ID = wrsi;
+    var wrsu = localStorage.getItem('wmam_wr_stream_url');     if(wrsu) WR_STREAM_URL = wrsu;
+    var wrsn = localStorage.getItem('wmam_wr_stream_name');    if(wrsn) WR_STREAM_NAME = wrsn;
     // ── One-time seed: Gen Mobile Starter Kit Replacement pay-link ──
     // Calvin already created the pay-link in Square; this attaches it to
     // the matching Store item (if it exists and has no link yet) so he
@@ -14750,6 +14763,25 @@ function doLogin(){
   setTimeout(function(){ try { if(typeof pointsMaybeAutoRun === 'function') pointsMaybeAutoRun(); } catch(e){} }, 1500);
   // Scheduled call reminders — start the periodic check
   setTimeout(function(){ try { if(typeof callReminderStart === 'function') callReminderStart(); } catch(e){} }, 3000);
+  // Pull waiting-room music settings from Supabase so all agents see Owner's choice
+  setTimeout(function(){
+    try {
+      if(typeof supaClient !== 'undefined' && supaClient){
+        supaClient.from('app_settings').select('value').eq('key','wr_music').maybeSingle().then(function(r){
+          if(r && r.data && r.data.value){
+            try {
+              var p = JSON.parse(r.data.value);
+              if(p.mode === 'mp3' || p.mode === 'stream') WR_MODE = p.mode;
+              if(typeof p.streamId === 'string') WR_STREAM_ID = p.streamId;
+              if(typeof p.streamUrl === 'string') WR_STREAM_URL = p.streamUrl;
+              if(typeof p.streamName === 'string') WR_STREAM_NAME = p.streamName;
+              console.log('[wr-music] Synced from Supabase: mode='+WR_MODE+', station='+WR_STREAM_ID);
+            } catch(e){ console.warn('[wr-music] parse failed:', e); }
+          }
+        }).catch(function(){});
+      }
+    } catch(e){}
+  }, 2500);
   // POST-LOGIN LANDING PAGE ROUTING
   // Owner → Owner Control (their actual home)
   // Everyone else → panelBO (the main back-office dashboard)
@@ -15366,6 +15398,7 @@ function buildNav(u){
       +(canAccess(u,'goal-settings') ? boDropBtn('goal-settings','🎯 Goals')         : '')
       +(canAccess(u,'form-builder')  ? boDropBtn('form-builder','🔧 Form Builder')   : '')
       +(canAccess(u,'campaign-docs') ? boDropBtn('campaign-docs','📄 Campaign Docs') : '')
+      +(canAccess(u,'wr-music')      ? boDropBtn('wr-music','🎵 Waiting Room Music') : '')
       +(canAccess(u,'alerts')        ? boDropBtn('alerts','🚨 Alerts')               : '');
     h += boGroupDrop('dd-manage','⚙️ Manage ▾', manageDrop);
   }
@@ -16632,6 +16665,7 @@ function gotoPanel(id, params){
     'my-payroll':panelMyPayroll,
     'payroll-view-beta':panelPayrollViewBeta,
     'my-orders':panelMyOrders,
+    'wr-music':panelWrMusic,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -36293,6 +36327,177 @@ function panelMyOrders(){
 //  END SQUARE BUY
 // ════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════
+//  WAITING ROOM MUSIC — OWNER PANEL
+//
+//  Owner picks: MP3 mode (existing playlist) OR Stream mode (live radio).
+//  Pre-vetted free station list + custom URL field. Choice persists to
+//  localStorage AND Supabase so all agents pick up the new setting on
+//  their next page-load.
+//
+//  Sync model: This is "Owner makes the choice, others read it on boot."
+//  No real-time push for now (would require Supabase realtime channel).
+//  Acceptable trade-off because changes are infrequent.
+// ════════════════════════════════════════════════════════════════════════
+function panelWrMusic(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('🔒 Waiting Room Music') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div></div>';
+  }
+  var h = panelHeader('🎵 Waiting Room Music');
+  h += '<div style="background:rgba(8,145,178,.07);border:1px solid rgba(8,145,178,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>Set what plays while agents wait for a call.</strong> Two modes: curated <strong>MP3 playlist</strong> (5 chill tracks, agents can pause/skip), or <strong>live radio stream</strong> (everyone hears the same thing in sync, no skipping). Stream mode is great for keeping the team vibe going during longer waits.';
+  h += '</div>';
+
+  // Current state
+  var resolved = wrResolveStream();
+  var statusText, statusFg;
+  if(WR_MODE === 'stream' && resolved){
+    statusText = '🔴 LIVE STREAM — ' + resolved.name;
+    statusFg = '#dc2626';
+  } else if(WR_MODE === 'stream' && !resolved){
+    statusText = '⚠ Stream mode set but no station picked';
+    statusFg = '#D97706';
+  } else {
+    statusText = '🎵 MP3 PLAYLIST — ' + WR_PLAYLIST.length + ' tracks';
+    statusFg = '#0891b2';
+  }
+  h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid '+statusFg+'"><div class="bo-card-head"><div class="bo-card-title">Currently active</div></div>';
+  h += '<div style="padding:14px 20px;font-family:Barlow Condensed,sans-serif"><div style="font-size:1.05rem;color:'+statusFg+';font-weight:700">'+statusText+'</div>';
+  h += '<div style="font-size:.7rem;color:var(--muted);margin-top:4px">Changes apply on each agent\'s next page-load. They don\'t need to do anything.</div></div></div>';
+
+  // Mode picker
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">1. Pick mode</div></div>';
+  h += '<div style="padding:18px 20px;display:flex;gap:14px;flex-wrap:wrap">';
+  // MP3 card
+  h += '<label style="flex:1;min-width:240px;cursor:pointer;display:block">';
+  h += '<input type="radio" name="wrModeRadio" value="mp3" '+(WR_MODE==='mp3'?'checked':'')+' style="display:none" onchange="wrmShowConfig(this.value)">';
+  h += '<div style="padding:18px;border:2px solid '+(WR_MODE==='mp3'?'#0891b2':'var(--sand)')+';border-radius:8px;background:'+(WR_MODE==='mp3'?'rgba(8,145,178,.05)':'white')+';transition:all .2s">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--brown);letter-spacing:1.5px;margin-bottom:6px">🎵 MP3 PLAYLIST</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.5">Curated playlist of 5 chill tracks. Each agent can pause/skip independently. Ideal for short waits.</div>';
+  h += '</div></label>';
+  // Stream card
+  h += '<label style="flex:1;min-width:240px;cursor:pointer;display:block">';
+  h += '<input type="radio" name="wrModeRadio" value="stream" '+(WR_MODE==='stream'?'checked':'')+' style="display:none" onchange="wrmShowConfig(this.value)">';
+  h += '<div style="padding:18px;border:2px solid '+(WR_MODE==='stream'?'#dc2626':'var(--sand)')+';border-radius:8px;background:'+(WR_MODE==='stream'?'rgba(220,38,38,.05)':'white')+';transition:all .2s">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--brown);letter-spacing:1.5px;margin-bottom:6px">🔴 LIVE RADIO STREAM</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.5">Everyone hears the same live stream in sync. No skipping. Plays whatever the station\'s DJ chose. Auto-starts when agent joins call.</div>';
+  h += '</div></label>';
+  h += '</div></div>';
+
+  // Stream config (only shown in stream mode)
+  h += '<div id="wrmStreamConfig" class="bo-card" style="margin-bottom:18px;display:'+(WR_MODE==='stream'?'block':'none')+'"><div class="bo-card-head"><div class="bo-card-title">2. Pick station</div></div>';
+  h += '<div style="padding:18px 20px;font-family:Barlow Condensed,sans-serif">';
+  h += '<div style="font-size:.74rem;color:var(--muted);margin-bottom:12px;line-height:1.6">Pre-vetted free stations from <strong>SomaFM</strong> (listener-supported, commercial-free, all genres). Or paste any public stream URL below.</div>';
+  // Preset stations
+  h += '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:18px">';
+  WR_STATIONS.forEach(function(s){
+    var isPicked = (WR_STREAM_ID === s.id);
+    h += '<label style="display:block;cursor:pointer">';
+    h += '<input type="radio" name="wrmStation" value="'+_escapeAttr(s.id)+'" '+(isPicked?'checked':'')+' onchange="wrmStationPicked(this.value)" style="display:none">';
+    h += '<div style="padding:12px 14px;border:2px solid '+(isPicked?'#0891b2':'var(--sand)')+';border-radius:6px;background:'+(isPicked?'rgba(8,145,178,.04)':'white')+';display:flex;align-items:center;gap:10px;transition:all .2s">';
+    h += '<div style="flex:1"><div style="font-weight:700;color:var(--brown);font-size:.92rem">'+(isPicked?'🔴 ':'')+_escapeHtml(s.name)+'</div>';
+    h += '<div style="font-size:.72rem;color:var(--muted);margin-top:2px">'+_escapeHtml(s.desc)+'</div></div>';
+    if(isPicked) h += '<span style="background:#dc2626;color:white;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 9px;border-radius:10px;font-weight:700">LIVE</span>';
+    h += '</div></label>';
+  });
+  h += '</div>';
+  // Custom URL
+  h += '<div style="border-top:1px solid var(--sand);padding-top:14px">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.85rem;letter-spacing:1.5px;color:var(--brown);margin-bottom:8px">Or use a custom stream URL</div>';
+  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Stream URL (must be public, mp3/aac/ogg)</label>';
+  h += '<input id="wrmCustomUrl" type="url" class="f-input" placeholder="https://..." value="'+_escapeAttr(WR_STREAM_URL)+'" style="font-family:monospace;font-size:.78rem"></div>';
+  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Display name (what agents see)</label>';
+  h += '<input id="wrmCustomName" type="text" class="f-input" placeholder="e.g. KEXP Seattle" value="'+_escapeAttr(WR_STREAM_NAME)+'"></div>';
+  h += '<button onclick="wrmSaveCustom()" style="padding:9px 18px;background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">Use this URL</button>';
+  h += '</div>';
+  h += '</div></div>';
+
+  // Save + test
+  h += '<div class="bo-card"><div style="padding:18px 20px;display:flex;gap:10px;flex-wrap:wrap">';
+  h += '<button onclick="wrmSave()" class="btn-fire" style="padding:11px 22px">💾 Save settings</button>';
+  if(WR_MODE === 'stream'){
+    h += '<button onclick="wrmTestStream()" style="padding:11px 22px;background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer;font-weight:700">🔊 Test in browser</button>';
+  }
+  h += '</div></div>';
+  return h;
+}
+
+function wrmShowConfig(mode){
+  var cfg = document.getElementById('wrmStreamConfig');
+  if(cfg) cfg.style.display = (mode === 'stream') ? 'block' : 'none';
+  WR_MODE = mode;  // optimistic local update — only persists on Save
+}
+
+function wrmStationPicked(stationId){
+  WR_STREAM_ID = stationId;
+  WR_STREAM_URL = '';   // Clear custom URL when picking a preset
+  WR_STREAM_NAME = '';
+}
+
+function wrmSaveCustom(){
+  var u = document.getElementById('wrmCustomUrl');
+  var n = document.getElementById('wrmCustomName');
+  if(!u || !u.value.trim()){ alert('Enter a stream URL.'); return; }
+  if(!/^https?:\/\//i.test(u.value.trim())){ alert('URL must start with http:// or https://'); return; }
+  WR_STREAM_URL = u.value.trim();
+  WR_STREAM_NAME = (n ? n.value.trim() : '') || 'Custom Station';
+  WR_STREAM_ID = '';   // Custom URL takes priority over preset
+  // Uncheck all preset radios
+  document.querySelectorAll('input[name="wrmStation"]').forEach(function(r){ r.checked = false; });
+  alert('✓ Custom URL saved. Click "Save settings" to push live to all agents.');
+}
+
+function wrmSave(){
+  var u = DB.current;
+  if(!isOwner(u)){ alert('Owner only.'); return; }
+  // Read mode from the form (in case they changed it but didn't trigger onchange)
+  var modeRadio = document.querySelector('input[name="wrModeRadio"]:checked');
+  if(modeRadio) WR_MODE = modeRadio.value;
+  // Persist locally + to Supabase
+  try {
+    localStorage.setItem('wmam_wr_mode', WR_MODE);
+    localStorage.setItem('wmam_wr_stream_id', WR_STREAM_ID || '');
+    localStorage.setItem('wmam_wr_stream_url', WR_STREAM_URL || '');
+    localStorage.setItem('wmam_wr_stream_name', WR_STREAM_NAME || '');
+  } catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    var payload = JSON.stringify({mode:WR_MODE, streamId:WR_STREAM_ID, streamUrl:WR_STREAM_URL, streamName:WR_STREAM_NAME});
+    supaClient.from('app_settings').upsert(
+      { key:'wr_music', value: payload },
+      { onConflict:'key' }
+    ).then(function(){}).catch(function(){});
+  }
+  alert('✓ Saved. All agents will pick up the new music settings on their next page-load (or next time they open the call modal).');
+  if(typeof gotoPanel === 'function') gotoPanel('wr-music');
+}
+
+function wrmTestStream(){
+  var s = wrResolveStream();
+  if(!s){ alert('No station configured. Pick one first.'); return; }
+  if(!confirm('Play "'+s.name+'" through your speakers right now?\n\n('+s.url+')\n\nClick OK to start, then a "Stop" button will appear.')) return;
+  if(wrAudio){ try { wrAudio.pause(); } catch(e){} }
+  wrAudio = new Audio(s.url);
+  wrAudio.volume = 0.6;
+  wrAudio.play().then(function(){
+    var stopBtn = document.createElement('button');
+    stopBtn.id = 'wrm-test-stop';
+    stopBtn.textContent = '⏹ Stop test stream';
+    stopBtn.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.84rem;letter-spacing:1.5px;text-transform:uppercase;padding:12px 20px;border-radius:8px;cursor:pointer;font-weight:700;box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:10000';
+    stopBtn.onclick = function(){
+      if(wrAudio){ try{wrAudio.pause();}catch(e){} wrAudio=null; }
+      stopBtn.remove();
+    };
+    document.body.appendChild(stopBtn);
+  }).catch(function(err){
+    alert('⚠ Stream failed to load: '+err.message+'\n\nThe URL may be down, blocked by CORS, or in an unsupported format.');
+  });
+}
+// ════════════════════════════════════════════════════════════════════════
+//  END WAITING ROOM MUSIC PANEL
+// ════════════════════════════════════════════════════════════════════════
+
 // Update help-text when AW Override Style dropdown changes.
 function aaAWModelChanged(){
   var sel = document.getElementById('aaAWModel');
@@ -37801,6 +38006,27 @@ var WR_PLAYLIST = [
   {title:'Hip-Hop Chill',       artist:'Boom Bap',      url:'https://cdn.pixabay.com/audio/2023/01/12/audio_b8cb7e8c1a.mp3'},
   {title:'Country Road',        artist:'Acoustic',      url:'https://cdn.pixabay.com/audio/2022/10/30/audio_347111d3ec.mp3'}
 ];
+
+// ── LIVE RADIO STREAM SUPPORT ──
+// Owner picks a mode ('mp3' for the playlist above, or 'stream' for live radio).
+// In stream mode all listeners pull from the same URL → naturally synced.
+// Pre-vetted free streams below (these are publicly accessible internet radio
+// stations — most are listener-supported with no licensing fees for redistribution).
+var WR_STATIONS = [
+  {id:'somafm-groove',  name:'SomaFM Groove Salad',     desc:'Downtempo / chillout — work-friendly, no lyrics-distraction', url:'https://ice1.somafm.com/groovesalad-128-mp3'},
+  {id:'somafm-lush',    name:'SomaFM Lush',             desc:'Mellow vocals + chill electronic',                            url:'https://ice1.somafm.com/lush-128-mp3'},
+  {id:'somafm-secret',  name:'SomaFM Secret Agent',     desc:'Spy-jazz / lounge — focus music',                             url:'https://ice1.somafm.com/secretagent-128-mp3'},
+  {id:'somafm-deep',    name:'SomaFM Deep Space One',   desc:'Ambient / space music',                                       url:'https://ice1.somafm.com/deepspaceone-128-mp3'},
+  {id:'somafm-indie',   name:'SomaFM Indie Pop Rocks',  desc:'Indie pop & rock — energetic',                                url:'https://ice1.somafm.com/indiepop-128-mp3'},
+  {id:'somafm-bagel',   name:'SomaFM BAGeL Radio',      desc:'Indie rock — eclectic',                                       url:'https://ice1.somafm.com/bagel-128-mp3'},
+  {id:'somafm-folk',    name:'SomaFM Folk Forward',     desc:'Indie folk — acoustic & singer-songwriter',                   url:'https://ice1.somafm.com/folkfwd-128-mp3'},
+  {id:'somafm-thetrip', name:'SomaFM The Trip',         desc:'Progressive house / trance — upbeat',                         url:'https://ice1.somafm.com/thetrip-128-mp3'}
+];
+var WR_MODE = 'mp3';                // 'mp3' or 'stream' — set by Owner via panel
+var WR_STREAM_ID  = 'somafm-groove'; // currently-selected station id
+var WR_STREAM_URL = '';             // override URL (for "custom URL" picks)
+var WR_STREAM_NAME = '';            // display name (custom)
+
 var wrAudio=null, wrTrackIdx=0, wrIsPlaying=false, wrWaiters={};
 
 function wrPlayTrack(idx){
@@ -37829,12 +38055,98 @@ function wrPlayTrack(idx){
   var np=document.getElementById('wr-now-playing'); if(np) np.textContent=t.title;
   var ar=document.getElementById('wr-artist'); if(ar) ar.textContent=t.artist;
 }
-function wrTogglePlay(){ if(!wrAudio){wrPlayTrack(wrTrackIdx);return;} if(wrIsPlaying){wrAudio.pause();wrIsPlaying=false;var btn=document.getElementById('wr-play-btn');if(btn)btn.textContent='\u25B6';}else{wrAudio.play().catch(function(){});wrIsPlaying=true;var btn=document.getElementById('wr-play-btn');if(btn)btn.textContent='\u23F8';} }
+function wrTogglePlay(){
+  if(!wrAudio){
+    // Nothing playing yet — start whichever mode is configured
+    wrAutoStartMusic();
+    return;
+  }
+  if(wrIsPlaying){
+    wrAudio.pause();
+    wrIsPlaying = false;
+    var btnP = document.getElementById('wr-play-btn'); if(btnP) btnP.textContent = '\u25B6';
+  } else {
+    wrAudio.play().catch(function(){});
+    wrIsPlaying = true;
+    var btnR = document.getElementById('wr-play-btn'); if(btnR) btnR.textContent = '\u23F8';
+  }
+}
 function wrNext(){ wrTrackIdx=(wrTrackIdx+1)%WR_PLAYLIST.length; wrPlayTrack(wrTrackIdx); }
 function wrPrev(){ wrTrackIdx=(wrTrackIdx-1+WR_PLAYLIST.length)%WR_PLAYLIST.length; wrPlayTrack(wrTrackIdx); }
 function wrSetVolume(val){ if(wrAudio) wrAudio.volume=parseInt(val)/100; }
 function wrSeek(e){ var bar=document.getElementById('wr-progress-bar'); if(!bar||!wrAudio||!wrAudio.duration) return; var rect=bar.getBoundingClientRect(); wrAudio.currentTime=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width))*wrAudio.duration; }
 function wrStopMusic(){ if(wrAudio){wrAudio.pause();wrAudio=null;} wrIsPlaying=false; }
+
+// ── LIVE RADIO STREAM PLAYBACK ──
+// Resolves the current station: returns { name, url } based on WR_MODE +
+// WR_STREAM_ID. If stream-id matches a preset, uses that; otherwise uses
+// the custom URL/name. Returns null if mode is mp3 or nothing configured.
+function wrResolveStream(){
+  if(WR_MODE !== 'stream') return null;
+  // Check preset list
+  var preset = WR_STATIONS.find(function(s){ return s.id === WR_STREAM_ID; });
+  if(preset) return { name: preset.name, url: preset.url, desc: preset.desc };
+  // Custom URL
+  if(WR_STREAM_URL){
+    return { name: WR_STREAM_NAME || 'Custom Station', url: WR_STREAM_URL, desc: '' };
+  }
+  return null;
+}
+
+// Start playing the configured live stream. Replaces any current playback.
+// Sets up <audio> with the stream URL and the user's volume preference.
+function wrPlayStream(){
+  var s = wrResolveStream();
+  if(!s){
+    console.warn('[wrPlayStream] No stream configured');
+    return;
+  }
+  if(wrAudio){ try { wrAudio.pause(); } catch(e){} wrAudio = null; }
+  wrAudio = new Audio(s.url);
+  wrAudio.crossOrigin = 'anonymous';  // hint for some streams
+  // Pull volume from the slider if present, otherwise 60%
+  var vol = 60;
+  try { vol = parseInt(((document.getElementById('wr-volume')||{value:'60'}).value)) || 60; } catch(e){}
+  wrAudio.volume = vol / 100;
+  wrAudio.addEventListener('error', function(e){
+    console.warn('[wrPlayStream] error on stream '+s.url, e);
+    var hint = document.getElementById('wr-play-hint');
+    if(hint){
+      hint.style.display = 'block';
+      hint.innerHTML = '<div style="padding:14px;background:rgba(220,38,38,.15);border:1px solid rgba(220,38,38,.4);border-radius:10px;color:rgba(255,255,255,.85);font-family:Barlow Condensed,sans-serif;font-size:.78rem;text-align:center">⚠ Stream unavailable. Owner can switch to a different station via Manage → Waiting Room Music.</div>';
+    }
+  });
+  var p = wrAudio.play();
+  if(p && typeof p.then === 'function'){
+    p.catch(function(err){
+      console.warn('[wrPlayStream] play() rejected — likely autoplay policy:', err);
+      wrShowTapToPlay();
+    });
+  }
+  wrIsPlaying = true;
+  // Update UI
+  var btn = document.getElementById('wr-play-btn'); if(btn) btn.textContent = '\u23F8';
+  var np = document.getElementById('wr-now-playing'); if(np) np.textContent = '🔴 LIVE — ' + s.name;
+  var ar = document.getElementById('wr-artist'); if(ar) ar.textContent = s.desc || 'Live stream';
+  // Hide playlist UI in stream mode (no tracks to skip through)
+  var pl = document.getElementById('wr-playlist'); if(pl) pl.style.display = 'none';
+  var plLabel = document.getElementById('wr-playlist-label'); if(plLabel) plLabel.style.display = 'none';
+  // Hide progress bar (live streams have no duration/seek)
+  var pb = document.getElementById('wr-progress-bar'); if(pb) pb.style.display = 'none';
+  // Hide skip buttons
+  var prevBtn = document.getElementById('wr-prev-btn'); if(prevBtn) prevBtn.style.display = 'none';
+  var nextBtn = document.getElementById('wr-next-btn'); if(nextBtn) nextBtn.style.display = 'none';
+}
+
+// Universal "start the music" — picks stream or MP3 based on WR_MODE.
+// Called when user taps the play button OR when join-call autoplays.
+function wrAutoStartMusic(){
+  if(WR_MODE === 'stream'){
+    wrPlayStream();
+  } else {
+    wrPlayTrack(0);
+  }
+}
 
 // ── TAP TO PLAY MUSIC ──
 // Browsers block autoplay without a user gesture. This creates a
@@ -37856,9 +38168,18 @@ function wrShowTapToPlay(){
 }
 
 function wrUserStartMusic(){
-  // Rebuild the real playlist UI (was replaced by the tap button).
+  // Hide the tap hint (it was the only thing in the playlist container)
+  var hint = document.getElementById('wr-play-hint');
+  if(hint) hint.style.display = 'none';
+  // In stream mode, just play the stream — no playlist UI needed
+  if(WR_MODE === 'stream'){
+    wrPlayStream();
+    return;
+  }
+  // MP3 mode: rebuild the playlist UI (was replaced by the tap button)
   var pl = document.getElementById('wr-playlist');
   if(pl){
+    pl.style.display = '';
     pl.innerHTML = WR_PLAYLIST.map(function(t,i){
       return '<div onclick="wrPlayTrack('+i+')" style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;cursor:pointer;background:'+(i===wrTrackIdx?'rgba(0,53,148,.4)':'transparent')+';border:1px solid '+(i===wrTrackIdx?'rgba(96,165,250,.3)':'transparent')+'">'
         + '<span style="font-size:.75rem;color:'+(i===wrTrackIdx?'#60A5FA':'rgba(255,255,255,.4)')+'">'+(i===wrTrackIdx?'\u25B6':'\u25CB')+'</span>'
@@ -37866,8 +38187,6 @@ function wrUserStartMusic(){
         + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:rgba(255,255,255,.3)">'+t.artist+'</div></div></div>';
     }).join('');
   }
-  var hint = document.getElementById('wr-play-hint');
-  if(hint && hint !== pl) hint.style.display = 'none';
   // Now play — we have a user gesture so autoplay policy is satisfied.
   wrPlayTrack(0);
 }
@@ -37908,15 +38227,36 @@ function showWaitingRoom(chId,chName,displayName){
     wrAvatar.innerHTML = '';
   }
   if(endBtn){ endBtn.textContent='\u2715 Leave'; endBtn.onclick=function(){ wrStopMusic(); wrLeave(chId,u?u.id:displayName); closeVideoCall(); }; }
-  // Build playlist UI
-  var pl=document.getElementById('wr-playlist');
-  if(pl) pl.innerHTML=WR_PLAYLIST.map(function(t,i){ return '<div onclick="wrPlayTrack('+i+')" style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;cursor:pointer;background:'+(i===wrTrackIdx?'rgba(0,53,148,.4)':'transparent')+';border:1px solid '+(i===wrTrackIdx?'rgba(96,165,250,.3)':'transparent')+'">'+'<span style="font-size:.75rem;color:'+(i===wrTrackIdx?'#60A5FA':'rgba(255,255,255,.4)')+'">'+(i===wrTrackIdx?'\u25B6':'\u25CB')+'</span>'+'<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:'+(i===wrTrackIdx?'white':'rgba(255,255,255,.65)')+'">'+t.title+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:rgba(255,255,255,.3)">'+t.artist+'</div></div></div>'; }).join('');
-  // ── WAITING ROOM MUSIC ──
-  // Browsers block audio autoplay without a user gesture. Instead of
-  // silently failing, show a visible "Tap to play music" prompt that
-  // the user clicks to start the first track. After the first click,
-  // nextTrack() and prevTrack() can play without extra gestures.
-  wrShowTapToPlay();
+  // ── WAITING ROOM MUSIC — STREAM OR MP3 MODE ──
+  // Owner sets the mode via Manage → Waiting Room Music. Stream mode pulls
+  // a live radio URL (everyone hears the same thing in sync); MP3 mode plays
+  // the curated playlist.
+  if(WR_MODE === 'stream'){
+    // Hide the playlist UI — streams have no tracks to skip
+    var pl = document.getElementById('wr-playlist');
+    if(pl){ pl.style.display = 'none'; pl.innerHTML = ''; }
+    var plLabel = document.getElementById('wr-playlist-label');
+    if(plLabel) plLabel.style.display = 'none';
+    var pb = document.getElementById('wr-progress-bar'); if(pb) pb.style.display = 'none';
+    var prevBtn = document.getElementById('wr-prev-btn'); if(prevBtn) prevBtn.style.display = 'none';
+    var nextBtn = document.getElementById('wr-next-btn'); if(nextBtn) nextBtn.style.display = 'none';
+    // Try to auto-play the stream. Browser autoplay policy may require a
+    // tap; if so wrPlayStream will fall back to wrShowTapToPlay automatically.
+    wrPlayStream();
+  } else {
+    // MP3 mode — build playlist UI
+    var pl=document.getElementById('wr-playlist');
+    if(pl){
+      pl.style.display = '';
+      pl.innerHTML=WR_PLAYLIST.map(function(t,i){ return '<div onclick="wrPlayTrack('+i+')" style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;cursor:pointer;background:'+(i===wrTrackIdx?'rgba(0,53,148,.4)':'transparent')+';border:1px solid '+(i===wrTrackIdx?'rgba(96,165,250,.3)':'transparent')+'">'+'<span style="font-size:.75rem;color:'+(i===wrTrackIdx?'#60A5FA':'rgba(255,255,255,.4)')+'">'+(i===wrTrackIdx?'\u25B6':'\u25CB')+'</span>'+'<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:'+(i===wrTrackIdx?'white':'rgba(255,255,255,.65)')+'">'+t.title+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:rgba(255,255,255,.3)">'+t.artist+'</div></div></div>'; }).join('');
+    }
+    var plLab = document.getElementById('wr-playlist-label'); if(plLab) plLab.style.display = '';
+    var pbm = document.getElementById('wr-progress-bar'); if(pbm) pbm.style.display = '';
+    var prevBtnM = document.getElementById('wr-prev-btn'); if(prevBtnM) prevBtnM.style.display = '';
+    var nextBtnM = document.getElementById('wr-next-btn'); if(nextBtnM) nextBtnM.style.display = '';
+    // Browsers block audio autoplay without a user gesture. Show "Tap to play".
+    wrShowTapToPlay();
+  }
   wrJoin(chId,u?u.name:displayName,u?u.id:displayName);
   wrFetchParticipants(chId);
   if(waitDiv._poll) clearInterval(waitDiv._poll);
@@ -38567,17 +38907,19 @@ setTimeout(initSocialBars, 100);
           </div>
           <!-- Controls -->
           <div style="display:flex;align-items:center;gap:12px;justify-content:center;margin-bottom:14px">
-            <button onclick="wrPrev()" title="Previous" style="background:none;border:none;color:rgba(255,255,255,.6);font-size:1.1rem;cursor:pointer;padding:6px;border-radius:50%;transition:background .2s" onmouseover="this.style.background='rgba(255,255,255,.1)'" onmouseout="this.style.background='none'">⏮</button>
+            <button onclick="wrPrev()" id="wr-prev-btn" title="Previous" style="background:none;border:none;color:rgba(255,255,255,.6);font-size:1.1rem;cursor:pointer;padding:6px;border-radius:50%;transition:background .2s" onmouseover="this.style.background='rgba(255,255,255,.1)'" onmouseout="this.style.background='none'">⏮</button>
             <button onclick="wrTogglePlay()" id="wr-play-btn" style="background:rgba(0,53,148,.6);border:1px solid rgba(96,165,250,.4);color:white;font-size:1.3rem;width:46px;height:46px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s" onmouseover="this.style.background='rgba(0,53,148,.9)'" onmouseout="this.style.background='rgba(0,53,148,.6)'">▶</button>
-            <button onclick="wrNext()" title="Next" style="background:none;border:none;color:rgba(255,255,255,.6);font-size:1.1rem;cursor:pointer;padding:6px;border-radius:50%;transition:background .2s" onmouseover="this.style.background='rgba(255,255,255,.1)'" onmouseout="this.style.background='none'">⏭</button>
+            <button onclick="wrNext()" id="wr-next-btn" title="Next" style="background:none;border:none;color:rgba(255,255,255,.6);font-size:1.1rem;cursor:pointer;padding:6px;border-radius:50%;transition:background .2s" onmouseover="this.style.background='rgba(255,255,255,.1)'" onmouseout="this.style.background='none'">⏭</button>
             <div style="display:flex;align-items:center;gap:6px;margin-left:8px">
               <span style="font-size:.9rem">🔈</span>
               <input type="range" id="wr-volume" min="0" max="100" value="60" oninput="wrSetVolume(this.value)" style="width:70px;accent-color:#60A5FA;cursor:pointer">
             </div>
           </div>
-          <!-- Playlist -->
-          <div style="font-family:'Barlow Condensed',sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.3);margin-bottom:8px">Playlist</div>
+          <!-- Playlist (only shown in MP3 mode) -->
+          <div id="wr-playlist-label" style="font-family:'Barlow Condensed',sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.3);margin-bottom:8px">Playlist</div>
           <div id="wr-playlist" style="display:flex;flex-direction:column;gap:4px;max-height:140px;overflow-y:auto"></div>
+          <!-- Tap-to-play hint (browser autoplay block) -->
+          <div id="wr-play-hint" style="display:none;margin-top:10px"></div>
         </div>
 
         <!-- Participants in waiting room -->
