@@ -2218,6 +2218,10 @@ function loadFromStorage(){
   try{
     var b = localStorage.getItem('wmam_brevo');
     if(b) BREVO_API_KEY = b;
+    var bse = localStorage.getItem('wmam_brevo_sender_email');
+    if(bse) BREVO_SENDER_EMAIL = bse;
+    var bsn = localStorage.getItem('wmam_brevo_sender_name');
+    if(bsn) BREVO_SENDER_NAME = bsn;
     var agents = localStorage.getItem('wmam_agents');
     if(agents){ DB.agents = JSON.parse(agents);
     DB.agents.forEach(function(a){ if(typeof normalizeAgentSales==='function') normalizeAgentSales(a); });
@@ -2233,6 +2237,22 @@ function loadFromStorage(){
     if(cm){ var c=JSON.parse(cm); Object.keys(c).forEach(function(k){CHANNEL_MSGS[k]=c[k];}); }
     var tm = localStorage.getItem('wmam_teamMsgs');
     if(tm){ var t2=JSON.parse(tm); Object.keys(t2).forEach(function(k){TEAM_MSGS[k]=t2[k];}); }
+    // ── Cleanup-pass fix: these were being SAVED but never LOADED, so
+    // the data evaporated on every page refresh. ──
+    // Returning agent requests (queue of "I worked here before" submissions)
+    var ret = localStorage.getItem('wmam_returning');
+    if(ret){ try { var rr = JSON.parse(ret); if(Array.isArray(rr)) RETURNING_AGENT_REQUESTS = rr; } catch(e){} }
+    // Form Builder access whitelist
+    var fba = localStorage.getItem('wmam_fb_access');
+    if(fba){ try { var fb = JSON.parse(fba); if(Array.isArray(fb)) FORM_BUILDER_ACCESS = fb; } catch(e){} }
+    // EmailJS config (kept for legacy invite emails — being phased out for Brevo)
+    var ejsP = localStorage.getItem('wmam_ejs_pub');
+    var ejsS = localStorage.getItem('wmam_ejs_svc');
+    var ejsT = localStorage.getItem('wmam_ejs_tpl');
+    if(ejsP || ejsS || ejsT){
+      window._ejsConfig = { pubKey: ejsP||'', serviceId: ejsS||'', templateId: ejsT||'' };
+      if(ejsP && typeof emailjs !== 'undefined'){ try { emailjs.init(ejsP); } catch(e){} }
+    }
   } catch(e){ console.warn('Storage load failed:', e); }
 }
 
@@ -2614,7 +2634,157 @@ function initReveal() {
   }), { threshold: 0.05, rootMargin: '0px 0px -40px 0px' });
   document.querySelectorAll('.reveal:not(.vis)').forEach(el => io.observe(el));
 }
-var BREVO_API_KEY = '';  // Set via back office Settings
+var BREVO_API_KEY = '';  // Set via Settings → Brevo (NEVER hardcode here — gets caught by GitHub secret scanning)
+var BREVO_SENDER_EMAIL = 'info@wmaminc.com';
+var BREVO_SENDER_NAME  = 'WMAMinc';
+
+// ── Unified Brevo email send helper ──
+// All Brevo calls should funnel through here. Returns a promise that
+// resolves to {ok, status, response} or rejects on network failure.
+//   opts: { to:[{email,name}], subject, htmlContent, textContent?,
+//           replyTo?, bcc?:[{email,name}], cc?:[{email,name}],
+//           senderName?, senderEmail? }
+function brevoSend(opts){
+  if(!BREVO_API_KEY){
+    console.warn('[brevoSend] No API key — email not sent.');
+    return Promise.resolve({ ok:false, status:0, error:'No API key configured' });
+  }
+  if(!opts || !Array.isArray(opts.to) || !opts.to.length){
+    console.warn('[brevoSend] No recipients — skipping.');
+    return Promise.resolve({ ok:false, status:0, error:'No recipients' });
+  }
+  if(!opts.subject || !opts.htmlContent){
+    console.warn('[brevoSend] Missing subject or htmlContent.');
+    return Promise.resolve({ ok:false, status:0, error:'Missing subject/body' });
+  }
+  // Filter out recipients without an email address (defensive)
+  var validTo = opts.to.filter(function(r){ return r && r.email && /@/.test(r.email); });
+  if(!validTo.length){
+    console.warn('[brevoSend] No valid email addresses in recipients.');
+    return Promise.resolve({ ok:false, status:0, error:'No valid emails' });
+  }
+  var body = {
+    sender: {
+      name:  opts.senderName  || BREVO_SENDER_NAME,
+      email: opts.senderEmail || BREVO_SENDER_EMAIL
+    },
+    to: validTo,
+    subject: opts.subject,
+    htmlContent: opts.htmlContent
+  };
+  if(opts.textContent) body.textContent = opts.textContent;
+  if(opts.replyTo) body.replyTo = opts.replyTo;
+  if(opts.bcc && opts.bcc.length) body.bcc = opts.bcc.filter(function(r){return r.email;});
+  if(opts.cc  && opts.cc.length)  body.cc  = opts.cc.filter(function(r){return r.email;});
+  return fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'api-key': BREVO_API_KEY },
+    body: JSON.stringify(body)
+  }).then(function(r){
+    if(!r.ok){
+      return r.text().then(function(txt){
+        console.warn('[brevoSend] Failed:', r.status, txt);
+        return { ok:false, status:r.status, error:txt };
+      });
+    }
+    return r.json().then(function(j){ return { ok:true, status:r.status, response:j }; });
+  }).catch(function(e){
+    console.warn('[brevoSend] Network error:', e);
+    return { ok:false, status:0, error:String(e) };
+  });
+}
+
+// ── BREVO SETTINGS PANEL ──
+// Owner can rotate the API key + sender info without touching code.
+// Stored in localStorage AND Supabase so other devices pick it up.
+function panelBrevoSettings(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('🔒 Brevo Email Settings') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div></div>';
+  }
+  var h = panelHeader('📧 Brevo Email Settings');
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>Manage your Brevo API key and sender info here.</strong> Rotate keys via Brevo dashboard → SMTP & API → API Keys → Generate new → Delete old → paste the new one here. Storage is local + Supabase (synced across your devices).';
+  h += '</div>';
+
+  var keyMasked = BREVO_API_KEY ? BREVO_API_KEY.slice(0, 12) + '••••••••' + BREVO_API_KEY.slice(-6) : '(not set)';
+
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">Current configuration</div></div>';
+  h += '<div style="padding:14px 20px;font-family:Barlow Condensed,sans-serif;font-size:.84rem;line-height:1.7">';
+  h += '<div><strong>API key:</strong> <code style="background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:.78rem">'+_escapeHtml(keyMasked)+'</code></div>';
+  h += '<div><strong>Sender name:</strong> '+_escapeHtml(BREVO_SENDER_NAME||'(not set)')+'</div>';
+  h += '<div><strong>Sender email:</strong> '+_escapeHtml(BREVO_SENDER_EMAIL||'(not set)')+'</div>';
+  h += '<div style="margin-top:8px;font-size:.7rem;color:var(--muted)">Status: '+(BREVO_API_KEY ? '<span style="color:#16a34a;font-weight:700">✓ Active</span>' : '<span style="color:#dc2626;font-weight:700">⚠ Not configured</span>')+'</div>';
+  h += '</div></div>';
+
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">Update settings</div></div>';
+  h += '<div style="padding:18px 20px">';
+  h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">API key (full string starts with <code>xkeysib-</code>)</label>';
+  h += '<input id="brSetKey" type="text" class="f-input" placeholder="xkeysib-..." style="font-family:monospace;font-size:.8rem">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-top:4px">Leave blank to keep current key.</div></div>';
+  h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Sender name</label>';
+  h += '<input id="brSetSenderName" type="text" class="f-input" placeholder="WMAMinc" value="'+_escapeAttr(BREVO_SENDER_NAME)+'"></div>';
+  h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Sender email (must be verified in Brevo)</label>';
+  h += '<input id="brSetSenderEmail" type="email" class="f-input" placeholder="info@wmaminc.com" value="'+_escapeAttr(BREVO_SENDER_EMAIL)+'"></div>';
+  h += '<button onclick="brevoSaveSettings()" class="btn-fire" style="padding:11px 22px">💾 Save settings</button>';
+  h += '<button onclick="brevoSendTest()" style="margin-left:10px;padding:11px 22px;background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">📤 Send test email</button>';
+  h += '</div></div>';
+  return h;
+}
+
+function brevoSaveSettings(){
+  var u = DB.current;
+  if(!isOwner(u)){ alert('Owner only.'); return; }
+  var newKey = (document.getElementById('brSetKey')||{value:''}).value.trim();
+  var senderName = (document.getElementById('brSetSenderName')||{value:''}).value.trim();
+  var senderEmail = (document.getElementById('brSetSenderEmail')||{value:''}).value.trim();
+  if(senderEmail && !/^[^@]+@[^@]+\.[^@]+$/.test(senderEmail)){ alert('Sender email looks invalid.'); return; }
+  if(newKey){
+    if(newKey.indexOf('xkeysib-') !== 0){
+      if(!confirm('That key does not start with "xkeysib-". Save anyway?')) return;
+    }
+    BREVO_API_KEY = newKey;
+    try { localStorage.setItem('wmam_brevo', newKey); } catch(e){}
+    if(typeof supaClient !== 'undefined' && supaClient){
+      supaClient.from('app_settings').upsert({key:'brevo_key', value:newKey},{onConflict:'key'}).then(function(){}).catch(function(){});
+    }
+  }
+  if(senderName){
+    BREVO_SENDER_NAME = senderName;
+    try { localStorage.setItem('wmam_brevo_sender_name', senderName); } catch(e){}
+    if(typeof supaClient !== 'undefined' && supaClient){
+      supaClient.from('app_settings').upsert({key:'brevo_sender_name', value:senderName},{onConflict:'key'}).then(function(){}).catch(function(){});
+    }
+  }
+  if(senderEmail){
+    BREVO_SENDER_EMAIL = senderEmail;
+    try { localStorage.setItem('wmam_brevo_sender_email', senderEmail); } catch(e){}
+    if(typeof supaClient !== 'undefined' && supaClient){
+      supaClient.from('app_settings').upsert({key:'brevo_sender_email', value:senderEmail},{onConflict:'key'}).then(function(){}).catch(function(){});
+    }
+  }
+  alert('✓ Brevo settings saved.');
+  if(typeof gotoPanel === 'function') gotoPanel('brevo-settings');
+}
+
+function brevoSendTest(){
+  var u = DB.current;
+  if(!isOwner(u)){ alert('Owner only.'); return; }
+  var to = prompt('Send a test email to which address?', u.email || BREVO_SENDER_EMAIL);
+  if(!to || !/^[^@]+@[^@]+\.[^@]+$/.test(to)){ alert('Invalid email.'); return; }
+  brevoSend({
+    to: [{email: to, name: 'Test recipient'}],
+    subject: 'WMAMinc — Brevo test email',
+    htmlContent: '<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto"><div style="background:#003594;padding:20px;text-align:center;color:white"><h2 style="margin:0">📧 Test email</h2></div><div style="padding:24px;background:#f8f9fa;line-height:1.6;color:#333">If you received this, your Brevo configuration is working correctly.<br><br><strong>API key:</strong> active<br><strong>Sender:</strong> '+_escapeHtml(BREVO_SENDER_NAME)+' &lt;'+_escapeHtml(BREVO_SENDER_EMAIL)+'&gt;<br><strong>Sent at:</strong> '+new Date().toLocaleString()+'</div><div style="background:#002268;padding:14px;text-align:center;color:rgba(255,255,255,.7);font-size:12px">WMAMinc. &nbsp;|&nbsp; ONE TEAM. ONE DREAM.</div></div>'
+  }).then(function(r){
+    if(r.ok){
+      alert('✓ Test email sent successfully (status '+r.status+'). Check inbox at '+to+'. May land in Spam if domain not yet authenticated.');
+    } else {
+      alert('⚠ Send failed (status '+r.status+'): '+(r.error||'unknown'));
+    }
+  });
+}
 var ACTIVE_CALLS = {};
 var jitsiApi    = null;
 var PANEL_HISTORY = [];
@@ -7587,6 +7757,70 @@ function onboardingEnterAgentCode(agentId,campaignName,code){
   notifyIds.forEach(function(id){pushNotification({toIds:[id],toRoles:[],icon:'🔑',title:agent.name+' is now coded — '+campaignName,body:agent.name+' has been assigned their agent code for '+campaignName+'. Reach out and welcome them to the team!',panel:'agent-master',priority:'high'});});
   if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
   CHANNEL_MSGS['national'].unshift({id:channelMsgNextId++,from:'Onboarding',role:'Onboarding',init:'OB',time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),type:'recognition',text:'🔑 AGENT CODED — '+agent.name+' is now active for '+campaignName+'! Welcome to the team.',photo:null});
+
+  // ── Brevo: Auto-email the agent with their welcome packet ──
+  // Fires whenever an agent gets their first carrier code (i.e. they're
+  // fully active in at least one campaign). Includes login info, training
+  // steps, and a list of the documents they signed.
+  if(typeof brevoSend === 'function' && agent.email){
+    var signedDocs = (typeof AGENT_SIGNED_DOCS !== 'undefined' && AGENT_SIGNED_DOCS[agentId]) ? AGENT_SIGNED_DOCS[agentId] : [];
+    var docList = signedDocs.length
+      ? '<ul style="margin:8px 0 0 18px;padding:0">'+signedDocs.map(function(d){return '<li style="margin:4px 0">'+_escapeHtml(d.docName||'document')+' <span style="color:#888;font-size:12px">— signed '+(d.signedAt?new Date(d.signedAt).toLocaleDateString():'')+'</span></li>';}).join('')+'</ul>'
+      : '<p style="color:#888;font-style:italic">Document records not available.</p>';
+    var welcomeBody = '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:white">'
+      +'<div style="background:#003594;padding:24px;text-align:center"><h1 style="color:white;margin:0;letter-spacing:2px;font-size:22px">🎉 WELCOME TO THE TEAM</h1><p style="color:rgba(255,255,255,.85);margin:6px 0 0;font-size:14px;letter-spacing:1px">ONE TEAM. ONE DREAM.</p></div>'
+      +'<div style="padding:28px;background:#f8f9fa">'
+      +'<p style="font-size:16px;color:#003594;font-weight:700;margin:0 0 12px">Hi '+_escapeHtml(agent.name)+',</p>'
+      +'<p style="font-size:14px;color:#333;line-height:1.6;margin:0 0 18px">Your onboarding packet is complete and you have been activated for <strong>'+_escapeHtml(campaignName)+'</strong>. You now have full access to the WMAMinc back office.</p>'
+      +'<table style="width:100%;border-collapse:collapse;background:white;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.06)">'
+      +'<tr><td style="padding:14px 16px;background:#003594;color:white;font-size:13px;letter-spacing:1.5px;text-transform:uppercase" colspan="2">Your access</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888;width:40%">Login URL</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px"><a href="https://wmaminc.com" style="color:#003594;font-weight:700">wmaminc.com</a></td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Username</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;font-family:monospace">'+_escapeHtml(agent.username||'(not set)')+'</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Campaign</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px"><strong>'+_escapeHtml(campaignName)+'</strong></td></tr>'
+      +'<tr><td style="padding:12px 16px;font-size:13px;color:#888">Agent code</td><td style="padding:12px 16px;font-size:14px;font-family:monospace">'+_escapeHtml(code)+'</td></tr>'
+      +'</table>'
+      +'<div style="margin-top:18px;background:white;border-radius:8px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.06)"><h3 style="margin:0 0 10px;color:#003594;font-size:14px;letter-spacing:1.5px;text-transform:uppercase">📄 Documents on file</h3>'+docList+'</div>'
+      +'<div style="margin-top:18px;background:#fff7ed;border-left:4px solid #D97706;padding:14px 16px;border-radius:4px"><strong style="color:#9a5a13">⚠ Important first steps:</strong><ol style="margin:8px 0 0 18px;color:#333;line-height:1.6">'
+      +'<li>Log in at <a href="https://wmaminc.com" style="color:#003594">wmaminc.com</a> using the username above</li>'
+      +'<li>Change your password on first login (<strong>My Profile → Change Password</strong>)</li>'
+      +'<li>Review your assigned training in the Training panel</li>'
+      +'<li>Submit your first daily audit when you start working</li>'
+      +'</ol></div>'
+      +'<p style="font-size:12px;color:#888;margin:18px 0 0">Questions? Reply to this email and the team will help.</p>'
+      +'</div>'
+      +'<div style="background:#002268;padding:14px;text-align:center;color:rgba(255,255,255,.7);font-size:12px">WMAMinc. &nbsp;|&nbsp; ONE TEAM. ONE DREAM.</div>'
+      +'</div>';
+    brevoSend({
+      to: [{email: agent.email, name: agent.name}],
+      subject: '🎉 Welcome to WMAMinc — '+campaignName+' access is live',
+      htmlContent: welcomeBody,
+      replyTo: { email: BREVO_SENDER_EMAIL, name: BREVO_SENDER_NAME }
+    });
+    // Also email Owner + Onboarding so the human team has a record
+    var staffEmails = [];
+    (DB.agents||[]).forEach(function(a){
+      if(!a.active || !a.email) return;
+      if(isOwner(a) || (typeof isOnboarding === 'function' && isOnboarding(a))){
+        staffEmails.push({email: a.email, name: a.name});
+      }
+    });
+    if(staffEmails.length){
+      brevoSend({
+        to: staffEmails,
+        subject: '🔑 Agent activated — '+agent.name+' / '+campaignName,
+        htmlContent: '<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;background:white">'
+          +'<div style="background:#003594;padding:18px;text-align:center;color:white"><h2 style="margin:0;letter-spacing:1.5px">🔑 Agent Activated</h2></div>'
+          +'<div style="padding:24px;background:#f8f9fa;line-height:1.6;color:#333">'
+          +'<p><strong>'+_escapeHtml(agent.name)+'</strong> just received their carrier code for <strong>'+_escapeHtml(campaignName)+'</strong> and is now fully active.</p>'
+          +'<table style="width:100%;border-collapse:collapse;background:white;margin-top:14px"><tr><td style="padding:8px 12px;font-size:13px;color:#888">Email</td><td style="padding:8px 12px;font-size:14px">'+_escapeHtml(agent.email||'—')+'</td></tr>'
+          +'<tr><td style="padding:8px 12px;font-size:13px;color:#888">Username</td><td style="padding:8px 12px;font-family:monospace">'+_escapeHtml(agent.username||'—')+'</td></tr>'
+          +'<tr><td style="padding:8px 12px;font-size:13px;color:#888">Code</td><td style="padding:8px 12px;font-family:monospace">'+_escapeHtml(code)+'</td></tr>'
+          +'<tr><td style="padding:8px 12px;font-size:13px;color:#888">Documents signed</td><td style="padding:8px 12px">'+signedDocs.length+'</td></tr></table>'
+          +'<p style="margin-top:14px;font-size:13px;color:#666">A welcome email with their packet has been auto-sent to '+_escapeHtml(agent.email||'(no email on file)')+'.</p>'
+          +'</div></div>'
+      });
+    }
+  }
 }
 
 function savePayrollData(){
@@ -8198,6 +8432,10 @@ function canAccess(u, area){
     // Phase 2C: Commission detail — same gate as Owner P&L
     case 'commission-detail':
       return canViewOwnerPL(u);
+    // Brevo panels — Owner only
+    case 'brevo-settings':
+    case 'mass-email':
+      return isOwner(u);
 
     // ── TL and above ──
     case 'myteam':           return isMgr || isTL;
@@ -14836,6 +15074,13 @@ function buildNav(u){
     if(chDrop) h += boGroupDrop('dd-community','💬 Community ▾', chDrop);
   }
 
+  // Owner-only email tools
+  if(isOwner(u)){
+    var emailDrop = boDropBtn('mass-email','📤 Mass Email')
+                  + boDropBtn('brevo-settings','⚙️ Brevo Settings');
+    h += boGroupDrop('dd-email','📧 Email ▾', emailDrop);
+  }
+
   // HR Portal
   // Schedule Training + Training Complete removed from HR dropdown per
   // Calvin's request (2026-04-21). They are being redone to be used by
@@ -16255,6 +16500,8 @@ function gotoPanel(id, params){
     'operating-costs':panelOperatingCosts,
     'owner-pl-carrier':panelOwnerPLCarrier,
     'commission-detail':panelCommissionDetail,
+    'brevo-settings':panelBrevoSettings,
+    'mass-email':panelMassEmail,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -21282,23 +21529,6 @@ function panelHRDashboard(){
       +'</div>';
   });
   h += '</div></div>';
-  return h;
-}
-
-function panelTrainingScheduled(){
-  var u = DB.current;
-  // Training scheduling belongs to HR, TL, MM, Onboarding, and Owner.
-  if(!isOwner(u) && !isHR(u) && !isOnboarding(u) && u.role!=='Team Leader' && u.role!=='Market Manager'){
-    return panelHeader('📅 Training Schedule') +
-      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Training management is restricted to HR, Team Leaders, Market Managers, Onboarding, and Owner.</div></div>';
-  }
-  var h = panelHeader('📅 Training Schedule');
-  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Schedule Training</div></div>'
-     + '<div style="padding:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">'
-     + 'Use the Training Schedule Form to book a new agent session.<br><br>'
-     + '<button onclick="window.open(\'https://form.jotform.com/91626043431147\',\'_blank\')" '
-     + 'class="btn-fire" style="font-size:.72rem;padding:10px 20px">Open Training Form \u2192</button>'
-     + '</div></div>';
   return h;
 }
 
@@ -34885,6 +35115,217 @@ function p2cShowCalculation(weekId, agentId, carrier, periodStart, periodEnd){
 // ════════════════════════════════════════════════════════════════════════
 //  END PHASE 2C
 // ════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+//  BREVO MASS EMAIL PANEL (Owner-only)
+//
+//  Pick recipients (All / by Role / by Campaign / specific agents), write
+//  subject + body, send. Brevo allows up to 100 recipients per single
+//  request — we batch in chunks of 50 and rate-limit between chunks to
+//  stay well under any throttling limits.
+// ════════════════════════════════════════════════════════════════════════
+
+function panelMassEmail(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return panelHeader('🔒 Mass Email') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div></div>';
+  }
+  var h = panelHeader('📧 Mass Email — Send to Team');
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>Send a single email to multiple agents.</strong> Pick a recipient group, write the message, preview the recipient list, hit send. Brevo handles delivery; we batch 50 at a time. Agents without an email on file are skipped automatically.';
+  h += '</div>';
+
+  if(!BREVO_API_KEY){
+    h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid #dc2626"><div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif"><strong style="color:#dc2626">⚠ Brevo not configured.</strong> Go to <a href="javascript:void(0)" onclick="gotoPanel(\'brevo-settings\')" style="color:var(--blue);font-weight:700">Brevo Settings</a> first.</div></div>';
+    return h;
+  }
+
+  // Build active agent list
+  var agents = (DB.agents||[]).filter(function(a){ return a.active; });
+  var withEmail = agents.filter(function(a){ return a.email && /@/.test(a.email); });
+  var withoutEmail = agents.length - withEmail.length;
+
+  // Recipient picker
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">1. Pick recipients</div></div>';
+  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
+  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Send to</label>';
+  h += '<select id="meRecipientGroup" class="f-input" onchange="meRefreshPreview()">';
+  h += '<option value="all">All active agents ('+withEmail.length+' with email)</option>';
+  h += '<optgroup label="By role">';
+  ['Field Agent','Team Leader','Market Manager','Campaign Manager','IBO','admin','HR','Inventory','Payroll','Onboarding'].forEach(function(role){
+    var n = withEmail.filter(function(a){ return a.role === role; }).length;
+    if(n > 0) h += '<option value="role:'+_escapeAttr(role)+'">'+_escapeHtml(role)+' ('+n+')</option>';
+  });
+  h += '</optgroup>';
+  // By campaign (active campaigns only)
+  if(typeof activeCampaigns === 'function'){
+    h += '<optgroup label="By campaign">';
+    activeCampaigns().forEach(function(c){
+      var n = withEmail.filter(function(a){
+        var ac = a.agentCodes||{};
+        return Object.prototype.hasOwnProperty.call(ac, c) && ac[c];
+      }).length;
+      if(n > 0) h += '<option value="campaign:'+_escapeAttr(c)+'">'+_escapeHtml(c)+' ('+n+')</option>';
+    });
+    h += '</optgroup>';
+  }
+  h += '<optgroup label="Other">';
+  h += '<option value="self">Just me (test)</option>';
+  h += '</optgroup>';
+  h += '</select></div>';
+  if(withoutEmail > 0){
+    h += '<div style="font-size:.7rem;color:var(--muted);margin-top:4px"><strong>Note:</strong> '+withoutEmail+' active agent(s) have no email on file — they will be silently skipped.</div>';
+  }
+  h += '</div></div>';
+
+  // Compose
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">2. Compose</div></div>';
+  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
+  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Subject</label>';
+  h += '<input id="meSubject" type="text" class="f-input" placeholder="e.g. Important: New training Monday at 9am CST"></div>';
+  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Message body (plain text — auto-wrapped in branded template)</label>';
+  h += '<textarea id="meBody" class="f-input" rows="10" placeholder="Hi team,&#10;&#10;Reminder that we have a national call Monday at 9am CST. Be on time — points are on the line.&#10;&#10;— Calvin" style="font-family:Arial,sans-serif;line-height:1.6"></textarea>';
+  h += '<div style="font-size:.66rem;color:var(--muted);margin-top:4px">Use blank lines for paragraph breaks. Basic links work: paste a URL and it stays clickable. The {{name}} token gets replaced with each recipient\'s first name.</div></div>';
+  h += '</div></div>';
+
+  // Preview button
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">3. Preview & Send</div></div>';
+  h += '<div style="padding:14px 18px">';
+  h += '<button onclick="meRefreshPreview()" style="padding:9px 16px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:5px;cursor:pointer;margin-right:8px">🔍 Show recipient list</button>';
+  h += '<button onclick="meSendNow()" class="btn-fire" style="padding:11px 22px;background:#16a34a;border-color:#16a34a">📤 SEND EMAIL</button>';
+  h += '<div id="mePreviewBox" style="margin-top:14px"></div>';
+  h += '</div></div>';
+
+  return h;
+}
+
+// Resolve the picked group to an array of {email, name} recipients
+function _meResolveRecipients(){
+  var sel = (document.getElementById('meRecipientGroup')||{value:'all'}).value;
+  var agents = (DB.agents||[]).filter(function(a){ return a.active && a.email && /@/.test(a.email); });
+  if(sel === 'all') return agents.map(function(a){ return {agent:a, email:a.email, name:a.name}; });
+  if(sel === 'self'){
+    var u = DB.current;
+    if(u && u.email) return [{agent:u, email:u.email, name:u.name}];
+    return [];
+  }
+  if(sel.indexOf('role:') === 0){
+    var role = sel.slice(5);
+    return agents.filter(function(a){ return a.role === role; }).map(function(a){return {agent:a, email:a.email, name:a.name};});
+  }
+  if(sel.indexOf('campaign:') === 0){
+    var camp = sel.slice(9);
+    return agents.filter(function(a){
+      var ac = a.agentCodes||{};
+      return Object.prototype.hasOwnProperty.call(ac, camp) && ac[camp];
+    }).map(function(a){return {agent:a, email:a.email, name:a.name};});
+  }
+  return [];
+}
+
+function meRefreshPreview(){
+  var box = document.getElementById('mePreviewBox');
+  if(!box) return;
+  var recipients = _meResolveRecipients();
+  if(!recipients.length){
+    box.innerHTML = '<div style="padding:14px;background:#fef3c7;border:1px solid #fde68a;border-radius:6px;font-family:Barlow Condensed,sans-serif;color:#92400e">⚠ No recipients in that group.</div>';
+    return;
+  }
+  var rows = recipients.map(function(r){
+    return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-size:.78rem"><strong>'+_escapeHtml(r.name)+'</strong></td><td style="padding:5px 8px;font-size:.78rem;color:var(--muted)">'+_escapeHtml(r.email)+'</td><td style="padding:5px 8px;font-size:.7rem;color:var(--muted)">'+_escapeHtml(r.agent.role||'—')+'</td></tr>';
+  }).join('');
+  box.innerHTML = '<div style="background:#f9fafb;border:1px solid var(--border);border-radius:6px;overflow:hidden">'
+    +'<div style="padding:10px 14px;background:#003594;color:white;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase">'+recipients.length+' recipient(s)</div>'
+    +'<div style="max-height:280px;overflow-y:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">'+rows+'</table></div></div>';
+}
+
+// Wraps the user's plain text body in our branded HTML template.
+function _meBuildHtmlBody(plainText, recipientName){
+  // Replace {{name}} with first name
+  var firstName = (recipientName||'').split(/\s+/)[0] || '';
+  var personalized = plainText.replace(/\{\{name\}\}/gi, firstName || 'there');
+  // Convert URLs to links
+  personalized = personalized.replace(/https?:\/\/[^\s<]+/g, function(url){
+    return '<a href="'+url+'" style="color:#003594;font-weight:700">'+url+'</a>';
+  });
+  // Paragraph breaks
+  var paragraphs = personalized.split(/\n\s*\n/).map(function(p){
+    return '<p style="margin:0 0 14px;line-height:1.6;color:#333;font-size:14px">'+p.replace(/\n/g,'<br>')+'</p>';
+  }).join('');
+  return '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:white">'
+    +'<div style="background:#003594;padding:20px;text-align:center"><h1 style="color:white;margin:0;letter-spacing:1.5px;font-size:18px">WMAMinc</h1></div>'
+    +'<div style="padding:28px;background:#f8f9fa">'+paragraphs+'</div>'
+    +'<div style="background:#002268;padding:14px;text-align:center;color:rgba(255,255,255,.7);font-size:12px">WMAMinc. &nbsp;|&nbsp; ONE TEAM. ONE DREAM.</div>'
+    +'</div>';
+}
+
+// SEND THE EMAIL — batched 50 at a time, sequential to avoid throttling.
+function meSendNow(){
+  var u = DB.current;
+  if(!isOwner(u)){ alert('Owner only.'); return; }
+  var subject = (document.getElementById('meSubject')||{value:''}).value.trim();
+  var body = (document.getElementById('meBody')||{value:''}).value.trim();
+  if(!subject){ alert('Subject is required.'); return; }
+  if(!body){ alert('Message body is required.'); return; }
+  var recipients = _meResolveRecipients();
+  if(!recipients.length){ alert('No valid recipients.'); return; }
+  if(!confirm('SEND TO '+recipients.length+' recipient(s)?\n\nSubject: '+subject+'\n\nThis CANNOT be undone.')) return;
+
+  var BATCH_SIZE = 50;
+  var DELAY_BETWEEN_BATCHES = 1500; // ms
+  var sent = 0, failed = 0;
+  var batches = [];
+  for(var i=0; i<recipients.length; i+=BATCH_SIZE){
+    batches.push(recipients.slice(i, i+BATCH_SIZE));
+  }
+  // Show progress modal
+  var prog = document.createElement('div');
+  prog.id = 'meSendProgress';
+  prog.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:white;border:2px solid var(--blue);border-radius:10px;padding:24px 32px;box-shadow:0 8px 32px rgba(0,0,0,.25);z-index:10000;min-width:340px;font-family:Barlow Condensed,sans-serif;text-align:center';
+  prog.innerHTML = '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:1.5px;color:var(--brown);margin-bottom:8px">📤 Sending...</div><div id="meProgText" style="color:var(--muted);font-size:.84rem">Starting...</div>';
+  var bd = document.createElement('div');
+  bd.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999';
+  document.body.appendChild(bd); document.body.appendChild(prog);
+
+  function updateProg(text){ var el = document.getElementById('meProgText'); if(el) el.textContent = text; }
+
+  function sendBatch(idx){
+    if(idx >= batches.length){
+      prog.remove(); bd.remove();
+      alert('✓ Send complete!\n\n'+sent+' sent, '+failed+' failed.\n\nFailures (if any) are logged in the browser console — check for [brevoSend] entries.');
+      return;
+    }
+    var batch = batches[idx];
+    updateProg('Batch '+(idx+1)+' of '+batches.length+' — sending to '+batch.length+' recipient(s)...');
+    // Brevo lets us send to multiple "to" addresses in one call but each
+    // recipient sees the others' addresses if we do that. To preserve
+    // privacy + personalize per-recipient, we send one-at-a-time within
+    // the batch, with a small inter-message delay.
+    var batchSent = 0, batchFailed = 0;
+    function nextInBatch(j){
+      if(j >= batch.length){
+        sent += batchSent; failed += batchFailed;
+        // Move to next batch with a delay
+        setTimeout(function(){ sendBatch(idx+1); }, DELAY_BETWEEN_BATCHES);
+        return;
+      }
+      var r = batch[j];
+      var html = _meBuildHtmlBody(body, r.name);
+      brevoSend({
+        to: [{email: r.email, name: r.name}],
+        subject: subject,
+        htmlContent: html,
+        replyTo: { email: BREVO_SENDER_EMAIL, name: BREVO_SENDER_NAME }
+      }).then(function(res){
+        if(res.ok) batchSent++; else batchFailed++;
+        setTimeout(function(){ nextInBatch(j+1); }, 80);  // Small per-message delay
+      });
+    }
+    nextInBatch(0);
+  }
+  sendBatch(0);
+}
 
 // Update help-text when AW Override Style dropdown changes.
 function aaAWModelChanged(){
