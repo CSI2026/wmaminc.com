@@ -8165,6 +8165,9 @@ function canAccess(u, area){
     // Ship C: My Redemptions — any active user
     case 'my-redemptions':
       return !!u.active;
+    // Ship A10: Visual org tree — Owner + Admin + Onboarding
+    case 'org-tree':
+      return isOwner(u) || u.role === 'admin' || isOnboarding(u);
 
     // ── TL and above ──
     case 'myteam':           return isMgr || isTL;
@@ -14948,6 +14951,7 @@ function buildNav(u){
       +boDropBtn('applications','📋 Applications')
       +boDropBtn('ll-teams','📍 LL Teams')
       +(canAccess(u,'markets-admin') ? boDropBtn('markets-admin','🗺️ Markets Roster') : '')
+      +(canAccess(u,'org-tree') ? boDropBtn('org-tree','🌳 Visual Org Tree') : '')
       +boDropBtn('reports','📊 Reports')
       +(canAccess(u,'agent-codes')   ? boDropBtn('agent-codes','🔑 Agent Codes')    : '')
       +(canAccess(u,'goal-settings') ? boDropBtn('goal-settings','🎯 Goals')         : '')
@@ -16210,6 +16214,7 @@ function gotoPanel(id, params){
     'call-schedule-admin':panelCallScheduleAdmin,
     'fulfillment':panelFulfillment,
     'my-redemptions':panelMyRedemptions,
+    'org-tree':panelOrgTree,
     'onboard-packages':panelOnboardPackages,
     'onboard-package-edit':panelOnboardPackageEdit,
     'onboard-assign':panelOnboardAssign,
@@ -33620,6 +33625,323 @@ function panelMyRedemptions(){
 }
 // ════════════════════════════════════════════════════════════════════════
 //  END SHIP C
+// ════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+//  SHIP A10 — VISUAL ORG TREE DASHBOARD
+//
+//  Top-down visual representation of the company org chart, filtered by
+//  campaign. Click any agent box → "Reassign" menu appears with eligible
+//  parents (powered by existing aaEligibleParents + paSaveOrgParent so
+//  we don't duplicate logic). Pay-affecting reassignments confirm first.
+//
+//  Access: Owner + Admin + Onboarding Dept (same as the inline editor on
+//  the agents table — these are the people who own org structure).
+// ════════════════════════════════════════════════════════════════════════
+
+// Build a {agentId → [childAgentIds]} map for one campaign.
+// "Children" = agents whose parentForCampaign(_, campaign) === agentId.
+// Top-of-org (no parent) agents are returned in the special key "__roots__".
+function _orgBuildChildMap(campaign){
+  var map = { __roots__: [] };
+  if(!Array.isArray(DB.agents)) return map;
+  // Org roles only — HR/Inventory dept/Onboarding dept/Owner/admin aren't
+  // part of the sales hierarchy and shouldn't appear in the tree at all.
+  var orgRoles = ['Field Agent','Sales Rep','Team Leader','Market Manager','Campaign Manager','IBO'];
+  // Initialize so even leaf agents appear in the map (with empty children list)
+  DB.agents.forEach(function(a){
+    if(!a.active) return;
+    if(orgRoles.indexOf(a.role) < 0) return;
+    if(!map[a.id]) map[a.id] = [];
+  });
+  DB.agents.forEach(function(a){
+    if(!a.active) return;
+    if(orgRoles.indexOf(a.role) < 0) return;
+    var parentId = (typeof parentForCampaign === 'function')
+      ? parentForCampaign(a, campaign)
+      : (a.teamLeaderId || a.marketManagerId || a.campaignManagerId || null);
+    if(parentId == null){
+      map.__roots__.push(a.id);
+    } else if(map[parentId]){
+      map[parentId].push(a.id);
+    } else {
+      // Parent isn't in the active set (deactivated mid-stream). Treat as root
+      // so the agent doesn't disappear from the tree entirely.
+      map.__roots__.push(a.id);
+    }
+  });
+  // Sort each list: by role priority then name. Higher roles render first.
+  function rolePriority(role){
+    return ({'IBO':0,'Campaign Manager':1,'Market Manager':2,'Team Leader':3,'Field Agent':4,'Sales Rep':4})[role] || 9;
+  }
+  Object.keys(map).forEach(function(k){
+    map[k].sort(function(aid, bid){
+      var a = DB.agents.find(function(x){return x.id===aid;});
+      var b = DB.agents.find(function(x){return x.id===bid;});
+      if(!a||!b) return 0;
+      var pa = rolePriority(a.role), pb = rolePriority(b.role);
+      if(pa !== pb) return pa - pb;
+      return (a.name||'').localeCompare(b.name||'');
+    });
+  });
+  return map;
+}
+
+// Render one agent box (recursive — renders children below).
+function _orgRenderNode(agentId, childMap, campaign, depth){
+  var a = DB.agents.find(function(x){ return x.id === agentId; });
+  if(!a) return '';
+  // Color per role
+  var roleColor = '#6b7280';
+  var roleEmoji = '👤';
+  if(a.role === 'IBO'){ roleColor = '#7c3aed'; roleEmoji = '🏢'; }
+  else if(a.role === 'Campaign Manager'){ roleColor = '#0891b2'; roleEmoji = '📊'; }
+  else if(a.role === 'Market Manager'){ roleColor = '#D97706'; roleEmoji = '🏬'; }
+  else if(a.role === 'Team Leader'){ roleColor = '#16a34a'; roleEmoji = '🎯'; }
+  // Field Agent stays grey
+  var children = childMap[agentId] || [];
+  var initials = (a.name||'?').split(/\s+/).map(function(p){return (p[0]||'').toUpperCase();}).join('').slice(0,2);
+  // Activations this period (rough display — pull monthly sales count if present)
+  var salesNote = '';
+  if(typeof a.sales === 'number' && a.sales > 0) salesNote = a.sales + ' sales';
+
+  var html = '<div class="org-node" data-agent-id="'+a.id+'" style="display:inline-flex;flex-direction:column;align-items:center;margin:0 8px">';
+  // The box itself
+  html += '<div onclick="orgPickAgent('+a.id+',\''+campaign.replace(/'/g,"\\'")+'\')" '
+       + 'style="background:white;border:2px solid '+roleColor+';border-radius:8px;padding:10px 14px;min-width:160px;box-shadow:0 2px 4px rgba(0,0,0,.06);cursor:pointer;transition:transform .1s,box-shadow .1s" '
+       + 'onmouseover="this.style.transform=\'translateY(-2px)\';this.style.boxShadow=\'0 4px 12px rgba(0,0,0,.12)\'" '
+       + 'onmouseout="this.style.transform=\'\';this.style.boxShadow=\'0 2px 4px rgba(0,0,0,.06)\'">';
+  html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+  html += '<div style="width:28px;height:28px;border-radius:50%;background:'+roleColor+';color:white;display:flex;align-items:center;justify-content:center;font-family:Bebas Neue,sans-serif;font-size:.8rem;flex-shrink:0">'+_escapeHtml(initials)+'</div>';
+  html += '<div style="flex:1;min-width:0">';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-weight:700;color:var(--brown);font-size:.84rem;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+_escapeHtml(a.name||'?')+'</div>';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;color:'+roleColor+';font-weight:700">'+roleEmoji+' '+_escapeHtml(a.role||'')+'</div>';
+  html += '</div></div>';
+  if(salesNote){
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);text-align:right">'+salesNote+'</div>';
+  }
+  html += '</div>';
+  // Children connector + recursion
+  if(children.length){
+    html += '<div style="width:2px;height:18px;background:'+roleColor+';opacity:.3;margin-top:4px"></div>';
+    // Horizontal connector line spanning all children
+    html += '<div style="display:flex;justify-content:center;align-items:flex-start;position:relative;padding-top:0">';
+    html += '<div style="position:absolute;top:0;left:24px;right:24px;height:2px;background:'+roleColor+';opacity:.3"></div>';
+    children.forEach(function(cid){
+      html += '<div style="display:inline-flex;flex-direction:column;align-items:center;padding-top:0">';
+      html += '<div style="width:2px;height:14px;background:'+roleColor+';opacity:.3"></div>';
+      html += _orgRenderNode(cid, childMap, campaign, depth+1);
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function panelOrgTree(){
+  var u = DB.current;
+  // Permission: Owner + admin + Onboarding can view & edit
+  var canEdit = isOwner(u) || u.role === 'admin' || (typeof isOnboarding === 'function' && isOnboarding(u));
+  if(!canEdit){
+    return panelHeader('🌳 Org Tree') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Restricted to Owner, Admin, and Onboarding.</div></div>';
+  }
+  var h = panelHeader('🌳 Visual Org Tree');
+
+  // Campaign filter — Q2 (a)
+  var campaigns = (typeof activeCampaigns === 'function') ? activeCampaigns() : ['Gen Mobile'];
+  if(!campaigns.length) campaigns = ['Gen Mobile'];
+  var selected = window._orgTreeCampaign || campaigns[0];
+  if(campaigns.indexOf(selected) < 0) selected = campaigns[0];
+
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>Visual representation of your org chart for the selected campaign.</strong> Click any agent box to reassign them to a different parent. Roles render top-down: 🏢 IBO → 📊 CM → 🏬 MM → 🎯 TL → 👤 Field Agent.';
+  h += '</div>';
+
+  // Filter row + legend
+  h += '<div class="bo-card" style="margin-bottom:18px"><div style="padding:14px 18px;display:flex;align-items:center;flex-wrap:wrap;gap:14px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--brown);font-weight:700">Campaign:</div>';
+  h += '<select id="orgCampaignSelect" onchange="orgChangeCampaign(this.value)" style="padding:7px 12px;border:1.5px solid var(--sand);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.84rem;background:white">';
+  campaigns.forEach(function(c){
+    h += '<option value="'+_escapeAttr(c)+'"'+(c===selected?' selected':'')+'>'+_escapeHtml(c)+'</option>';
+  });
+  h += '</select>';
+  // Legend
+  h += '<div style="margin-left:auto;display:flex;gap:10px;flex-wrap:wrap;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">';
+  ['🏢 IBO','📊 CM','🏬 MM','🎯 TL','👤 Field Agent'].forEach(function(l){
+    h += '<span>'+l+'</span>';
+  });
+  h += '</div>';
+  h += '</div></div>';
+
+  // Build the tree
+  var childMap = _orgBuildChildMap(selected);
+  var roots = childMap.__roots__ || [];
+  if(!roots.length){
+    h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">🌳</div><div>No org structure yet for this campaign.</div><div style="font-size:.72rem;margin-top:8px">Add agents and assign their reports-to via the agents table or the new Add Person form.</div></div></div>';
+    return h;
+  }
+
+  // Group roots by role for cleaner top-row layout
+  // (e.g., multiple CMs at top show side-by-side, each with their own subtree)
+  h += '<div class="bo-card" style="overflow-x:auto;padding:24px"><div style="display:flex;justify-content:flex-start;align-items:flex-start;gap:32px;min-width:max-content">';
+  roots.forEach(function(rootId){
+    h += '<div style="display:inline-block">';
+    h += _orgRenderNode(rootId, childMap, selected, 0);
+    h += '</div>';
+  });
+  h += '</div></div>';
+
+  // Stats footer
+  var totalActive = (DB.agents||[]).filter(function(a){return a.active;}).length;
+  var roleCounts = {};
+  (DB.agents||[]).forEach(function(a){
+    if(!a.active) return;
+    roleCounts[a.role] = (roleCounts[a.role] || 0) + 1;
+  });
+  h += '<div class="bo-card" style="margin-top:18px"><div class="bo-card-head"><div class="bo-card-title">📊 Org snapshot</div></div>';
+  h += '<div style="padding:14px 20px;display:flex;flex-wrap:wrap;gap:18px;font-family:Barlow Condensed,sans-serif">';
+  h += '<div><strong style="font-size:1.4rem;color:var(--blue)">'+totalActive+'</strong> <span style="font-size:.72rem;color:var(--muted);letter-spacing:1px;text-transform:uppercase">total active</span></div>';
+  ['IBO','Campaign Manager','Market Manager','Team Leader','Field Agent'].forEach(function(r){
+    if(!roleCounts[r]) return;
+    h += '<div><strong style="font-size:1.1rem;color:var(--brown)">'+roleCounts[r]+'</strong> <span style="font-size:.7rem;color:var(--muted);letter-spacing:1px;text-transform:uppercase">'+r+'</span></div>';
+  });
+  h += '</div></div>';
+
+  return h;
+}
+
+function orgChangeCampaign(campaign){
+  window._orgTreeCampaign = campaign;
+  if(typeof gotoPanel === 'function') gotoPanel('org-tree');
+}
+
+// Click on an agent box → opens an inline reassign popup.
+// Lists eligible parents from aaEligibleParents (which already knows the
+// role-tier rules), shows current parent, and saves via paSaveOrgParent.
+function orgPickAgent(agentId, campaign){
+  var u = DB.current;
+  if(!u || (!isOwner(u) && u.role !== 'admin' && (typeof isOnboarding !== 'function' || !isOnboarding(u)))){
+    return;
+  }
+  var a = (DB.agents||[]).find(function(x){ return x.id === agentId; });
+  if(!a){ alert('Agent not found.'); return; }
+
+  // Build the popup. Reuse a single global popup div so we never accumulate.
+  var existing = document.getElementById('orgReassignPopup');
+  if(existing) existing.remove();
+
+  var pop = document.createElement('div');
+  pop.id = 'orgReassignPopup';
+  pop.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:white;border:2px solid var(--blue);border-radius:10px;padding:22px 26px;box-shadow:0 8px 32px rgba(0,0,0,.25);z-index:10000;max-width:480px;width:90%;max-height:85vh;overflow-y:auto;font-family:Barlow Condensed,sans-serif';
+
+  // Backdrop
+  var bd = document.createElement('div');
+  bd.id = 'orgReassignBackdrop';
+  bd.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9999';
+  bd.onclick = function(){ pop.remove(); bd.remove(); };
+
+  var html = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">';
+  html += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:1.5px;color:var(--brown)">'+_escapeHtml(a.name)+'</div>';
+  html += '<div style="font-size:.72rem;color:var(--muted);letter-spacing:1px;text-transform:uppercase">'+_escapeHtml(a.role||'')+' · '+_escapeHtml(campaign)+'</div></div>';
+  html += '<button onclick="document.getElementById(\'orgReassignPopup\').remove();document.getElementById(\'orgReassignBackdrop\').remove()" style="background:none;border:none;font-size:1.4rem;color:var(--muted);cursor:pointer;padding:0 4px">×</button>';
+  html += '</div>';
+
+  // IBOs sit at the top — no parent to pick
+  if(a.role === 'IBO'){
+    html += '<div style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.25);border-radius:6px;padding:14px;color:#7c3aed;font-weight:700;text-align:center">🏢 IBO is top-of-org — no parent above this role.</div>';
+    html += '<div style="margin-top:14px"><button onclick="orgOpenAgentProfile('+agentId+');document.getElementById(\'orgReassignPopup\').remove();document.getElementById(\'orgReassignBackdrop\').remove()" style="background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;width:100%">Open Profile</button></div>';
+    pop.innerHTML = html;
+    document.body.appendChild(bd);
+    document.body.appendChild(pop);
+    return;
+  }
+
+  // Get eligible parents
+  var eligibles = (typeof aaEligibleParents === 'function') ? aaEligibleParents(a.role, campaign) : [{id:null,label:'⬆ Top of org'}];
+  var currentParent = (a.reportsTo && Object.prototype.hasOwnProperty.call(a.reportsTo, campaign))
+    ? a.reportsTo[campaign]
+    : (typeof parentForCampaign === 'function' ? parentForCampaign(a, campaign) : null);
+  var currentLabel = (function(){
+    if(currentParent == null) return '⬆ Top of org';
+    var p = (DB.agents||[]).find(function(x){ return x.id === currentParent; });
+    return p ? (p.name + ' · ' + p.role) : '(unknown #'+currentParent+')';
+  })();
+
+  html += '<div style="margin-bottom:12px;padding:10px 12px;background:var(--cream);border-radius:6px"><div style="font-size:.66rem;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:3px">Currently reports to</div><div style="font-weight:700;color:var(--brown)">'+_escapeHtml(currentLabel)+'</div></div>';
+
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px">Reassign to:</div>';
+  html += '<div style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">';
+  if(!eligibles.length){
+    html += '<div style="padding:14px;color:var(--muted);font-style:italic;text-align:center">No eligible parents found for this role.</div>';
+  } else {
+    eligibles.forEach(function(p){
+      var v = (p.id === null) ? '__top__' : String(p.id);
+      var isCurrent = (currentParent == null && p.id === null) || (typeof currentParent === 'number' && currentParent === p.id);
+      html += '<div onclick="orgConfirmReassign('+agentId+',\''+campaign.replace(/'/g,"\\'")+'\',\''+v+'\')" '
+           + 'style="padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;align-items:center;gap:10px;'+(isCurrent?'background:rgba(0,53,148,.08)':'')+'" '
+           + 'onmouseover="this.style.background=\'rgba(0,53,148,.04)\'" onmouseout="this.style.background=\''+(isCurrent?'rgba(0,53,148,.08)':'transparent')+'\'">';
+      html += '<div style="flex:1">'+_escapeHtml(p.label)+'</div>';
+      if(isCurrent) html += '<span style="font-size:.62rem;color:var(--blue);font-weight:700;letter-spacing:1px">CURRENT</span>';
+      html += '</div>';
+    });
+  }
+  html += '</div>';
+
+  // Bottom actions
+  html += '<div style="margin-top:14px;display:flex;gap:8px">';
+  html += '<button onclick="orgOpenAgentProfile('+agentId+');document.getElementById(\'orgReassignPopup\').remove();document.getElementById(\'orgReassignBackdrop\').remove()" style="background:none;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:4px;cursor:pointer;flex:1">Open Full Profile</button>';
+  html += '<button onclick="document.getElementById(\'orgReassignPopup\').remove();document.getElementById(\'orgReassignBackdrop\').remove()" style="background:none;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:4px;cursor:pointer">Cancel</button>';
+  html += '</div>';
+
+  pop.innerHTML = html;
+  document.body.appendChild(bd);
+  document.body.appendChild(pop);
+}
+
+// Called when user picks a new parent. Confirms (since this is pay-affecting),
+// then calls existing paSaveOrgParent for the actual write.
+async function orgConfirmReassign(agentId, campaign, value){
+  var a = (DB.agents||[]).find(function(x){ return x.id === agentId; });
+  if(!a) return;
+  var newLabel;
+  if(value === '__top__'){
+    newLabel = 'Top of org (no manager above)';
+  } else {
+    var pid = parseInt(value, 10);
+    var p = (DB.agents||[]).find(function(x){ return x.id === pid; });
+    newLabel = p ? (p.name + ' · ' + p.role) : '(unknown)';
+  }
+  var msg = 'Reassign ' + a.name + ' (' + (a.role||'') + ') to:\n\n' + newLabel
+          + '\n\nCampaign: ' + campaign
+          + '\n\nThis affects who gets paid override commission on this agent\'s sales going forward. Existing finalized payroll weeks are NOT changed. Proceed?';
+  if(!confirm(msg)) return;
+  // Delegate to existing helper (handles save + Supabase + visual flash)
+  if(typeof paSaveOrgParent === 'function'){
+    await paSaveOrgParent(agentId, campaign, value);
+  } else {
+    console.warn('[orgConfirmReassign] paSaveOrgParent not available');
+  }
+  // Close popup + refresh the org tree
+  var pop = document.getElementById('orgReassignPopup');
+  var bd = document.getElementById('orgReassignBackdrop');
+  if(pop) pop.remove();
+  if(bd) bd.remove();
+  if(typeof gotoPanel === 'function') gotoPanel('org-tree');
+}
+
+// Convenience — opens the existing Edit Person modal so they can do
+// fuller edits (name, codes, programs, etc.) than just reassignment.
+function orgOpenAgentProfile(agentId){
+  if(typeof openEditPerson === 'function'){
+    openEditPerson(agentId);
+  } else if(typeof openEditAgent === 'function'){
+    openEditAgent(agentId);
+  }
+}
+// ════════════════════════════════════════════════════════════════════════
+//  END SHIP A10
 // ════════════════════════════════════════════════════════════════════════
 
 // Update help-text when AW Override Style dropdown changes.
