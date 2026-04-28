@@ -35410,6 +35410,31 @@ function p2cShowCalculation(weekId, agentId, carrier, periodStart, periodEnd){
 //  stay well under any throttling limits.
 // ════════════════════════════════════════════════════════════════════════
 
+// ── PROGRAM → CAMPAIGN MAP ──
+// Used by Mass Email + future SMS to let Owner pick targets hierarchically.
+// Source of truth for which campaigns roll up under which program.
+var PROGRAM_CAMPAIGNS = {
+  'Lifeline': ['Gen Mobile', 'TruConnect', 'Assurance', 'Excess'],
+  'Internet': ['Astound', 'Chuzo'],
+  'ACA':      ['ACA']
+};
+function _meAllCampaigns(){
+  var out = [];
+  Object.keys(PROGRAM_CAMPAIGNS).forEach(function(p){
+    PROGRAM_CAMPAIGNS[p].forEach(function(c){ if(out.indexOf(c) < 0) out.push(c); });
+  });
+  return out;
+}
+
+// Roles available in the picker. Order matters — leadership first.
+var ME_ROLES = [
+  {key:'IBO',             label:'IBO',             icon:'💼'},
+  {key:'Campaign Manager',label:'Campaign Manager',icon:'📊'},
+  {key:'Market Manager',  label:'Market Manager',  icon:'🗺️'},
+  {key:'Team Leader',     label:'Team Leader',     icon:'👥'},
+  {key:'Field Agent',     label:'Field Agent',     icon:'🎯'}
+];
+
 function panelMassEmail(){
   var u = DB.current;
   if(!isOwner(u)){
@@ -35418,7 +35443,7 @@ function panelMassEmail(){
   }
   var h = panelHeader('📧 Mass Email — Send to Team');
   h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
-  h += '<strong>Send a single email to multiple agents.</strong> Pick a recipient group, write the message, preview the recipient list, hit send. Brevo handles delivery; we batch 50 at a time. Agents without an email on file are skipped automatically.';
+  h += '<strong>Send to a hierarchy: Program → Campaign → Role.</strong> Pick one or more programs (or "All Programs"), then pick campaigns within them (or "All Campaigns"), then pick which roles. Recipient count updates live. Click <strong>Show recipient list</strong> before sending to verify.';
   h += '</div>';
 
   if(!BREVO_API_KEY){
@@ -35426,87 +35451,156 @@ function panelMassEmail(){
     return h;
   }
 
-  // Build active agent list
-  var agents = (DB.agents||[]).filter(function(a){ return a.active; });
-  var withEmail = agents.filter(function(a){ return a.email && /@/.test(a.email); });
-  var withoutEmail = agents.length - withEmail.length;
-
-  // Recipient picker
-  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">1. Pick recipients</div></div>';
+  // ── 1. PROGRAM PICKER ──
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">1. Program(s)</div></div>';
   h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
-  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Send to</label>';
-  h += '<select id="meRecipientGroup" class="f-input" onchange="meRefreshPreview()">';
-  h += '<option value="all">All active agents ('+withEmail.length+' with email)</option>';
-  h += '<optgroup label="By role">';
-  ['Field Agent','Team Leader','Market Manager','Campaign Manager','IBO','admin','HR','Inventory','Payroll','Onboarding'].forEach(function(role){
-    var n = withEmail.filter(function(a){ return a.role === role; }).length;
-    if(n > 0) h += '<option value="role:'+_escapeAttr(role)+'">'+_escapeHtml(role)+' ('+n+')</option>';
+  h += '<div style="margin-bottom:10px"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:700;color:var(--blue)"><input type="checkbox" id="mePgmAll" checked onchange="meTogglePgmAll(this.checked)" style="width:16px;height:16px;accent-color:#003594"> All programs</label></div>';
+  h += '<div style="display:flex;gap:14px;flex-wrap:wrap">';
+  Object.keys(PROGRAM_CAMPAIGNS).forEach(function(pgm){
+    h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown)"><input type="checkbox" name="mePgm" value="'+_escapeAttr(pgm)+'" checked onchange="meRefreshCampaigns()" style="width:16px;height:16px;accent-color:#003594"> '+_escapeHtml(pgm)+'</label>';
   });
-  h += '</optgroup>';
-  // By campaign (active campaigns only)
-  if(typeof activeCampaigns === 'function'){
-    h += '<optgroup label="By campaign">';
-    activeCampaigns().forEach(function(c){
-      var n = withEmail.filter(function(a){
-        var ac = a.agentCodes||{};
-        return Object.prototype.hasOwnProperty.call(ac, c) && ac[c];
-      }).length;
-      if(n > 0) h += '<option value="campaign:'+_escapeAttr(c)+'">'+_escapeHtml(c)+' ('+n+')</option>';
-    });
-    h += '</optgroup>';
-  }
-  h += '<optgroup label="Other">';
-  h += '<option value="self">Just me (test)</option>';
-  h += '</optgroup>';
-  h += '</select></div>';
-  if(withoutEmail > 0){
-    h += '<div style="font-size:.7rem;color:var(--muted);margin-top:4px"><strong>Note:</strong> '+withoutEmail+' active agent(s) have no email on file — they will be silently skipped.</div>';
-  }
+  h += '</div></div></div>';
+
+  // ── 2. CAMPAIGN PICKER (dynamic based on programs) ──
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">2. Campaign(s)</div></div>';
+  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
+  h += '<div style="margin-bottom:10px"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:700;color:var(--blue)"><input type="checkbox" id="meCampAll" checked onchange="meToggleCampAll(this.checked)" style="width:16px;height:16px;accent-color:#003594"> All campaigns (in selected programs)</label></div>';
+  h += '<div id="meCampaignList" style="display:flex;gap:14px;flex-wrap:wrap"></div>';
   h += '</div></div>';
 
-  // Compose
-  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">2. Compose</div></div>';
+  // ── 3. ROLE PICKER ──
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">3. Role(s)</div></div>';
+  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
+  h += '<div style="margin-bottom:10px"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:700;color:var(--blue)"><input type="checkbox" id="meRoleAll" checked onchange="meToggleRoleAll(this.checked)" style="width:16px;height:16px;accent-color:#003594"> All roles</label></div>';
+  h += '<div style="display:flex;gap:14px;flex-wrap:wrap">';
+  ME_ROLES.forEach(function(r){
+    h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown)"><input type="checkbox" name="meRole" value="'+_escapeAttr(r.key)+'" checked onchange="meUpdateCount()" style="width:16px;height:16px;accent-color:#003594"> '+r.icon+' '+_escapeHtml(r.label)+'</label>';
+  });
+  h += '</div>';
+  h += '</div></div>';
+
+  // ── LIVE COUNT ──
+  h += '<div id="meCountBanner" style="background:linear-gradient(135deg,#003594,#001e52);color:white;border-radius:8px;padding:14px 18px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;font-family:Barlow Condensed,sans-serif">';
+  h += '<div><div style="font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.7)">Will send to</div><div id="meRecipientCount" style="font-family:Bebas Neue,sans-serif;font-size:1.6rem;letter-spacing:1.5px">— recipients</div></div>';
+  h += '<button onclick="meRefreshPreview()" style="padding:9px 16px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:5px;cursor:pointer">🔍 Show list</button>';
+  h += '</div>';
+  h += '<div id="mePreviewBox" style="margin-bottom:14px"></div>';
+
+  // ── COMPOSE ──
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">4. Compose</div></div>';
   h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
   h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Subject</label>';
-  h += '<input id="meSubject" type="text" class="f-input" placeholder="e.g. Important: New training Monday at 9am CST"></div>';
+  h += '<input id="meSubject" type="text" class="f-input" placeholder="e.g. Important: National call Monday at 9am CST"></div>';
   h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Message body (plain text — auto-wrapped in branded template)</label>';
-  h += '<textarea id="meBody" class="f-input" rows="10" placeholder="Hi team,&#10;&#10;Reminder that we have a national call Monday at 9am CST. Be on time — points are on the line.&#10;&#10;— Calvin" style="font-family:Arial,sans-serif;line-height:1.6"></textarea>';
-  h += '<div style="font-size:.66rem;color:var(--muted);margin-top:4px">Use blank lines for paragraph breaks. Basic links work: paste a URL and it stays clickable. The {{name}} token gets replaced with each recipient\'s first name.</div></div>';
+  h += '<textarea id="meBody" class="f-input" rows="10" placeholder="Hi {{name}},&#10;&#10;Reminder that we have a national call Monday at 9am CST. Be on time — points are on the line.&#10;&#10;— Calvin" style="font-family:Arial,sans-serif;line-height:1.6"></textarea>';
+  h += '<div style="font-size:.66rem;color:var(--muted);margin-top:4px">Use blank lines for paragraph breaks. URLs auto-link. <code>{{name}}</code> gets replaced with each recipient\'s first name.</div></div>';
   h += '</div></div>';
 
-  // Preview button
-  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">3. Preview & Send</div></div>';
-  h += '<div style="padding:14px 18px">';
-  h += '<button onclick="meRefreshPreview()" style="padding:9px 16px;background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:5px;cursor:pointer;margin-right:8px">🔍 Show recipient list</button>';
+  // ── SEND ──
+  h += '<div class="bo-card"><div style="padding:14px 18px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">';
   h += '<button onclick="meSendNow()" class="btn-fire" style="padding:11px 22px;background:#16a34a;border-color:#16a34a">📤 SEND EMAIL</button>';
-  h += '<div id="mePreviewBox" style="margin-top:14px"></div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">Brevo handles delivery. Batched 50 at a time, ~80ms between messages. Agents without an email are silently skipped.</div>';
   h += '</div></div>';
+
+  // Initial render of campaigns + count (deferred so the DOM is ready)
+  setTimeout(function(){ try { meRefreshCampaigns(); } catch(e){} }, 50);
 
   return h;
 }
 
-// Resolve the picked group to an array of {email, name} recipients
+// ── Picker handlers ──
+
+// Master toggle: "All programs" — checks/unchecks all program checkboxes
+function meTogglePgmAll(checked){
+  document.querySelectorAll('input[name="mePgm"]').forEach(function(cb){ cb.checked = checked; });
+  meRefreshCampaigns();
+}
+
+// Master toggle: "All campaigns" — checks/unchecks all campaign checkboxes
+function meToggleCampAll(checked){
+  document.querySelectorAll('input[name="meCamp"]').forEach(function(cb){ cb.checked = checked; });
+  meUpdateCount();
+}
+
+// Master toggle: "All roles"
+function meToggleRoleAll(checked){
+  document.querySelectorAll('input[name="meRole"]').forEach(function(cb){ cb.checked = checked; });
+  meUpdateCount();
+}
+
+// Re-render the campaign checkboxes based on selected programs
+function meRefreshCampaigns(){
+  var box = document.getElementById('meCampaignList');
+  if(!box) return;
+  // Read selected programs
+  var selectedPgms = [];
+  document.querySelectorAll('input[name="mePgm"]:checked').forEach(function(cb){ selectedPgms.push(cb.value); });
+  // Sync the "All programs" checkbox state
+  var pgmAllCb = document.getElementById('mePgmAll');
+  if(pgmAllCb) pgmAllCb.checked = (selectedPgms.length === Object.keys(PROGRAM_CAMPAIGNS).length);
+  // Build the list of campaigns under those programs
+  var campaigns = [];
+  selectedPgms.forEach(function(p){
+    (PROGRAM_CAMPAIGNS[p]||[]).forEach(function(c){ if(campaigns.indexOf(c) < 0) campaigns.push(c); });
+  });
+  if(!campaigns.length){
+    box.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:.78rem">Pick at least one program above.</div>';
+    meUpdateCount();
+    return;
+  }
+  box.innerHTML = campaigns.map(function(c){
+    return '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown)"><input type="checkbox" name="meCamp" value="'+_escapeAttr(c)+'" checked onchange="meUpdateCount()" style="width:16px;height:16px;accent-color:#003594"> '+_escapeHtml(c)+'</label>';
+  }).join('');
+  // Re-tick "All campaigns" since we just rebuilt and all are checked
+  var campAllCb = document.getElementById('meCampAll');
+  if(campAllCb) campAllCb.checked = true;
+  meUpdateCount();
+}
+
+// Update the live recipient count in the banner
+function meUpdateCount(){
+  var recipients = _meResolveRecipients();
+  var el = document.getElementById('meRecipientCount');
+  if(el) el.textContent = recipients.length + ' recipient' + (recipients.length===1?'':'s');
+  // Sync "All campaigns" checkbox
+  var allCamp = document.getElementById('meCampAll');
+  var totalCamps = document.querySelectorAll('input[name="meCamp"]').length;
+  var checkedCamps = document.querySelectorAll('input[name="meCamp"]:checked').length;
+  if(allCamp) allCamp.checked = (totalCamps > 0 && totalCamps === checkedCamps);
+  // Sync "All roles" checkbox
+  var allRole = document.getElementById('meRoleAll');
+  var totalRoles = document.querySelectorAll('input[name="meRole"]').length;
+  var checkedRoles = document.querySelectorAll('input[name="meRole"]:checked').length;
+  if(allRole) allRole.checked = (totalRoles > 0 && totalRoles === checkedRoles);
+  // Live update of preview box if it's showing
+  var preview = document.getElementById('mePreviewBox');
+  if(preview && preview.innerHTML.trim()) meRefreshPreview();
+}
+
+// Resolve picker state to a recipient list. Filters: campaigns ∩ roles.
+//   - Agent must have an active code in AT LEAST ONE selected campaign
+//   - Agent's role must match AT LEAST ONE selected role
+//   - Agent must be active and have an email
 function _meResolveRecipients(){
-  var sel = (document.getElementById('meRecipientGroup')||{value:'all'}).value;
   var agents = (DB.agents||[]).filter(function(a){ return a.active && a.email && /@/.test(a.email); });
-  if(sel === 'all') return agents.map(function(a){ return {agent:a, email:a.email, name:a.name}; });
-  if(sel === 'self'){
-    var u = DB.current;
-    if(u && u.email) return [{agent:u, email:u.email, name:u.name}];
-    return [];
-  }
-  if(sel.indexOf('role:') === 0){
-    var role = sel.slice(5);
-    return agents.filter(function(a){ return a.role === role; }).map(function(a){return {agent:a, email:a.email, name:a.name};});
-  }
-  if(sel.indexOf('campaign:') === 0){
-    var camp = sel.slice(9);
-    return agents.filter(function(a){
-      var ac = a.agentCodes||{};
-      return Object.prototype.hasOwnProperty.call(ac, camp) && ac[camp];
-    }).map(function(a){return {agent:a, email:a.email, name:a.name};});
-  }
-  return [];
+  // Read selected campaigns
+  var selectedCamps = [];
+  document.querySelectorAll('input[name="meCamp"]:checked').forEach(function(cb){ selectedCamps.push(cb.value); });
+  // Read selected roles
+  var selectedRoles = [];
+  document.querySelectorAll('input[name="meRole"]:checked').forEach(function(cb){ selectedRoles.push(cb.value); });
+  // If no campaigns selected, no one matches
+  if(!selectedCamps.length || !selectedRoles.length) return [];
+  return agents.filter(function(a){
+    // Role match
+    if(selectedRoles.indexOf(a.role) < 0) return false;
+    // Campaign match — agent must have a code in at least one selected campaign
+    var ac = a.agentCodes || {};
+    var hasMatch = selectedCamps.some(function(c){
+      return Object.prototype.hasOwnProperty.call(ac, c) && ac[c];
+    });
+    return hasMatch;
+  }).map(function(a){ return {agent:a, email:a.email, name:a.name}; });
 }
 
 function meRefreshPreview(){
