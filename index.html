@@ -7593,12 +7593,12 @@ function onboardingEnterAgentCode(agentId,campaignName,code){
   }
 
   // ── Brevo: Welcome SMS auto-fire ──
-  // Fires alongside the welcome email if the agent has a phone on file.
-  // Short message — designed to fit in a single 160-char SMS segment ($0.0079
-  // per recipient). Failures are logged but don't block the rest of the flow.
-  if(typeof brevoSendSms === 'function' && agent.phone && BREVO_API_KEY){
+  // Fires alongside the welcome email IF (1) agent has phone, (2) agent opted
+  // in to SMS during onboarding (smsConsent === true). TCPA compliance —
+  // never text someone who didn't explicitly consent.
+  if(typeof brevoSendSms === 'function' && agent.phone && BREVO_API_KEY && agent.smsConsent === true){
     var firstName = (agent.name||'').split(/\s+/)[0] || 'there';
-    var smsMsg = 'Hi '+firstName+'! Your WMAMinc agent code for '+campaignName+' is active. Log in at wmaminc.com — username: '+(agent.username||'(see email)')+'. Welcome to the team!';
+    var smsMsg = 'Hi '+firstName+'! Your WMAMinc agent code for '+campaignName+' is active. Log in at wmaminc.com — username: '+(agent.username||'(see email)')+'. Reply STOP to opt out.';
     // Cap at 160 chars to stay in single segment for cost control
     if(smsMsg.length > 160) smsMsg = smsMsg.slice(0, 157) + '...';
     brevoSendSms({ to: agent.phone, content: smsMsg })
@@ -7606,6 +7606,8 @@ function onboardingEnterAgentCode(agentId,campaignName,code){
         if(r.ok) console.log('[welcome-sms] sent to '+agent.name+' ('+agent.phone+')');
         else console.warn('[welcome-sms] failed for '+agent.name+':', r.error);
       });
+  } else if(agent.phone && BREVO_API_KEY && agent.smsConsent !== true){
+    console.log('[welcome-sms] skipped — '+agent.name+' did not opt in to SMS');
   }
 }
 
@@ -23579,6 +23581,19 @@ function openStepSignModal(agentId,campaignName,step){
     +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">'+stepTitle+'</div>'
     +'</div>'
     +'<div style="padding:24px 32px;overflow-y:auto;flex:1">'+contractHTML
+    // ── SMS CONSENT (TCPA opt-in) — only on step 2 (policy step) ──
+    // US federal law (TCPA) requires explicit prior express consent before
+    // sending SMS to anyone. Without this, fines can be $500-$1,500 per text.
+    // Default: UNCHECKED — user must affirmatively opt in. Capture timestamp
+    // for legal proof; persist in agent.smsConsent.
+    +(step===2 ? '<div style="background:rgba(8,145,178,.05);border:2px solid rgba(8,145,178,.25);border-radius:8px;padding:16px 18px;margin-top:20px">'
+        +'<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:2px;color:#0E7490;margin-bottom:8px">📱 Optional: SMS Notifications</div>'
+        +'<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.82rem;line-height:1.5;color:var(--brown)">'
+        +'<input type="checkbox" id="step-sms-consent" style="margin-top:3px;width:18px;height:18px;flex-shrink:0;cursor:pointer;accent-color:#0E7490">'
+        +'<span><strong>Yes, I consent to receive SMS text messages from WMAMinc.</strong> I understand WMAMinc may send me text messages related to my agent role, including welcome messages, training reminders, payroll notifications, and time-sensitive alerts. I can opt out at any time by replying STOP. Standard message and data rates may apply. Message frequency varies. Consent is not a condition of my contractor agreement.</span>'
+        +'</label>'
+        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-top:8px;padding-top:8px;border-top:1px dashed rgba(0,0,0,.08)">Leaving this unchecked is fine — you\'ll still receive all important info via email and the portal. You can change this later in My Profile.</div>'
+        +'</div>' : '')
     +'<div style="border-top:2px solid var(--border);padding-top:18px;margin-top:20px">'
     +'<label style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:6px">Digital Signature — Type your full legal name *</label>'
     +'<input id="step-sig-input" type="text" style="width:100%;padding:12px 14px;border:2px solid var(--border);border-radius:6px;font-family:Georgia,serif;font-size:1.1rem;color:var(--brown);font-style:italic" placeholder="Type your full legal name to sign">'
@@ -23596,6 +23611,28 @@ function openStepSignModal(agentId,campaignName,step){
 function submitStepSignature(agentId,campaignName,step){
   var sigEl=document.getElementById('step-sig-input');
   if(!sigEl||!sigEl.value.trim()){alert('Please type your full legal name to sign.');return;}
+  // Capture SMS consent on step 2 (policy step). Stored on agent record with
+  // timestamp + signature name for TCPA legal proof. Default false if unchecked.
+  if(step === 2){
+    var consentBox = document.getElementById('step-sms-consent');
+    var agent = DB.agents.find(function(a){ return a.id === parseInt(agentId,10); });
+    if(agent && consentBox){
+      if(consentBox.checked){
+        agent.smsConsent = true;
+        agent.smsConsentAt = new Date().toISOString();
+        agent.smsConsentBy = sigEl.value.trim();  // their typed signature = their name = legal proof
+        console.log('[sms-consent] '+agent.name+' OPTED IN at '+agent.smsConsentAt);
+      } else {
+        agent.smsConsent = false;
+        agent.smsConsentAt = new Date().toISOString();
+        console.log('[sms-consent] '+agent.name+' DECLINED at '+agent.smsConsentAt);
+      }
+      try {
+        if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent);
+        if(typeof saveToStorage === 'function') saveToStorage();
+      } catch(e){ console.warn('[sms-consent] save failed:', e); }
+    }
+  }
   agentCompleteStep(agentId,campaignName,step,{signature:sigEl.value.trim()});
   document.getElementById('stepSignModal').remove();
   gotoPanel('my-documents');
@@ -31951,11 +31988,63 @@ function panelMyProfile(){
     }
     h += '</div></div>';
 
+    // ── SMS consent management ──
+    // Agents can update their TCPA opt-in status anytime. Required for federal
+    // compliance. Opt-out timestamp is recorded for legal record.
+    var hasConsent = u.smsConsent === true;
+    h += '<div class="bo-card" style="margin-top:18px"><div class="bo-card-head"><div class="bo-card-title">📱 SMS Text Notifications</div></div>';
+    h += '<div style="padding:18px 22px;font-family:Barlow Condensed,sans-serif">';
+    if(!u.phone){
+      h += '<div style="background:rgba(0,0,0,.04);border:1px solid var(--border);border-radius:6px;padding:12px 14px;font-size:.78rem;color:var(--muted)">No phone number on file. Add one to your profile (contact HR) before enabling SMS.</div>';
+    } else {
+      h += '<div style="font-size:.84rem;color:var(--brown);line-height:1.6;margin-bottom:12px">Status: ';
+      if(hasConsent) h += '<strong style="color:#16a34a">✓ Opted in</strong> on '+(u.smsConsentAt ? new Date(u.smsConsentAt).toLocaleDateString() : 'unknown date')+' — you may receive SMS texts at <strong>'+_escapeHtml(u.phone)+'</strong>.';
+      else h += '<strong style="color:var(--muted)">Not opted in</strong> — WMAMinc will not text you. You\'ll still get notifications via email and the portal.';
+      h += '</div>';
+      if(hasConsent){
+        h += '<button onclick="myProfileSmsOptOut()" style="padding:9px 16px;background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">Opt Out of SMS</button>';
+        h += '<div style="font-size:.66rem;color:var(--muted);margin-top:6px">You can also reply STOP to any text we send.</div>';
+      } else {
+        h += '<button onclick="myProfileSmsOptIn()" style="padding:9px 16px;background:#0E7490;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">Opt In to SMS</button>';
+        h += '<div style="font-size:.66rem;color:var(--muted);margin-top:6px">Standard message and data rates may apply. Reply STOP to opt out at any time.</div>';
+      }
+    }
+    h += '</div></div>';
+
     return h;
   } catch(e){
     console.warn('[panelMyProfile] failed safely:', e);
     return panelHeader('👤 My Profile') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Profile failed to load.</div></div>';
   }
+}
+
+// ── SMS opt-in/out helpers ──
+function myProfileSmsOptIn(){
+  var u = DB.current; if(!u){ return; }
+  if(!confirm('Opt in to SMS texts from WMAMinc?\n\nBy clicking OK you consent to receive text messages including welcome notifications, training reminders, and time-sensitive alerts. Message and data rates may apply. Reply STOP to opt out at any time.\n\nYour consent will be recorded with timestamp for legal compliance.')) return;
+  u.smsConsent = true;
+  u.smsConsentAt = new Date().toISOString();
+  u.smsConsentBy = u.name + ' (self via My Profile)';
+  try {
+    if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(u);
+    if(typeof saveToStorage === 'function') saveToStorage();
+  } catch(e){ console.warn('[opt-in] save failed:', e); }
+  alert('✓ Opted in. You may now receive SMS notifications.');
+  if(typeof gotoPanel === 'function') gotoPanel('my-profile');
+}
+
+function myProfileSmsOptOut(){
+  var u = DB.current; if(!u){ return; }
+  if(!confirm('Opt out of SMS texts from WMAMinc?\n\nYou will no longer receive any text messages from WMAMinc. You will still receive notifications via email and the portal.\n\nYou can opt back in anytime.')) return;
+  u.smsConsent = false;
+  u.smsConsentAt = new Date().toISOString();
+  u.smsConsentBy = u.name + ' (opt-out via My Profile)';
+  try {
+    if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(u);
+    if(typeof saveToStorage === 'function') saveToStorage();
+  } catch(e){ console.warn('[opt-out] save failed:', e); }
+  alert('✓ Opted out. WMAMinc will not text you.');
+  if(typeof gotoPanel === 'function') gotoPanel('my-profile');
 }
 
 async function myProfileChangePassword(){
@@ -35605,7 +35694,15 @@ function panelMassSms(){
   }
   var h = panelHeader('📱 Mass SMS — Text the Team');
   h += '<div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
-  h += '<strong>Text agents through Brevo.</strong> Same Program → Campaign → Role picker as Mass Email. Each SMS costs Brevo credits (~$0.0079 per msg in US). Messages over 160 chars get auto-split into multiple segments (each billed separately). Agents with no valid phone number on file are silently skipped.';
+  h += '<strong>Text agents through Brevo.</strong> Same Program → Campaign → Role picker as Mass Email. Each SMS costs Brevo credits (~$0.0079 per msg in US). Messages over 160 chars get auto-split into multiple segments (each billed separately).';
+  h += '</div>';
+  // ── TCPA compliance banner ──
+  // Federal law (TCPA) requires explicit prior express consent before sending
+  // SMS. Agents opt in via the checkbox during onboarding step 2. This panel
+  // only includes opted-in agents in the recipient count. Mass-texting non-
+  // consented contacts can result in $500-$1,500 fines per message.
+  h += '<div style="background:#fef3c7;border:2px solid #f59e0b;border-radius:8px;padding:12px 16px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.76rem;color:#78350f;line-height:1.5">';
+  h += '<strong>⚖ TCPA: Only opted-in agents are included.</strong> Federal law requires explicit consent before SMS. Agents opt in via the SMS Consent checkbox during onboarding step 2. Agents without a phone, without valid phone format, or who declined SMS consent are silently skipped from the recipient count.';
   h += '</div>';
 
   if(!BREVO_API_KEY){
@@ -35700,11 +35797,15 @@ function msRefreshCampaigns(){
   msUpdateCount();
 }
 
-// SMS-specific resolver: only includes agents with a valid (normalizable) phone.
+// SMS-specific resolver: only includes agents with a valid (normalizable) phone
+// AND who explicitly opted in to SMS during onboarding (smsConsent === true).
+// This is TCPA legal compliance — texting non-consented contacts can result in
+// $500-$1,500 fines per text under federal law.
 function _msResolveRecipients(){
   var agents = (DB.agents||[]).filter(function(a){
     if(!a.active) return false;
     if(!a.phone) return false;
+    if(a.smsConsent !== true) return false;  // TCPA: must have explicit opt-in
     return brevoNormalizePhone(a.phone) !== null;
   });
   var selectedCamps = [];
