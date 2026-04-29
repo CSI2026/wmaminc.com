@@ -2364,9 +2364,11 @@ function brevoSendSms(opts){
     return Promise.resolve({ ok:false, status:0, error:'No API key configured' });
   }
   if(!opts || !opts.to){
+    console.warn('[brevoSendSms] No recipient');
     return Promise.resolve({ ok:false, status:0, error:'No recipient' });
   }
   if(!opts.content || !opts.content.trim()){
+    console.warn('[brevoSendSms] Empty content');
     return Promise.resolve({ ok:false, status:0, error:'Empty content' });
   }
   var phone = brevoNormalizePhone(opts.to);
@@ -2379,22 +2381,29 @@ function brevoSendSms(opts){
     sender: sender,
     recipient: phone,
     content: opts.content,
-    type: 'transactional'  // 'transactional' for service messages, 'marketing' for promo (different routing/regulations)
+    type: 'transactional'
   };
-  return fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
+  // Log everything before the request so we can debug delivery failures
+  console.log('[brevoSendSms] Sending:', { sender: sender, recipient: phone, contentLen: opts.content.length, type: 'transactional' });
+  // CORRECT endpoint per Brevo docs: /v3/transactionalSMS/send (NOT /sms — that was wrong and would 404)
+  return fetch('https://api.brevo.com/v3/transactionalSMS/send', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'api-key': BREVO_API_KEY },
+    headers: { 'Content-Type': 'application/json', 'api-key': BREVO_API_KEY, 'accept': 'application/json' },
     body: JSON.stringify(body)
   }).then(function(r){
+    console.log('[brevoSendSms] Response status:', r.status, r.statusText);
     if(!r.ok){
       return r.text().then(function(txt){
-        console.warn('[brevoSendSms] Failed:', r.status, txt);
+        console.error('[brevoSendSms] FAILED with body:', txt);
         return { ok:false, status:r.status, error:txt };
       });
     }
-    return r.json().then(function(j){ return { ok:true, status:r.status, response:j }; });
+    return r.json().then(function(j){
+      console.log('[brevoSendSms] SUCCESS body:', j);
+      return { ok:true, status:r.status, response:j };
+    });
   }).catch(function(e){
-    console.warn('[brevoSendSms] Network error:', e);
+    console.error('[brevoSendSms] Network error:', e);
     return { ok:false, status:0, error:String(e) };
   });
 }
@@ -2411,6 +2420,20 @@ function panelBrevoSettings(){
   var h = panelHeader('📧 Brevo Email Settings');
   h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
   h += '<strong>Manage your Brevo API key and sender info here.</strong> Rotate keys via Brevo dashboard → SMTP & API → API Keys → Generate new → Delete old → paste the new one here. Storage is local + Supabase (synced across your devices).';
+  h += '</div>';
+
+  // ── CRITICAL SMS SENDER ID WARNING ──
+  // Brevo requires accounts created after March 13, 2026 to register a Sender ID
+  // for each country before SMS will deliver. Without registration, the API
+  // accepts the request and may even charge credits, but US carriers reject
+  // the SMS silently. This banner makes the requirement visible.
+  h += '<div style="background:#fef3c7;border:2px solid #f59e0b;border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:#78350f;line-height:1.6">';
+  h += '<div style="font-weight:700;font-size:.9rem;margin-bottom:6px">⚠ IMPORTANT: SMS DELIVERY TO US NUMBERS</div>';
+  h += 'If your Brevo account was created <strong>after March 13, 2026</strong>, you MUST register a Sender ID in Brevo dashboard for the United States BEFORE SMS will deliver. Without registration:<br>';
+  h += '• The API request will appear to succeed<br>';
+  h += '• Credits may NOT be deducted (carriers reject before billing)<br>';
+  h += '• No SMS arrives at the recipient phone<br><br>';
+  h += '<strong>To register:</strong> Brevo dashboard → <strong>Senders, Domains & Dedicated IPs</strong> → <strong>SMS Senders</strong> tab → <strong>Register</strong> for United States. Brevo may take 1-3 business days to approve.';
   h += '</div>';
 
   var keyMasked = BREVO_API_KEY ? BREVO_API_KEY.slice(0, 12) + '••••••••' + BREVO_API_KEY.slice(-6) : '(not set)';
@@ -2498,16 +2521,19 @@ function brevoSendTestSms(){
   if(!confirm('Send test SMS to '+normalized+'?\n\nThis will use 1 SMS credit on your Brevo account (~$0.0079 in the US).')) return;
   brevoSendSms({
     to: normalized,
-    content: 'WMAMinc test SMS — sent '+new Date().toLocaleString()+'. If you got this, your Brevo SMS config works!'
+    content: 'WMAMinc test SMS - sent '+new Date().toLocaleString()+'. If you got this, your Brevo SMS config works!'
   }).then(function(r){
     if(r.ok){
-      alert('✓ Test SMS sent (status '+r.status+')! Check your phone.\n\nIf nothing arrives in 60 seconds: 1) confirm phone is correct, 2) check Brevo dashboard for delivery status, 3) some carriers block alpha-sender SMS by default.');
+      alert('✓ Test SMS request accepted by Brevo (status '+r.status+').\n\nIMPORTANT: This means Brevo accepted the request, but the SMS may NOT actually be delivered if:\n\n1) Your account was created AFTER March 13, 2026 and you have NOT registered a Sender ID in Brevo dashboard for the United States. Without a registered Sender ID, US carriers REJECT the SMS silently.\n\n2) US carriers blocked the alpha sender (WMAMinc).\n\n3) Phone is on a Do-Not-Call list.\n\nCheck Brevo dashboard → Transactional → SMS → Logs to see actual delivery status. If credits did NOT decrement, the SMS was rejected at the carrier level.\n\nFull request details logged to browser console.');
     } else {
       var err = r.error||'unknown';
       var hint = '';
       if(err.indexOf('credits') >= 0 || err.indexOf('balance') >= 0) hint = '\n\n💡 You may need to add SMS credits in Brevo dashboard.';
-      else if(err.indexOf('sender') >= 0) hint = '\n\n💡 Check the SMS sender name (max 11 alphanumeric chars).';
-      alert('⚠ SMS failed (status '+r.status+'): '+err+hint);
+      else if(err.toLowerCase().indexOf('sender') >= 0) hint = '\n\n💡 Sender issue — either the sender name is invalid (must be 3-11 alphanumeric chars), OR you need to register a Sender ID in Brevo dashboard for the United States. Brevo requires this for accounts created after March 13, 2026.';
+      else if(r.status === 401) hint = '\n\n💡 API key is invalid or wrong account. Verify the key in Brevo dashboard → SMTP & API.';
+      else if(r.status === 404) hint = '\n\n💡 Endpoint not found — code bug, contact Claude.';
+      else if(r.status === 400) hint = '\n\n💡 Bad request — check the error body above for which field is wrong.';
+      alert('⚠ SMS failed (status '+r.status+'): '+err+hint+'\n\nFull error logged to browser console.');
     }
   });
 }
@@ -7564,6 +7590,22 @@ function onboardingEnterAgentCode(agentId,campaignName,code){
           +'</div></div>'
       });
     }
+  }
+
+  // ── Brevo: Welcome SMS auto-fire ──
+  // Fires alongside the welcome email if the agent has a phone on file.
+  // Short message — designed to fit in a single 160-char SMS segment ($0.0079
+  // per recipient). Failures are logged but don't block the rest of the flow.
+  if(typeof brevoSendSms === 'function' && agent.phone && BREVO_API_KEY){
+    var firstName = (agent.name||'').split(/\s+/)[0] || 'there';
+    var smsMsg = 'Hi '+firstName+'! Your WMAMinc agent code for '+campaignName+' is active. Log in at wmaminc.com — username: '+(agent.username||'(see email)')+'. Welcome to the team!';
+    // Cap at 160 chars to stay in single segment for cost control
+    if(smsMsg.length > 160) smsMsg = smsMsg.slice(0, 157) + '...';
+    brevoSendSms({ to: agent.phone, content: smsMsg })
+      .then(function(r){
+        if(r.ok) console.log('[welcome-sms] sent to '+agent.name+' ('+agent.phone+')');
+        else console.warn('[welcome-sms] failed for '+agent.name+':', r.error);
+      });
   }
 }
 
@@ -12649,6 +12691,7 @@ function panelOwnerControl(){
   h += '<button onclick="syncAllToSupabase();this.textContent=\'\u2705 Synced!\';setTimeout(function(){document.querySelector(\'.ocp-sync-btn\').textContent=\'\uD83D\uDD04 Force Sync Now\';},2500)" '
     +'class="ocp-sync-btn" style="background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:9px 18px;border-radius:4px;cursor:pointer">'
     +'\uD83D\uDD04 Force Sync Now</button>';
+  h += '<button onclick="ddRotatePassphrase()" title="Re-encrypt all DD records with a new passphrase. Use when revoking access from a user who knows the current passphrase." style="background:rgba(220,38,38,.2);border:1px solid rgba(252,165,165,.5);color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:9px 18px;border-radius:4px;cursor:pointer">\uD83D\uDD10 Rotate DD Key</button>';
   h += '</div>';
   h += '</div>';
 
@@ -15731,13 +15774,14 @@ async function sendSMSBrevo(phone, message){
   if(digits.length!==11) return; // not a valid US number
   var intlPhone = '+'+digits;
   try{
-    await fetch('https://api.brevo.com/v3/transactionalSMS/sms',{
+    await fetch('https://api.brevo.com/v3/transactionalSMS/send',{
       method:'POST',
-      headers:{'Content-Type':'application/json','api-key':BREVO_API_KEY},
+      headers:{'Content-Type':'application/json','api-key':BREVO_API_KEY,'accept':'application/json'},
       body:JSON.stringify({
         sender:'WMAMinc',
         recipient: intlPhone,
-        content: message.slice(0,160)
+        content: message.slice(0,160),
+        type: 'transactional'
       })
     });
   } catch(e){ console.warn('SMS send failed:',e); }
@@ -20082,19 +20126,24 @@ function ppNotifyAgentOfCompChange(agent, plan, isAddendum){
         .catch(function(e){console.warn('[Brevo] email failed:',e);});
     }catch(e){ console.warn('[Brevo] email throw:',e); }
   }
-  // Fire SMS (Brevo /v3/transactionalSMS/sms) if phone exists
+  // Fire SMS (Brevo /v3/transactionalSMS/send) if phone exists
   if(agent.phone){
     try{
-      fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
-        method:'POST',
-        headers:{'accept':'application/json','api-key':key,'content-type':'application/json'},
-        body: JSON.stringify({
-          sender:'WMAMinc',
-          recipient: agent.phone.replace(/[^\d]/g,''),
-          content:'WMAMinc Portal: '+subject+'. Log in to acknowledge: https://wmaminc.com/'
-        })
-      }).then(function(){console.log('[Brevo] SMS sent to '+agent.phone);})
-        .catch(function(e){console.warn('[Brevo] SMS failed:',e);});
+      var smsPhone = (typeof brevoNormalizePhone === 'function') ? brevoNormalizePhone(agent.phone) : null;
+      if(!smsPhone){ console.warn('[Brevo] SMS skipped — invalid phone:', agent.phone); }
+      else {
+        fetch('https://api.brevo.com/v3/transactionalSMS/send', {
+          method:'POST',
+          headers:{'accept':'application/json','api-key':key,'content-type':'application/json'},
+          body: JSON.stringify({
+            sender:'WMAMinc',
+            recipient: smsPhone,
+            content:'WMAMinc Portal: '+subject+'. Log in to acknowledge: https://wmaminc.com/',
+            type: 'transactional'
+          })
+        }).then(function(r){console.log('[Brevo] SMS request to '+smsPhone+' — status '+r.status);})
+          .catch(function(e){console.warn('[Brevo] SMS failed:',e);});
+      }
     }catch(e){ console.warn('[Brevo] SMS throw:',e); }
   }
 }
@@ -28082,6 +28131,151 @@ function ddClearPassphrase(){
   catch(e){ return false; }
 }
 function ddHasPassphrase(){ return !!ddGetPassphrase(); }
+
+// ── KEY ROTATION ──
+// Use case: someone with the current passphrase needs access revoked (e.g.
+// employee leaves, K-Anna reassigned). We can't take their browser-stored
+// passphrase away from them. But we CAN re-encrypt all DD records with a
+// new passphrase, making the OLD one useless going forward.
+//
+// Owner-only flow:
+//   1. Confirm caution prompt
+//   2. Enter NEW passphrase (must differ from current)
+//   3. Pull all encrypted records from direct_deposits table
+//   4. For each: decrypt with OLD passphrase, re-encrypt with NEW, update
+//   5. After complete: update Owner's local passphrase to NEW
+//   6. Owner manually distributes NEW passphrase to authorized users
+//
+// CRITICAL: After rotation, anyone holding OLD passphrase can no longer
+// decrypt anything. They must be given the NEW one (or excluded).
+async function ddRotatePassphrase(){
+  var u = DB.current;
+  if(!isOwner(u)){ alert('🔒 Owner only. Key rotation is a critical security action.'); return; }
+  if(typeof supaClient === 'undefined' || !supaClient){ alert('Supabase not connected. Cannot rotate.'); return; }
+
+  // Step 1 — confirm caution
+  var oldPw = ddGetPassphrase();
+  if(!oldPw){
+    alert('⚠ You don\'t have the current passphrase stored in this browser. Cannot rotate without it (we can\'t decrypt the existing records). Enter the current passphrase first via any DD panel, then return here.');
+    return;
+  }
+  if(!confirm(
+    '🔐 ROTATE DIRECT DEPOSIT PASSPHRASE?\n\n' +
+    'This will:\n' +
+    '  1. Re-encrypt EVERY direct deposit record with a NEW passphrase\n' +
+    '  2. INVALIDATE the current passphrase — anyone holding it loses access\n' +
+    '  3. Require you to manually distribute the new passphrase to authorized users\n\n' +
+    'Use case: an employee with access has left or been removed.\n\n' +
+    'This action cannot be undone. Continue?'
+  )) return;
+
+  // Step 2 — get new passphrase, enforce different + min length
+  var newPw = prompt('Enter NEW passphrase (min 8 chars, must differ from current):');
+  if(!newPw){ alert('Cancelled.'); return; }
+  if(newPw.length < 8){ alert('Passphrase must be at least 8 characters.'); return; }
+  if(newPw === oldPw){ alert('New passphrase must be DIFFERENT from current.'); return; }
+  var confirmPw = prompt('Re-enter NEW passphrase to confirm:');
+  if(confirmPw !== newPw){ alert('Passphrases did not match. Aborted.'); return; }
+
+  // Step 3 — pull all encrypted records
+  var prog = document.createElement('div');
+  prog.id = 'ddRotateProgress';
+  prog.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:white;border:2px solid #003594;border-radius:10px;padding:24px 32px;box-shadow:0 8px 32px rgba(0,0,0,.25);z-index:10000;min-width:340px;font-family:Barlow Condensed,sans-serif;text-align:center';
+  prog.innerHTML = '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:1.5px;color:#003594;margin-bottom:8px">🔐 Rotating passphrase...</div><div id="ddRotateText" style="color:var(--muted);font-size:.84rem">Loading records...</div>';
+  var bd = document.createElement('div');
+  bd.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999';
+  document.body.appendChild(bd); document.body.appendChild(prog);
+
+  try {
+    var allRows;
+    try {
+      var resp = await supaClient.from('direct_deposits').select('*');
+      if(resp.error) throw resp.error;
+      allRows = resp.data || [];
+    } catch(e){
+      prog.remove(); bd.remove();
+      alert('⚠ Failed to load records: '+(e.message||e));
+      return;
+    }
+
+    if(!allRows.length){
+      prog.remove(); bd.remove();
+      ddSetPassphrase(newPw);
+      alert('✓ No DD records to re-encrypt. Passphrase updated locally for you. Distribute the new passphrase to other authorized users.');
+      return;
+    }
+
+    var pt = document.getElementById('ddRotateText');
+    if(pt) pt.textContent = 'Re-encrypting '+allRows.length+' records...';
+
+    // Encrypted fields per record. Adjust if schema has more/fewer.
+    var encryptedFields = ['ssn_encrypted','routing_encrypted','account_encrypted'];
+    var ok = 0, failed = 0, failedIds = [];
+    for(var i = 0; i < allRows.length; i++){
+      var row = allRows[i];
+      var rowOk = true;
+      var updates = {};
+      for(var f = 0; f < encryptedFields.length; f++){
+        var field = encryptedFields[f];
+        var cipher = row[field];
+        if(!cipher) continue; // skip empty fields
+        try {
+          // Decrypt with OLD
+          var plain = await ddDecryptValue(cipher, oldPw);
+          if(plain === null){
+            console.warn('[rotate] decrypt returned null for row '+row.id+' field '+field);
+            rowOk = false; break;
+          }
+          // Re-encrypt with NEW
+          var newCipher = await ddEncryptValue(plain, newPw);
+          if(!newCipher){
+            console.warn('[rotate] encrypt returned null for row '+row.id+' field '+field);
+            rowOk = false; break;
+          }
+          updates[field] = newCipher;
+        } catch(e){
+          console.warn('[rotate] field error row '+row.id+' field '+field, e);
+          rowOk = false; break;
+        }
+      }
+      if(rowOk && Object.keys(updates).length){
+        try {
+          var upd = await supaClient.from('direct_deposits').update(updates).eq('id', row.id);
+          if(upd.error){ rowOk = false; console.warn('[rotate] update failed row '+row.id, upd.error); }
+        } catch(e){ rowOk = false; console.warn('[rotate] update threw row '+row.id, e); }
+      }
+      if(rowOk) ok++;
+      else { failed++; failedIds.push(row.id); }
+      if(pt) pt.textContent = 'Re-encrypted '+(i+1)+' of '+allRows.length+'... ('+ok+' ok, '+failed+' failed)';
+    }
+
+    prog.remove(); bd.remove();
+
+    if(failed === 0){
+      // SUCCESS — switch local passphrase to new
+      ddSetPassphrase(newPw);
+      alert('✓ ROTATION COMPLETE\n\n' +
+        ok+' records successfully re-encrypted with new passphrase.\n\n' +
+        'Your local passphrase has been updated. Anyone still using the OLD passphrase will no longer be able to decrypt anything.\n\n' +
+        'NEXT STEPS:\n' +
+        '1. Securely share the NEW passphrase with authorized users only\n' +
+        '2. Do NOT share it with anyone whose access you just revoked\n' +
+        '3. Have other authorized users update their passphrase via My Profile → DD Passphrase');
+    } else {
+      // PARTIAL FAILURE — DO NOT switch local passphrase, or some records become unreadable
+      alert('⚠ PARTIAL FAILURE\n\n' +
+        ok+' records re-encrypted successfully.\n' +
+        failed+' records FAILED (IDs: '+failedIds.slice(0,10).join(', ')+(failedIds.length > 10 ? '…' : '')+')\n\n' +
+        'IMPORTANT: Your local passphrase has NOT been changed because some records failed. Mixed encryption state would lock you out of the failed records.\n\n' +
+        'Try again, or contact support. Failed record IDs are also logged to console.');
+      console.error('[rotate] failed record IDs:', failedIds);
+    }
+  } catch(e){
+    prog.remove(); bd.remove();
+    console.error('[rotate] catastrophic error:', e);
+    alert('⚠ Rotation failed catastrophically: '+(e.message||e)+'\n\nNo passphrase change was applied. Records may be in mixed state — verify by viewing a few DD records.');
+  }
+}
 
 // Prompt user to set/enter passphrase. Returns Promise<string|null>.
 async function ddPromptPassphrase(reason){
