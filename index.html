@@ -5208,23 +5208,42 @@ function gmCalculateWeek(weekRows){
       // RULE (verified vs spec): TL and MM are PEERS at the same level.
       // Both get $1/each on Field Agents below them — neither overrides
       // on the other, and neither overrides on the Campaign Manager.
+      //
+      // MULTI-TL aware (Calvin 2026-04-30): route TL override to the agent's actual
+      // teamLeaderId (verified by role='Team Leader'), not blindly to team.leader.
       Object.keys(t.agents).forEach(function(aidStr){
         var aidI = parseInt(aidStr);
         var a = t.agents[aidStr];
         var enrollments = a.nlad + a.tribal;
         if(!enrollments) return;
-        var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
-        // TL: skip enrollments by TL themselves, MM, or CM
-        if(tlId && aidI !== tlId && aidI !== mmId && aidI !== cmId){
-          bump(tlId, enrollments * GM_RATES.standardOverride.teamLeader,
-               'TL override on '+aName,
-               enrollments, GM_RATES.standardOverride.teamLeader);
+        var agRec = DB.agents.find(function(x){return x.id===aidI;});
+        var aName = (agRec || {name:'agent'}).name;
+        var agentRole = agRec ? agRec.role : 'Field Agent';
+        // TL override: route to this specific agent's TL via teamLeaderId.
+        // Skip if the agent IS a TL/MM/CM themselves.
+        if(agentRole !== 'Team Leader' && agentRole !== 'Market Manager' && aidI !== cmId){
+          var thisAgentsTLId = agRec && agRec.teamLeaderId;
+          if(thisAgentsTLId){
+            var tlRec = DB.agents.find(function(x){return x.id===thisAgentsTLId;});
+            if(tlRec && tlRec.role === 'Team Leader'){
+              bump(thisAgentsTLId, enrollments * GM_RATES.standardOverride.teamLeader,
+                   'TL override on '+aName,
+                   enrollments, GM_RATES.standardOverride.teamLeader);
+            }
+          }
         }
-        // MM: skip enrollments by MM themselves, TL, or CM
-        if(mmId && aidI !== mmId && aidI !== tlId && aidI !== cmId){
-          bump(mmId, enrollments * GM_RATES.standardOverride.marketManager,
-               'MM override on '+aName,
-               enrollments, GM_RATES.standardOverride.marketManager);
+        // MM override: route to this specific agent's MM via marketManagerId.
+        // Skip if the agent IS an MM/CM themselves (MM does override on TLs in GM model).
+        if(agentRole !== 'Market Manager' && aidI !== cmId){
+          var thisAgentsMMId = agRec && agRec.marketManagerId;
+          if(thisAgentsMMId){
+            var mmRec = DB.agents.find(function(x){return x.id===thisAgentsMMId;});
+            if(mmRec && mmRec.role === 'Market Manager'){
+              bump(thisAgentsMMId, enrollments * GM_RATES.standardOverride.marketManager,
+                   'MM override on '+aName,
+                   enrollments, GM_RATES.standardOverride.marketManager);
+            }
+          }
         }
       });
     } else if(team){
@@ -5235,32 +5254,43 @@ function gmCalculateWeek(weekRows){
     // Layer 3: Campaign Manager override (only for cm-difference and cm-oklahoma)
     if((cmModel === 'cm-difference' || cmModel === 'cm-oklahoma') && cm){
       cmId = cm.id;
-      // CRITICAL: TL/MM only earn override on agents who are NOT the TL/MM
-      // themselves (Layer 2 enforces this). So the CM's leftover calculation
-      // must compute per-agent whether tl/mm actually got paid for THAT agent's
-      // deals. If MM does their own deals, MM didn't get $1, so the CM's
-      // leftover should be larger ($13 - $9 - 0 - 0 = $4 per deal, not $2).
-      var teamTL = team ? team.leader : null;
-      var teamMM = team ? team.marketManager : null;
-      var hasTL = !!teamTL;
-      var hasMM = !!teamMM && teamMM !== teamTL;  // dedup if same person
+      // CRITICAL (Calvin 2026-04-30): TL/MM override is paid per-agent based on
+      // each agent's specific teamLeaderId/marketManagerId — NOT the team's
+      // single leader pointer. So the leftover calc must check this agent's chain.
+      // If MM does their own deals, MM didn't get $1, so CM's leftover is larger
+      // ($13 - $9 - 0 - 0 = $4 per deal, not $2).
 
       Object.keys(t.agents).forEach(function(aidStr){
         var aidI = parseInt(aidStr);
         var a = t.agents[aidStr];
+        var agRec = DB.agents.find(function(x){return x.id===aidI;});
+        var agentRole = agRec ? agRec.role : 'Field Agent';
 
         // Per-agent: did TL/MM actually earn override on THIS agent's deals?
-        // TL overrides on people BELOW them: not TL themselves, not MM (above), not CM (above)
-        // MM overrides on people BELOW them: not MM themselves, not CM (above)
         // EXCEPTION: in cm-oklahoma (Tanita's market), TL/MM override is SKIPPED in Layer 2,
         // so we must NOT subtract phantom TL/MM amounts from her leftover here.
-        var tlPaidForThisAgent, mmPaidForThisAgent;
-        if(cmModel === 'cm-oklahoma'){
-          tlPaidForThisAgent = 0;
-          mmPaidForThisAgent = 0;
-        } else {
-          tlPaidForThisAgent = (hasTL && aidI !== teamTL && aidI !== teamMM && aidI !== cmId) ? GM_RATES.standardOverride.teamLeader : 0;
-          mmPaidForThisAgent = (hasMM && aidI !== teamMM && aidI !== cmId) ? GM_RATES.standardOverride.marketManager : 0;
+        var tlPaidForThisAgent = 0, mmPaidForThisAgent = 0;
+        if(cmModel !== 'cm-oklahoma'){
+          // TL paid only if this agent has a real TL above them (not CM/MM/TL themselves)
+          if(agentRole !== 'Team Leader' && agentRole !== 'Market Manager' && aidI !== cmId){
+            var thisTLId = agRec && agRec.teamLeaderId;
+            if(thisTLId){
+              var tlRec = DB.agents.find(function(x){return x.id===thisTLId;});
+              if(tlRec && tlRec.role === 'Team Leader'){
+                tlPaidForThisAgent = GM_RATES.standardOverride.teamLeader;
+              }
+            }
+          }
+          // MM paid only if this agent has a real MM above them (not CM/MM themselves)
+          if(agentRole !== 'Market Manager' && aidI !== cmId){
+            var thisMMId = agRec && agRec.marketManagerId;
+            if(thisMMId){
+              var mmRec = DB.agents.find(function(x){return x.id===thisMMId;});
+              if(mmRec && mmRec.role === 'Market Manager'){
+                mmPaidForThisAgent = GM_RATES.standardOverride.marketManager;
+              }
+            }
+          }
         }
 
         if(aidI === cmId){
@@ -5445,6 +5475,42 @@ function tcTierRate(count, tier){
 // }
 //
 // Returns: { perAgent: {agentId:{amount,breakdown,rows}}, byTeam, warnings }
+// ════════════════════════════════════════════════════════════════════════
+//  MULTI-TL HELPERS (added 2026-04-30 for Calvin's Tulsa team where both
+//  Sheila id 12 AND Najee id 13 are role:'Team Leader').
+//
+//  The original engine used team.leader (a single pointer) to detect TLs.
+//  That breaks when a team has multiple TLs because:
+//    - Only the agent at team.leader gets TL personal sliding rate.
+//      Other TLs get paid as Field Agents (underpaid by $5/$2/Tribal in TC).
+//    - Only the team.leader pointer gets TL override pool. Other TLs get
+//      $0 override on their own field agents.
+//    - The team.leader pointer gets TL override on PEER TLs' deals,
+//      which they shouldn't (peer TLs don't override each other).
+//
+//  Correct rule: a TL is anyone with role === 'Team Leader'. Each Field
+//  Agent's TL override goes to that agent's teamLeaderId (the specific TL
+//  who supervises them), not to whoever happens to be team.leader.
+// ════════════════════════════════════════════════════════════════════════
+function payrollIsTL(agentId){
+  if(!agentId || !DB || !DB.agents) return false;
+  var a = DB.agents.find(function(x){return x.id===agentId;});
+  return !!(a && a.role === 'Team Leader');
+}
+
+// Get the TL agent ID who supervises this agent (or null).
+// - If this agent IS a TL, returns their own id (they're "self-supervised" for personal rates)
+// - If this agent is a Field Agent, returns their teamLeaderId
+// - If neither (CM/MM/IBO/Sales Rep), returns null
+function payrollTLForAgent(agentId){
+  if(!agentId || !DB || !DB.agents) return null;
+  var a = DB.agents.find(function(x){return x.id===agentId;});
+  if(!a) return null;
+  if(a.role === 'Team Leader') return a.id;
+  if(a.role === 'Field Agent' && a.teamLeaderId) return a.teamLeaderId;
+  return null;
+}
+
 function tcCalculateWeek(weekRows){
   var byAgent = {};
   var byTeam  = {};
@@ -5555,21 +5621,31 @@ function tcCalculateWeek(weekRows){
     var cmId = cm ? cm.id : null;
 
     // Layer 1: pay agents and TL at their base rates
+    //
+    // CRITICAL (Calvin 2026-04-30): TL detection MUST use agent.role === 'Team Leader',
+    // not the team.leader pointer. Tulsa team has BOTH Sheila (id 12) AND Najee (id 13)
+    // as Team Leaders, but team.leader can only point to one of them. Using the role
+    // ensures every TL gets TL rates on their personal deals.
     Object.keys(t.agents).forEach(function(aidStr){
       var aidI = parseInt(aidStr);
       var a = t.agents[aidStr];
       var personalLabel = '';
+      var agentRecord = DB.agents.find(function(x){return x.id===aidI;});
+      var agentRole   = agentRecord ? agentRecord.role : 'Field Agent';
+      var isThisAgentTL = (agentRole === 'Team Leader');
+      var isThisAgentMM = (agentRole === 'Market Manager');
+      var isThisAgentCM = (aidI === cmId) || (agentRole === 'Campaign Manager');
 
       // NLAD personal
       if(a.nlad){
         var nladRate, nladLabel;
-        if(aidI === cmId && tcModel === 'tc-cm-difference'){
+        if(isThisAgentCM && tcModel === 'tc-cm-difference'){
           nladRate  = TC_RATES.cmDifference.nladPersonal;  // $10
           nladLabel = 'Personal NLAD ($'+nladRate+')';
-        } else if(aidI === mmId){
+        } else if(isThisAgentMM){
           nladRate  = TC_RATES.nlad.mm;                     // $10
           nladLabel = 'Personal NLAD ($'+nladRate+' MM rate)';
-        } else if(aidI === tlId){
+        } else if(isThisAgentTL){
           nladRate  = TC_RATES.nlad.tl;                     // $8
           nladLabel = 'Personal NLAD ($'+nladRate+' TL rate)';
         } else {
@@ -5582,19 +5658,20 @@ function tcCalculateWeek(weekRows){
       // Tribal personal
       if(a.tribal){
         var tribalPay, tribalLabel, tribalRate;
-        if(aidI === cmId && tcModel === 'tc-cm-difference'){
+        if(isThisAgentCM && tcModel === 'tc-cm-difference'){
           tribalRate = TC_RATES.cmDifference.tribalPersonal;  // $28 flat
           tribalPay  = a.tribal * tribalRate;
           tribalLabel = 'Personal Tribal ($'+tribalRate+' CM rate)';
-        } else if(aidI === tlId){
+        } else if(isThisAgentTL){
+          // TLs (any of them) get TL sliding rate on personal Tribal
           tribalPay  = tcSlidingTotal(a.tribal, TC_RATES.tribal.tlTier);
           tribalRate = a.tribal ? tribalPay / a.tribal : 0;
           tribalLabel = 'Personal Tribal (TL sliding)';
         } else {
-          // Standard agent (or MM doing personal Tribal — no MM layer in Tribal)
+          // Field Agent (or MM doing personal Tribal — no MM layer in Tribal)
           tribalPay  = tcSlidingTotal(a.tribal, TC_RATES.tribal.agentTier);
           tribalRate = a.tribal ? tribalPay / a.tribal : 0;
-          tribalLabel = (aidI === mmId)
+          tribalLabel = isThisAgentMM
             ? 'Personal Tribal (no MM layer — paid as agent)'
             : 'Tribal enrollments';
         }
@@ -5612,26 +5689,39 @@ function tcCalculateWeek(weekRows){
       }
     });
 
-    // Layer 2: Tribal TL override (TL keeps the difference between their tier and the agent's tier)
-    if(tlId){
-      Object.keys(t.agents).forEach(function(aidStr){
-        var aidI = parseInt(aidStr);
-        if(aidI === tlId)  return;  // not on themselves
-        if(aidI === mmId)  return;  // peers — no override on MM
-        if(aidI === cmId)  return;  // CM is above
-        var a = t.agents[aidStr];
-        if(!a.tribal) return;
-        var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
-        var agentTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.agentTier);
-        var tlTribalRate    = tcTierRate(a.tribal, TC_RATES.tribal.tlTier);
-        var diffPerEnrollment = tlTribalRate - agentTribalRate;
-        if(diffPerEnrollment > 0){
-          bump(tlId, a.tribal * diffPerEnrollment,
-               'TL Tribal override on '+aName+' ($'+diffPerEnrollment+'/each)',
-               a.tribal, diffPerEnrollment);
-        }
-      });
-    }
+    // Layer 2: Tribal TL override (TL keeps the diff between their tier and the agent's tier)
+    //
+    // CRITICAL (Calvin 2026-04-30): Each agent's TL diff goes to THAT agent's specific
+    // teamLeaderId — not blindly to team.leader. Tulsa team has both Sheila and Najee
+    // as TLs; Brittany reports to Sheila (teamLeaderId=12), Endica reports to Najee
+    // (teamLeaderId=13). The diff must route to the correct TL.
+    Object.keys(t.agents).forEach(function(aidStr){
+      var aidI = parseInt(aidStr);
+      var a = t.agents[aidStr];
+      if(!a.tribal) return;
+      var agentRecord = DB.agents.find(function(x){return x.id===aidI;});
+      if(!agentRecord) return;
+      var agentRole = agentRecord.role || 'Field Agent';
+      // TL/MM/CM don't trigger TL override on themselves or their peers/superiors
+      if(agentRole === 'Team Leader')   return;
+      if(agentRole === 'Market Manager') return;
+      if(agentRole === 'Campaign Manager' || aidI === cmId) return;
+      // Find this agent's TL via their teamLeaderId
+      var thisAgentsTLId = agentRecord.teamLeaderId;
+      if(!thisAgentsTLId) return;  // no TL above this agent
+      // Verify the TL exists and is actually a Team Leader
+      var tlRecord = DB.agents.find(function(x){return x.id===thisAgentsTLId;});
+      if(!tlRecord || tlRecord.role !== 'Team Leader') return;
+      var aName = agentRecord.name || 'agent';
+      var agentTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.agentTier);
+      var tlTribalRate    = tcTierRate(a.tribal, TC_RATES.tribal.tlTier);
+      var diffPerEnrollment = tlTribalRate - agentTribalRate;
+      if(diffPerEnrollment > 0){
+        bump(thisAgentsTLId, a.tribal * diffPerEnrollment,
+             'TL Tribal override on '+aName+' ($'+diffPerEnrollment+'/each)',
+             a.tribal, diffPerEnrollment);
+      }
+    });
 
     // Layer 3: NLAD MM override ($2/each on agent NLAD enrollments)
     // No MM Tribal override (MM doesn't exist on Tribal).
@@ -5640,10 +5730,12 @@ function tcCalculateWeek(weekRows){
         var aidI = parseInt(aidStr);
         if(aidI === mmId) return;
         if(aidI === cmId) return;  // CM is above MM
-        if(aidI === tlId) return;  // TL is peer (TL is paid $8 same as agent — MM doesn't override on TL? confirm)
+        // Detect TL by role (multi-TL safe) — MM doesn't override on TLs
+        var agRec = DB.agents.find(function(x){return x.id===aidI;});
+        if(agRec && agRec.role === 'Team Leader') return;
         var a = t.agents[aidStr];
         if(!a.nlad) return;
-        var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
+        var aName = (agRec || {name:'agent'}).name;
         bump(mmId, a.nlad * TC_RATES.nlad.mmOverridePerAgentEnrollment,
              'MM NLAD override on '+aName+' ($'+TC_RATES.nlad.mmOverridePerAgentEnrollment+'/each)',
              a.nlad, TC_RATES.nlad.mmOverridePerAgentEnrollment);
@@ -5659,22 +5751,29 @@ function tcCalculateWeek(weekRows){
     //     tier 1 deal: $18 agent + $5 TL diff + $5 Tanita = $28
     //     tier 2 deal: $23 agent + $2 TL diff + $3 Tanita = $28
     //   No deal ever costs the company more than $28 per Tribal.
+    //
+    // MULTI-TL aware: must check each agent's actual teamLeaderId (and that the
+    // TL has role='Team Leader') to know if a TL was actually paid in Layer 2.
     if(tcModel === 'tc-cm-difference' && cmId){
       Object.keys(t.agents).forEach(function(aidStr){
         var aidI = parseInt(aidStr);
         if(aidI === cmId) return;  // not on themselves
         var a = t.agents[aidStr];
-        var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
+        var agentRecord = DB.agents.find(function(x){return x.id===aidI;});
+        if(!agentRecord) return;
+        var agentRole = agentRecord.role || 'Field Agent';
+        var aName = agentRecord.name || 'agent';
+        var isThisAgentTL = (agentRole === 'Team Leader');
+        var isThisAgentMM = (agentRole === 'Market Manager');
 
         // NLAD: max(0, $10 − agent_rate − mm_override). Total per NLAD = $10.
-        //   Agent rate: TL/Field Agent both $8, MM $10 (so MM doesn't trigger Tanita's cut)
-        //   MM override (already paid in Layer 3): $2/each on agent NLAD only
         if(a.nlad){
           var agentNLADRate;
-          if(aidI === mmId)      agentNLADRate = TC_RATES.nlad.mm;       // $10 — no Tanita cut
-          else if(aidI === tlId) agentNLADRate = TC_RATES.nlad.tl;       // $8
+          if(isThisAgentMM)      agentNLADRate = TC_RATES.nlad.mm;       // $10 — no Tanita cut
+          else if(isThisAgentTL) agentNLADRate = TC_RATES.nlad.tl;       // $8
           else                   agentNLADRate = TC_RATES.nlad.agent;    // $8
-          var mmOverridePaid = (mmId && aidI !== mmId && aidI !== tlId)
+          // MM override (already paid in Layer 3): $2/each on agent NLAD only
+          var mmOverridePaid = (mmId && !isThisAgentMM && !isThisAgentTL)
             ? TC_RATES.nlad.mmOverridePerAgentEnrollment : 0;
           var nladLeftover = Math.max(0, TC_RATES.cmDifference.nladPersonal - agentNLADRate - mmOverridePaid);
           if(nladLeftover > 0){
@@ -5688,23 +5787,25 @@ function tcCalculateWeek(weekRows){
         if(a.tribal){
           // Agent's actual Tribal rate based on THEIR personal count tier
           var agentTribalRate;
-          if(aidI === tlId){
-            // TL personal Tribal — they got TL sliding ($23/$25)
+          if(isThisAgentTL){
+            // TLs got TL sliding ($23/$25)
             agentTribalRate = (a.tribal <= TC_RATES.tribal.tlTier.tier1Cap)
               ? TC_RATES.tribal.tlTier.tier1
               : TC_RATES.tribal.tlTier.tier2;
           } else {
-            // Field Agent personal Tribal — agent sliding ($18/$23)
+            // Field Agent (or MM) got agent sliding ($18/$23)
             agentTribalRate = (a.tribal <= TC_RATES.tribal.agentTier.tier1Cap)
               ? TC_RATES.tribal.agentTier.tier1
               : TC_RATES.tribal.agentTier.tier2;
           }
-          // TL override that was paid to TL in Layer 2 for this agent's enrollments
-          // (TL gets diff between TL tier rate and agent tier rate, only on field agents below them)
+          // TL override paid in Layer 2 — only if this agent reports to a real TL
           var tlOverridePaid = 0;
-          if(tlId && aidI !== tlId && aidI !== mmId){
-            var tlTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.tlTier);
-            tlOverridePaid = Math.max(0, tlTribalRate - agentTribalRate);
+          if(!isThisAgentTL && !isThisAgentMM && agentRecord.teamLeaderId){
+            var tlRecord = DB.agents.find(function(x){return x.id===agentRecord.teamLeaderId;});
+            if(tlRecord && tlRecord.role === 'Team Leader'){
+              var tlTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.tlTier);
+              tlOverridePaid = Math.max(0, tlTribalRate - agentTribalRate);
+            }
           }
           var tribalLeftover = Math.max(0, TC_RATES.cmDifference.tribalPersonal - agentTribalRate - tlOverridePaid);
           if(tribalLeftover > 0){
@@ -5717,7 +5818,7 @@ function tcCalculateWeek(weekRows){
     }
   });
 
-  return { perAgent: byAgent, byTeam: byTeam, model:'truconnect-v2', warnings: warnings };
+  return { perAgent: byAgent, byTeam: byTeam, model:'truconnect-v3', warnings: warnings };
 }
 
 function tcFormatBreakdown(perAgent){
