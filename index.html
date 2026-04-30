@@ -19368,11 +19368,32 @@ function panelPayrollWeekDetail(){
   h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Total</th>';
   h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Chargebacks</th>';
   // Phase 2C: per-row "Show Calc" button (Owner only)
+  // Two columns: CARRIER GROSS (what TruConnect pays Calvin) vs AGENT COMMISSION
+  // (what the agent earns per the engine). The variance = Calvin's gross profit
+  // on that agent. Critical for P&L — and prevents the bug where the carrier
+  // gross was being treated as the agent's pay.
   if(canViewOwnerPL(DB.current)){
-    h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Gross</th>';
+    h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)" title="What the carrier pays YOU per this agent">Carrier Gross</th>';
+    h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:#16a34a" title="What you owe this agent per their comp model">Agent Commission</th>';
     h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Calc</th>';
   }
   h += '</tr></thead><tbody>';
+
+  // Pre-calculate engine commissions for all agents in this week (single batch
+  // call — engine groups by team and applies overrides correctly). Cached
+  // per-agent so we don't re-run the engine for each row render.
+  var engineByAgent = {};
+  if(canViewOwnerPL(DB.current) && typeof p2cCalculateForWeek === 'function'){
+    try {
+      var weekResult = p2cCalculateForWeek(w.id);
+      if(weekResult && weekResult.perAgent){
+        Object.keys(weekResult.perAgent).forEach(function(aid){
+          engineByAgent[aid] = weekResult.perAgent[aid].totalCommissionCents || 0;
+        });
+      }
+    } catch(e){ console.warn('[panelPayrollWeekDetail] engine calc failed:', e); }
+  }
+
   (w.rows||[]).forEach(function(r){
     h += '<tr style="border-bottom:1px solid var(--border)">';
     h += '<td style="padding:8px 10px"><strong>'+(r.agentName||'—')+'</strong></td>';
@@ -19386,7 +19407,17 @@ function panelPayrollWeekDetail(){
     h += '<td style="padding:8px 10px;text-align:right;font-weight:700;color:var(--blue)">'+tot+'</td>';
     h += '<td style="padding:8px 10px;text-align:right;color:'+(r.chargebackTotal?'#991B1B':'var(--muted2)')+'">'+(r.chargebackTotal?'$'+(r.chargebackTotal/100).toFixed(2):'—')+'</td>';
     if(canViewOwnerPL(DB.current)){
-      h += '<td style="padding:8px 10px;text-align:right;color:var(--brown);font-weight:700">$'+((r.grossCents||0)/100).toFixed(2)+'</td>';
+      // Carrier gross — what TruConnect/etc. pays Calvin per this agent
+      h += '<td style="padding:8px 10px;text-align:right;color:var(--brown);font-weight:700" title="Carrier paid you this for this agent\'s activations">$'+((r.grossCents||0)/100).toFixed(2)+'</td>';
+      // Agent commission — what Calvin owes this agent per the engine
+      var commissionCents = (r.agentId && engineByAgent[r.agentId] != null) ? engineByAgent[r.agentId] : null;
+      if(commissionCents !== null){
+        var profit = (r.grossCents||0) - commissionCents;
+        var profitColor = profit >= 0 ? '#16a34a' : '#dc2626';
+        h += '<td style="padding:8px 10px;text-align:right;color:#16a34a;font-weight:700" title="What you owe this agent (engine calc). Profit on this agent: $'+(profit/100).toFixed(2)+'">$'+(commissionCents/100).toFixed(2)+'</td>';
+      } else {
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted);font-size:.74rem" title="Engine could not calculate — check team membership">—</td>';
+      }
       var btnDisabled = !r.agentId;
       h += '<td style="padding:8px 10px;text-align:right">';
       if(btnDisabled){
@@ -36347,12 +36378,24 @@ function panelMyPayroll(){
     return panelHeader('💰 My Payroll') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Access pending. This feature is currently in limited beta. Check back soon.</div></div>';
   }
   var h = panelHeader('💰 My Payroll');
-  // Build per-week rows for THIS agent only
+  // Build per-week rows for THIS agent only.
+  // CRITICAL: We must show the ENGINE-CALCULATED commission (what they actually
+  // earn per their comp model), NOT the carrier gross (what TruConnect pays
+  // Calvin). Showing the wrong one would have agents thinking they earn $40
+  // per activation when they actually earn $18-$23 sliding.
   var weeks = (typeof PAYROLL_WEEKS !== 'undefined' && Array.isArray(PAYROLL_WEEKS)) ? PAYROLL_WEEKS : [];
   var myRows = [];
   weeks.forEach(function(w){
     (w.rows||[]).forEach(function(r){
       if(r.agentId === u.id){
+        // Run engine for this agent in this week to get TRUE commission
+        var commissionCents = 0;
+        if(typeof p2cCalculateForAgent === 'function'){
+          try {
+            var calc = p2cCalculateForAgent(u.id, w.carrier, w.periodStart, w.periodEnd);
+            commissionCents = (calc && calc.totalCommissionCents) || 0;
+          } catch(e){ console.warn('[panelMyPayroll] engine failed for week '+w.id+':', e); }
+        }
         myRows.push({
           weekId: w.id,
           carrier: w.carrier,
@@ -36360,9 +36403,9 @@ function panelMyPayroll(){
           periodEnd: w.periodEnd,
           status: w.status,
           activations: (r.activations && r.activations.Total) || 0,
-          grossCents: r.grossCents || 0,
+          grossCents: commissionCents,  // YOUR commission (not the carrier gross)
           chargebackCents: r.chargebackTotal || 0,
-          netCents: (r.grossCents || 0) + (r.chargebackTotal || 0)  // chargebacks already negative
+          netCents: commissionCents + (r.chargebackTotal || 0)  // chargebacks already negative
         });
       }
     });
