@@ -3646,6 +3646,409 @@ function tcCalculateForStoredWeek(weekId, opts){
   return result;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  GEN MOBILE COMMISSION ENGINE — encoded directly from Calvin's PDF
+//  ("Williams Marketing and Management Inc. - Gen Mobile Compensation Plan")
+//
+//  STANDARD AGENTS, TLs, MMs (NLAD AND Tribal):
+//    NLAD 1-30:   $9 per enrollment + $1 email + $5 BYOD
+//    NLAD 31+:    $11 per enrollment + $1 email + $5 BYOD
+//    Tribal 1-30: $29 per enrollment + $1 email + $5 BYOD
+//    Tribal 31+:  $34 per enrollment + $1 email + $5 BYOD
+//    (Tier 2 applies retroactively to ALL enrollments once threshold hit)
+//
+//  STANDARD MANAGER OVERRIDE (TL/MM, NOT IBOs/CMs at flat $13):
+//    +$1 per enrollment completed by their assigned agents
+//
+//  IBO + CM at flat rate (Juan Rincon, Brandon Smith, Tanita Flowers — per PDF):
+//    $13 per enrollment + $1 email + $5 BYOD (NLAD AND Tribal)
+//    Their agents below them get standard rates.
+//
+//  STEPHANIE TUBMAN — special tier (per Calvin 2026-04-30):
+//    NLAD:   $13 + $1 email
+//    Tribal: $29 (1-30) → $34 (31+) sliding + $1 email
+//    (No BYOD bonus per PDF for Stephanie)
+//
+//  Engine routes by agent.cmModel:
+//    'gm-flat-13' — IBO / CM flat $13 (Juan, Brandon, Tanita)
+//    'gm-stephanie' — Stephanie's tier
+//    null/undefined — standard sliding
+// ════════════════════════════════════════════════════════════════════════
+
+var GM_RATES = {
+  // Standard sliding (Field Agents, TLs, MMs — both NLAD and Tribal)
+  standardAgent: {
+    nlad:   { tier1Cap:30, tier1:9,  tier2:11 },
+    tribal: { tier1Cap:30, tier1:29, tier2:34 },
+    emailBonus: 1,
+    byodBonus:  5
+  },
+  // Standard manager override ($1/each on assigned agent enrollments)
+  standardManagerOverride: 1,
+  // IBO / CM flat rate (Juan, Brandon, Tanita per PDF)
+  iboCmFlat: {
+    nladPerEnrollment:   13,
+    tribalPerEnrollment: 13,
+    emailBonus: 1,
+    byodBonus:  5
+  },
+  // Stephanie Tubman — distinct tier (NLAD $13 per Calvin 2026-04-30; Tribal sliding $29/$34)
+  stephanie: {
+    nladPerEnrollment: 13,
+    tribal: { tier1Cap:30, tier1:29, tier2:34 },
+    emailBonus: 1
+    // no BYOD per PDF (omitted intentionally)
+  }
+};
+
+// Sliding total for GM Tribal — retroactive (matches TC pattern)
+function gmSlidingTotal(count, tierCfg){
+  if(!count || count <= 0) return 0;
+  if(count <= tierCfg.tier1Cap) return count * tierCfg.tier1;
+  return count * tierCfg.tier2;
+}
+
+// Find an agent's GM model. Reads agent.cmModel.
+// 'gm-flat-13' → IBO/CM flat. 'gm-stephanie' → Stephanie's special tier.
+// Anything else → standard sliding.
+function gmModelOf(agent){
+  if(!agent) return 'standard';
+  return agent.cmModel || 'standard';
+}
+
+// ── ENGINE ──
+// Input rows: [{agentId, isTribal, hasEmail, isBYOD, chargebackCents}, ...]
+// Output: {perAgent: {id: {amount, breakdown}}, byTeam: {...}}
+function gmCalculateWeek(weekRows){
+  var byAgent = {}, byTeam = {};
+  if(!Array.isArray(weekRows)){ console.error('[gmCalculateWeek] weekRows must be array'); return {perAgent:byAgent, byTeam:byTeam}; }
+
+  function bump(agentId, amount, label, count, rate){
+    if(!byAgent[agentId]) byAgent[agentId] = { amount:0, breakdown:[], rows:0 };
+    byAgent[agentId].amount += amount;
+    byAgent[agentId].breakdown.push({ label:label, count:count, rate:rate, amount:amount });
+    if(count) byAgent[agentId].rows += count;
+  }
+
+  // Pass 1: bucket by team + tally per-agent counts
+  weekRows.forEach(function(r){
+    if(!r || !r.agentId) return;
+    // Team lookup — reuse TC's team logic since teams are universal
+    var team = (typeof tcAgentTeam === 'function') ? tcAgentTeam(r.agentId) : null;
+    var teamId = team ? team.id : '__no_team__';
+    if(!byTeam[teamId]) byTeam[teamId] = { team:team, rows:[], nladCount:0, tribalCount:0, emailCount:0, byodCount:0, agents:{} };
+    var t = byTeam[teamId];
+    t.rows.push(r);
+    if(r.isTribal) t.tribalCount++; else t.nladCount++;
+    if(r.hasEmail) t.emailCount++;
+    if(r.isBYOD)   t.byodCount++;
+    if(!t.agents[r.agentId]) t.agents[r.agentId] = {nlad:0, tribal:0, email:0, byod:0, cb:0};
+    var a = t.agents[r.agentId];
+    if(r.isTribal) a.tribal++; else a.nlad++;
+    if(r.hasEmail) a.email++;
+    if(r.isBYOD)   a.byod++;
+    if(r.chargebackCents) a.cb += r.chargebackCents;
+  });
+
+  // Pass 2: pay each agent at their model's rate
+  Object.keys(byTeam).forEach(function(teamId){
+    var t = byTeam[teamId];
+
+    Object.keys(t.agents).forEach(function(aidStr){
+      var aidI = parseInt(aidStr);
+      var a = t.agents[aidStr];
+      var agent = DB.agents.find(function(x){return x.id===aidI;});
+      var model = gmModelOf(agent);
+      var role  = agent ? agent.role : 'Field Agent';
+
+      if(model === 'gm-flat-13'){
+        // Juan / Brandon / Tanita flat $13 per enrollment + bonuses
+        var nladPay   = a.nlad   * GM_RATES.iboCmFlat.nladPerEnrollment;
+        var tribalPay = a.tribal * GM_RATES.iboCmFlat.tribalPerEnrollment;
+        var emailPay  = a.email  * GM_RATES.iboCmFlat.emailBonus;
+        var byodPay   = a.byod   * GM_RATES.iboCmFlat.byodBonus;
+        if(a.nlad)   bump(aidI, nladPay,   'NLAD enrollments ($'+GM_RATES.iboCmFlat.nladPerEnrollment+' flat — '+role+')', a.nlad, GM_RATES.iboCmFlat.nladPerEnrollment);
+        if(a.tribal) bump(aidI, tribalPay, 'Tribal enrollments ($'+GM_RATES.iboCmFlat.tribalPerEnrollment+' flat — '+role+')', a.tribal, GM_RATES.iboCmFlat.tribalPerEnrollment);
+        if(a.email)  bump(aidI, emailPay,  'Email bonus', a.email, GM_RATES.iboCmFlat.emailBonus);
+        if(a.byod)   bump(aidI, byodPay,   'BYOD bonus',  a.byod,  GM_RATES.iboCmFlat.byodBonus);
+      } else if(model === 'gm-stephanie'){
+        // Stephanie's special: $14 NLAD, $29/$34 Tribal sliding, $1 email, no BYOD
+        var nladPay2   = a.nlad * GM_RATES.stephanie.nladPerEnrollment;
+        var tribalPay2 = gmSlidingTotal(a.tribal, GM_RATES.stephanie.tribal);
+        var emailPay2  = a.email * GM_RATES.stephanie.emailBonus;
+        var tribalRate2 = a.tribal ? tribalPay2/a.tribal : 0;
+        if(a.nlad)   bump(aidI, nladPay2,  'NLAD ($'+GM_RATES.stephanie.nladPerEnrollment+' Stephanie tier)', a.nlad, GM_RATES.stephanie.nladPerEnrollment);
+        if(a.tribal) bump(aidI, tribalPay2,'Tribal (Stephanie sliding)', a.tribal, tribalRate2);
+        if(a.email)  bump(aidI, emailPay2, 'Email bonus', a.email, GM_RATES.stephanie.emailBonus);
+        if(a.byod)   bump(aidI, 0, 'BYOD (no bonus per Stephanie tier)', a.byod, 0);
+      } else {
+        // Standard sliding for everyone else (Field Agent, TL, MM)
+        var nladStd   = gmSlidingTotal(a.nlad,   GM_RATES.standardAgent.nlad);
+        var tribalStd = gmSlidingTotal(a.tribal, GM_RATES.standardAgent.tribal);
+        var emailStd  = a.email * GM_RATES.standardAgent.emailBonus;
+        var byodStd   = a.byod  * GM_RATES.standardAgent.byodBonus;
+        var nladRate  = a.nlad   ? nladStd/a.nlad   : 0;
+        var tribalRate= a.tribal ? tribalStd/a.tribal : 0;
+        if(a.nlad)   bump(aidI, nladStd,   'NLAD (sliding $'+GM_RATES.standardAgent.nlad.tier1+'/$'+GM_RATES.standardAgent.nlad.tier2+')', a.nlad, nladRate);
+        if(a.tribal) bump(aidI, tribalStd, 'Tribal (sliding $'+GM_RATES.standardAgent.tribal.tier1+'/$'+GM_RATES.standardAgent.tribal.tier2+')', a.tribal, tribalRate);
+        if(a.email)  bump(aidI, emailStd,  'Email bonus', a.email, GM_RATES.standardAgent.emailBonus);
+        if(a.byod)   bump(aidI, byodStd,   'BYOD bonus',  a.byod,  GM_RATES.standardAgent.byodBonus);
+      }
+
+      // Chargebacks deducted from activator (negative cents)
+      if(a.cb) bump(aidI, a.cb/100, 'Chargebacks', 0, 0);
+    });
+
+    // Layer 2: Standard Manager override per PDF.
+    // TLs and MMs get +$1 per enrollment completed by agents below them.
+    // Skip if the manager themselves is on flat-13 model (IBO/CM rate).
+    Object.keys(t.agents).forEach(function(aidStr){
+      var aidI = parseInt(aidStr);
+      var a = t.agents[aidStr];
+      var agentRec = DB.agents.find(function(x){return x.id===aidI;});
+      if(!agentRec) return;
+      // Skip if this agent has no enrollments (nothing to override)
+      if(!a.nlad && !a.tribal) return;
+      // Find this agent's TL and MM. They get $1 each per enrollment.
+      var tlId = agentRec.teamLeaderId;
+      var mmId = agentRec.marketManagerId;
+      var enrollments = a.nlad + a.tribal;
+      if(tlId){
+        var tl = DB.agents.find(function(x){return x.id===tlId;});
+        // TL gets override only if they're on standard model (not flat-13)
+        if(tl && gmModelOf(tl) === 'standard' && tl.id !== aidI){
+          bump(tlId, enrollments * GM_RATES.standardManagerOverride,
+               'TL override on '+agentRec.name+' ($'+GM_RATES.standardManagerOverride+'/each)',
+               enrollments, GM_RATES.standardManagerOverride);
+        }
+      }
+      if(mmId && mmId !== tlId){
+        var mm = DB.agents.find(function(x){return x.id===mmId;});
+        if(mm && gmModelOf(mm) === 'standard' && mm.id !== aidI){
+          bump(mmId, enrollments * GM_RATES.standardManagerOverride,
+               'MM override on '+agentRec.name+' ($'+GM_RATES.standardManagerOverride+'/each)',
+               enrollments, GM_RATES.standardManagerOverride);
+        }
+      }
+    });
+  });
+
+  return { perAgent: byAgent, byTeam: byTeam, model:'gen-mobile-v1' };
+}
+
+// ── GM INVOICE PARSER ──
+// Parses the "GEN BUP" sheet from a WIL-Invoice .xlsx. Returns activations
+// keyed by agent name with NLAD/Tribal/Email/BYOD counts.
+function gmParseInvoice(workbook){
+  if(!workbook || !workbook.SheetNames) throw new Error('Invalid workbook');
+  // Find GEN BUP or Gen Mobile pay summary sheet
+  var sheetName = workbook.SheetNames.find(function(n){
+    return /gen\s*bup/i.test(n) || /gen\s*mobile.*pay/i.test(n) || /gm.*pay/i.test(n);
+  });
+  if(!sheetName) throw new Error('Could not find Gen Mobile sheet (looked for "GEN BUP" or similar)');
+  var sheet = workbook.Sheets[sheetName];
+  var rows = XLSX.utils.sheet_to_json(sheet, {header:1, raw:true, defval:''});
+  if(!rows.length) throw new Error('Empty sheet');
+
+  // Find header row — has 'Agent' (not 'Agent Name' for GM)
+  var headerIdx = -1, headers = [];
+  for(var i=0; i<Math.min(20, rows.length); i++){
+    var r = rows[i];
+    if(!Array.isArray(r)) continue;
+    var hasAgent = r.indexOf('Agent') >= 0 || r.indexOf('Agent Name') >= 0;
+    if(hasAgent && (r.indexOf('Carrier')>=0 || r.indexOf('Product Type')>=0 || r.indexOf('Commission')>=0)){
+      headerIdx = i; headers = r; break;
+    }
+  }
+  if(headerIdx < 0) throw new Error('Could not find Gen Mobile header row');
+
+  function col(name){ return headers.indexOf(name); }
+  var iAgent  = col('Agent') >= 0 ? col('Agent') : col('Agent Name');
+  var iDate   = col('Date');
+  var iTeam   = col('Team');
+  var iState  = col('State');
+  var iESN    = col('ESN');
+  var iProdType = col('Product Type');
+  var iCommission = col('Commission');
+  var iPaidServ = col('Paid Services');
+  var iPaidServDeduction = col('Paid Services Deduction');
+  var iTotal  = col('Total');
+  var iStatus = col('Status');
+  var iOrder  = col('Order DD: Order Number');
+  var iLastName = col('Last Name');
+
+  var details = [];
+  var minDate = null, maxDate = null;
+  for(var j=headerIdx+1; j<rows.length; j++){
+    var rr = rows[j];
+    if(!Array.isArray(rr) || !rr[iAgent]) continue;
+    var agentName = String(rr[iAgent]).trim();
+    if(!agentName) continue;
+
+    // Determine NLAD vs Tribal — by State or Carrier or Product Type
+    // GM PDF distinguishes by where the enrollment was. State == OK and customer
+    // on Tribal land is a tribal sale; otherwise NLAD. Without explicit Tribal
+    // column, infer from the Carrier or Status field.
+    // SAFEST default: treat as NLAD unless the Product Type or State explicitly indicates Tribal.
+    var prodType = String(rr[iProdType]||'').toLowerCase();
+    var state = String(rr[iState]||'').toUpperCase();
+    var isTribal = /tribal/i.test(prodType);
+
+    // Email: if Paid Services contains an email count, hasEmail=true
+    var paidServ = String(rr[iPaidServ]||'');
+    var hasEmail = /email/i.test(paidServ) || (parseFloat(paidServ)||0) >= 1;
+
+    // BYOD: from Product Type
+    var isBYOD = /byod|sim/i.test(prodType);
+
+    var dateStr = '';
+    if(typeof rr[iDate] === 'number'){
+      var dt = new Date(Date.UTC(1899,11,30) + rr[iDate]*86400000);
+      dateStr = dt.toISOString().slice(0,10);
+      if(!minDate || dateStr < minDate) minDate = dateStr;
+      if(!maxDate || dateStr > maxDate) maxDate = dateStr;
+    } else if(rr[iDate]){
+      dateStr = String(rr[iDate]).slice(0,10);
+    }
+
+    details.push({
+      agentName: agentName,
+      date: dateStr,
+      team:  String(rr[iTeam]||'').trim(),
+      state: state,
+      isTribal: isTribal,
+      hasEmail: hasEmail,
+      isBYOD:   isBYOD,
+      productType: prodType,
+      esn: String(rr[iESN]||''),
+      orderNum: String(rr[iOrder]||''),
+      lastName: String(rr[iLastName]||''),
+      status: String(rr[iStatus]||''),
+      commission: parseFloat(rr[iCommission]||0)||0,
+      paidServices: parseFloat(rr[iPaidServ]||0)||0,
+      paidServicesDeduction: parseFloat(rr[iPaidServDeduction]||0)||0,
+      total: parseFloat(rr[iTotal]||0)||0
+    });
+  }
+
+  // Try to grab invoice meta from first sheet (same logic as TC)
+  var invoiceNum = '', periodStart = minDate || '', periodEnd = maxDate || '';
+  var invSheet = workbook.Sheets[workbook.SheetNames[0]];
+  if(invSheet){
+    var invRows = XLSX.utils.sheet_to_json(invSheet, {header:1, raw:true, defval:''});
+    for(var k=0; k<Math.min(15, invRows.length); k++){
+      var rrr = invRows[k] || [];
+      rrr.forEach(function(c, ci){
+        var s = String(c||'');
+        if(/Invoice\s*#/i.test(s) && rrr[ci+1]) invoiceNum = String(rrr[ci+1]);
+        if(/Period/i.test(s) && rrr[ci+1]){
+          var p = String(rrr[ci+1]);
+          var m2 = p.match(/(\d{1,2}\/\d{1,2}\/\d{2,4})\s*[–-]\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/);
+          if(m2){
+            function dmy2(s){ var p=s.split('/'); var y=p[2].length===2?'20'+p[2]:p[2]; return y+'-'+('0'+p[0]).slice(-2)+'-'+('0'+p[1]).slice(-2); }
+            periodStart = dmy2(m2[1]); periodEnd = dmy2(m2[2]);
+          }
+        }
+      });
+    }
+  }
+
+  return {
+    invoiceNum: invoiceNum,
+    periodStart: periodStart,
+    periodEnd:   periodEnd,
+    details:     details,
+    chargebacks: [],   // TODO: parse GEN Aging Phone Deduction sheet if it has chargebacks
+    deviceCharges: []  // TODO: parse GEN Device Upgrades sheet
+  };
+}
+
+// Build a payroll week from parsed GM invoice
+function gmInvoiceToWeek(parsed, uploadedBy){
+  if(!parsed || !Array.isArray(parsed.details)) return null;
+  var byAgent = {};
+  parsed.details.forEach(function(d){
+    var key = (d.agentName||'').toLowerCase().trim();
+    if(!key) return;
+    if(!byAgent[key]){
+      var match = (DB.agents||[]).find(function(a){
+        if(!a) return false;
+        var code = a.agentCodes && a.agentCodes['Gen Mobile'];
+        if(code && String(code).toLowerCase().trim() === key) return true;
+        if(a.name && a.name.toLowerCase().trim() === key) return true;
+        return false;
+      });
+      byAgent[key] = {
+        agentId:   match ? match.id : null,
+        agentName: match ? match.name : d.agentName,
+        agentCode: d.agentName,
+        market:    d.team,
+        activations: { NLAD:0, Tribal:0, Email:0, BYOD:0, Total:0 },
+        grossCents: 0,
+        details:   []
+      };
+    }
+    var rec = byAgent[key];
+    if(d.isTribal) rec.activations.Tribal++; else rec.activations.NLAD++;
+    if(d.hasEmail) rec.activations.Email++;
+    if(d.isBYOD)   rec.activations.BYOD++;
+    rec.activations.Total++;
+    rec.grossCents += Math.round((d.total||0)*100);
+    rec.details.push(d);
+  });
+
+  return {
+    id: 'pwgm-' + Date.now(),
+    carrier: 'Gen Mobile',
+    invoiceNum: parsed.invoiceNum,
+    periodStart: parsed.periodStart,
+    periodEnd:   parsed.periodEnd,
+    status: 'imported',
+    rows: Object.keys(byAgent).map(function(k){return byAgent[k];}),
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: uploadedBy || (DB.current && DB.current.name) || 'system'
+  };
+}
+
+// Run engine on a stored GM week
+function gmCalculateForStoredWeek(weekId){
+  var w = (PAYROLL_WEEKS||[]).find(function(x){return x.id === weekId;});
+  if(!w || w.carrier !== 'Gen Mobile') return null;
+  var engineRows = [];
+  (w.rows||[]).forEach(function(r){
+    if(!r.agentId) return;
+    (r.details||[]).forEach(function(d){
+      engineRows.push({
+        agentId:  r.agentId,
+        isTribal: !!d.isTribal,
+        hasEmail: !!d.hasEmail,
+        isBYOD:   !!d.isBYOD,
+        chargebackCents: 0
+      });
+    });
+  });
+  return gmCalculateWeek(engineRows);
+}
+
+// Set GM models on the seeded agents per Calvin's locked spec
+// (Run once on first load to migrate cached data)
+function gmEnsureSeededModels(){
+  if(!DB || !DB.agents) return;
+  var spec = {
+    'Tanita Flowers': 'gm-flat-13',
+    'Brandon Smith':  'gm-flat-13',
+    'Juan Rincon':    'gm-flat-13',
+    'Stephanie Tubman':'gm-stephanie'
+  };
+  DB.agents.forEach(function(a){
+    if(spec[a.name] && a.cmModel !== spec[a.name]){
+      a.cmModel = spec[a.name];
+    }
+  });
+}
+// Auto-run on load
+if(typeof DB !== 'undefined' && DB.agents) gmEnsureSeededModels();
+
 
 // ══════════════════════════════════════════════
 //  PROGRAM & CAMPAIGN MANAGEMENT
@@ -7085,6 +7488,10 @@ function changePassword(){
   // Update in DB
   const agent = DB.agents.find(function(a){return a.id===u.id;});
   if(agent){ agent.password = nw; u.password = nw; }
+  // CRITICAL FIX (2026-04-30): Persist to localStorage + Supabase.
+  // Bug was that password updates were only in-memory and lost on refresh.
+  if(typeof saveAgentToSupabase === 'function' && agent) saveAgentToSupabase(agent);
+  else if(typeof saveToStorage === 'function') saveToStorage();
   showPwMsg('Password updated successfully!','#059669');
   document.getElementById('pwCurrent').value='';
   document.getElementById('pwNew').value='';
@@ -11988,6 +12395,7 @@ function agwOnProgramsChange(){
       html += '<div style="display:flex;gap:10px;align-items:center;padding:8px 12px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:white">';
       html += '<label style="display:flex;align-items:center;gap:8px;flex:0 0 160px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:'+color+';font-weight:700"><input type="checkbox" id="agwCamp-'+safeId+'" onchange="agwToggleCampaignCode(\''+safeId+'\', this.checked)" style="accent-color:'+color+';width:16px;height:16px"> '+_escapeHtml(camp)+'</label>';
       html += '<input type="text" id="agwCode-'+safeId+'" data-camp="'+_escapeAttr(camp)+'" placeholder="Agent code (when assigned)" style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;display:none">';
+      html += '<button type="button" id="agwGen-'+safeId+'" onclick="agwGenerateCode(\''+safeId+'\', \''+_escapeAttr(camp)+'\')" title="Generate a unique code" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer;display:none;flex-shrink:0">⚡ Generate</button>';
       html += '</div>';
     });
     html += '</div>';
@@ -11995,12 +12403,62 @@ function agwOnProgramsChange(){
   box.innerHTML = html;
 }
 
-// Show/hide the agent-code input when a campaign is checked
+// Show/hide the agent-code input (and Generate button) when a campaign is checked
 function agwToggleCampaignCode(safeId, checked){
   var input = document.getElementById('agwCode-'+safeId);
+  var genBtn = document.getElementById('agwGen-'+safeId);
+  if(input){
+    input.style.display = checked ? 'block' : 'none';
+    if(!checked) input.value = '';
+  }
+  if(genBtn){
+    genBtn.style.display = checked ? 'inline-block' : 'none';
+  }
+}
+
+// Generate a unique code for a carrier based on agent's name + carrier prefix.
+// Pattern: <CARRIER-PREFIX>-<INITIALS>-<NN>  e.g. "TC-BA-01" for Brittany Alexander on TruConnect
+// Increments NN if the proposed code is already in use by another agent.
+function agwGenerateCode(safeId, carrier){
+  var input = document.getElementById('agwCode-'+safeId);
   if(!input) return;
-  input.style.display = checked ? 'block' : 'none';
-  if(!checked) input.value = '';
+  var nameField = document.getElementById('agwName').value.trim();
+  if(!nameField){
+    alert('Enter the agent\'s full name first — code is generated from initials.');
+    return;
+  }
+  // Build initials (first letters of each name part, max 3)
+  var parts = nameField.split(/\s+/).filter(function(p){return p;});
+  var initials = parts.slice(0,3).map(function(p){return p.charAt(0).toUpperCase();}).join('');
+  if(!initials) initials = 'AG';
+  // Carrier prefix
+  var prefixes = {
+    'TruConnect':'TC', 'Gen Mobile':'GM', 'Assurance':'AS', 'Excess':'EX',
+    'Chuzo':'CZ', 'Astound':'AT', 'ACA':'ACA'
+  };
+  var prefix = prefixes[carrier] || carrier.substring(0,3).toUpperCase();
+  // Find next sequential number not in use across all agents for this carrier
+  var existingId = parseInt(document.getElementById('agwId').value)||0;
+  function isCodeTaken(code){
+    return DB.agents.some(function(a){
+      if(a.id === existingId) return false;  // ignore own current code
+      if(!a.agentCodes) return false;
+      var ac = a.agentCodes[carrier];
+      return ac && String(ac).trim().toUpperCase() === code.toUpperCase();
+    });
+  }
+  var n = 1, code = '';
+  while(n <= 99){
+    var nn = (n<10?'0':'') + n;
+    code = prefix + '-' + initials + '-' + nn;
+    if(!isCodeTaken(code)) break;
+    n++;
+  }
+  input.value = code;
+  // Visual feedback
+  input.style.background = 'rgba(22,163,74,.08)';
+  input.style.borderColor = '#16a34a';
+  setTimeout(function(){ input.style.background=''; input.style.borderColor=''; }, 1200);
 }
 
 // Save agent — runs validation, builds agent record, persists
@@ -15068,7 +15526,7 @@ function panelPayroll(){
   var h = panelHeader('💰 Payroll Department');
   h += '<div style="display:flex;gap:8px;margin-bottom:18px;flex-wrap:wrap">'
     +'<button onclick="prShowTab(\'summary\')" id="pr-tab-summary" style="background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;border-radius:6px;cursor:pointer">💰 Commission Summary</button>'
-    +'<button onclick="prShowTab(\'tcweeks\')" id="pr-tab-tcweeks" style="background:var(--offwhite);color:var(--muted);border:1px solid var(--border);font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;border-radius:6px;cursor:pointer">📥 TC Invoices</button>'
+    +'<button onclick="prShowTab(\'tcweeks\')" id="pr-tab-tcweeks" style="background:var(--offwhite);color:var(--muted);border:1px solid var(--border);font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;border-radius:6px;cursor:pointer">📥 Carrier Invoices</button>'
     +'<button onclick="prShowTab(\'rates\')" id="pr-tab-rates" style="background:var(--offwhite);color:var(--muted);border:1px solid var(--border);font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;border-radius:6px;cursor:pointer">⚙️ Commission Rates</button>'
     +'<button onclick="prShowTab(\'notes\')" id="pr-tab-notes" style="background:var(--offwhite);color:var(--muted);border:1px solid var(--border);font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;border-radius:6px;cursor:pointer">📝 Agent Pay Notes</button>'
     +'</div>';
@@ -15133,12 +15591,12 @@ function panelPayroll(){
   h += '<div style="padding:12px 20px;font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted);background:rgba(0,53,148,.03);border-top:1px solid var(--border)">⚠️ Estimates only. Always verify against carrier portal reports before issuing payments.</div>';
   h += '</div></div>'; // end card + summary pane
 
-  // ── TAB 2: TC Invoices (TruConnect upload + commission view) ──
+  // ── TAB 2: Carrier Invoices — auto-detects TC or GM from sheet contents ──
   h += '<div id="pr-pane-tcweeks" style="display:none">';
-  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">📥 Upload TruConnect Invoice (.xlsx)</div>'
-    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted)">Drop the WIL-Invoice file here. Each row is parsed and matched to an agent by their TruConnect code.</div></div>';
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">📥 Upload Carrier Invoice (.xlsx)</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted)">Drop a WIL-Invoice file. Auto-detects TruConnect (TC Pay Summary) or Gen Mobile (GEN BUP). Each row matched to an agent by their carrier code.</div></div>';
   h += '<div style="padding:18px 20px">';
-  h += '<input type="file" id="tcInvoiceFile" accept=".xlsx" onchange="tcUploadInvoice(this)" style="font-family:Barlow Condensed,sans-serif;font-size:.78rem"> ';
+  h += '<input type="file" id="tcInvoiceFile" accept=".xlsx" onchange="puUploadInvoice(this)" style="font-family:Barlow Condensed,sans-serif;font-size:.78rem"> ';
   h += '<div id="tcUploadStatus" style="margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)"></div>';
   h += '</div></div>';
 
@@ -15149,6 +15607,7 @@ function panelPayroll(){
   } else {
     h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:2px solid var(--border)">'
       +'<th style="text-align:left;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Invoice</th>'
+      +'<th style="text-align:left;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Carrier</th>'
       +'<th style="text-align:left;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Period</th>'
       +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Agents</th>'
       +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Activations</th>'
@@ -15159,21 +15618,23 @@ function panelPayroll(){
     PAYROLL_WEEKS.slice().reverse().forEach(function(w){
       var totalActs = (w.rows||[]).reduce(function(s,r){return s+((r.activations&&r.activations.Total)||0);}, 0);
       var totalGross = (w.rows||[]).reduce(function(s,r){return s+(r.grossCents||0);}, 0);
-      // Run engine for this week to get true commission
+      // Run the right engine based on carrier
       var commCents = 0;
       try {
-        var er = tcCalculateForStoredWeek(w.id);
+        var er = (w.carrier === 'Gen Mobile') ? gmCalculateForStoredWeek(w.id) : tcCalculateForStoredWeek(w.id);
         if(er && er.perAgent) Object.keys(er.perAgent).forEach(function(aid){ commCents += Math.round((er.perAgent[aid].amount||0)*100); });
-      } catch(e){}
+      } catch(e){ console.warn('[panelPayroll] engine calc failed:', e); }
+      var carrierColor = w.carrier === 'Gen Mobile' ? '#7c3aed' : '#1a8c4e';
       h += '<tr style="border-bottom:1px solid var(--border)">'
-        +'<td style="padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><strong>'+(w.invoiceNum||'(no #)')+'</strong></td>'
-        +'<td style="padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted)">'+(w.periodStart||'?')+' → '+(w.periodEnd||'?')+'</td>'
+        +'<td style="padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><strong>'+_escapeHtml(w.invoiceNum||'(no #)')+'</strong></td>'
+        +'<td style="padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.74rem"><span style="color:'+carrierColor+';font-weight:700">'+_escapeHtml(w.carrier||'?')+'</span></td>'
+        +'<td style="padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted)">'+_escapeHtml(w.periodStart||'?')+' → '+_escapeHtml(w.periodEnd||'?')+'</td>'
         +'<td style="padding:8px 10px;text-align:right;font-family:Barlow Condensed,sans-serif">'+(w.rows||[]).length+'</td>'
         +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--blue)">'+totalActs+'</td>'
         +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;font-size:1.0rem;color:#7a4a25">$'+(totalGross/100).toFixed(2)+'</td>'
         +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;font-size:1.0rem;color:#16a34a">$'+(commCents/100).toFixed(2)+'</td>'
         +'<td style="padding:8px 10px;text-align:right">'
-        +'<button onclick="tcViewWeek(\''+w.id+'\')" style="background:rgba(0,53,148,.1);border:1px solid rgba(0,53,148,.3);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer">View</button> '
+        +'<button onclick="puViewWeek(\''+w.id+'\')" style="background:rgba(0,53,148,.1);border:1px solid rgba(0,53,148,.3);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer">View</button> '
         +'<button onclick="tcDeleteWeek(\''+w.id+'\')" style="background:rgba(220,38,38,.1);border:1px solid rgba(220,38,38,.3);color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer;margin-left:4px">×</button>'
         +'</td></tr>';
     });
@@ -15325,6 +15786,155 @@ function tcDeleteWeek(weekId){
   tcSavePayrollWeeks();
   if(typeof gotoPanel === 'function'){ gotoPanel('payroll'); setTimeout(function(){ prShowTab('tcweeks'); },50); }
 }
+
+// ── Smart upload: auto-detect TC or GM from sheet structure
+function puUploadInvoice(input){
+  var file = input.files && input.files[0];
+  if(!file) return;
+  var status = document.getElementById('tcUploadStatus');
+  if(status){ status.style.color='var(--muted)'; status.textContent='⏳ Loading parser...'; }
+  tcEnsureSheetJS(function(){
+    if(status) status.textContent='⏳ Reading file...';
+    var reader = new FileReader();
+    reader.onload = function(e){
+      try {
+        var data = new Uint8Array(e.target.result);
+        var wb = XLSX.read(data, {type:'array'});
+        if(status) status.textContent='⏳ Detecting carrier...';
+
+        var hasTC = wb.SheetNames.some(function(n){ return /tc\s*pay\s*summary|truconnect.*pay/i.test(n); });
+        var hasGM = wb.SheetNames.some(function(n){ return /gen\s*bup|gen\s*mobile.*pay|gm.*pay/i.test(n); });
+
+        var imported = [];
+        var errors = [];
+
+        if(hasTC){
+          if(status) status.textContent='⏳ Parsing TruConnect...';
+          try {
+            var tcParsed = tcParseInvoice(wb);
+            if(tcParsed.details.length){
+              var tcWeek = tcInvoiceToWeek(tcParsed, DB.current && DB.current.name);
+              if(tcWeek){
+                var dup = PAYROLL_WEEKS.find(function(w){return w.carrier==='TruConnect' && w.invoiceNum && tcWeek.invoiceNum && w.invoiceNum===tcWeek.invoiceNum;});
+                if(dup) PAYROLL_WEEKS = PAYROLL_WEEKS.filter(function(w){return w.id !== dup.id;});
+                PAYROLL_WEEKS.push(tcWeek);
+                imported.push('TruConnect: '+tcParsed.details.length+' activations / '+tcWeek.rows.length+' agents');
+              }
+            }
+          } catch(e){ errors.push('TruConnect parse: '+e.message); }
+        }
+
+        if(hasGM){
+          if(status) status.textContent='⏳ Parsing Gen Mobile...';
+          try {
+            var gmParsed = gmParseInvoice(wb);
+            if(gmParsed.details.length){
+              var gmWeek = gmInvoiceToWeek(gmParsed, DB.current && DB.current.name);
+              if(gmWeek){
+                var dup2 = PAYROLL_WEEKS.find(function(w){return w.carrier==='Gen Mobile' && w.invoiceNum && gmWeek.invoiceNum && w.invoiceNum===gmWeek.invoiceNum;});
+                if(dup2) PAYROLL_WEEKS = PAYROLL_WEEKS.filter(function(w){return w.id !== dup2.id;});
+                PAYROLL_WEEKS.push(gmWeek);
+                imported.push('Gen Mobile: '+gmParsed.details.length+' activations / '+gmWeek.rows.length+' agents');
+              }
+            }
+          } catch(e){ errors.push('Gen Mobile parse: '+e.message); }
+        }
+
+        if(!imported.length && !errors.length){
+          if(status){ status.style.color='#dc2626'; status.textContent='⚠ No recognized carrier sheets found. Looked for "TC Pay Summary" and "GEN BUP".'; }
+          return;
+        }
+
+        tcSavePayrollWeeks();
+
+        var msg = '';
+        if(imported.length) msg = '✓ Imported — '+imported.join(' | ');
+        if(errors.length) msg += (msg?' | ':'⚠ ') + errors.join(' | ');
+        if(status){ status.style.color = imported.length ? '#16a34a' : '#dc2626'; status.textContent = msg; }
+        input.value = '';
+        if(typeof gotoPanel === 'function'){ setTimeout(function(){ gotoPanel('payroll'); setTimeout(function(){ prShowTab('tcweeks'); }, 50); }, 800); }
+      } catch(err){
+        console.error('[puUploadInvoice]', err);
+        if(status){ status.style.color='#dc2626'; status.textContent='⚠ Error: '+err.message; }
+      }
+    };
+    reader.onerror = function(){
+      if(status){ status.style.color='#dc2626'; status.textContent='⚠ Could not read file.'; }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// Smart view: route to TC or GM detail by carrier
+function puViewWeek(weekId){
+  var w = (PAYROLL_WEEKS||[]).find(function(x){return x.id===weekId;});
+  if(!w) return;
+  if(w.carrier === 'Gen Mobile') return gmViewWeek(weekId);
+  return tcViewWeek(weekId);
+}
+
+// GM detail view (mirrors tcViewWeek but for GM data + breakdown)
+function gmViewWeek(weekId){
+  var target = document.getElementById('tcWeekDetail');
+  if(!target) return;
+  var w = (PAYROLL_WEEKS||[]).find(function(x){return x.id===weekId;});
+  if(!w){ target.innerHTML = '<div class="bo-card"><div style="padding:20px">Week not found.</div></div>'; return; }
+
+  var engineResult = gmCalculateForStoredWeek(weekId);
+  var engineByAgent = (engineResult && engineResult.perAgent) || {};
+
+  var totalGross = (w.rows||[]).reduce(function(s,r){return s+(r.grossCents||0);},0);
+  var totalActs  = (w.rows||[]).reduce(function(s,r){return s+((r.activations&&r.activations.Total)||0);},0);
+  var totalComm = 0;
+  Object.keys(engineByAgent).forEach(function(aid){ totalComm += Math.round((engineByAgent[aid].amount||0)*100); });
+  var profit = totalGross - totalComm;
+
+  var h = '<div class="bo-card" style="margin-bottom:14px;border-left:4px solid #7c3aed"><div class="bo-card-head"><div class="bo-card-title">⚡ Gen Mobile — '+_escapeHtml(w.invoiceNum||'(no #)')+' — '+_escapeHtml(w.periodStart||'?')+' → '+_escapeHtml(w.periodEnd||'?')+'</div></div>';
+  h += '<div class="bo-stats" style="padding:14px 20px">';
+  h += '<div class="bo-stat"><div class="bs-label">Activations</div><div class="bs-val" style="color:var(--blue)">'+totalActs+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Carrier Gross</div><div class="bs-val" style="color:#7a4a25">$'+(totalGross/100).toFixed(2)+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Agent Commission</div><div class="bs-val" style="color:#16a34a">$'+(totalComm/100).toFixed(2)+'</div></div>';
+  h += '<div class="bo-stat" style="border-left:3px solid '+(profit>=0?'#16a34a':'#dc2626')+';padding-left:12px"><div class="bs-label">Gross Profit</div><div class="bs-val" style="color:'+(profit>=0?'#16a34a':'#dc2626')+'">$'+(profit/100).toFixed(2)+'</div></div>';
+  h += '</div></div>';
+
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Per-agent breakdown</div></div>';
+  h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:2px solid var(--border)">'
+    +'<th style="text-align:left;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Agent</th>'
+    +'<th style="text-align:left;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Market</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">NLAD</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:#7c3aed">Tribal</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:#0891b2">Email</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:#16a34a">BYOD</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Total</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:#7a4a25">Gross</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:#16a34a">Commission</th>'
+    +'</tr></thead><tbody>';
+  (w.rows||[]).forEach(function(r){
+    var entry = r.agentId ? engineByAgent[r.agentId] : null;
+    var commCents = entry ? Math.round((entry.amount||0)*100) : null;
+    h += '<tr style="border-bottom:1px solid var(--border)">'
+      +'<td style="padding:8px 10px"><strong>'+_escapeHtml(r.agentName||'?')+'</strong>'+(!r.agentId?' <span style="color:#dc2626;font-size:.7rem">(unmatched)</span>':'')+'</td>'
+      +'<td style="padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted)">'+_escapeHtml(r.market||'?')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right">'+((r.activations&&r.activations.NLAD)||'—')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;color:#7c3aed;font-weight:700">'+((r.activations&&r.activations.Tribal)||'—')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;color:#0891b2">'+((r.activations&&r.activations.Email)||'—')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;color:#16a34a">'+((r.activations&&r.activations.BYOD)||'—')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--blue)">'+((r.activations&&r.activations.Total)||0)+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;color:#7a4a25">$'+((r.grossCents||0)/100).toFixed(2)+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;color:#16a34a;font-weight:700">'+(commCents===null?'<span style="color:var(--muted);font-size:.74rem">—</span>':'$'+(commCents/100).toFixed(2))+'</td>'
+      +'</tr>';
+    if(entry && entry.breakdown && entry.breakdown.length){
+      entry.breakdown.forEach(function(b){
+        h += '<tr style="background:rgba(124,58,237,.03)"><td colspan="8" style="padding:3px 10px 3px 30px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">↳ '+_escapeHtml(b.label||'')+' '+(b.count?'('+b.count+(b.rate?' × $'+(typeof b.rate==='number'?b.rate.toFixed(2):b.rate):'')+')':'')+'</td><td style="padding:3px 10px;text-align:right;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:'+(b.amount<0?'#dc2626':'#16a34a')+'">$'+(b.amount||0).toFixed(2)+'</td></tr>';
+      });
+    }
+  });
+  h += '</tbody></table></div></div>';
+
+  target.innerHTML = h;
+  target.scrollIntoView({behavior:'smooth', block:'start'});
+}
+
 function tcViewWeek(weekId){
   var target = document.getElementById('tcWeekDetail');
   if(!target) return;
