@@ -19160,16 +19160,135 @@ function panelPayrollUploadPreview(){
   return h;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  COMMISSION ENGINE BRIDGE (Calvin 2026-04-30)
+//
+//  The parser populates rows with `grossCents` from the carrier invoice
+//  (e.g. TruConnect's $40 ISO Pay Rate). That's company revenue, NOT what
+//  each person should be paid. To compute actual agent commissions —
+//  with TL diff, CM ceiling, multi-TL routing — we need to run the
+//  matched rows through tcCalculateWeek (or gmCalculateWeek) and project
+//  the engine output back onto the row display.
+//
+//  Returns: { byAgent: {aid: {commissionCents, breakdown:[...]}},
+//             totalCommissionCents,
+//             allAgentIds:[...] }   // includes TL/CM who got override but
+//                                   // didn't enroll directly
+// ════════════════════════════════════════════════════════════════════════
+function ppComputeAgentCommissions(parsed, carrier){
+  var out = { byAgent:{}, totalCommissionCents:0, allAgentIds:[] };
+  if(!parsed || !parsed.rows) return out;
+
+  // 1) Match rows to agents so we have an agentId for each enrollment
+  var match = ppMatchRowsToAgents(parsed, carrier);
+  if(!match.matched.length) return out;
+
+  // 2) Expand matched rows into per-enrollment events for the engine
+  var events = [];
+  match.matched.forEach(function(m){
+    var aid = m.agent.id;
+    var act = m.row.activations || {};
+    if(carrier === 'TruConnect'){
+      // TC: activations.Total is total deals, activations.Tribal is the count of Tribal deals
+      // The other (Total - Tribal) are NLAD deals.
+      var tribalCount = act.Tribal || 0;
+      var nladCount   = (act.Total || 0) - tribalCount;
+      for(var i=0;i<tribalCount;i++){ events.push({ agentId:aid, isTribal:true }); }
+      for(var j=0;j<nladCount;j++){   events.push({ agentId:aid, isTribal:false }); }
+      // Chargebacks accumulate against the agent
+      if(m.row.chargebackTotal){
+        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal });
+      }
+    } else if(carrier === 'Gen Mobile'){
+      // GM: activations has TRB (Tribal), other counts are NLAD variants.
+      // Total includes both Tribal and NLAD. Email + BYOD are flags on activator's deals.
+      var trb   = act.TRB || 0;
+      var total = act.Total || 0;
+      var nlad  = total - trb;
+      var email = act.Email || 0;
+      var byod  = act.BYOD_SIM || 0;
+      // Distribute email/byod flags across deals (just attach to first N enrollments)
+      var emailLeft = email, byodLeft = byod;
+      for(var k=0;k<trb;k++){
+        events.push({
+          agentId:aid, isTribal:true,
+          hasEmail: emailLeft-- > 0,
+          isBYOD:   byodLeft--  > 0
+        });
+      }
+      for(var l=0;l<nlad;l++){
+        events.push({
+          agentId:aid, isTribal:false,
+          hasEmail: emailLeft-- > 0,
+          isBYOD:   byodLeft--  > 0
+        });
+      }
+      if(m.row.chargebackTotal){
+        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal });
+      }
+    } else if(carrier === 'Assurance'){
+      // Assurance — engine path. If awCalculateWeek exists, use it.
+      // Otherwise, fall back to grossCents (carrier rate) for AW agents.
+      var awTotal = act.Total || 0;
+      // AW activations all NLAD-equivalent for now (no Tribal split column in AW)
+      for(var n=0;n<awTotal;n++){ events.push({ agentId:aid, isTribal:false }); }
+      if(m.row.chargebackTotal){
+        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal });
+      }
+    }
+  });
+
+  // 3) Run through the appropriate engine
+  var engine = null;
+  if(carrier === 'TruConnect' && typeof tcCalculateWeek === 'function') engine = tcCalculateWeek;
+  else if(carrier === 'Gen Mobile' && typeof gmCalculateWeek === 'function') engine = gmCalculateWeek;
+  else if(carrier === 'Assurance' && typeof awCalculateWeek === 'function') engine = awCalculateWeek;
+
+  if(!engine){
+    // No engine available — fall back to carrier gross
+    match.matched.forEach(function(m){
+      var cents = m.row.grossCents || 0;
+      out.byAgent[m.agent.id] = { commissionCents: cents, breakdown: [] };
+      out.totalCommissionCents += cents;
+      out.allAgentIds.push(m.agent.id);
+    });
+    return out;
+  }
+
+  var result = engine(events);
+  if(!result || !result.perAgent) return out;
+
+  // 4) Collect per-agent commissions, including TL/CM override earners
+  Object.keys(result.perAgent).forEach(function(aid){
+    var entry = result.perAgent[aid];
+    var cents = Math.round(entry.amount * 100);
+    out.byAgent[aid] = {
+      commissionCents: cents,
+      breakdown: entry.breakdown || [],
+      rows: entry.rows || 0
+    };
+    out.totalCommissionCents += cents;
+    out.allAgentIds.push(parseInt(aid, 10));
+  });
+
+  return out;
+}
+
 function ppRenderCarrierPreview(carrier, parsed){
   var match = ppMatchRowsToAgents(parsed, carrier);
   var matched = match.matched, unmatched = match.unmatched;
   var isTC = carrier === 'TruConnect';
-  var totalAct = 0, totalCB = 0, totalGross = 0;
+  // Compute actual agent commissions via the engine — this is the real
+  // money math, not the carrier's per-row rate.
+  var commissions = ppComputeAgentCommissions(parsed, carrier);
+  var totalAct = 0, totalCB = 0;
+  var totalCarrierGross = 0;  // what the carrier paid Calvin (revenue)
   Object.keys(parsed.rows||{}).forEach(function(k){
     totalAct   += (parsed.rows[k].activations && parsed.rows[k].activations.Total) || 0;
     totalCB    += parsed.rows[k].chargebackTotal || 0;
-    totalGross += parsed.rows[k].grossCents || 0;
+    totalCarrierGross += parsed.rows[k].grossCents || 0;
   });
+  var totalAgentPay = commissions.totalCommissionCents;
   var h = '';
   var carrierColor = carrier==='Gen Mobile' ? '#2a7de1' :
                      carrier==='TruConnect' ? '#7c3aed' :
@@ -19181,7 +19300,8 @@ function ppRenderCarrierPreview(carrier, parsed){
   h += '<span><strong style="color:#059669">'+matched.length+'</strong> matched</span>';
   h += '<span><strong style="color:#991B1B">'+unmatched.length+'</strong> unmatched</span>';
   h += '<span><strong>'+totalAct+'</strong> activations</span>';
-  if(isTC && totalGross) h += '<span style="color:#059669"><strong>$'+(totalGross/100).toFixed(2)+'</strong> agent gross</span>';
+  if(totalAgentPay) h += '<span style="color:#059669"><strong>$'+(totalAgentPay/100).toFixed(2)+'</strong> agent pay</span>';
+  if(isTC && totalCarrierGross) h += '<span style="color:var(--muted)"><strong>$'+(totalCarrierGross/100).toFixed(2)+'</strong> carrier paid</span>';
   if(totalCB) h += '<span style="color:#991B1B"><strong>$'+(totalCB/100).toFixed(2)+'</strong> chargebacks</span>';
   h += '</div></div>';
   h += '<div style="padding:16px 18px">';
@@ -19242,13 +19362,22 @@ function ppRenderCarrierPreview(carrier, parsed){
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Tribal</th>';
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">My TC App</th>';
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">TC Plus</th>';
-      h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Gross</th>';
+      h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Pay</th>';
     } else {
+      h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Pay</th>';
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Chargebacks</th>';
     }
     h += '</tr></thead><tbody>';
+    // Track which agents we've rendered (so we can append override-only earners after)
+    var renderedAids = {};
     matched.forEach(function(m){
       var total = (m.row.activations && m.row.activations.Total) || 0;
+      var aid = m.agent.id;
+      renderedAids[aid] = true;
+      // Pull engine commission for this agent (replaces m.row.grossCents which was
+      // carrier rate × deals, not the actual commission)
+      var commEntry = commissions.byAgent[aid] || { commissionCents:0, breakdown:[] };
+      var commCents = commEntry.commissionCents;
       h += '<tr style="border-bottom:1px solid var(--border)">';
       h += '<td style="padding:8px 10px"><strong>'+m.agent.name+'</strong><div style="font-size:.7rem;color:var(--muted)">'+m.agent.username+'</div></td>';
       h += '<td style="padding:8px 10px;font-family:monospace;font-size:.78rem">'+m.row.agentCode+'</td>';
@@ -19256,14 +19385,39 @@ function ppRenderCarrierPreview(carrier, parsed){
       h += '<td style="padding:8px 10px;text-align:right;font-weight:700;color:var(--blue)">'+total+'</td>';
       if(isTC){
         var act = m.row.activations || {};
-        var gross = m.row.grossCents || 0;
         h += '<td style="padding:8px 10px;text-align:right">'+(act.Tribal||0)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right">'+(act.MyTcApp||0)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right">'+(act.TcPlus||0)+'</td>';
-        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(gross?'$'+(gross/100).toFixed(2):'—')+'</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(commCents?'$'+(commCents/100).toFixed(2):'—')+'</td>';
       } else {
         var cb = m.row.chargebackTotal || 0;
+        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(commCents?'$'+(commCents/100).toFixed(2):'—')+'</td>';
         h += '<td style="padding:8px 10px;text-align:right;color:'+(cb?'#991B1B':'var(--muted2)')+'">'+(cb?'$'+(cb/100).toFixed(2):'—')+'</td>';
+      }
+      h += '</tr>';
+    });
+    // Render TLs / CMs who got override commission but didn't have direct enrollments
+    // (e.g., a TL whose pay all comes from the diff override on field agents below them)
+    var overrideOnly = (commissions.allAgentIds || []).filter(function(aid){
+      return !renderedAids[aid] && (commissions.byAgent[aid] && commissions.byAgent[aid].commissionCents > 0);
+    });
+    overrideOnly.forEach(function(aid){
+      var ag = DB.agents.find(function(x){return x.id===aid;}) || {name:'Agent #'+aid, username:''};
+      var commCents = commissions.byAgent[aid].commissionCents;
+      h += '<tr style="border-bottom:1px solid var(--border);background:rgba(124,58,237,.03)" title="Override only — no direct enrollments this week">';
+      h += '<td style="padding:8px 10px"><strong>'+ag.name+'</strong>'
+        +'<div style="font-size:.7rem;color:var(--muted)">'+(ag.username||'')+(ag.role?' • '+ag.role:'')+'</div></td>';
+      h += '<td style="padding:8px 10px;font-size:.7rem;color:var(--muted);font-style:italic">— override —</td>';
+      h += '<td style="padding:8px 10px;font-size:.78rem">—</td>';
+      h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
+      if(isTC){
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">$'+(commCents/100).toFixed(2)+'</td>';
+      } else {
+        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">$'+(commCents/100).toFixed(2)+'</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted2)">—</td>';
       }
       h += '</tr>';
     });
@@ -19308,22 +19462,60 @@ function ppCommitStaged(){
     var parsed  = det.parsed;
     if(!parsed) return;
     var match = ppMatchRowsToAgents(parsed, carrier);
+    // Run the commission engine — produces the actual per-agent pay
+    // (ceiling-respected, multi-TL safe, override-routed correctly).
+    // The output replaces the old "grossCents = carrier × deals" approach,
+    // which was overpaying because it ignored the commission split.
+    var commissions = ppComputeAgentCommissions(parsed, carrier);
     var rows = [];
+    var renderedAids = {};
     match.matched.forEach(function(m){
+      var aid = m.agent.id;
+      renderedAids[aid] = true;
+      var commEntry = commissions.byAgent[aid] || { commissionCents:0, breakdown:[] };
       var row = {
         agentCode:       m.row.agentCode,
-        agentId:         m.agent.id,
+        agentId:         aid,
         agentName:       m.agent.name,
         market:          m.row.market || m.row.distributor || m.row.teamName || '',
         activations:     m.row.activations,
         chargebacks:     m.row.chargebacks || [],
-        chargebackTotal: m.row.chargebackTotal || 0
+        chargebackTotal: m.row.chargebackTotal || 0,
+        // grossCents = ENGINE COMMISSION (what the agent actually gets paid)
+        grossCents:      commEntry.commissionCents,
+        // breakdown = engine's per-line explanation (Personal / TL diff / etc.)
+        commissionBreakdown: commEntry.breakdown || [],
+        // carrierGrossCents = what the carrier paid Calvin for this agent's deals
+        // (was the old grossCents value; preserved for P&L revenue tracking)
+        carrierGrossCents: m.row.grossCents || 0
       };
-      // TruConnect carries extra per-order audit detail + per-agent gross pay.
-      if(m.row.details)    row.details    = m.row.details;
-      if(m.row.grossCents != null) row.grossCents = m.row.grossCents;
-      if(m.row.teamName)   row.teamName   = m.row.teamName;
+      // TruConnect carries extra per-order audit detail.
+      if(m.row.details)  row.details  = m.row.details;
+      if(m.row.teamName) row.teamName = m.row.teamName;
       rows.push(row);
+    });
+    // Add rows for agents who got commission via override only (TLs, CMs)
+    // but didn't have direct enrollments — they need to appear in the week
+    // record so their pay shows up everywhere downstream.
+    (commissions.allAgentIds||[]).forEach(function(aid){
+      if(renderedAids[aid]) return;
+      var commEntry = commissions.byAgent[aid];
+      if(!commEntry || commEntry.commissionCents === 0) return;
+      var ag = DB.agents.find(function(x){return x.id===aid;});
+      if(!ag) return;
+      rows.push({
+        agentCode:       (ag.agentCodes && ag.agentCodes[carrier]) || '',
+        agentId:         aid,
+        agentName:       ag.name,
+        market:          '',
+        activations:     { Total:0, Tribal:0, NLAD:0, MyTcApp:0, TcPlus:0, TRB:0, Email:0, BYOD_SIM:0 },
+        chargebacks:     [],
+        chargebackTotal: 0,
+        grossCents:      commEntry.commissionCents,
+        commissionBreakdown: commEntry.breakdown || [],
+        carrierGrossCents: 0,
+        overrideOnly:    true   // flag so UI can label it as "override only"
+      });
     });
     var unmatchedCodes = match.unmatched.map(function(r){return r.agentCode;});
     var weekRecord = {
@@ -19335,7 +19527,11 @@ function ppCommitStaged(){
       uploadedBy:  u.id,
       status:      'draft',
       rows:        rows,
-      unmatchedCodes: unmatchedCodes
+      unmatchedCodes: unmatchedCodes,
+      // Engine version tag — lets us re-run/audit later if rate spec changes
+      commissionEngine: (carrier === 'TruConnect') ? 'truconnect-v2'
+                      : (carrier === 'Gen Mobile') ? 'gen-mobile-v2'
+                      : 'unknown'
     };
     // TruConnect: store invoice-level company totals for Phase 3 P&L.
     if(parsed.invoice) weekRecord.invoice = parsed.invoice;
