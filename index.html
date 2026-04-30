@@ -4027,7 +4027,279 @@ function gmCalculateForStoredWeek(weekId){
       });
     });
   });
-  return gmCalculateWeek(engineRows);
+  var result = gmCalculateWeek(engineRows);
+  if(!result || !result.perAgent) result = { perAgent:{}, byTeam:{} };
+
+  // Apply per-agent clawbacks parsed from BREAKEVEN section
+  // Each clawback is a fixed dollar amount ($15 or $25) deducted from the activator's commission.
+  // Per Calvin: "whatever that number is we deduct from that agent commission, if a IBO we deduct from them directly"
+  function bumpRev(aid, amt, label){
+    if(!result.perAgent[aid]) result.perAgent[aid] = { amount:0, breakdown:[], rows:0 };
+    result.perAgent[aid].amount += amt;
+    result.perAgent[aid].breakdown.push({ label:label, count:0, rate:0, amount:amt });
+  }
+  (w.rows||[]).forEach(function(r){
+    if(!r.agentId) return;
+    (r.clawbacks||[]).forEach(function(cb){
+      // cb.amount is positive in the paste (e.g., 15 or 25); we deduct as negative
+      var amt = -Math.abs(cb.amount||0);
+      bumpRev(r.agentId, amt, 'Upsell clawback: '+cb.model+' ('+cb.date+')');
+    });
+  });
+  return result;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  GEN MOBILE PASTE PARSER
+//
+//  Calvin pastes the carrier's pay report directly (4 sections, tab-separated):
+//    1. Top P&L summary (skipped — informational only, that's what carrier
+//       paid him at wholesale; agents earn per his own comp plan)
+//    2. Per-agent activations table
+//         Header starts with "Team Name" then "Street Agent (Short)"
+//         Columns: 1-NLAD, 2-NLAD+, 3-CA, 4-CA+NLAD, 5-TRB, Total, Data,
+//                  BYOD SIM, Email
+//         Rows where Street Agent column is blank = team subtotals (skipped)
+//         Per Calvin's lock: only column 1-NLAD counts as NLAD. The other
+//         NLAD-style columns (NLAD+, CA, CA+NLAD) are not paid for now.
+//    3. BREAKEVEN section — per-agent upsell clawbacks ($15 or $25)
+//         Header: BREAKEVEN | Agent | DATE | ORDER | MODEL | IMEI | TYPE | B/E
+//         (B/E values look like "($15)" or "($25)" — parens means negative)
+//    4. ASSURANCE table at bottom — different carrier, parsed separately
+// ════════════════════════════════════════════════════════════════════════
+function gmParsePaste(text){
+  if(!text || typeof text !== 'string') throw new Error('Empty paste');
+  var lines = text.replace(/\r/g,'').split('\n');
+  var details = [];
+  var clawbacks = [];  // [{agentName, team, date, orderNum, model, imei, type, amount}]
+
+  // Detect period from "GENMOBILE (4/12 - 4/18)" line
+  var periodStart = '', periodEnd = '';
+  for(var i=0; i<lines.length; i++){
+    var pm = lines[i].match(/GENMOBILE\s*\(\s*(\d{1,2}\/\d{1,2})\s*-\s*(\d{1,2}\/\d{1,2})\s*\)/i);
+    if(pm){
+      var year = new Date().getFullYear();
+      function toIso(mmdd){
+        var p = mmdd.split('/');
+        return year + '-' + ('0'+p[0]).slice(-2) + '-' + ('0'+p[1]).slice(-2);
+      }
+      periodStart = toIso(pm[1]);
+      periodEnd = toIso(pm[2]);
+      break;
+    }
+  }
+
+  // Section 2: per-agent activations
+  // Find the header row containing "Team Name" and "Street Agent"
+  var actHeaderIdx = -1;
+  for(var ai=0; ai<lines.length; ai++){
+    if(/Team Name/.test(lines[ai]) && /Street Agent/i.test(lines[ai])){
+      actHeaderIdx = ai;
+      break;
+    }
+  }
+
+  if(actHeaderIdx >= 0){
+    var headers = lines[actHeaderIdx].split('\t').map(function(h){return h.trim();});
+    function colIdx(name){
+      for(var i=0; i<headers.length; i++){
+        if(headers[i].toLowerCase() === name.toLowerCase()) return i;
+      }
+      return -1;
+    }
+    var iTeam   = colIdx('Team Name');
+    var iAgent  = colIdx('Street Agent (Short)');
+    if(iAgent < 0) iAgent = colIdx('Street Agent');
+    var iNLAD   = colIdx('1-NLAD');
+    var iTRB    = colIdx('5-TRB');
+    if(iTRB < 0) iTRB = colIdx('TRB');
+    var iBYOD   = colIdx('BYOD SIM');
+    var iEmail  = colIdx('Email');
+
+    // Walk rows after the header until we hit a blank line or the BREAKEVEN section
+    for(var rj=actHeaderIdx+1; rj<lines.length; rj++){
+      var ln = lines[rj];
+      if(!ln.trim()) continue;
+      // Stop conditions: hit BREAKEVEN section or ASSURANCE
+      if(/BREAKEVEN|^IMPORTANT:|^ASSURANCE/i.test(ln)) break;
+      var cols = ln.split('\t');
+      if(cols.length < 4) continue;
+      var teamName  = (cols[iTeam]||'').trim();
+      var agentCode = (cols[iAgent]||'').trim();
+      // Skip team-subtotal rows (Street Agent column blank)
+      if(!agentCode) continue;
+      // Only column 1-NLAD counts as NLAD per Calvin's lock
+      var nlad   = parseInt(cols[iNLAD]||'0', 10) || 0;
+      var tribal = parseInt(cols[iTRB]||'0', 10) || 0;
+      var byod   = parseInt(cols[iBYOD]||'0', 10) || 0;
+      var emails = parseInt(cols[iEmail]||'0', 10) || 0;
+
+      // Each NLAD enrollment becomes one detail row
+      // Email and BYOD bonuses spread across the agent's enrollments —
+      // the engine sees per-row hasEmail/isBYOD flags. We mark the FIRST N
+      // enrollments as hasEmail (for N email count), same for BYOD.
+      var totalEnrollments = nlad + tribal;
+      if(!totalEnrollments && !byod && !emails) continue;
+      var emailRemaining = emails;
+      var byodRemaining = byod;
+      // NLAD details
+      for(var n=0; n<nlad; n++){
+        details.push({
+          agentName: agentCode,
+          date: periodEnd,
+          team: teamName,
+          isTribal: false,
+          hasEmail: emailRemaining-- > 0,
+          isBYOD:   byodRemaining-- > 0,
+          productType: 'NLAD',
+          orderNum: '',
+          total: 0  // GM paste doesn't show per-row gross
+        });
+      }
+      // Tribal details
+      for(var t=0; t<tribal; t++){
+        details.push({
+          agentName: agentCode,
+          date: periodEnd,
+          team: teamName,
+          isTribal: true,
+          hasEmail: emailRemaining-- > 0,
+          isBYOD:   byodRemaining-- > 0,
+          productType: 'Tribal',
+          orderNum: '',
+          total: 0
+        });
+      }
+    }
+  }
+
+  // Section 3: BREAKEVEN clawbacks
+  // Header row contains "BREAKEVEN" and "Agent" and "B/E"
+  var beHeaderIdx = -1;
+  for(var bi=0; bi<lines.length; bi++){
+    if(/BREAKEVEN/i.test(lines[bi]) && /Agent/i.test(lines[bi]) && /B\/E/i.test(lines[bi])){
+      beHeaderIdx = bi;
+      break;
+    }
+  }
+  if(beHeaderIdx >= 0){
+    var beHeaders = lines[beHeaderIdx].split('\t').map(function(h){return h.trim();});
+    function beCol(name){
+      for(var k=0; k<beHeaders.length; k++){
+        if(beHeaders[k].toLowerCase().indexOf(name.toLowerCase()) >= 0) return k;
+      }
+      return -1;
+    }
+    var iBeTeam = 0;  // first column is the team in this section
+    var iBeAgent = beCol('Agent');
+    var iBeDate = beCol('Date');
+    var iBeOrder = beCol('Order');
+    var iBeModel = beCol('Model');
+    var iBeIMEI = beCol('IMEI');
+    var iBeType = beCol('Type');
+    var iBeBE = beCol('B/E');
+
+    for(var bj=beHeaderIdx+1; bj<lines.length; bj++){
+      var bln = lines[bj];
+      if(!bln.trim()) continue;
+      if(/^ASSURANCE/i.test(bln)) break;  // hit Assurance section
+      var bcols = bln.split('\t');
+      if(bcols.length < 6) continue;
+      var bAgent = (bcols[iBeAgent]||'').trim();
+      if(!bAgent) continue;
+      // Parse "($15)" or "($25)" — parens mean negative dollars
+      var beStr = (bcols[iBeBE]||'').trim();
+      var amount = 0;
+      var amtMatch = beStr.match(/\(\$?(\d+(?:\.\d+)?)\)/);
+      if(amtMatch) amount = parseFloat(amtMatch[1])||0;
+      else {
+        // Fallback: pure dollar amount, treat as negative
+        var pm2 = beStr.match(/-?\$?(\d+(?:\.\d+)?)/);
+        if(pm2) amount = parseFloat(pm2[1])||0;
+      }
+      if(amount > 0){
+        clawbacks.push({
+          agentName: bAgent,
+          team: (bcols[iBeTeam]||'').trim(),
+          date: (bcols[iBeDate]||'').trim(),
+          orderNum: (bcols[iBeOrder]||'').trim(),
+          model: (bcols[iBeModel]||'').trim(),
+          imei: (bcols[iBeIMEI]||'').trim(),
+          type: (bcols[iBeType]||'').trim(),
+          amount: amount
+        });
+      }
+    }
+  }
+
+  return {
+    invoiceNum: '',  // paste doesn't carry an invoice #
+    periodStart: periodStart,
+    periodEnd:   periodEnd,
+    details:     details,
+    clawbacks:   clawbacks
+  };
+}
+
+// Build a payroll week from parsed GM PASTE data.
+// Different from gmInvoiceToWeek (which takes xlsx-parsed data) — paste data
+// has clawbacks instead of chargebacks, and matches agents by 'Gen Mobile' code.
+function gmPasteToWeek(parsed, uploadedBy){
+  if(!parsed || !Array.isArray(parsed.details)) return null;
+  var byAgent = {};
+
+  function ensureAgent(code, team){
+    var key = (code||'').toLowerCase().trim();
+    if(!key) return null;
+    if(byAgent[key]) return byAgent[key];
+    var match = (DB.agents||[]).find(function(a){
+      if(!a) return false;
+      var ac = a.agentCodes && a.agentCodes['Gen Mobile'];
+      if(ac && String(ac).toLowerCase().trim() === key) return true;
+      return false;
+    });
+    byAgent[key] = {
+      agentId:    match ? match.id : null,
+      agentName:  match ? match.name : code,
+      agentCode:  code,
+      market:     team || '',
+      activations: { NLAD:0, Tribal:0, Email:0, BYOD:0, Total:0 },
+      grossCents: 0,
+      details:    [],
+      clawbacks:  []  // [{date, model, amount, orderNum, imei, type}]
+    };
+    return byAgent[key];
+  }
+
+  // Activations
+  parsed.details.forEach(function(d){
+    var rec = ensureAgent(d.agentName, d.team);
+    if(!rec) return;
+    if(d.isTribal) rec.activations.Tribal++; else rec.activations.NLAD++;
+    if(d.hasEmail) rec.activations.Email++;
+    if(d.isBYOD)   rec.activations.BYOD++;
+    rec.activations.Total++;
+    rec.details.push(d);
+  });
+  // Clawbacks
+  (parsed.clawbacks||[]).forEach(function(cb){
+    var rec = ensureAgent(cb.agentName, cb.team);
+    if(!rec) return;
+    rec.clawbacks.push(cb);
+  });
+
+  return {
+    id: 'pwgm-' + Date.now(),
+    carrier: 'Gen Mobile',
+    invoiceNum: parsed.invoiceNum || ('GM-paste-' + Date.now()),
+    periodStart: parsed.periodStart,
+    periodEnd:   parsed.periodEnd,
+    status: 'imported',
+    rows: Object.keys(byAgent).map(function(k){return byAgent[k];}),
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: uploadedBy || (DB.current && DB.current.name) || 'system',
+    source: 'paste'
+  };
 }
 
 // Set GM models on the seeded agents per Calvin's locked spec
@@ -4048,6 +4320,273 @@ function gmEnsureSeededModels(){
 }
 // Auto-run on load
 if(typeof DB !== 'undefined' && DB.agents) gmEnsureSeededModels();
+
+
+// ════════════════════════════════════════════════════════════════════════
+//  ASSURANCE WIRELESS COMMISSION ENGINE
+//
+//  Per Calvin's locked spec (2026-04-30):
+//    - Agents earn $0 on AW deals (Calvin keeps the carrier money)
+//    - MMs earn $5/each on every deal type (NLAD Phone, NLAD SIM,
+//      CA Phone, CA SIM) — including their own personal deals
+//    - AW codes (MMGC9CN, MMGC9CO, etc.) match to agents via
+//      agent.agentCodes['Assurance']
+//
+//  Carrier rates (informational — Calvin's revenue, not paid out):
+//    AW-NLAD Phone  $24
+//    AW-NLAD SIM    $26
+//    AW-CA Phone    $34
+//    AW-CA SIM      $36
+//    These are NOT used by the engine. The engine ONLY pays the $5/each
+//    MM override.
+// ════════════════════════════════════════════════════════════════════════
+
+var AW_RATES = {
+  // What Calvin pays out per agent role
+  mmOverridePerDeal: 5,    // MM gets $5/each on every deal type
+  agentPay: 0,             // Field agents earn $0 on AW per Calvin's spec
+  // Carrier-side rates (revenue) — informational only, not used by engine
+  carrierRevenue: {
+    nladPhone: 24, nladSim: 26, caPhone: 34, caSim: 36
+  }
+};
+
+// ── ENGINE ──
+// Input rows: [{agentId, dealType:'nladPhone'|'nladSim'|'caPhone'|'caSim'}, ...]
+// Output: {perAgent: {id: {amount, breakdown}}, byTeam}
+//
+// Logic:
+//   - Each deal generates $5 paid to whichever MM "owns" that agent.
+//     If the agent IS an MM (e.g., they personally close a deal), they
+//     get the $5 themselves (per Calvin: yes, MM earns on own deals too).
+//   - If the agent has an MM in their chain (agent.marketManagerId), the
+//     $5 goes to the MM.
+//   - If the agent reports up to a CM/IBO directly with no MM, the $5
+//     stays with Calvin (no MM in the chain to pay).
+//   - Field agents themselves never receive AW pay (per spec).
+function awCalculateWeek(weekRows){
+  var byAgent = {}, byTeam = {};
+  if(!Array.isArray(weekRows)){ console.error('[awCalculateWeek] weekRows must be array'); return {perAgent:byAgent, byTeam:byTeam}; }
+
+  function bump(agentId, amount, label, count, rate){
+    if(!byAgent[agentId]) byAgent[agentId] = { amount:0, breakdown:[], rows:0 };
+    byAgent[agentId].amount += amount;
+    byAgent[agentId].breakdown.push({ label:label, count:count, rate:rate, amount:amount });
+    if(count) byAgent[agentId].rows += count;
+  }
+
+  // Pass 1: bucket per agent & determine MM owner
+  // perActivator[aid] = {nladPhone, nladSim, caPhone, caSim, mmOwnerId}
+  var perActivator = {};
+  weekRows.forEach(function(r){
+    if(!r || !r.agentId) return;
+    if(!perActivator[r.agentId]){
+      var agent = DB.agents.find(function(x){return x.id === r.agentId;});
+      if(!agent) return;
+      // Determine MM owner: if this agent IS an MM, they get the override on their own deals
+      var mmOwnerId;
+      if(agent.role === 'Market Manager') mmOwnerId = agent.id;
+      else if(agent.marketManagerId) mmOwnerId = agent.marketManagerId;
+      else mmOwnerId = null;  // No MM in chain — Calvin keeps the $5
+      perActivator[r.agentId] = {
+        agent: agent,
+        mmOwnerId: mmOwnerId,
+        nladPhone: 0, nladSim: 0, caPhone: 0, caSim: 0, total: 0
+      };
+    }
+    var a = perActivator[r.agentId];
+    if(r.dealType === 'nladPhone') a.nladPhone++;
+    else if(r.dealType === 'nladSim') a.nladSim++;
+    else if(r.dealType === 'caPhone') a.caPhone++;
+    else if(r.dealType === 'caSim') a.caSim++;
+    a.total++;
+  });
+
+  // Pass 2: pay each MM the $5 override per deal (across all types)
+  Object.keys(perActivator).forEach(function(aidStr){
+    var entry = perActivator[aidStr];
+    var aidI = parseInt(aidStr);
+    var activator = entry.agent;
+    if(!entry.mmOwnerId){
+      // No MM — Calvin keeps the money. Still log a $0 entry for visibility.
+      // (Don't add to byAgent at all — field agent earns nothing per spec.)
+      return;
+    }
+    var mmAgent = DB.agents.find(function(x){return x.id === entry.mmOwnerId;});
+    if(!mmAgent){
+      console.warn('[awCalculateWeek] MM not found for agent', activator.name);
+      return;
+    }
+    var totalDeals = entry.total;
+    if(totalDeals === 0) return;
+    var override = totalDeals * AW_RATES.mmOverridePerDeal;
+    // Build label per deal type breakdown
+    var typeParts = [];
+    if(entry.nladPhone) typeParts.push(entry.nladPhone+' NLAD Phone');
+    if(entry.nladSim)   typeParts.push(entry.nladSim+' NLAD SIM');
+    if(entry.caPhone)   typeParts.push(entry.caPhone+' CA Phone');
+    if(entry.caSim)     typeParts.push(entry.caSim+' CA SIM');
+    var labelDetail = typeParts.join(' + ');
+    var ownLabel = (mmAgent.id === activator.id)
+      ? 'AW MM personal deals — '+labelDetail
+      : 'AW MM override on '+activator.name+' — '+labelDetail;
+    bump(mmAgent.id, override, ownLabel+' ($'+AW_RATES.mmOverridePerDeal+'/each)', totalDeals, AW_RATES.mmOverridePerDeal);
+  });
+
+  return { perAgent: byAgent, byTeam: byTeam, model:'assurance-v1' };
+}
+
+// ── AW PASTE PARSER ──
+// Reads the ASSURANCE section out of a tab-separated paste:
+//   ASSURANCE (4/9 - 4/15)
+//   Distributor | Agent | CA SIM | CA PHONE | NLAD SIM | NLAD PHONE | Total | Data | BE | No Usage Count | Deact Count
+// Skips blank-Agent rows (those are distributor totals).
+function awParsePaste(text){
+  if(!text || typeof text !== 'string') throw new Error('Empty paste');
+  var lines = text.replace(/\r/g,'').split('\n');
+  var details = [];
+
+  // Find the AW header line — "ASSURANCE (date - date)"
+  var sectionStart = -1, periodStart = '', periodEnd = '';
+  for(var i=0; i<lines.length; i++){
+    var pm = lines[i].match(/^ASSURANCE\s*\(\s*(\d{1,2}\/\d{1,2})\s*-\s*(\d{1,2}\/\d{1,2})\s*\)/i);
+    if(pm){
+      sectionStart = i;
+      var year = new Date().getFullYear();
+      function toIso(mmdd){
+        var p = mmdd.split('/');
+        return year + '-' + ('0'+p[0]).slice(-2) + '-' + ('0'+p[1]).slice(-2);
+      }
+      periodStart = toIso(pm[1]);
+      periodEnd = toIso(pm[2]);
+      break;
+    }
+  }
+  if(sectionStart < 0) throw new Error('Could not find ASSURANCE section header (expected: "ASSURANCE (mm/dd - mm/dd)")');
+
+  // Find the data header row right after the section start
+  var headerIdx = -1, headers = [];
+  for(var hi = sectionStart+1; hi < lines.length && hi < sectionStart+5; hi++){
+    if(/Distributor/i.test(lines[hi]) && /Agent/i.test(lines[hi])){
+      headerIdx = hi;
+      headers = lines[hi].split('\t').map(function(h){return h.trim();});
+      break;
+    }
+  }
+  if(headerIdx < 0) throw new Error('Could not find AW data header (Distributor/Agent row)');
+
+  function colIdx(name){
+    for(var ci=0; ci<headers.length; ci++){
+      if(headers[ci].toLowerCase() === name.toLowerCase()) return ci;
+    }
+    return -1;
+  }
+  var iAgent = colIdx('Agent');
+  var iCASim = colIdx('CA SIM');
+  var iCAPhone = colIdx('CA PHONE');
+  var iNLADSim = colIdx('NLAD SIM');
+  var iNLADPhone = colIdx('NLAD PHONE');
+
+  for(var rj = headerIdx+1; rj < lines.length; rj++){
+    var ln = lines[rj];
+    if(!ln.trim()) break;  // blank line ends section
+    var cols = ln.split('\t');
+    if(cols.length < 4) continue;
+    var agentCode = (cols[iAgent]||'').trim();
+    if(!agentCode) continue;  // skip distributor-total rows
+    var caSim     = parseInt(cols[iCASim]||'0', 10) || 0;
+    var caPhone   = parseInt(cols[iCAPhone]||'0', 10) || 0;
+    var nladSim   = parseInt(cols[iNLADSim]||'0', 10) || 0;
+    var nladPhone = parseInt(cols[iNLADPhone]||'0', 10) || 0;
+
+    // Each deal becomes one detail row
+    for(var n=0; n<nladPhone; n++){
+      details.push({ agentName:agentCode, dealType:'nladPhone', date:periodEnd });
+    }
+    for(var n=0; n<nladSim; n++){
+      details.push({ agentName:agentCode, dealType:'nladSim', date:periodEnd });
+    }
+    for(var n=0; n<caPhone; n++){
+      details.push({ agentName:agentCode, dealType:'caPhone', date:periodEnd });
+    }
+    for(var n=0; n<caSim; n++){
+      details.push({ agentName:agentCode, dealType:'caSim', date:periodEnd });
+    }
+  }
+
+  return {
+    invoiceNum: '',
+    periodStart: periodStart,
+    periodEnd:   periodEnd,
+    details:     details
+  };
+}
+
+// Build a payroll week from parsed AW paste data
+function awPasteToWeek(parsed, uploadedBy){
+  if(!parsed || !Array.isArray(parsed.details)) return null;
+  var byAgent = {};
+
+  function ensureAgent(code){
+    var key = (code||'').toLowerCase().trim();
+    if(!key) return null;
+    if(byAgent[key]) return byAgent[key];
+    var match = (DB.agents||[]).find(function(a){
+      if(!a) return false;
+      var ac = a.agentCodes && a.agentCodes['Assurance'];
+      if(ac && String(ac).toLowerCase().trim() === key) return true;
+      return false;
+    });
+    byAgent[key] = {
+      agentId:    match ? match.id : null,
+      agentName:  match ? match.name : code,
+      agentCode:  code,
+      market:     '',
+      activations: { NLADPhone:0, NLADSim:0, CAPhone:0, CASim:0, Total:0 },
+      grossCents: 0,
+      details:    []
+    };
+    return byAgent[key];
+  }
+
+  parsed.details.forEach(function(d){
+    var rec = ensureAgent(d.agentName);
+    if(!rec) return;
+    if(d.dealType === 'nladPhone'){ rec.activations.NLADPhone++; rec.grossCents += AW_RATES.carrierRevenue.nladPhone*100; }
+    else if(d.dealType === 'nladSim'){ rec.activations.NLADSim++; rec.grossCents += AW_RATES.carrierRevenue.nladSim*100; }
+    else if(d.dealType === 'caPhone'){ rec.activations.CAPhone++; rec.grossCents += AW_RATES.carrierRevenue.caPhone*100; }
+    else if(d.dealType === 'caSim'){ rec.activations.CASim++; rec.grossCents += AW_RATES.carrierRevenue.caSim*100; }
+    rec.activations.Total++;
+    rec.details.push(d);
+  });
+
+  return {
+    id: 'pwaw-' + Date.now(),
+    carrier: 'Assurance',
+    invoiceNum: parsed.invoiceNum || ('AW-paste-' + Date.now()),
+    periodStart: parsed.periodStart,
+    periodEnd:   parsed.periodEnd,
+    status: 'imported',
+    rows: Object.keys(byAgent).map(function(k){return byAgent[k];}),
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: uploadedBy || (DB.current && DB.current.name) || 'system',
+    source: 'paste'
+  };
+}
+
+// Run engine on a stored AW week
+function awCalculateForStoredWeek(weekId){
+  var w = (PAYROLL_WEEKS||[]).find(function(x){return x.id === weekId;});
+  if(!w || w.carrier !== 'Assurance') return null;
+  var engineRows = [];
+  (w.rows||[]).forEach(function(r){
+    if(!r.agentId) return;
+    (r.details||[]).forEach(function(d){
+      engineRows.push({ agentId: r.agentId, dealType: d.dealType });
+    });
+  });
+  return awCalculateWeek(engineRows);
+}
 
 
 // ══════════════════════════════════════════════
@@ -15591,14 +16130,28 @@ function panelPayroll(){
   h += '<div style="padding:12px 20px;font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted);background:rgba(0,53,148,.03);border-top:1px solid var(--border)">⚠️ Estimates only. Always verify against carrier portal reports before issuing payments.</div>';
   h += '</div></div>'; // end card + summary pane
 
-  // ── TAB 2: Carrier Invoices — auto-detects TC or GM from sheet contents ──
+  // ── TAB 2: Carrier Invoices — supports BOTH xlsx upload AND text paste ──
   h += '<div id="pr-pane-tcweeks" style="display:none">';
-  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">📥 Upload Carrier Invoice (.xlsx)</div>'
-    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted)">Drop a WIL-Invoice file. Auto-detects TruConnect (TC Pay Summary) or Gen Mobile (GEN BUP). Each row matched to an agent by their carrier code.</div></div>';
+
+  // Upload section
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">📥 Upload Carrier Invoice (.xlsx)</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted)">Drop a WIL-Invoice file. Auto-detects TruConnect (TC Pay Summary) or Gen Mobile (GEN BUP). Matches each row to an agent by their carrier code.</div></div>';
   h += '<div style="padding:18px 20px">';
   h += '<input type="file" id="tcInvoiceFile" accept=".xlsx" onchange="puUploadInvoice(this)" style="font-family:Barlow Condensed,sans-serif;font-size:.78rem"> ';
   h += '<div id="tcUploadStatus" style="margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)"></div>';
   h += '</div></div>';
+
+  // Paste-in section (for Gen Mobile, which doesn\'t come as xlsx)
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">📋 Paste Carrier Pay Data</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted)">Paste data from Gen Mobile (or TruConnect) directly. Auto-detects format. Tab-separated data works best — copy directly from the email or report.</div></div>';
+  h += '<div style="padding:14px 20px">';
+  h += '<textarea id="puPasteBox" placeholder="Paste your GM, TC, or Assurance pay data here, then click Process below…" '
+    +'style="width:100%;min-height:160px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-family:monospace;font-size:.75rem;resize:vertical;background:#fafafa"></textarea>';
+  h += '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
+  h += '<button onclick="puProcessPaste()" class="btn-fire" style="padding:9px 22px;font-size:.72rem">▶ Process Paste</button>';
+  h += '<button onclick="document.getElementById(\'puPasteBox\').value=\'\'; document.getElementById(\'puPasteStatus\').textContent=\'\';" style="background:var(--offwhite);border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:4px;cursor:pointer">Clear</button>';
+  h += '<div id="puPasteStatus" style="margin-left:12px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)"></div>';
+  h += '</div></div></div>';
 
   // List of stored weeks
   h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Imported Invoices</div></div>';
@@ -15621,10 +16174,13 @@ function panelPayroll(){
       // Run the right engine based on carrier
       var commCents = 0;
       try {
-        var er = (w.carrier === 'Gen Mobile') ? gmCalculateForStoredWeek(w.id) : tcCalculateForStoredWeek(w.id);
+        var er;
+        if(w.carrier === 'Gen Mobile')        er = gmCalculateForStoredWeek(w.id);
+        else if(w.carrier === 'Assurance')    er = awCalculateForStoredWeek(w.id);
+        else                                  er = tcCalculateForStoredWeek(w.id);
         if(er && er.perAgent) Object.keys(er.perAgent).forEach(function(aid){ commCents += Math.round((er.perAgent[aid].amount||0)*100); });
       } catch(e){ console.warn('[panelPayroll] engine calc failed:', e); }
-      var carrierColor = w.carrier === 'Gen Mobile' ? '#7c3aed' : '#1a8c4e';
+      var carrierColor = w.carrier === 'Gen Mobile' ? '#7c3aed' : (w.carrier === 'Assurance' ? '#f59e0b' : '#1a8c4e');
       h += '<tr style="border-bottom:1px solid var(--border)">'
         +'<td style="padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><strong>'+_escapeHtml(w.invoiceNum||'(no #)')+'</strong></td>'
         +'<td style="padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.74rem"><span style="color:'+carrierColor+';font-weight:700">'+_escapeHtml(w.carrier||'?')+'</span></td>'
@@ -15865,12 +16421,205 @@ function puUploadInvoice(input){
   });
 }
 
+// ── Smart paste: auto-detect format from pasted text and route to right parser
+function puProcessPaste(){
+  var status = document.getElementById('puPasteStatus');
+  var box = document.getElementById('puPasteBox');
+  if(!box || !status) return;
+  var text = box.value || '';
+  if(!text.trim()){
+    status.style.color = '#dc2626';
+    status.textContent = '⚠ Paste box is empty.';
+    return;
+  }
+  status.style.color = 'var(--muted)';
+  status.textContent = '⏳ Detecting format…';
+
+  // Detect carrier from content
+  var isGM = /MMG\s+CIR/i.test(text) && /Street Agent/i.test(text);
+  var isAssurance = /^ASSURANCE/im.test(text) && /Distributor/i.test(text);
+  var isTC = /TruConnect|TC Pay Summary/i.test(text);
+
+  // The full GM paste has BOTH a Gen Mobile section AND an Assurance section.
+  // We process whichever we find, and store as separate weeks.
+  var imported = [];
+  var errors = [];
+
+  if(isGM){
+    try {
+      status.textContent = '⏳ Parsing Gen Mobile…';
+      var parsed = gmParsePaste(text);
+      if(parsed.details.length){
+        var week = gmPasteToWeek(parsed, DB.current && DB.current.name);
+        if(week){
+          // Replace duplicate (same carrier + period)
+          var dup = PAYROLL_WEEKS.find(function(w){
+            return w.carrier === 'Gen Mobile' && w.periodStart === week.periodStart && w.periodEnd === week.periodEnd;
+          });
+          if(dup){
+            if(!confirm('A Gen Mobile pay period for '+week.periodStart+' → '+week.periodEnd+' is already imported. Replace it with this paste?')){
+              status.textContent = 'Cancelled (duplicate period).';
+              return;
+            }
+            PAYROLL_WEEKS = PAYROLL_WEEKS.filter(function(w){ return w.id !== dup.id; });
+          }
+          PAYROLL_WEEKS.push(week);
+          var unmatched = (week.rows||[]).filter(function(r){ return !r.agentId; });
+          var msg = parsed.details.length+' activations / '+week.rows.length+' agents';
+          if(unmatched.length) msg += ' ('+unmatched.length+' unmatched: '+unmatched.map(function(r){return r.agentCode;}).slice(0,3).join(', ')+(unmatched.length>3?'…':'')+')';
+          if(parsed.clawbacks.length) msg += ', '+parsed.clawbacks.length+' clawbacks';
+          imported.push('Gen Mobile: '+msg);
+        }
+      } else {
+        errors.push('Gen Mobile section detected but no agent rows found');
+      }
+    } catch(e){ errors.push('GM parse: '+e.message); console.error('[puProcessPaste GM]', e); }
+  }
+
+  if(isAssurance){
+    // Assurance parsing — engine spec pending from Calvin.
+    // For now, skip with a clear message so Calvin knows it was seen but not processed.
+    if(typeof awParsePaste === 'function'){
+      try {
+        status.textContent = '⏳ Parsing Assurance…';
+        var awParsed = awParsePaste(text);
+        if(awParsed.details && awParsed.details.length){
+          var awWeek = awPasteToWeek(awParsed, DB.current && DB.current.name);
+          if(awWeek){
+            var awDup = PAYROLL_WEEKS.find(function(w){
+              return w.carrier === 'Assurance' && w.periodStart === awWeek.periodStart && w.periodEnd === awWeek.periodEnd;
+            });
+            if(awDup) PAYROLL_WEEKS = PAYROLL_WEEKS.filter(function(w){return w.id !== awDup.id;});
+            PAYROLL_WEEKS.push(awWeek);
+            imported.push('Assurance: '+(awParsed.details.length)+' activations / '+awWeek.rows.length+' agents');
+          }
+        }
+      } catch(e){ errors.push('AW parse: '+e.message); }
+    } else {
+      errors.push('Assurance section detected but engine not yet configured (waiting on rate spec)');
+    }
+  }
+
+  if(isTC){
+    // TC paste path — TC normally comes as xlsx, but if Calvin pastes from a
+    // copied table we can attempt to parse. For now, recommend the upload path
+    // since TC's structure is more complex (multiple sheets in xlsx).
+    errors.push('TruConnect detected — please use the .xlsx upload box above for TC data');
+  }
+
+  if(!imported.length && !errors.length){
+    status.style.color = '#dc2626';
+    status.textContent = '⚠ Could not detect a recognized carrier format. Looking for "MMG CIR" (GM), "TruConnect" (TC), or "ASSURANCE" headers.';
+    return;
+  }
+
+  if(imported.length){
+    tcSavePayrollWeeks();
+    status.style.color = '#16a34a';
+    status.textContent = '✓ Imported — ' + imported.join(' | ') + (errors.length ? ' | ⚠ '+errors.join(' | ') : '');
+    setTimeout(function(){
+      box.value = '';
+      if(typeof gotoPanel === 'function') gotoPanel('payroll');
+      setTimeout(function(){ if(typeof prShowTab === 'function') prShowTab('tcweeks'); }, 50);
+    }, 1500);
+  } else {
+    status.style.color = '#dc2626';
+    status.textContent = '⚠ ' + errors.join(' | ');
+  }
+}
+
 // Smart view: route to TC or GM detail by carrier
 function puViewWeek(weekId){
   var w = (PAYROLL_WEEKS||[]).find(function(x){return x.id===weekId;});
   if(!w) return;
   if(w.carrier === 'Gen Mobile') return gmViewWeek(weekId);
+  if(w.carrier === 'Assurance')  return awViewWeek(weekId);
   return tcViewWeek(weekId);
+}
+
+// AW detail view — mirrors GM/TC but uses AW deal-type columns
+function awViewWeek(weekId){
+  var target = document.getElementById('tcWeekDetail');
+  if(!target) return;
+  var w = (PAYROLL_WEEKS||[]).find(function(x){return x.id===weekId;});
+  if(!w){ target.innerHTML = '<div class="bo-card"><div style="padding:20px">Week not found.</div></div>'; return; }
+
+  var engineResult = awCalculateForStoredWeek(weekId);
+  var engineByAgent = (engineResult && engineResult.perAgent) || {};
+
+  var totalGross = (w.rows||[]).reduce(function(s,r){return s+(r.grossCents||0);},0);
+  var totalActs  = (w.rows||[]).reduce(function(s,r){return s+((r.activations&&r.activations.Total)||0);},0);
+  var totalComm = 0;
+  Object.keys(engineByAgent).forEach(function(aid){ totalComm += Math.round((engineByAgent[aid].amount||0)*100); });
+  var profit = totalGross - totalComm;
+
+  var h = '<div class="bo-card" style="margin-bottom:14px;border-left:4px solid #f59e0b"><div class="bo-card-head"><div class="bo-card-title">⚡ Assurance Wireless — '+_escapeHtml(w.invoiceNum||'(no #)')+' — '+_escapeHtml(w.periodStart||'?')+' → '+_escapeHtml(w.periodEnd||'?')+'</div></div>';
+  h += '<div class="bo-stats" style="padding:14px 20px">';
+  h += '<div class="bo-stat"><div class="bs-label">Activations</div><div class="bs-val" style="color:var(--blue)">'+totalActs+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Carrier Gross</div><div class="bs-val" style="color:#7a4a25">$'+(totalGross/100).toFixed(2)+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">MM Override Paid</div><div class="bs-val" style="color:#16a34a">$'+(totalComm/100).toFixed(2)+'</div></div>';
+  h += '<div class="bo-stat" style="border-left:3px solid '+(profit>=0?'#16a34a':'#dc2626')+';padding-left:12px"><div class="bs-label">Calvin Keeps</div><div class="bs-val" style="color:'+(profit>=0?'#16a34a':'#dc2626')+'">$'+(profit/100).toFixed(2)+'</div></div>';
+  h += '</div>';
+  h += '<div style="padding:0 20px 16px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);font-style:italic">Per AW spec: agents earn $0, MMs earn $5 per deal (their own + their agents\').</div></div>';
+
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Per-agent activations & MM payouts</div></div>';
+  h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:2px solid var(--border)">'
+    +'<th style="text-align:left;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Agent</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">NLAD Phone</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">NLAD SIM</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">CA Phone</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">CA SIM</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Total</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:#7a4a25">Carrier Gross</th>'
+    +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:#16a34a">Goes to MM</th>'
+    +'</tr></thead><tbody>';
+  (w.rows||[]).forEach(function(r){
+    // Find which MM gets the override on this activator's deals
+    var activator = r.agentId ? DB.agents.find(function(x){return x.id===r.agentId;}) : null;
+    var mmId = null;
+    if(activator){
+      if(activator.role === 'Market Manager') mmId = activator.id;
+      else if(activator.marketManagerId) mmId = activator.marketManagerId;
+    }
+    var mm = mmId ? DB.agents.find(function(x){return x.id===mmId;}) : null;
+    var totalDeals = (r.activations||{}).Total || 0;
+    var mmPay = totalDeals * AW_RATES.mmOverridePerDeal;
+    h += '<tr style="border-bottom:1px solid var(--border)">'
+      +'<td style="padding:8px 10px"><strong>'+_escapeHtml(r.agentName||'?')+'</strong>'+(!r.agentId?' <span style="color:#dc2626;font-size:.7rem">(unmatched)</span>':'')+'<div style="font-family:monospace;font-size:.7rem;color:var(--muted)">'+_escapeHtml(r.agentCode||'')+'</div></td>'
+      +'<td style="padding:8px 10px;text-align:right">'+((r.activations&&r.activations.NLADPhone)||'—')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right">'+((r.activations&&r.activations.NLADSim)||'—')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right">'+((r.activations&&r.activations.CAPhone)||'—')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right">'+((r.activations&&r.activations.CASim)||'—')+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--blue)">'+totalDeals+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;color:#7a4a25">$'+((r.grossCents||0)/100).toFixed(2)+'</td>'
+      +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;color:#16a34a;font-weight:700">'+(mm?'$'+mmPay.toFixed(2)+'<div style="font-size:.65rem;color:var(--muted);font-weight:400">→ '+_escapeHtml(mm.name)+'</div>':'<span style="color:var(--muted);font-size:.74rem">no MM</span>')+'</td>'
+      +'</tr>';
+  });
+  h += '</tbody></table></div></div>';
+
+  // MM payout summary (totals per MM)
+  if(Object.keys(engineByAgent).length){
+    h += '<div class="bo-card" style="margin-top:14px"><div class="bo-card-head"><div class="bo-card-title">MM Payout Summary</div></div>';
+    h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:2px solid var(--border)">'
+      +'<th style="text-align:left;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Market Manager</th>'
+      +'<th style="text-align:right;padding:8px 10px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:#16a34a">Total Override</th>'
+      +'</tr></thead><tbody>';
+    Object.keys(engineByAgent).forEach(function(aid){
+      var ag = DB.agents.find(function(x){return x.id == aid;});
+      var entry = engineByAgent[aid];
+      h += '<tr style="border-bottom:1px solid var(--border)">'
+        +'<td style="padding:8px 10px"><strong>'+_escapeHtml(ag?ag.name:'unknown')+'</strong></td>'
+        +'<td style="padding:8px 10px;text-align:right;font-family:Bebas Neue,sans-serif;color:#16a34a;font-weight:700">$'+entry.amount.toFixed(2)+'</td>'
+        +'</tr>';
+      entry.breakdown.forEach(function(b){
+        h += '<tr style="background:rgba(245,158,11,.04)"><td style="padding:3px 10px 3px 30px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">↳ '+_escapeHtml(b.label||'')+'</td><td style="padding:3px 10px;text-align:right;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:#16a34a">$'+(b.amount||0).toFixed(2)+'</td></tr>';
+      });
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  target.innerHTML = h;
+  target.scrollIntoView({behavior:'smooth', block:'start'});
 }
 
 // GM detail view (mirrors tcViewWeek but for GM data + breakdown)
