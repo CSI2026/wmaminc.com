@@ -5194,8 +5194,13 @@ function gmCalculateWeek(weekRows){
 
     // Layer 2: TL/MM standard overrides ($1/each from team agents — not their own,
     // and not the Campaign Manager either, since CM is above TL/MM in the hierarchy)
+    //
+    // LOCKED SPEC (Calvin 2026-04-30): TL/MM override does NOT apply in Tanita's
+    // cm-oklahoma market. In her market, every deal is worth exactly $34 (Tribal) or
+    // standard NLAD rate, agent gets sliding, Tanita keeps the difference. No TL cut.
+    // Override DOES apply in standard markets and cm-difference (Brandon) markets.
     var tlId = null, mmId = null, cmId = null;
-    if(team){
+    if(team && cmModel !== 'cm-oklahoma'){
       tlId = team.leader;
       mmId = team.marketManager;
       cmId = team.campaignManager;  // skip overrides on CM's own deals
@@ -5222,6 +5227,9 @@ function gmCalculateWeek(weekRows){
                enrollments, GM_RATES.standardOverride.marketManager);
         }
       });
+    } else if(team){
+      // cm-oklahoma: still need cmId set for downstream Layer 3 logic
+      cmId = team.campaignManager;
     }
 
     // Layer 3: Campaign Manager override (only for cm-difference and cm-oklahoma)
@@ -5244,8 +5252,16 @@ function gmCalculateWeek(weekRows){
         // Per-agent: did TL/MM actually earn override on THIS agent's deals?
         // TL overrides on people BELOW them: not TL themselves, not MM (above), not CM (above)
         // MM overrides on people BELOW them: not MM themselves, not CM (above)
-        var tlPaidForThisAgent = (hasTL && aidI !== teamTL && aidI !== teamMM && aidI !== cmId) ? GM_RATES.standardOverride.teamLeader : 0;
-        var mmPaidForThisAgent = (hasMM && aidI !== teamMM && aidI !== cmId) ? GM_RATES.standardOverride.marketManager : 0;
+        // EXCEPTION: in cm-oklahoma (Tanita's market), TL/MM override is SKIPPED in Layer 2,
+        // so we must NOT subtract phantom TL/MM amounts from her leftover here.
+        var tlPaidForThisAgent, mmPaidForThisAgent;
+        if(cmModel === 'cm-oklahoma'){
+          tlPaidForThisAgent = 0;
+          mmPaidForThisAgent = 0;
+        } else {
+          tlPaidForThisAgent = (hasTL && aidI !== teamTL && aidI !== teamMM && aidI !== cmId) ? GM_RATES.standardOverride.teamLeader : 0;
+          mmPaidForThisAgent = (hasMM && aidI !== teamMM && aidI !== cmId) ? GM_RATES.standardOverride.marketManager : 0;
+        }
 
         if(aidI === cmId){
           // CM's PERSONAL enrollments — pay at full personal rates
@@ -5635,6 +5651,14 @@ function tcCalculateWeek(weekRows){
     }
 
     // Layer 4: CM-difference (Tanita) — applies only when tcModel === 'tc-cm-difference'
+    // LOCKED SPEC (Calvin 2026-04-30):
+    //   Every Tribal deal is worth $28 to the company. Agent gets their tier rate
+    //   ($18 tier 1 / $23 tier 2). TL gets the difference between their tier rate
+    //   and the agent's tier rate ($5 tier 1 / $2 tier 2). Tanita keeps WHATEVER'S
+    //   LEFT to make the deal total exactly $28. So:
+    //     tier 1 deal: $18 agent + $5 TL diff + $5 Tanita = $28
+    //     tier 2 deal: $23 agent + $2 TL diff + $3 Tanita = $28
+    //   No deal ever costs the company more than $28 per Tribal.
     if(tcModel === 'tc-cm-difference' && cmId){
       Object.keys(t.agents).forEach(function(aidStr){
         var aidI = parseInt(aidStr);
@@ -5642,25 +5666,58 @@ function tcCalculateWeek(weekRows){
         var a = t.agents[aidStr];
         var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
 
-        // NLAD: $2/each on agent + TL NLAD enrollments (MM has none if MM exists,
-        // since MM gets $10 personal — but CM rate is also $10, so no diff there)
-        if(a.nlad && aidI !== mmId){
-          bump(cmId, a.nlad * TC_RATES.cmDifference.nladOverridePerAgent,
-               'CM NLAD override on '+aName+' ($'+TC_RATES.cmDifference.nladOverridePerAgent+'/each)',
-               a.nlad, TC_RATES.cmDifference.nladOverridePerAgent);
+        // NLAD: max(0, $10 − agent_rate − mm_override). Total per NLAD = $10.
+        //   Agent rate: TL/Field Agent both $8, MM $10 (so MM doesn't trigger Tanita's cut)
+        //   MM override (already paid in Layer 3): $2/each on agent NLAD only
+        if(a.nlad){
+          var agentNLADRate;
+          if(aidI === mmId)      agentNLADRate = TC_RATES.nlad.mm;       // $10 — no Tanita cut
+          else if(aidI === tlId) agentNLADRate = TC_RATES.nlad.tl;       // $8
+          else                   agentNLADRate = TC_RATES.nlad.agent;    // $8
+          var mmOverridePaid = (mmId && aidI !== mmId && aidI !== tlId)
+            ? TC_RATES.nlad.mmOverridePerAgentEnrollment : 0;
+          var nladLeftover = Math.max(0, TC_RATES.cmDifference.nladPersonal - agentNLADRate - mmOverridePaid);
+          if(nladLeftover > 0){
+            bump(cmId, a.nlad * nladLeftover,
+                 'CM NLAD diff on '+aName+' ($'+nladLeftover+'/each, ceiling $'+TC_RATES.cmDifference.nladPersonal+')',
+                 a.nlad, nladLeftover);
+          }
         }
 
-        // Tribal: $30 flat per enrollment by anyone below (TL or agent)
+        // Tribal: max(0, $28 − agent_tier_rate − tl_override_paid). Total per Tribal = $28.
         if(a.tribal){
-          bump(cmId, a.tribal * TC_RATES.cmDifference.tribalOverridePerEnrollment,
-               'CM Tribal override on '+aName+' ($'+TC_RATES.cmDifference.tribalOverridePerEnrollment+'/each)',
-               a.tribal, TC_RATES.cmDifference.tribalOverridePerEnrollment);
+          // Agent's actual Tribal rate based on THEIR personal count tier
+          var agentTribalRate;
+          if(aidI === tlId){
+            // TL personal Tribal — they got TL sliding ($23/$25)
+            agentTribalRate = (a.tribal <= TC_RATES.tribal.tlTier.tier1Cap)
+              ? TC_RATES.tribal.tlTier.tier1
+              : TC_RATES.tribal.tlTier.tier2;
+          } else {
+            // Field Agent personal Tribal — agent sliding ($18/$23)
+            agentTribalRate = (a.tribal <= TC_RATES.tribal.agentTier.tier1Cap)
+              ? TC_RATES.tribal.agentTier.tier1
+              : TC_RATES.tribal.agentTier.tier2;
+          }
+          // TL override that was paid to TL in Layer 2 for this agent's enrollments
+          // (TL gets diff between TL tier rate and agent tier rate, only on field agents below them)
+          var tlOverridePaid = 0;
+          if(tlId && aidI !== tlId && aidI !== mmId){
+            var tlTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.tlTier);
+            tlOverridePaid = Math.max(0, tlTribalRate - agentTribalRate);
+          }
+          var tribalLeftover = Math.max(0, TC_RATES.cmDifference.tribalPersonal - agentTribalRate - tlOverridePaid);
+          if(tribalLeftover > 0){
+            bump(cmId, a.tribal * tribalLeftover,
+                 'CM Tribal diff on '+aName+' ($'+tribalLeftover+'/each, ceiling $'+TC_RATES.cmDifference.tribalPersonal+')',
+                 a.tribal, tribalLeftover);
+          }
         }
       });
     }
   });
 
-  return { perAgent: byAgent, byTeam: byTeam, model:'truconnect-v1', warnings: warnings };
+  return { perAgent: byAgent, byTeam: byTeam, model:'truconnect-v2', warnings: warnings };
 }
 
 function tcFormatBreakdown(perAgent){
