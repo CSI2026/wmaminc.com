@@ -5511,6 +5511,620 @@ function payrollTLForAgent(agentId){
   return null;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  PER-DEAL PAY SPLITS (Calvin 2026-04-30, real-money critical)
+//
+//  Given a single deal's enroller + flags, return who got paid what cents.
+//  This is the inverse of the engine — used at commit time to build a
+//  per-orderNumber pay map that later powers chargeback claw-back math:
+//  when a deal is canceled, we look up who was paid for it and reverse
+//  EXACTLY the splits that were applied originally ("we paid $18, take
+//  $18 back; TL got $5, take $5 back; Tanita got $5, take $5 back").
+//
+//  Tier is derived from the agent's TOTAL Tribal count for the original
+//  week (since rates are sliding retroactive). The caller passes
+//  agentTribalTotalThatWeek so we can determine if the agent crossed cap.
+//
+//  Returns: [{aid, role:'agent'|'tl'|'mm'|'cm', cents}]
+//  Sum of cents = exactly TC ceiling ($28 Tribal / $10 NLAD) per locked spec.
+// ════════════════════════════════════════════════════════════════════════
+function payrollComputeDealSplit(opts){
+  // opts: {carrier, agentId, isTribal, agentTribalTotalThatWeek, agentNladTotalThatWeek}
+  var carrier = opts.carrier;
+  var aid = opts.agentId;
+  if(!aid) return [];
+  var agent = DB.agents.find(function(x){return x.id===aid;});
+  if(!agent) return [];
+  var splits = [];
+
+  // Resolve chain: agent's TL, MM, CM (per their personal hierarchy)
+  var tlId = (agent.role === 'Field Agent') ? (agent.teamLeaderId || null) : null;
+  var mmId = agent.marketManagerId || null;
+  var cmId = agent.campaignManagerId || null;
+  var aIsTL = (agent.role === 'Team Leader');
+  var aIsMM = (agent.role === 'Market Manager');
+  var aIsCM = (agent.role === 'Campaign Manager');
+
+  // Look up CM for tcModel (Tanita's market vs standard)
+  // If agent IS a CM, use their own tcModel/cmModel directly (they don't have
+  // a campaignManagerId pointing to themselves).
+  var cmAgent;
+  if(aIsCM){
+    cmAgent = agent;
+  } else {
+    cmAgent = cmId ? DB.agents.find(function(x){return x.id===cmId;}) : null;
+  }
+  var tcModel = (cmAgent && cmAgent.tcModel) || 'none';
+  var cmModel = (cmAgent && cmAgent.cmModel) || 'none';
+
+  if(carrier === 'TruConnect'){
+    if(opts.isTribal){
+      // ── TC TRIBAL ── ceiling $28 per deal
+      var tribalTotal = opts.agentTribalTotalThatWeek || 1;
+      var inTier2 = tribalTotal > 30;
+
+      // Agent's personal Tribal rate
+      var agentRate;
+      if(aIsCM && tcModel === 'tc-cm-difference'){
+        // Tanita personal: $28 flat, no TL/CM split
+        agentRate = 28;
+        splits.push({aid:aid, role:'cm-personal', cents:agentRate*100});
+        return splits;
+      } else if(aIsTL){
+        agentRate = inTier2 ? 25 : 23;  // TL sliding
+      } else {
+        agentRate = inTier2 ? 23 : 18;  // agent sliding
+      }
+      splits.push({aid:aid, role:(aIsTL?'tl-personal':'agent'), cents:agentRate*100});
+
+      // TL diff override (if agent is field agent reporting to a TL)
+      var tlOverride = 0;
+      if(tlId && agent.role === 'Field Agent'){
+        var tlRate = inTier2 ? 25 : 23;
+        tlOverride = tlRate - agentRate;
+        if(tlOverride > 0){
+          splits.push({aid:tlId, role:'tl-diff', cents:tlOverride*100});
+        }
+      }
+
+      // CM fill — only in tc-cm-difference markets (Tanita)
+      if(tcModel === 'tc-cm-difference' && cmId){
+        var cmFill = 28 - agentRate - tlOverride;
+        if(cmFill > 0){
+          splits.push({aid:cmId, role:'cm-fill', cents:cmFill*100});
+        }
+      }
+      return splits;
+    } else {
+      // ── TC NLAD ── ceiling $10 per deal
+      var agentNLADRate;
+      if(aIsCM && tcModel === 'tc-cm-difference'){
+        agentNLADRate = 10;  // Tanita personal flat $10
+        splits.push({aid:aid, role:'cm-personal', cents:1000});
+        return splits;
+      } else if(aIsMM){
+        agentNLADRate = 10;  // MM personal flat $10
+      } else {
+        agentNLADRate = 8;   // Agent and TL both $8
+      }
+      splits.push({aid:aid, role:(aIsTL?'tl-personal':aIsMM?'mm-personal':'agent'), cents:agentNLADRate*100});
+
+      // MM override on field agent NLAD ($2/each)
+      var mmOverride = 0;
+      if(mmId && agent.role === 'Field Agent' && !aIsMM){
+        mmOverride = 2;
+        splits.push({aid:mmId, role:'mm-override', cents:200});
+      }
+
+      // CM fill if tc-cm-difference
+      if(tcModel === 'tc-cm-difference' && cmId && !aIsCM){
+        var cmFill = 10 - agentNLADRate - mmOverride;
+        if(cmFill > 0){
+          splits.push({aid:cmId, role:'cm-fill', cents:cmFill*100});
+        }
+      }
+      return splits;
+    }
+  }
+
+  if(carrier === 'Gen Mobile'){
+    // GM Tribal: $34 ceiling in cm-oklahoma (Tanita), no TL override there
+    if(opts.isTribal){
+      var tribalTotal = opts.agentTribalTotalThatWeek || 1;
+      var inTier2 = tribalTotal > 30;
+      var agentRate;
+      if(aIsCM && cmModel === 'cm-oklahoma'){
+        agentRate = 34;  // Tanita personal flat $34
+        splits.push({aid:aid, role:'cm-personal', cents:3400});
+        return splits;
+      } else {
+        agentRate = inTier2 ? 34 : 29;  // agent + TL both same sliding in cm-oklahoma
+      }
+      splits.push({aid:aid, role:(aIsTL?'tl-personal':'agent'), cents:agentRate*100});
+
+      // TL/MM override only in non-cm-oklahoma markets ($1/each)
+      if(cmModel !== 'cm-oklahoma' && agent.role === 'Field Agent'){
+        if(tlId){ splits.push({aid:tlId, role:'tl-override', cents:100}); }
+        if(mmId){ splits.push({aid:mmId, role:'mm-override', cents:100}); }
+      }
+
+      // CM fill in cm-oklahoma
+      if(cmModel === 'cm-oklahoma' && cmId && !aIsCM){
+        var cmFill = 34 - agentRate;
+        if(cmFill > 0) splits.push({aid:cmId, role:'cm-fill', cents:cmFill*100});
+      }
+      return splits;
+    } else {
+      // GM NLAD: $9-$11 sliding + Tanita +$1 flat
+      var nladTotal = opts.agentNladTotalThatWeek || 1;
+      var inTier2 = nladTotal > 30;
+      var agentRate;
+      if(aIsCM && cmModel === 'cm-oklahoma'){
+        agentRate = 13;  // Tanita NLAD personal flat
+        splits.push({aid:aid, role:'cm-personal', cents:1300});
+        return splits;
+      } else {
+        agentRate = inTier2 ? 11 : 9;
+      }
+      splits.push({aid:aid, role:(aIsTL?'tl-personal':'agent'), cents:agentRate*100});
+
+      if(cmModel !== 'cm-oklahoma' && agent.role === 'Field Agent'){
+        if(tlId){ splits.push({aid:tlId, role:'tl-override', cents:100}); }
+        if(mmId){ splits.push({aid:mmId, role:'mm-override', cents:100}); }
+      }
+      if(cmModel === 'cm-oklahoma' && cmId && !aIsCM){
+        // Tanita gets +$1 flat NLAD override
+        splits.push({aid:cmId, role:'cm-flat', cents:100});
+      }
+      return splits;
+    }
+  }
+
+  // Assurance and others — fall back to a single agent split equal to the carrier rate
+  // (will improve when AW spec is locked + chargeback rules are confirmed)
+  return splits;
+}
+
+// Build a per-orderNumber pay map for a TC week. Used at commit time to
+// power historical chargeback lookups. Each entry says: "this orderNumber
+// was a Tribal/NLAD deal enrolled by agentX, and the splits were [...]."
+//
+// Input:  parsedRows (TC parser output, has details[] with orderNum/tribal/date)
+// Output: {orderNumber: {date, tribal, enrollerAid, splits:[...]}}
+function payrollBuildDealPayMap(parsedRows, carrier){
+  if(carrier !== 'TruConnect') return {};  // GM/AW handled separately
+  var map = {};
+  // First, count each agent's totals so we know their tier
+  var agentTribalCount = {}, agentNladCount = {};
+  Object.keys(parsedRows||{}).forEach(function(code){
+    var r = parsedRows[code];
+    if(!r.details) return;
+    // Resolve agent for these rows via agentCodes
+    var agent = DB.agents.find(function(a){
+      var ac = a.agentCodes || {};
+      return ac['TruConnect'] && ac['TruConnect'].trim() === code.trim();
+    });
+    if(!agent) return;
+    r.details.forEach(function(d){
+      if(d.tribal) agentTribalCount[agent.id] = (agentTribalCount[agent.id]||0) + 1;
+      else         agentNladCount[agent.id]   = (agentNladCount[agent.id]||0)   + 1;
+    });
+  });
+  // Now build per-orderNumber splits
+  Object.keys(parsedRows||{}).forEach(function(code){
+    var r = parsedRows[code];
+    if(!r.details) return;
+    var agent = DB.agents.find(function(a){
+      var ac = a.agentCodes || {};
+      return ac['TruConnect'] && ac['TruConnect'].trim() === code.trim();
+    });
+    if(!agent) return;
+    r.details.forEach(function(d){
+      if(!d.orderNum) return;
+      var splits = payrollComputeDealSplit({
+        carrier: 'TruConnect',
+        agentId: agent.id,
+        isTribal: !!d.tribal,
+        agentTribalTotalThatWeek: agentTribalCount[agent.id] || 0,
+        agentNladTotalThatWeek:   agentNladCount[agent.id]   || 0
+      });
+      map[d.orderNum] = {
+        date:        d.date || '',
+        orderNum:    d.orderNum,
+        tribal:      !!d.tribal,
+        enrollerAid: agent.id,
+        enrollerName:agent.name,
+        splits:      splits
+      };
+    });
+  });
+  return map;
+}
+
+// Look up a deal's pay splits by orderNumber across ALL saved payroll weeks.
+// Used when a chargeback row arrives and we need to know what was paid.
+// Returns the deal entry from payrollBuildDealPayMap, or null if not found.
+function payrollLookupDealPay(orderNum, carrier){
+  if(!orderNum || !PAYROLL_WEEKS || !PAYROLL_WEEKS.length) return null;
+  // Newest weeks first (most likely the chargeback references a recent deal)
+  var sorted = PAYROLL_WEEKS.slice().sort(function(a,b){
+    return (b.uploadedAt||'').localeCompare(a.uploadedAt||'');
+  });
+  for(var i=0;i<sorted.length;i++){
+    var w = sorted[i];
+    if(carrier && w.carrier !== carrier) continue;
+    if(w.dealPaySplits && w.dealPaySplits[orderNum]){
+      return Object.assign({}, w.dealPaySplits[orderNum], {weekId: w.id, periodEnd: w.periodEnd});
+    }
+  }
+  return null;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  CARRYOVER DEBT LEDGER (Calvin 2026-04-30)
+//
+//  When deductions exceed an agent's current week pay (after cascade up
+//  the chain), the unpaid portion becomes carryover debt. Next week's
+//  pay starts by clearing the debt before agent receives anything.
+//
+//  Stored per-agent in PAYROLL_DEBT_LEDGER, persisted to localStorage
+//  + Supabase app_settings key='payroll_debt_ledger'.
+//
+//  Format: {agentId: {balanceCents, history:[{date, deltaCents, reason, weekId}]}}
+//    balanceCents > 0 means agent owes the company (negative balance to pay)
+//    balanceCents = 0 means clean
+//    balanceCents < 0 should NEVER happen (we don't credit; just zero out)
+// ════════════════════════════════════════════════════════════════════════
+var PAYROLL_DEBT_LEDGER = {};
+
+function loadPayrollDebtLedger(){
+  try{
+    var raw = localStorage.getItem('wmam_payroll_debt_ledger');
+    PAYROLL_DEBT_LEDGER = raw ? (JSON.parse(raw) || {}) : {};
+  }catch(e){ PAYROLL_DEBT_LEDGER = {}; }
+}
+
+function savePayrollDebtLedger(){
+  try{ localStorage.setItem('wmam_payroll_debt_ledger', JSON.stringify(PAYROLL_DEBT_LEDGER)); }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    supaClient.from('app_settings').upsert(
+      {key:'payroll_debt_ledger', value: JSON.stringify(PAYROLL_DEBT_LEDGER)},
+      {onConflict:'key'}
+    ).then(function(){}).catch(function(){});
+  }
+}
+
+function payrollAddDebt(agentId, cents, reason, weekId){
+  if(!agentId || !cents || cents <= 0) return;
+  if(!PAYROLL_DEBT_LEDGER[agentId]){
+    PAYROLL_DEBT_LEDGER[agentId] = { balanceCents:0, history:[] };
+  }
+  var l = PAYROLL_DEBT_LEDGER[agentId];
+  l.balanceCents += cents;
+  l.history.push({
+    date:    new Date().toISOString(),
+    delta:   cents,
+    reason:  reason || 'unspecified',
+    weekId:  weekId || ''
+  });
+  savePayrollDebtLedger();
+}
+
+function payrollClearDebt(agentId, cents, reason, weekId){
+  if(!agentId || !cents || cents <= 0) return 0;
+  if(!PAYROLL_DEBT_LEDGER[agentId]) return 0;
+  var l = PAYROLL_DEBT_LEDGER[agentId];
+  var cleared = Math.min(l.balanceCents, cents);
+  if(cleared <= 0) return 0;
+  l.balanceCents -= cleared;
+  l.history.push({
+    date:    new Date().toISOString(),
+    delta:  -cleared,
+    reason:  reason || 'next week clearance',
+    weekId:  weekId || ''
+  });
+  savePayrollDebtLedger();
+  return cleared;
+}
+
+function payrollGetDebt(agentId){
+  if(!PAYROLL_DEBT_LEDGER[agentId]) return 0;
+  return PAYROLL_DEBT_LEDGER[agentId].balanceCents || 0;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  DEDUCTION & CREDIT CASCADE ENGINE (Calvin 2026-04-30)
+//
+//  Takes:
+//   - commissions: {byAgent:{aid:{commissionCents,...}}, totalCommissionCents}
+//                  the engine output for this week (gross pay before deductions)
+//   - deductions:  [{type, agentName, amountCents, orderNum, isTribal, ...}]
+//                  parsed from chargeback/aging/upgrade tabs
+//   - credits:     [{type, agentName, amountCents, orderNum, ..., requiresLookup}]
+//                  parsed from port spif / aging credit tabs
+//   - carrier:     'TruConnect' | 'Gen Mobile' | 'Assurance'
+//   - weekId:      string id of the week being committed (for audit trail)
+//
+//  Applies the cascade per Calvin's locked rule:
+//   1. Open carryover debt is paid off first from agent's gross pay
+//   2. Deductions hit the named agent first; whatever they can't cover
+//      cascades up: agent → TL → MM → CM
+//   3. If even the CM can't cover, remainder goes into carryover debt
+//      against the named agent for next week
+//   4. Credits are added back. Port Spif goes to the named agent.
+//      Aging Phone Credit looks up who originally paid (across all weeks)
+//      and refunds the same person — could be agent, TL, MM, or CM.
+//
+//  Returns:
+//   {
+//     netByAgent: {aid: {grossCents, deductionsCents, creditsCents,
+//                        debtPaidCents, netCents,
+//                        cascade:[...trail], carryoverCents}},
+//     unresolved: [{deduction/credit, reason}],   // unmatched names, lookups that failed
+//     audit:      [...full per-deduction trail]
+//   }
+//
+// ════════════════════════════════════════════════════════════════════════
+function payrollApplyDeductions(opts){
+  var commissions = opts.commissions || { byAgent:{}, totalCommissionCents:0, allAgentIds:[] };
+  var deductions  = opts.deductions  || [];
+  var credits     = opts.credits     || [];
+  var carrier     = opts.carrier     || 'TruConnect';
+  var weekId      = opts.weekId      || '';
+  var dryRun      = !!opts.dryRun;   // if true, don't mutate the debt ledger
+
+  // Build a working copy of per-agent gross pay (mutable balances)
+  var balances = {};
+  Object.keys(commissions.byAgent || {}).forEach(function(aid){
+    var aidI = parseInt(aid, 10);
+    var entry = commissions.byAgent[aid];
+    balances[aidI] = {
+      aid: aidI,
+      grossCents:      entry.commissionCents || 0,
+      remainingCents:  entry.commissionCents || 0,
+      deductionsCents: 0,
+      creditsCents:    0,
+      debtPaidCents:   0,
+      cascade:         [],
+      carryoverCents:  0
+    };
+  });
+
+  // Helper: ensure an agent has a balance entry (even if gross was 0)
+  function ensureBalance(aid){
+    if(!balances[aid]){
+      balances[aid] = {
+        aid: aid,
+        grossCents: 0, remainingCents: 0, deductionsCents: 0, creditsCents: 0,
+        debtPaidCents: 0, cascade: [], carryoverCents: 0
+      };
+    }
+    return balances[aid];
+  }
+
+  // Helper: resolve agent name → agent record (case-insensitive trim match)
+  function resolveAgent(name){
+    if(!name) return null;
+    var clean = String(name).trim().toLowerCase();
+    return DB.agents.find(function(a){
+      if(!a || !a.name) return false;
+      return a.name.trim().toLowerCase() === clean;
+    });
+  }
+
+  // Helper: build the cascade chain for an agent (agent → TL → MM → CM)
+  function getCascadeChain(agent){
+    var chain = [{aid: agent.id, role: agent.role || 'agent', name: agent.name}];
+    var seen  = { [agent.id]: true };
+    if(agent.role === 'Field Agent' && agent.teamLeaderId && !seen[agent.teamLeaderId]){
+      var tl = DB.agents.find(function(a){return a.id===agent.teamLeaderId;});
+      if(tl){ chain.push({aid: tl.id, role: 'Team Leader', name: tl.name}); seen[tl.id] = true; }
+    }
+    if(agent.marketManagerId && !seen[agent.marketManagerId]){
+      var mm = DB.agents.find(function(a){return a.id===agent.marketManagerId;});
+      if(mm){ chain.push({aid: mm.id, role: 'Market Manager', name: mm.name}); seen[mm.id] = true; }
+    }
+    if(agent.campaignManagerId && !seen[agent.campaignManagerId]){
+      var cm = DB.agents.find(function(a){return a.id===agent.campaignManagerId;});
+      if(cm){ chain.push({aid: cm.id, role: 'Campaign Manager', name: cm.name}); seen[cm.id] = true; }
+    }
+    return chain;
+  }
+
+  var audit = [];        // every deduction/credit, with full trail
+  var unresolved = [];   // entries where name didn't match or lookup failed
+
+  // ── PHASE 0: Pay off prior carryover debt from gross pay ──────────
+  // Each agent with debt has it cleared first before any new deductions.
+  Object.keys(balances).forEach(function(aidStr){
+    var b = balances[aidStr];
+    var prior = payrollGetDebt(b.aid);
+    if(prior > 0 && b.remainingCents > 0){
+      var clearable = Math.min(prior, b.remainingCents);
+      b.remainingCents -= clearable;
+      b.debtPaidCents  += clearable;
+      if(!dryRun) payrollClearDebt(b.aid, clearable, 'cleared from week '+weekId, weekId);
+      audit.push({
+        kind: 'debt-clear',
+        aid: b.aid,
+        amountCents: clearable,
+        priorBalance: prior,
+        newBalance: prior - clearable,
+        weekId: weekId
+      });
+    }
+  });
+
+  // ── PHASE 1: Apply deductions with cascade ────────────────────────
+  deductions.forEach(function(d){
+    var agent = resolveAgent(d.agentName);
+    if(!agent){
+      unresolved.push({ kind:'deduction', deduction:d, reason:'agent name not matched: '+d.agentName });
+      return;
+    }
+    var chain = getCascadeChain(agent);
+    var owed  = d.amountCents;
+    var trail = [];
+    // Walk the cascade
+    for(var i=0; i<chain.length && owed>0; i++){
+      var link = chain[i];
+      var b = ensureBalance(link.aid);
+      var pay = Math.min(b.remainingCents, owed);
+      if(pay > 0){
+        b.remainingCents  -= pay;
+        b.deductionsCents += pay;
+        b.cascade.push({
+          type:        d.type,
+          orderNum:    d.orderNum,
+          amountCents: pay,
+          fromName:    agent.name,           // the named agent the deduction was attributed to
+          paidByRole:  link.role,            // who actually absorbed it
+          paidByAid:   link.aid
+        });
+        trail.push({aid: link.aid, name: link.name, role: link.role, paidCents: pay});
+        owed -= pay;
+      }
+    }
+    // Anything left becomes carryover debt against the NAMED AGENT
+    if(owed > 0){
+      var nb = ensureBalance(agent.id);
+      nb.carryoverCents += owed;
+      if(!dryRun){
+        payrollAddDebt(agent.id, owed,
+          d.type+(d.orderNum?' #'+d.orderNum:'')+' (uncovered after cascade)', weekId);
+      }
+      trail.push({aid: agent.id, name: agent.name, role: 'CARRYOVER DEBT', paidCents: owed});
+    }
+    audit.push({
+      kind:        'deduction',
+      type:        d.type,
+      orderNum:    d.orderNum,
+      agentName:   d.agentName,
+      agentId:     agent.id,
+      amountCents: d.amountCents,
+      isTribal:    d.isTribal,
+      trail:       trail
+    });
+  });
+
+  // ── PHASE 2: Apply credits ────────────────────────────────────────
+  credits.forEach(function(c){
+    var agent = resolveAgent(c.agentName);
+    if(!agent){
+      unresolved.push({ kind:'credit', credit:c, reason:'agent name not matched: '+c.agentName });
+      return;
+    }
+    if(c.requiresLookup && c.orderNum){
+      // Aging Phone Credit: look up who actually paid the matching deduction
+      // in the historical audit trail (across saved weeks). For now, we
+      // search PAYROLL_WEEKS for a deduction with the same orderNum and
+      // refund whoever absorbed it. If we can't find it, fall back to
+      // refunding the named agent.
+      var found = false;
+      var sortedWeeks = (PAYROLL_WEEKS||[]).slice().sort(function(a,b){
+        return (b.uploadedAt||'').localeCompare(a.uploadedAt||'');
+      });
+      for(var w=0; w<sortedWeeks.length && !found; w++){
+        var wk = sortedWeeks[w];
+        var deductionAudit = (wk.deductionAudit || []);
+        for(var d2=0; d2<deductionAudit.length; d2++){
+          var pa = deductionAudit[d2];
+          if(pa.kind==='deduction' && pa.type === 'Aging Phone' && pa.orderNum === c.orderNum){
+            // Refund each person on the original trail proportionally
+            (pa.trail || []).forEach(function(t){
+              if(t.role === 'CARRYOVER DEBT'){
+                // Original payer never paid (debt was carryover) — clear that debt instead
+                if(!dryRun) payrollClearDebt(t.aid, t.paidCents, 'Aging Phone Credit '+c.orderNum, weekId);
+                audit.push({
+                  kind: 'credit',
+                  type: c.type,
+                  orderNum: c.orderNum,
+                  amountCents: t.paidCents,
+                  appliedTo: t.aid,
+                  appliedToName: t.name,
+                  via: 'debt clearance'
+                });
+              } else {
+                var b = ensureBalance(t.aid);
+                b.creditsCents   += t.paidCents;
+                b.remainingCents += t.paidCents;
+                audit.push({
+                  kind: 'credit',
+                  type: c.type,
+                  orderNum: c.orderNum,
+                  amountCents: t.paidCents,
+                  appliedTo: t.aid,
+                  appliedToName: t.name,
+                  via: 'reverse cascade'
+                });
+              }
+            });
+            found = true;
+            break;
+          }
+        }
+      }
+      if(!found){
+        // Fall back: pay credit to named agent
+        var b = ensureBalance(agent.id);
+        b.creditsCents   += c.amountCents;
+        b.remainingCents += c.amountCents;
+        audit.push({
+          kind: 'credit',
+          type: c.type,
+          orderNum: c.orderNum,
+          amountCents: c.amountCents,
+          appliedTo: agent.id,
+          appliedToName: agent.name,
+          via: 'fallback (no historical deduction found)'
+        });
+        unresolved.push({
+          kind: 'credit-no-match',
+          credit: c,
+          reason: 'no historical deduction matched orderNum — paid to named agent as fallback'
+        });
+      }
+      return;
+    }
+    // Simple credit (Port Spif, etc.) — pay directly to named agent
+    var b = ensureBalance(agent.id);
+    b.creditsCents   += c.amountCents;
+    b.remainingCents += c.amountCents;
+    audit.push({
+      kind: 'credit',
+      type: c.type,
+      orderNum: c.orderNum,
+      amountCents: c.amountCents,
+      appliedTo: agent.id,
+      appliedToName: agent.name,
+      via: 'direct'
+    });
+  });
+
+  // ── PHASE 3: Build final netByAgent map ───────────────────────────
+  var netByAgent = {};
+  Object.keys(balances).forEach(function(aidStr){
+    var b = balances[aidStr];
+    netByAgent[b.aid] = {
+      grossCents:      b.grossCents,
+      deductionsCents: b.deductionsCents,
+      creditsCents:    b.creditsCents,
+      debtPaidCents:   b.debtPaidCents,
+      // Net pay = gross − deductions absorbed − debt cleared + credits
+      // (remainingCents already accounts for everything, but show clearly)
+      netCents:        b.remainingCents,
+      cascade:         b.cascade,
+      carryoverCents:  b.carryoverCents
+    };
+  });
+
+  return {
+    netByAgent:  netByAgent,
+    unresolved:  unresolved,
+    audit:       audit
+  };
+}
+
 function tcCalculateWeek(weekRows){
   var byAgent = {};
   var byTeam  = {};
@@ -6584,6 +7198,266 @@ function parseTruConnectFile(arrayBuffer){
       total:     tot
     });
   });
+
+  // ── DEDUCTION & CREDIT TABS (Calvin 2026-04-30) ──────────────────
+  //
+  // The TC excel file may contain any of these tabs IF they apply to
+  // the week. Parser tolerates absence — if a tab isn't present, skip
+  // it. Each parsed entry gets attributed to a named agent for later
+  // cascade processing.
+  //
+  // Locked spec:
+  //   • TC Cancels 14 day chargeback → debit agent $28 (Tribal) / $10 (NLAD).
+  //     Cascade up the chain if agent has insufficient pay.
+  //   • TC Aging Phone Deduction → debit agent the EXACT row amount
+  //     (device cost — could be $45, $80, etc). Cascade.
+  //   • TC Device Upgrades → debit agent the EXACT row amount. Cascade.
+  //   • Port Spif → credit agent $7 per port row.
+  //   • TC Aging Phone Credit → reverse earlier Aging Phone Deduction.
+  //     Lookup who originally paid; refund them.
+  result.deductions = [];   // [{type, agentName, amountCents, orderNum, date, isTribal, raw}]
+  result.credits    = [];   // [{type, agentName, amountCents, orderNum, date, raw}]
+
+  // Helper: find a sheet by regex match against tab name (case-insensitive)
+  function findSheet(rx){
+    var nm = wb.SheetNames.find(function(n){return rx.test(n);});
+    if(!nm) return null;
+    return { name:nm, data: XLSX.utils.sheet_to_json(wb.Sheets[nm], {header:1, defval:''}) };
+  }
+
+  // Helper: locate a row that contains the header by a marker phrase
+  function findHeaderRow(data, markerRx){
+    for(var i=0; i<Math.min(15, data.length); i++){
+      var r = data[i];
+      if(r && r.some && r.some(function(c){return markerRx.test(String(c||''));})){
+        return { idx:i, headers: r.map(function(c){return String(c||'').trim();}) };
+      }
+    }
+    return null;
+  }
+
+  // Helper: find column index by header-name patterns (returns -1 if missing)
+  function colIdx(headers, candidates){
+    for(var i=0;i<headers.length;i++){
+      for(var j=0;j<candidates.length;j++){
+        if(new RegExp('^\\s*'+candidates[j]+'\\s*$','i').test(headers[i])) return i;
+      }
+    }
+    return -1;
+  }
+
+  // Helper: parse money cell (handles "$", "(123)" parens-as-negative, blanks)
+  function parseMoney(v){
+    if(v === '' || v === null || v === undefined) return 0;
+    var s = String(v).trim();
+    if(!s) return 0;
+    // Parens means negative
+    var neg = /^\(.*\)$/.test(s);
+    s = s.replace(/[(),$\s]/g,'');
+    var n = parseFloat(s);
+    if(isNaN(n)) return 0;
+    return Math.round((neg ? -Math.abs(n) : n) * 100);  // cents
+  }
+
+  // ── TAB: TC Cancels 14 day chargeback ─────────────────────────────
+  // Per Calvin: debit agent $28 (Tribal) or $10 (NLAD). The spreadsheet
+  // typically has Order Number, Date, Agent Name, Tribal flag (Y/N),
+  // and sometimes an Amount column (which we IGNORE per spec — we use
+  // the ceiling instead).
+  try{
+    var cancelSheet = findSheet(/cancel.*14|14.*chargeback|cancels.*chargeback/i);
+    if(cancelSheet){
+      var hdr = findHeaderRow(cancelSheet.data, /agent.*name|order|tribal/i);
+      if(hdr){
+        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colIdx(hdr.headers, ['Date','Activation Date','Cancel Date']);
+        var iTribal= colIdx(hdr.headers, ['Tribal']);
+        var iRatePlan = colIdx(hdr.headers, ['Rate Plan','RatePlan']);
+        cancelSheet.data.slice(hdr.idx+1).forEach(function(r){
+          if(!r || !r.length) return;
+          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
+          if(!name || /^total/i.test(name)) return;
+          var orderNum = iOrder>=0 ? String(r[iOrder]||'').trim() : '';
+          var date     = iDate>=0  ? ppExcelDateToStr(r[iDate])     : '';
+          var tribalFlag = iTribal>=0 ? /^Y(ES)?$/i.test(String(r[iTribal]||'').trim()) : null;
+          // If tribal column missing, infer from rate plan if possible
+          var isTribal = (tribalFlag !== null) ? tribalFlag :
+                         (iRatePlan>=0 ? /tribal/i.test(String(r[iRatePlan]||'')) : false);
+          // Locked spec: $28 for Tribal cancel, $10 for NLAD cancel
+          var amountCents = isTribal ? 2800 : 1000;
+          result.deductions.push({
+            type:        '14-day Cancel',
+            agentName:   name,
+            amountCents: amountCents,
+            orderNum:    orderNum,
+            date:        date,
+            isTribal:    isTribal,
+            raw:         { sheet: cancelSheet.name, row: r }
+          });
+        });
+      } else {
+        result.errors.push('Cancel sheet "'+cancelSheet.name+'" found but header row could not be located.');
+      }
+    }
+  }catch(e){
+    result.errors.push('Cancel sheet parse failed: '+e.message);
+  }
+
+  // ── TAB: TC Aging Phone Deduction ─────────────────────────────────
+  // Per Calvin: debit agent the EXACT amount on the row (device cost,
+  // varies widely). Need an agent name + amount column.
+  try{
+    var agingDed = findSheet(/aging.*phone.*deduct|aging.*deduct/i);
+    if(agingDed){
+      var hdr = findHeaderRow(agingDed.data, /agent.*name|amount|cost/i);
+      if(hdr){
+        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iAmt   = colIdx(hdr.headers, ['Amount','Cost','Deduction','Charge']);
+        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colIdx(hdr.headers, ['Date','Deduction Date']);
+        var iIMEI  = colIdx(hdr.headers, ['IMEI','Device IMEI','Serial']);
+        var iModel = colIdx(hdr.headers, ['Model','Device','Phone Model']);
+        agingDed.data.slice(hdr.idx+1).forEach(function(r){
+          if(!r || !r.length) return;
+          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
+          if(!name || /^total/i.test(name)) return;
+          var amt = iAmt>=0 ? parseMoney(r[iAmt]) : 0;
+          if(amt === 0) return;
+          // Per spec, deduction amount on this tab is positive cost — make it positive cents
+          var amountCents = Math.abs(amt);
+          result.deductions.push({
+            type:        'Aging Phone',
+            agentName:   name,
+            amountCents: amountCents,
+            orderNum:    iOrder>=0 ? String(r[iOrder]||'').trim() : '',
+            date:        iDate>=0  ? ppExcelDateToStr(r[iDate])     : '',
+            imei:        iIMEI>=0  ? String(r[iIMEI]||'').trim()    : '',
+            model:       iModel>=0 ? String(r[iModel]||'').trim()   : '',
+            isTribal:    null,
+            raw:         { sheet: agingDed.name, row: r }
+          });
+        });
+      } else {
+        result.errors.push('Aging Phone Deduction sheet "'+agingDed.name+'" found but header row could not be located.');
+      }
+    }
+  }catch(e){
+    result.errors.push('Aging Phone Deduction parse failed: '+e.message);
+  }
+
+  // ── TAB: TC Device Upgrades ───────────────────────────────────────
+  // Per Calvin: debit agent the EXACT amount on the row.
+  try{
+    var devUpg = findSheet(/device\s*upgrade/i);
+    if(devUpg){
+      var hdr = findHeaderRow(devUpg.data, /agent.*name|amount|upgrade/i);
+      if(hdr){
+        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iAmt   = colIdx(hdr.headers, ['Amount','Cost','Upgrade Cost','Charge']);
+        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colIdx(hdr.headers, ['Date','Upgrade Date']);
+        var iIMEI  = colIdx(hdr.headers, ['IMEI','Device IMEI','Serial']);
+        var iModel = colIdx(hdr.headers, ['Model','Device','Phone Model']);
+        devUpg.data.slice(hdr.idx+1).forEach(function(r){
+          if(!r || !r.length) return;
+          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
+          if(!name || /^total/i.test(name)) return;
+          var amt = iAmt>=0 ? parseMoney(r[iAmt]) : 0;
+          if(amt === 0) return;
+          var amountCents = Math.abs(amt);
+          result.deductions.push({
+            type:        'Device Upgrade',
+            agentName:   name,
+            amountCents: amountCents,
+            orderNum:    iOrder>=0 ? String(r[iOrder]||'').trim() : '',
+            date:        iDate>=0  ? ppExcelDateToStr(r[iDate])     : '',
+            imei:        iIMEI>=0  ? String(r[iIMEI]||'').trim()    : '',
+            model:       iModel>=0 ? String(r[iModel]||'').trim()   : '',
+            isTribal:    null,
+            raw:         { sheet: devUpg.name, row: r }
+          });
+        });
+      } else {
+        result.errors.push('Device Upgrades sheet "'+devUpg.name+'" found but header row could not be located.');
+      }
+    }
+  }catch(e){
+    result.errors.push('Device Upgrades parse failed: '+e.message);
+  }
+
+  // ── TAB: Port Spif ────────────────────────────────────────────────
+  // Per Calvin: $7 per port to the agent. Tab might list amount per row
+  // or just count the rows — we use $7 flat per row.
+  try{
+    var portSheet = findSheet(/port.*spif|portin.*spif/i);
+    if(portSheet){
+      var hdr = findHeaderRow(portSheet.data, /agent.*name|order/i);
+      if(hdr){
+        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colIdx(hdr.headers, ['Date']);
+        portSheet.data.slice(hdr.idx+1).forEach(function(r){
+          if(!r || !r.length) return;
+          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
+          if(!name || /^total/i.test(name)) return;
+          result.credits.push({
+            type:        'Port Spif',
+            agentName:   name,
+            amountCents: 700,  // $7 per port
+            orderNum:    iOrder>=0 ? String(r[iOrder]||'').trim() : '',
+            date:        iDate>=0  ? ppExcelDateToStr(r[iDate])     : '',
+            raw:         { sheet: portSheet.name, row: r }
+          });
+        });
+      } else {
+        result.errors.push('Port Spif sheet "'+portSheet.name+'" found but header row could not be located.');
+      }
+    }
+  }catch(e){
+    result.errors.push('Port Spif parse failed: '+e.message);
+  }
+
+  // ── TAB: TC Aging Phone Credit ───────────────────────────────────
+  // Per Calvin: reverses an earlier Aging Phone Deduction. We look up
+  // who actually paid for the deduction (might be agent or cascaded TL/CM).
+  // Lookup happens later in the cascade engine — here we just capture
+  // the row data so the engine can match it to a historical payment.
+  try{
+    var agingCred = findSheet(/aging.*phone.*credit|aging.*credit/i);
+    if(agingCred){
+      var hdr = findHeaderRow(agingCred.data, /agent.*name|amount|credit/i);
+      if(hdr){
+        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iAmt   = colIdx(hdr.headers, ['Amount','Cost','Credit','Refund']);
+        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colIdx(hdr.headers, ['Date','Credit Date']);
+        var iIMEI  = colIdx(hdr.headers, ['IMEI','Device IMEI','Serial']);
+        agingCred.data.slice(hdr.idx+1).forEach(function(r){
+          if(!r || !r.length) return;
+          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
+          if(!name || /^total/i.test(name)) return;
+          var amt = iAmt>=0 ? parseMoney(r[iAmt]) : 0;
+          if(amt === 0) return;
+          result.credits.push({
+            type:        'Aging Phone Credit',
+            agentName:   name,
+            amountCents: Math.abs(amt),
+            orderNum:    iOrder>=0 ? String(r[iOrder]||'').trim() : '',
+            date:        iDate>=0  ? ppExcelDateToStr(r[iDate])     : '',
+            imei:        iIMEI>=0  ? String(r[iIMEI]||'').trim()    : '',
+            // Flag: this credit needs historical lookup of who originally paid
+            requiresLookup: true,
+            raw:         { sheet: agingCred.name, row: r }
+          });
+        });
+      } else {
+        result.errors.push('Aging Phone Credit sheet "'+agingCred.name+'" found but header row could not be located.');
+      }
+    }
+  }catch(e){
+    result.errors.push('Aging Phone Credit parse failed: '+e.message);
+  }
 
   return result;
 }
@@ -10366,6 +11240,7 @@ async function loadFromSupabase(){
         if(s.key==='payroll_access' && s.value){ try{var pa=JSON.parse(s.value);if(Array.isArray(pa))PAYROLL_ACCESS=pa;}catch(e){} }
         if(s.key==='payroll_upload_access' && s.value){ try{var pua=JSON.parse(s.value);if(Array.isArray(pua))PAYROLL_UPLOAD_ACCESS=pua;}catch(e){} }
         if(s.key==='payroll_weeks' && s.value){ try{var pw=JSON.parse(s.value);if(Array.isArray(pw))PAYROLL_WEEKS=pw;}catch(e){} }
+        if(s.key==='payroll_debt_ledger' && s.value){ try{var pdl=JSON.parse(s.value);if(typeof pdl==='object'&&pdl)PAYROLL_DEBT_LEDGER=pdl;}catch(e){} }
         if(s.key==='comp_plans' && s.value){ try{var cp=JSON.parse(s.value);if(Array.isArray(cp))COMP_PLANS=cp;}catch(e){} }
         if(s.key==='comp_assignments' && s.value){ try{var ca=JSON.parse(s.value);if(Array.isArray(ca))COMP_ASSIGNMENTS=ca;}catch(e){} }
         if(s.key==='comp_templates' && s.value){ try{var ct=JSON.parse(s.value);if(typeof ct==='object'&&ct)COMP_TEMPLATES=ct;}catch(e){} }
@@ -14601,7 +15476,7 @@ function doLogin(){
   launchBO(found);
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
-  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadCompPlans(); loadOnboardData(); loadStore(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
+  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadPayrollDebtLedger(); loadCompPlans(); loadOnboardData(); loadStore(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
   // Ship B: auto-run points batch on login (idempotent, no-op before 9am CST)
   setTimeout(function(){ try { if(typeof pointsMaybeAutoRun === 'function') pointsMaybeAutoRun(); } catch(e){} }, 1500);
   // Scheduled call reminders — start the periodic check
@@ -19281,6 +20156,32 @@ function ppRenderCarrierPreview(carrier, parsed){
   // Compute actual agent commissions via the engine — this is the real
   // money math, not the carrier's per-row rate.
   var commissions = ppComputeAgentCommissions(parsed, carrier);
+  // Apply deductions and credits via the cascade engine (dry run for preview).
+  // This mirrors what will happen at commit time, so the user sees final
+  // net pay before saving.
+  var cascadeResult = null;
+  var totalDeductions = 0, totalCredits = 0, totalCarryover = 0, totalDebtCleared = 0;
+  if(isTC && (parsed.deductions || parsed.credits)){
+    try{
+      cascadeResult = payrollApplyDeductions({
+        commissions: commissions,
+        deductions:  parsed.deductions || [],
+        credits:     parsed.credits    || [],
+        carrier:     carrier,
+        weekId:      'preview',
+        dryRun:      true
+      });
+      Object.keys(cascadeResult.netByAgent || {}).forEach(function(aid){
+        var n = cascadeResult.netByAgent[aid];
+        totalDeductions  += n.deductionsCents || 0;
+        totalCredits     += n.creditsCents || 0;
+        totalCarryover   += n.carryoverCents || 0;
+        totalDebtCleared += n.debtPaidCents || 0;
+      });
+    }catch(e){
+      console.warn('[ppRenderCarrierPreview] cascade preview failed:', e);
+    }
+  }
   var totalAct = 0, totalCB = 0;
   var totalCarrierGross = 0;  // what the carrier paid Calvin (revenue)
   Object.keys(parsed.rows||{}).forEach(function(k){
@@ -19289,6 +20190,7 @@ function ppRenderCarrierPreview(carrier, parsed){
     totalCarrierGross += parsed.rows[k].grossCents || 0;
   });
   var totalAgentPay = commissions.totalCommissionCents;
+  var totalNetPay = totalAgentPay + totalCredits - totalDeductions - totalDebtCleared;
   var h = '';
   var carrierColor = carrier==='Gen Mobile' ? '#2a7de1' :
                      carrier==='TruConnect' ? '#7c3aed' :
@@ -19300,9 +20202,16 @@ function ppRenderCarrierPreview(carrier, parsed){
   h += '<span><strong style="color:#059669">'+matched.length+'</strong> matched</span>';
   h += '<span><strong style="color:#991B1B">'+unmatched.length+'</strong> unmatched</span>';
   h += '<span><strong>'+totalAct+'</strong> activations</span>';
-  if(totalAgentPay) h += '<span style="color:#059669"><strong>$'+(totalAgentPay/100).toFixed(2)+'</strong> agent pay</span>';
-  if(isTC && totalCarrierGross) h += '<span style="color:var(--muted)"><strong>$'+(totalCarrierGross/100).toFixed(2)+'</strong> carrier paid</span>';
-  if(totalCB) h += '<span style="color:#991B1B"><strong>$'+(totalCB/100).toFixed(2)+'</strong> chargebacks</span>';
+  if(totalAgentPay) h += '<span style="color:var(--muted)"><strong>$'+(totalAgentPay/100).toFixed(2)+'</strong> gross commission</span>';
+  if(totalDeductions) h += '<span style="color:#991B1B"><strong>−$'+(totalDeductions/100).toFixed(2)+'</strong> deductions</span>';
+  if(totalDebtCleared) h += '<span style="color:#D97706"><strong>−$'+(totalDebtCleared/100).toFixed(2)+'</strong> prior debt</span>';
+  if(totalCredits) h += '<span style="color:#059669"><strong>+$'+(totalCredits/100).toFixed(2)+'</strong> credits</span>';
+  if(totalDeductions || totalCredits || totalDebtCleared){
+    h += '<span style="color:#059669;font-weight:700;border-left:2px solid #059669;padding-left:12px"><strong>$'+(totalNetPay/100).toFixed(2)+'</strong> NET PAY</span>';
+  }
+  if(totalCarryover) h += '<span style="color:#991B1B"><strong>$'+(totalCarryover/100).toFixed(2)+'</strong> carryover debt</span>';
+  if(isTC && totalCarrierGross) h += '<span style="color:var(--muted2)"><strong>$'+(totalCarrierGross/100).toFixed(2)+'</strong> carrier paid</span>';
+  if(totalCB) h += '<span style="color:#991B1B"><strong>$'+(totalCB/100).toFixed(2)+'</strong> upsell deductions</span>';
   h += '</div></div>';
   h += '<div style="padding:16px 18px">';
 
@@ -19425,6 +20334,111 @@ function ppRenderCarrierPreview(carrier, parsed){
   } else {
     h += '<div style="padding:16px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No rows matched yet. Assign unmatched codes above to build the import.</div>';
   }
+
+  // ── DEDUCTIONS & CREDITS SECTION (TruConnect only for now) ────────
+  if(isTC && cascadeResult){
+    var ded = parsed.deductions || [];
+    var cre = parsed.credits || [];
+    if(ded.length || cre.length){
+      h += '<div style="margin-top:24px;padding-top:18px;border-top:2px solid var(--border)">';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:#991B1B;letter-spacing:1.5px;margin-bottom:10px">⚠ DEDUCTIONS & CREDITS</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:14px">Cascade rule: deduction hits the named agent first; if their commission can\'t cover it, the remainder rolls up to TL → MM → CM. Anything still uncovered after the chain becomes carryover debt for next week.</div>';
+
+      // Deductions table
+      if(ded.length){
+        h += '<div style="background:rgba(204,0,0,.03);border:1px solid rgba(204,0,0,.2);border-radius:8px;padding:12px 14px;margin-bottom:12px">';
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:#991B1B;font-weight:700;margin-bottom:8px">Deductions ('+ded.length+')</div>';
+        h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif"><thead><tr style="border-bottom:1px solid rgba(204,0,0,.2)">';
+        h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Type</th>';
+        h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Agent</th>';
+        h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Order #</th>';
+        h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Amount</th>';
+        h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Cascade Trail</th>';
+        h += '</tr></thead><tbody>';
+        // Pull the audit trail for each deduction so we can show who actually paid
+        (cascadeResult.audit||[]).filter(function(a){return a.kind==='deduction';}).forEach(function(a){
+          h += '<tr style="border-bottom:1px solid rgba(0,0,0,.05)">';
+          h += '<td style="padding:7px 8px;font-size:.74rem"><strong style="color:#991B1B">'+a.type+'</strong>'+(a.isTribal?'<span style="font-size:.6rem;color:var(--muted);margin-left:6px">Tribal</span>':a.isTribal===false?'<span style="font-size:.6rem;color:var(--muted);margin-left:6px">NLAD</span>':'')+'</td>';
+          h += '<td style="padding:7px 8px;font-size:.74rem">'+a.agentName+'</td>';
+          h += '<td style="padding:7px 8px;font-family:monospace;font-size:.7rem;color:var(--muted)">'+(a.orderNum||'—')+'</td>';
+          h += '<td style="padding:7px 8px;text-align:right;font-weight:700;color:#991B1B">−$'+(a.amountCents/100).toFixed(2)+'</td>';
+          h += '<td style="padding:7px 8px;font-size:.7rem">';
+          (a.trail||[]).forEach(function(t,idx){
+            if(idx>0) h += ' → ';
+            var color = t.role==='CARRYOVER DEBT' ? '#991B1B' : (idx===0 ? 'var(--brown)' : '#7c3aed');
+            h += '<span style="color:'+color+'"><strong>'+t.name+'</strong> $'+(t.paidCents/100).toFixed(2)+(t.role==='CARRYOVER DEBT'?' <em>(debt)</em>':'')+'</span>';
+          });
+          h += '</td></tr>';
+        });
+        h += '</tbody></table></div></div>';
+      }
+
+      // Credits table
+      if(cre.length){
+        h += '<div style="background:rgba(5,150,105,.03);border:1px solid rgba(5,150,105,.2);border-radius:8px;padding:12px 14px;margin-bottom:12px">';
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:#059669;font-weight:700;margin-bottom:8px">Credits ('+cre.length+')</div>';
+        h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif"><thead><tr style="border-bottom:1px solid rgba(5,150,105,.2)">';
+        h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Type</th>';
+        h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Agent</th>';
+        h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Order #</th>';
+        h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Amount</th>';
+        h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Paid To</th>';
+        h += '</tr></thead><tbody>';
+        (cascadeResult.audit||[]).filter(function(a){return a.kind==='credit';}).forEach(function(a){
+          h += '<tr style="border-bottom:1px solid rgba(0,0,0,.05)">';
+          h += '<td style="padding:7px 8px;font-size:.74rem"><strong style="color:#059669">'+a.type+'</strong></td>';
+          h += '<td style="padding:7px 8px;font-size:.74rem">'+(a.appliedToName||'—')+'</td>';
+          h += '<td style="padding:7px 8px;font-family:monospace;font-size:.7rem;color:var(--muted)">'+(a.orderNum||'—')+'</td>';
+          h += '<td style="padding:7px 8px;text-align:right;font-weight:700;color:#059669">+$'+(a.amountCents/100).toFixed(2)+'</td>';
+          h += '<td style="padding:7px 8px;font-size:.7rem;color:var(--muted)"><em>'+(a.via||'')+'</em></td>';
+          h += '</tr>';
+        });
+        h += '</tbody></table></div></div>';
+      }
+
+      // Unresolved (name didn't match)
+      if(cascadeResult.unresolved && cascadeResult.unresolved.length){
+        h += '<div style="background:rgba(217,119,6,.06);border:1px solid rgba(217,119,6,.3);border-radius:8px;padding:12px 14px;margin-bottom:12px">';
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:#D97706;font-weight:700;margin-bottom:8px">⚠ '+cascadeResult.unresolved.length+' Unresolved (manual review)</div>';
+        h += '<ul style="margin:0;padding-left:20px;font-family:Barlow Condensed,sans-serif;font-size:.74rem">';
+        cascadeResult.unresolved.forEach(function(u){
+          var d = u.deduction || u.credit;
+          h += '<li><strong>'+(d.type||u.kind)+'</strong> — '+u.reason+(d.amountCents?' ($'+(d.amountCents/100).toFixed(2)+')':'')+'</li>';
+        });
+        h += '</ul></div>';
+      }
+
+      // Per-agent net pay summary
+      h += '<div style="background:rgba(0,53,148,.03);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:12px 14px">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--blue);font-weight:700;margin-bottom:8px">Net Pay Summary</div>';
+      h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+      h += '<thead><tr style="border-bottom:1px solid rgba(0,53,148,.2)">';
+      h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Agent</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Gross</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Prior Debt</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Deductions</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Credits</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Net Pay</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Carryover</th>';
+      h += '</tr></thead><tbody>';
+      Object.keys(cascadeResult.netByAgent || {}).sort(function(a,b){return parseInt(a)-parseInt(b);}).forEach(function(aid){
+        var n = cascadeResult.netByAgent[aid];
+        var ag = DB.agents.find(function(x){return x.id===parseInt(aid);}) || {name:'Agent #'+aid};
+        h += '<tr style="border-bottom:1px solid rgba(0,0,0,.05)">';
+        h += '<td style="padding:6px 8px;font-size:.78rem"><strong>'+ag.name+'</strong></td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:var(--muted)">$'+(n.grossCents/100).toFixed(2)+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(n.debtPaidCents?'#D97706':'var(--muted2)')+'">'+(n.debtPaidCents?'−$'+(n.debtPaidCents/100).toFixed(2):'—')+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(n.deductionsCents?'#991B1B':'var(--muted2)')+'">'+(n.deductionsCents?'−$'+(n.deductionsCents/100).toFixed(2):'—')+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(n.creditsCents?'#059669':'var(--muted2)')+'">'+(n.creditsCents?'+$'+(n.creditsCents/100).toFixed(2):'—')+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.85rem;color:#059669;font-weight:700">$'+(n.netCents/100).toFixed(2)+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(n.carryoverCents?'#991B1B':'var(--muted2)')+'">'+(n.carryoverCents?'$'+(n.carryoverCents/100).toFixed(2):'—')+'</td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table></div></div>';
+      h += '</div>';  // close DEDUCTIONS & CREDITS section
+    }
+  }
+
   h += '</div></div>';
   return h;
 }
@@ -19535,6 +20549,53 @@ function ppCommitStaged(){
     };
     // TruConnect: store invoice-level company totals for Phase 3 P&L.
     if(parsed.invoice) weekRecord.invoice = parsed.invoice;
+    // Per-deal pay map: when a chargeback arrives next week referencing
+    // an orderNumber from THIS week, we'll look up here to know exactly
+    // what was paid (agent rate + TL diff + CM fill) and reverse those
+    // splits. Only built for TruConnect — GM/AW chargeback flows differ.
+    if(carrier === 'TruConnect'){
+      try{
+        weekRecord.dealPaySplits = payrollBuildDealPayMap(parsed.rows, carrier);
+      }catch(e){
+        console.warn('[ppCommitStaged] dealPaySplits build failed:', e);
+        weekRecord.dealPaySplits = {};
+      }
+    }
+    // Apply deductions and credits via cascade. This mutates the debt
+    // ledger (clears prior debt, adds new carryover). Updates each row's
+    // grossCents to reflect NET pay (after deductions/credits/debt).
+    if(carrier === 'TruConnect' && (parsed.deductions || parsed.credits)){
+      try{
+        var cascadeFinal = payrollApplyDeductions({
+          commissions: commissions,
+          deductions:  parsed.deductions || [],
+          credits:     parsed.credits    || [],
+          carrier:     carrier,
+          weekId:      weekRecord.id,
+          dryRun:      false   // for real this time
+        });
+        // Update each row's grossCents to be NET pay (after deductions)
+        rows.forEach(function(row){
+          var net = cascadeFinal.netByAgent[row.agentId];
+          if(net){
+            row.grossCommissionCents = row.grossCents;  // preserve gross for audit
+            row.grossCents           = net.netCents;     // net is what they actually receive
+            row.deductionsApplied    = net.deductionsCents;
+            row.creditsApplied       = net.creditsCents;
+            row.priorDebtPaid        = net.debtPaidCents;
+            row.carryoverDebtAdded   = net.carryoverCents;
+          }
+        });
+        // Store full cascade audit on the week so future Aging Phone Credits
+        // can look up who paid for which deduction
+        weekRecord.deductionAudit = cascadeFinal.audit;
+        weekRecord.deductionsParsed = parsed.deductions || [];
+        weekRecord.creditsParsed = parsed.credits || [];
+        weekRecord.unresolvedDeductions = cascadeFinal.unresolved;
+      }catch(e){
+        console.warn('[ppCommitStaged] cascade apply failed:', e);
+      }
+    }
     PAYROLL_WEEKS.push(weekRecord);
     saved++;
   });
