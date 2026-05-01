@@ -10805,6 +10805,15 @@ function deviceHolderId(device){
 
 // Public API: given a user and a campaign name, return the device list
 // they can see. Replaces the old gmScopedDevices and legacyScopedDevices.
+//
+// Calvin 2026-04-30: now unions the legacy INVENTORY_DEVICES pool too.
+// The generic /inv-upload writes to INVENTORY_DEVICES with a `campaign`
+// field on each device. Without this union, GM dashboards only saw
+// devices uploaded via /gm-upload (which writes to GM_INVENTORY) — so
+// devices uploaded via the generic flow were invisible everywhere
+// except panelInvDashboard's "ALL INVENTORY" table (the only thing
+// that read the legacy pool directly). This fix makes them visible
+// to Gen Mobile dashboards, scoreboards, and MM/CM rollups.
 function inventoryVisibleTo(user, campaign){
   try {
     if(!user) return [];
@@ -10825,6 +10834,18 @@ function inventoryVisibleTo(user, campaign){
         }
       }
     }
+
+    // Calvin 2026-04-30: union legacy INVENTORY_DEVICES whose `campaign`
+    // field matches the requested campaign. This keeps both upload paths
+    // (legacy and campaign-specific) visible to the same dashboards.
+    // Use a copy so we don't mutate the underlying campaign pool.
+    var unifiedPool = pool.slice();
+    if(campaign && typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
+      INVENTORY_DEVICES.forEach(function(d){
+        if(d && d.campaign === campaign) unifiedPool.push(d);
+      });
+    }
+    pool = unifiedPool;
 
     // Owner / Admin / Inventory Dept → see all
     if(typeof isOwner === 'function' && isOwner(user)) return pool.slice();
@@ -23816,6 +23837,317 @@ function invSmartRemove(deviceIds, reason){
   }, 50);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY ASSIGNMENT (Calvin 2026-04-30)
+//
+//  Lets the Owner / Inventory Dept assign devices to ANY recipient
+//  (Market Manager, Campaign Manager, Team Leader, Field Agent) directly
+//  from any inventory table — single device or bulk.
+//
+//  Key design:
+//   - Pool-agnostic: works for legacy INVENTORY_DEVICES AND every campaign
+//     pool (GM_INVENTORY, TC_INVENTORY, AW_INVENTORY, EX_INVENTORY)
+//   - Idempotent on status: changes status to 'assigned' regardless of
+//     the device's previous state ('uploaded' from legacy uploads,
+//     'unassigned' from campaign uploads)
+//   - Sets every holder field used anywhere in the system, so dashboards
+//     read consistently:
+//       assignedTo / assignedToName  (campaign pools, transfer-accept code)
+//       holderId   / holderName      (legacy pool, summary widgets)
+//       recipientId / recipientName  (some upload paths)
+//       mmId       / mmName          (when recipient is an MM/CM, also
+//                                      sets the 30-day expiry clock)
+//   - Writes a chainOfCustody entry just like the existing transfer flow
+//     so we keep audit history when devices move
+// ════════════════════════════════════════════════════════════════════════
+
+// Module state for the bulk-select checkboxes on the inventory table
+window.INV_ASSIGN_STATE = window.INV_ASSIGN_STATE || { selectedIds: {} };
+
+// Resolve a device id to {device, pool, campaign} from any pool.
+// Used by both the assign and remove flows so they handle both legacy
+// and campaign-specific devices uniformly.
+function invFindDeviceAnyPool(deviceId){
+  var hits = [];
+  function _scan(pool, campaignName){
+    if(!pool || !Array.isArray(pool)) return;
+    var dev = pool.find(function(x){return String(x.id)===String(deviceId);});
+    if(dev) hits.push({device:dev, pool:pool, campaign:campaignName});
+  }
+  if(typeof activeCampaigns === 'function'){
+    activeCampaigns().forEach(function(c){
+      var cfg = (typeof campaignCfg === 'function') ? campaignCfg(c) : null;
+      if(cfg && typeof cfg.inventory === 'function'){
+        try { _scan(cfg.inventory(), c); } catch(e){}
+      }
+    });
+  }
+  if(typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
+    _scan(INVENTORY_DEVICES, 'Legacy');
+  }
+  return hits[0] || null;
+}
+
+// Toggle a device id in the bulk-select set. Updates the UI counter live.
+function invToggleSelect(deviceId, checkboxEl){
+  if(checkboxEl && checkboxEl.checked){
+    window.INV_ASSIGN_STATE.selectedIds[deviceId] = true;
+  } else {
+    delete window.INV_ASSIGN_STATE.selectedIds[deviceId];
+  }
+  var countEl = document.getElementById('invAssignSelCount');
+  if(countEl){
+    var n = Object.keys(window.INV_ASSIGN_STATE.selectedIds).length;
+    countEl.textContent = n;
+    var bar = document.getElementById('invAssignBulkBar');
+    if(bar) bar.style.display = n > 0 ? 'flex' : 'none';
+  }
+}
+
+// Clear all selections (e.g. on panel re-enter)
+function invAssignClearSelection(){
+  window.INV_ASSIGN_STATE.selectedIds = {};
+  var countEl = document.getElementById('invAssignSelCount');
+  if(countEl) countEl.textContent = '0';
+  var bar = document.getElementById('invAssignBulkBar');
+  if(bar) bar.style.display = 'none';
+  document.querySelectorAll('.inv-row-select').forEach(function(cb){ cb.checked = false; });
+}
+
+// Open the assignment modal for a single device id
+function invAssignOpenSingle(deviceId){
+  invAssignOpen([deviceId]);
+}
+
+// Open the assignment modal for all currently bulk-selected devices
+function invAssignOpenBulk(){
+  var ids = Object.keys(window.INV_ASSIGN_STATE.selectedIds);
+  if(!ids.length){ alert('Select at least one device first.'); return; }
+  invAssignOpen(ids);
+}
+
+// Open the assignment modal for an array of device ids. Renders a
+// lightweight modal directly (no dependency on existing modal system).
+function invAssignOpen(deviceIds){
+  if(!Array.isArray(deviceIds) || !deviceIds.length) return;
+  // Resolve devices and detect any blocked by pending transfers
+  var resolved = [], missing = [];
+  deviceIds.forEach(function(id){
+    var hit = invFindDeviceAnyPool(id);
+    if(hit) resolved.push(hit);
+    else missing.push(id);
+  });
+  if(!resolved.length){
+    alert('Could not locate the selected device(s) in any inventory pool.');
+    return;
+  }
+
+  // Build recipient list — every active sales-role agent
+  var recipients = DB.agents.filter(function(a){
+    if(!a.active) return false;
+    if(typeof isSalesRole === 'function' && !isSalesRole(a)) return false;
+    return true;
+  });
+  // Sort: MM/CM first, then TL, then Field Agents, alphabetical within each group
+  var roleOrder = {'Campaign Manager':1,'IBO':1,'Market Manager':2,'Team Leader':3,'Field Agent':4};
+  recipients.sort(function(a,b){
+    var ra = roleOrder[a.role]||9, rb = roleOrder[b.role]||9;
+    if(ra !== rb) return ra - rb;
+    return a.name.localeCompare(b.name);
+  });
+
+  // Build modal HTML
+  var modalId = 'invAssignModal';
+  var existing = document.getElementById(modalId);
+  if(existing) existing.remove();
+
+  var html = ''
+    + '<div id="'+modalId+'" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:flex-start;justify-content:center;padding-top:6vh;overflow-y:auto" onclick="if(event.target===this)invAssignClose()">'
+    + '<div style="background:white;border-radius:12px;max-width:560px;width:92%;box-shadow:0 24px 60px rgba(0,0,0,.3);overflow:hidden">'
+    + '<div style="background:linear-gradient(135deg,var(--blue),var(--blue3));color:white;padding:18px 22px">'
+    + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;letter-spacing:2px">📦 ASSIGN '+resolved.length+' DEVICE'+(resolved.length===1?'':'S')+'</div>'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;opacity:.85;margin-top:2px">Pick a recipient. The expiry clock starts the moment they accept (auto-accepts here since this is an Owner/Inv Dept assignment).</div>'
+    + '</div>'
+    + '<div style="padding:20px 22px">';
+
+  // Show first few IMEIs for context
+  var imeiPreview = resolved.slice(0,4).map(function(r){return r.device.imei;}).join(', ');
+  if(resolved.length > 4) imeiPreview += '… and '+(resolved.length-4)+' more';
+  html += '<div style="background:rgba(0,53,148,.04);border:1px solid rgba(0,53,148,.15);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:monospace;font-size:.74rem;color:var(--brown);line-height:1.5;word-break:break-all">'+imeiPreview+'</div>';
+
+  html += '<label style="display:block;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:6px">Recipient</label>';
+  html += '<select id="invAssignRecipient" style="width:100%;padding:11px 14px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.88rem;background:white;margin-bottom:14px">';
+  html += '<option value="">— Select an agent / manager —</option>';
+  // Group by role
+  var lastRole = null;
+  recipients.forEach(function(a){
+    if(a.role !== lastRole){
+      if(lastRole !== null) html += '</optgroup>';
+      html += '<optgroup label="'+a.role+'">';
+      lastRole = a.role;
+    }
+    html += '<option value="'+a.id+'">'+a.name+'</option>';
+  });
+  if(lastRole) html += '</optgroup>';
+  html += '</select>';
+
+  html += '<label style="display:block;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:6px">Reason (optional)</label>';
+  html += '<input type="text" id="invAssignReason" placeholder="e.g. distribution, transfer to active market" style="width:100%;padding:10px 14px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;margin-bottom:18px">';
+
+  // Action buttons
+  html += '<div style="display:flex;gap:10px;justify-content:flex-end">';
+  html += '<button onclick="invAssignClose()" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">Cancel</button>';
+  html += '<button onclick="invAssignCommit('+JSON.stringify(deviceIds).replace(/"/g,'&quot;')+')" class="btn-fire" style="padding:10px 22px;font-size:.78rem">📦 Assign</button>';
+  html += '</div>';
+
+  html += '</div></div></div>';
+
+  var wrap = document.createElement('div');
+  wrap.innerHTML = html;
+  document.body.appendChild(wrap.firstChild);
+}
+
+function invAssignClose(){
+  var el = document.getElementById('invAssignModal');
+  if(el) el.remove();
+}
+
+// Commit the assignment. For each device in deviceIds, set all holder
+// fields, status, and append a chainOfCustody entry. Save and re-render.
+function invAssignCommit(deviceIds){
+  var u = DB.current;
+  if(!u){ alert('Not signed in.'); return; }
+  if(!isOwner(u) && !(typeof isInventory==='function' && isInventory(u)) && !(typeof canAccess==='function' && canAccess(u,'inventory'))){
+    alert('Inventory Department or Owner only.');
+    return;
+  }
+  var sel = document.getElementById('invAssignRecipient');
+  var reasonEl = document.getElementById('invAssignReason');
+  var recipId = sel ? parseInt(sel.value) : 0;
+  if(!recipId){ alert('Pick a recipient first.'); return; }
+  var recipient = DB.agents.find(function(a){return a.id===recipId;});
+  if(!recipient){ alert('Recipient not found.'); return; }
+  var reason = (reasonEl && reasonEl.value || '').trim() || 'distribution';
+
+  var now      = new Date();
+  var nowISO   = now.toISOString();
+  var nowDate  = nowISO.slice(0,10);
+
+  // Block: any device in a pending transfer must be cleared first
+  var blocked = [];
+  var pendingStatuses = {'pending':1,'pending-approval':1,'pending-agent-signature':1};
+  deviceIds.forEach(function(id){
+    var hit = invFindDeviceAnyPool(id);
+    if(!hit || hit.campaign === 'Legacy') return;
+    var cfg = campaignCfg(hit.campaign);
+    if(!cfg || !cfg.transfers) return;
+    (cfg.transfers()||[]).forEach(function(t){
+      if(!t || !pendingStatuses[t.status]) return;
+      var imeiList = t.imeis || (t.devices||[]).map(function(d){return d.imei;});
+      if(imeiList.indexOf(hit.device.imei) >= 0){
+        blocked.push({imei:hit.device.imei, fromName:t.fromName, toName:t.toName});
+      }
+    });
+  });
+  if(blocked.length){
+    var msg = '🛑 ' + blocked.length + ' device(s) cannot be assigned — they are in pending transfers:\n\n';
+    blocked.slice(0,10).forEach(function(b){
+      msg += '  • ' + b.imei + '  (' + b.fromName + ' → ' + b.toName + ')\n';
+    });
+    if(blocked.length > 10) msg += '  …and ' + (blocked.length - 10) + ' more\n';
+    msg += '\nClear those transfers first, then try again.';
+    alert(msg);
+    return;
+  }
+
+  // Compute the recipient's expiry window (mirrors invAcceptTransfer logic)
+  function _expiryDaysForRecipient(){
+    if(recipient.role === 'Market Manager' || recipient.role === 'Campaign Manager' || recipient.role === 'IBO') return 30;
+    if(recipient.role === 'Team Leader') return 14;
+    return 10; // Field Agent and others
+  }
+  var expiryDays = _expiryDaysForRecipient();
+  var expiryISO  = new Date(now.getTime() + expiryDays*86400000).toISOString();
+  var expiryDate = expiryISO.slice(0,10);
+
+  var assigned = 0, missed = 0;
+  deviceIds.forEach(function(id){
+    var hit = invFindDeviceAnyPool(id);
+    if(!hit){ missed++; return; }
+    var d = hit.device;
+
+    var prevHolder     = d.assignedToName || d.holderName || d.mmName || 'Inventory';
+    var prevHolderId   = d.assignedTo || d.holderId || d.mmId || null;
+
+    // Set every holder field consumers might read
+    d.assignedTo       = recipient.id;
+    d.assignedToName   = recipient.name;
+    d.assignedAt       = nowISO;
+    d.assignedDate     = nowDate;
+    d.holderId         = recipient.id;
+    d.holderName       = recipient.name;
+    d.recipientId      = recipient.id;
+    d.recipientName    = recipient.name;
+    d.status           = 'assigned';
+    d.expiryDate       = expiryDate;
+    // MM/CM-specific fields used by Gen Mobile pipeline
+    if(recipient.role === 'Market Manager' || recipient.role === 'Campaign Manager' || recipient.role === 'IBO'){
+      d.mmId          = recipient.id;
+      d.mmName        = recipient.name;
+      d.mmExpiresAt   = expiryISO;
+    } else if(recipient.role === 'Team Leader'){
+      d.tlExpiresAt   = expiryISO;
+    } else {
+      d.agentExpiresAt= expiryISO;
+    }
+
+    // Audit trail
+    if(!d.chainOfCustody) d.chainOfCustody = [];
+    d.chainOfCustody.push({
+      from:    prevHolder,
+      fromId:  prevHolderId,
+      to:      recipient.name,
+      toId:    recipient.id,
+      at:      nowISO,
+      type:    'owner-assign',
+      reason:  reason,
+      by:      u.name,
+      byId:    u.id
+    });
+    assigned++;
+  });
+
+  try { if(typeof saveInventory === 'function') saveInventory(); } catch(e){ console.warn('[invAssignCommit] saveInventory failed:', e); }
+  try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){ console.warn('[invAssignCommit] saveToStorage failed:', e); }
+
+  // Notify the recipient
+  if(typeof pushNotification === 'function'){
+    try {
+      pushNotification({
+        toIds:[recipient.id], toRoles:[], icon:'📦',
+        title:'Inventory Assigned to You',
+        body: assigned + ' device(s) assigned by ' + u.name + '. ' + expiryDays + '-day clock has started.',
+        panel:'inv-my-inventory', priority:'high'
+      });
+    } catch(e){}
+  }
+
+  // Reset selection state and close modal
+  invAssignClose();
+  invAssignClearSelection();
+
+  // Re-render current panel and toast
+  if(typeof window._currentPanelId === 'string' && typeof gotoPanel === 'function'){
+    gotoPanel(window._currentPanelId);
+  } else if(typeof gotoPanel === 'function'){
+    gotoPanel('inv-dashboard');
+  }
+  setTimeout(function(){
+    if(typeof cdFlash === 'function') cdFlash('✓ '+assigned+' device(s) assigned to '+recipient.name);
+    else alert('✓ '+assigned+' device(s) assigned to '+recipient.name+(missed?(' ('+missed+' could not be located)'):''));
+  }, 50);
+}
+
 // Owner approves deletion — permanently removes from system
 function invApproveDeletion(reqId){
   var u = DB.current;
@@ -23910,12 +24242,35 @@ function invAssignBatchToMM(batchId){
 function panelInvDashboard(){
   var u       = DB.current;
   var isInvRole = canAccess(u,'inventory');
-  var devices = INVENTORY_DEVICES;
+  // Calvin 2026-04-30: union the legacy pool with all campaign pools so the
+  // top-strip stats reflect ALL devices in the system, not just legacy uploads.
+  // Devices uploaded via the campaign-specific paths (GM_INVENTORY, TC_INVENTORY,
+  // etc.) were invisible in this dashboard before this fix.
+  var devices = (typeof INVENTORY_DEVICES !== 'undefined' && INVENTORY_DEVICES) ? INVENTORY_DEVICES.slice() : [];
+  if(typeof activeCampaigns === 'function'){
+    activeCampaigns().forEach(function(c){
+      var cfg = (typeof campaignCfg === 'function') ? campaignCfg(c) : null;
+      if(cfg && typeof cfg.inventory === 'function'){
+        try {
+          var pool = cfg.inventory() || [];
+          pool.forEach(function(d){
+            // Tag with campaign so downstream rendering shows it correctly
+            if(!d.campaign) d.campaign = c;
+            devices.push(d);
+          });
+        } catch(e){ /* skip pools that fail */ }
+      }
+    });
+  }
   var today   = new Date(); today.setHours(0,0,0,0);
 
   var total    = devices.length;
+  // Status-tolerant: legacy uses 'available'/'uploaded', campaign pools use 'unassigned'.
   var assigned = devices.filter(function(d){return d.status==='assigned';}).length;
-  var available= devices.filter(function(d){return d.status==='available';}).length;
+  var available= devices.filter(function(d){
+    var s = d.status;
+    return s==='available' || s==='unassigned' || !s;
+  }).length;
   var uploaded = devices.filter(function(d){return d.status==='uploaded';}).length;
   var expired  = devices.filter(function(d){
     return d.assignedDate && invDaysRemaining(d.expiryDate, d.assignedDate) < 0;
@@ -23963,13 +24318,32 @@ function panelInvDashboard(){
   h += '<div class="bo-stat"><div class="bs-label">Pending Requests</div><div class="bs-val">'+pendingReqs+'</div></div>';
   h += '</div>';
 
-  // ── Gen Mobile live summary (separate system) ──
-  var gmTotal      = GM_INVENTORY.length;
-  var gmUnassigned = GM_INVENTORY.filter(function(d){return d.status==='unassigned';}).length;
-  var gmAssigned   = GM_INVENTORY.filter(function(d){return d.status==='assigned';}).length;
-  var gmActivated  = GM_INVENTORY.filter(function(d){return d.status==='activated';}).length;
-  var gmExpiring   = GM_INVENTORY.filter(function(d){
-    var dy = gmDeviceDaysLeft(d); return dy!==null && dy>=0 && dy<=10;
+  // ── Gen Mobile live summary (reads BOTH GM_INVENTORY and the
+  // legacy INVENTORY_DEVICES filtered by campaign='Gen Mobile' so
+  // generic uploads show up here too — Calvin 2026-04-30 fix) ──
+  var gmAll = GM_INVENTORY.slice();
+  if(typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
+    INVENTORY_DEVICES.forEach(function(d){
+      if(d && d.campaign === 'Gen Mobile') gmAll.push(d);
+    });
+  }
+  // Status-tolerant counts: 'unassigned' (campaign pool) and 'uploaded'
+  // (legacy pool) both mean "not yet assigned to anyone".
+  function _gmIsUnassigned(d){
+    var s = d && d.status;
+    return s === 'unassigned' || s === 'uploaded' || s === 'available' || !s;
+  }
+  var gmTotal      = gmAll.length;
+  var gmUnassigned = gmAll.filter(_gmIsUnassigned).length;
+  var gmAssigned   = gmAll.filter(function(d){return d.status==='assigned';}).length;
+  var gmActivated  = gmAll.filter(function(d){return d.status==='activated';}).length;
+  var gmExpiring   = gmAll.filter(function(d){
+    var dy = (typeof gmDeviceDaysLeft==='function') ? gmDeviceDaysLeft(d) : null;
+    if(dy === null && d.expiryDate){
+      // Legacy devices use a different field shape — fall back to invDaysRemaining
+      dy = invDaysRemaining(d.expiryDate, d.assignedDate);
+    }
+    return dy !== null && dy >= 0 && dy <= 10;
   }).length;
   h += '<div class="bo-card" style="margin-bottom:20px">';
   h += '<div class="bo-card-head" style="border-left:4px solid var(--blue)">';
@@ -24002,6 +24376,9 @@ function panelInvDashboard(){
 
   // ── Full inventory table ──
   if(devices.length && isInvRole){
+    // Reset bulk-select state on every render so stale selections from
+    // a previous panel visit don't carry over
+    if(typeof invAssignClearSelection === 'function') invAssignClearSelection();
     var sortedDevs = devices.slice().sort(function(a,b){
       var da=invDaysRemaining(a.expiryDate,a.assignedDate);
       var db2=invDaysRemaining(b.expiryDate,b.assignedDate);
@@ -24010,16 +24387,29 @@ function panelInvDashboard(){
       if(db2===null) return -1;
       return da-db2; // ascending = most urgent first
     });
+
+    // Bulk-action bar (hidden until something is selected)
+    h += '<div id="invAssignBulkBar" style="display:none;background:linear-gradient(135deg,rgba(0,53,148,.08),rgba(0,53,148,.03));border:1.5px solid rgba(0,53,148,.30);border-radius:8px;padding:12px 18px;margin-bottom:10px;align-items:center;gap:14px;flex-wrap:wrap">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.86rem;color:var(--brown)"><strong style="color:var(--blue);font-size:1.05rem" id="invAssignSelCount">0</strong> device(s) selected</div>';
+    h += '<button onclick="invAssignOpenBulk()" class="btn-fire" style="padding:8px 18px;font-size:.74rem;letter-spacing:1.5px">📦 Assign Selected →</button>';
+    h += '<button onclick="invAssignClearSelection()" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer">Clear</button>';
+    h += '</div>';
+
     h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">All Inventory (Most Urgent First)</div>';
     h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">'+total+' devices total</div></div>';
-    h += '<div style="overflow-x:auto"><table><thead><tr><th>IMEI</th><th>Type</th><th>Campaign</th><th>Status</th><th>Holder</th><th>Expiry</th><th>Time Left</th>';
+    h += '<div style="overflow-x:auto"><table><thead><tr>';
+    if(isInvRole) h += '<th style="width:30px"></th>';
+    h += '<th>IMEI</th><th>Type</th><th>Campaign</th><th>Status</th><th>Holder</th><th>Expiry</th><th>Time Left</th>';
     if(isInvRole) h += '<th></th>';
     h += '</tr></thead><tbody>';
     sortedDevs.slice(0,50).forEach(function(d){
       var days = invDaysRemaining(d.expiryDate, d.assignedDate);
       var rowBg = days!==null && days<0 ? 'rgba(204,0,0,.04)' : days<=3 ? 'rgba(204,0,0,.02)' : '';
-      var statusColor = {available:'#059669',assigned:'#2a7de1',uploaded:'#D97706',expired:'#CC0000'}[d.status]||'#888';
+      var statusColor = {available:'#059669',assigned:'#2a7de1',uploaded:'#D97706',unassigned:'#D97706',expired:'#CC0000'}[d.status]||'#888';
       h += '<tr style="background:'+rowBg+'">';
+      if(isInvRole){
+        h += '<td><input type="checkbox" class="inv-row-select" onchange="invToggleSelect(\''+d.id+'\',this)" style="cursor:pointer"></td>';
+      }
       h += '<td style="font-family:monospace;font-size:.75rem">'+d.imei+'</td>';
       h += '<td style="font-size:.78rem;text-transform:capitalize">'+d.type+'</td>';
       h += '<td style="font-size:.78rem">'+d.campaign+'</td>';
@@ -24034,11 +24424,15 @@ function panelInvDashboard(){
       h += '<td style="font-size:.75rem">'+(d.expiryDate||'\u2014')+'</td>';
       h += '<td>'+invExpiryBadge(d)+''+invExpiryBar(d)+'</td>';
       if(isInvRole){
-        h += '<td><button onclick="invSmartRemove([\''+d.id+'\'],\'\')" style="background:none;border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1px;text-transform:uppercase;padding:4px 8px;border-radius:4px;cursor:pointer">Remove</button></td>';
+        // Per-row actions: Assign + Remove
+        h += '<td style="white-space:nowrap">';
+        h += '<button onclick="invAssignOpenSingle(\''+d.id+'\')" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.3);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1px;text-transform:uppercase;padding:4px 8px;border-radius:4px;cursor:pointer;margin-right:4px">Assign</button>';
+        h += '<button onclick="invSmartRemove([\''+d.id+'\'],\'\')" style="background:none;border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1px;text-transform:uppercase;padding:4px 8px;border-radius:4px;cursor:pointer">Remove</button>';
+        h += '</td>';
       }
       h += '</tr>';
     });
-    if(devices.length > 50) h += '<tr><td colspan="8" style="text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);padding:10px">Showing 50 of '+devices.length+' — Export to Excel for full list</td></tr>';
+    if(devices.length > 50) h += '<tr><td colspan="9" style="text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);padding:10px">Showing 50 of '+devices.length+' — Export to Excel for full list</td></tr>';
     h += '</tbody></table></div></div>';
   }
 
