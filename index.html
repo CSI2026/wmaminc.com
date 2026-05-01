@@ -846,11 +846,22 @@ tr:hover td { background:rgba(0,53,148,.02); }
 .bo-topbar-row2 {
   display: flex;
   align-items: center;
-  padding: 0 5%;
+  padding: 0 2%;
   gap: 0;
   overflow-x: auto;
+  overflow-y: hidden;
   min-height: 44px;
+  scrollbar-width: thin;          /* Firefox: visible-but-thin scrollbar */
+  scrollbar-color: var(--silver) transparent;
 }
+/* Webkit (Chrome/Safari/Edge): thin visible scrollbar */
+.bo-topbar-row2::-webkit-scrollbar { height: 6px; }
+.bo-topbar-row2::-webkit-scrollbar-track { background: transparent; }
+.bo-topbar-row2::-webkit-scrollbar-thumb {
+  background: var(--silver);
+  border-radius: 3px;
+}
+.bo-topbar-row2::-webkit-scrollbar-thumb:hover { background: var(--blue); }
 
 /* Nav buttons — clone of public site nav style */
 .bo-nav-top-btn {
@@ -939,7 +950,8 @@ tr:hover td { background:rgba(0,53,148,.02); }
   display: none;
   position: fixed;
   top: 88px;
-  min-width: 220px;
+  min-width: 360px;
+  max-width: calc(100vw - 16px);
   background: #fff;
   border: 1px solid var(--grey-mid);
   border-top: 3px solid var(--blue);
@@ -956,7 +968,7 @@ tr:hover td { background:rgba(0,53,148,.02); }
 /* Single-column override for short lists (≤3 items) */
 .bo-nav-dd.dd-single.dd-open {
   grid-template-columns: 1fr;
-  min-width: 200px;
+  min-width: 240px;
 }
 
 .bo-drop-item {
@@ -16973,8 +16985,24 @@ function toggleBODD(id, triggerBtn){
     // Position under the trigger button using fixed coords
     if(triggerBtn){
       var rect = triggerBtn.getBoundingClientRect();
+      // Calvin 2026-04-30 fix: prevent right-edge overflow.
+      // Default: align dropdown's left edge to trigger's left edge.
+      // If that would push the dropdown's right edge past the viewport,
+      // re-anchor: align dropdown's right edge to trigger's right edge.
+      // Force a layout pass so we can read the dropdown's actual width.
       el.style.left = rect.left + 'px';
       el.style.top  = (rect.bottom + 2) + 'px';
+      el.style.right = '';
+      // Read width after the dropdown is rendered (it's already display:grid)
+      var ddRect = el.getBoundingClientRect();
+      var viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+      var rightMargin = 8; // breathing room from right edge
+      if(ddRect.right > viewportWidth - rightMargin){
+        // Re-anchor to right edge of trigger; use right CSS prop so it auto-flips
+        var newLeft = rect.right - ddRect.width;
+        if(newLeft < 8) newLeft = 8; // also prevent left-edge clip
+        el.style.left = newLeft + 'px';
+      }
     }
   }
 }
@@ -23661,6 +23689,133 @@ function invRequestDeletion(deviceIds, reason){
   gotoPanel('inv-dashboard');
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  invSmartRemove — Calvin 2026-04-30
+//
+//  The REMOVE button on inventory tables (panelInvDashboard etc.) used to
+//  call invRequestDeletion directly, which:
+//    1. prompts for a reason (annoying for the Owner)
+//    2. only submits a REQUEST that the Owner then has to approve
+//
+//  This wrapper branches by role:
+//    - Owner:  instant hard delete, single confirm dialog, with the same
+//              transfer pre-flight check used by the bulk delete panel.
+//    - Inv Dept (or anyone else with inventory access): falls through to
+//              the existing invRequestDeletion flow with reason prompt.
+//
+//  Same call signature as invRequestDeletion so existing buttons work
+//  with a one-word swap.
+// ════════════════════════════════════════════════════════════════════════
+function invSmartRemove(deviceIds, reason){
+  var u = DB.current;
+  if(!u){ alert('Not signed in.'); return; }
+  if(!Array.isArray(deviceIds)) deviceIds = [deviceIds];
+  if(!deviceIds.length){ return; }
+
+  // Non-owner: keep the existing request-queue flow as-is
+  if(!isOwner(u)){
+    return invRequestDeletion(deviceIds, reason);
+  }
+
+  // Owner path: instant hard delete with safety checks.
+  // Find which devices (and from which campaign) match the ids. Devices
+  // can live in legacy INVENTORY_DEVICES OR any campaign-specific pool.
+  // We need to know each device's pool so we can splice from the right one.
+  var hits = []; // [{id, imei, devRef, pool, campaign}]
+  function _scanPool(pool, campaignName){
+    if(!pool || !Array.isArray(pool)) return;
+    deviceIds.forEach(function(targetId){
+      var dev = pool.find(function(x){return String(x.id)===String(targetId);});
+      if(dev) hits.push({id:dev.id, imei:dev.imei, devRef:dev, pool:pool, campaign:campaignName});
+    });
+  }
+  // Scan campaign pools first, then legacy
+  if(typeof activeCampaigns === 'function'){
+    activeCampaigns().forEach(function(c){
+      var cfg = campaignCfg(c);
+      if(cfg && typeof cfg.inventory === 'function'){
+        _scanPool(cfg.inventory(), c);
+      }
+    });
+  }
+  if(typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
+    _scanPool(INVENTORY_DEVICES, 'Legacy');
+  }
+
+  // Dedupe by id (in case a device id collides across pools — shouldn't,
+  // but defensive)
+  var seen = {};
+  hits = hits.filter(function(h){
+    if(seen[h.id]) return false;
+    seen[h.id] = true;
+    return true;
+  });
+
+  if(!hits.length){
+    alert('Could not locate the selected device(s) in any inventory pool. They may have already been removed.');
+    return;
+  }
+
+  // Pre-flight: block on pending transfers (mirror Owner Inv Delete logic)
+  var pendingStatuses = {'pending':1,'pending-approval':1,'pending-agent-signature':1};
+  var blocked = [];
+  hits.forEach(function(hit){
+    if(hit.campaign === 'Legacy') return; // Legacy has no transfer pool
+    var cfg = campaignCfg(hit.campaign);
+    if(!cfg || !cfg.transfers) return;
+    var transfers = cfg.transfers() || [];
+    transfers.forEach(function(t){
+      if(!t || !pendingStatuses[t.status]) return;
+      var imeiList = t.imeis || (t.devices||[]).map(function(d){return d.imei;});
+      if(imeiList.indexOf(hit.imei) >= 0){
+        blocked.push({imei:hit.imei, fromName:t.fromName, toName:t.toName, status:t.status});
+      }
+    });
+  });
+  if(blocked.length){
+    var msg = '🛑 ' + blocked.length + ' device(s) cannot be deleted — they are in pending transfers:\n\n';
+    blocked.slice(0,10).forEach(function(b){
+      msg += '  • ' + b.imei + '  (' + b.fromName + ' → ' + b.toName + ', ' + b.status + ')\n';
+    });
+    if(blocked.length > 10) msg += '  …and ' + (blocked.length - 10) + ' more\n';
+    msg += '\nClear those transfers first (Inventory → Pending Transfers), then try again.';
+    alert(msg);
+    return;
+  }
+
+  // Confirm and delete
+  var label = hits.length === 1
+    ? ('IMEI ' + hits[0].imei)
+    : (hits.length + ' devices');
+  if(!confirm('PERMANENTLY DELETE ' + label + '?\n\nThis is an Owner-direct hard delete. No log, no undo.')){
+    return;
+  }
+
+  var removed = 0;
+  hits.forEach(function(hit){
+    var idx = hit.pool.findIndex(function(x){return String(x.id)===String(hit.id);});
+    if(idx >= 0){
+      hit.pool.splice(idx, 1);
+      removed++;
+    }
+  });
+
+  try { if(typeof saveInventory === 'function') saveInventory(); } catch(e){ console.warn('[invSmartRemove] saveInventory failed:', e); }
+  try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){ console.warn('[invSmartRemove] saveToStorage failed:', e); }
+
+  // Re-render whatever panel called this so the table updates
+  if(typeof window._currentPanelId === 'string' && typeof gotoPanel === 'function'){
+    gotoPanel(window._currentPanelId);
+  } else if(typeof gotoPanel === 'function'){
+    gotoPanel('inv-dashboard');
+  }
+  // Toast/alert at end so user sees confirmation after re-render
+  setTimeout(function(){
+    if(typeof cdFlash === 'function') cdFlash('✓ ' + removed + ' device(s) deleted.');
+    else alert('✓ ' + removed + ' device(s) deleted.');
+  }, 50);
+}
+
 // Owner approves deletion — permanently removes from system
 function invApproveDeletion(reqId){
   var u = DB.current;
@@ -23879,7 +24034,7 @@ function panelInvDashboard(){
       h += '<td style="font-size:.75rem">'+(d.expiryDate||'\u2014')+'</td>';
       h += '<td>'+invExpiryBadge(d)+''+invExpiryBar(d)+'</td>';
       if(isInvRole){
-        h += '<td><button onclick="invRequestDeletion([\''+d.id+'\'],\'\')" style="background:none;border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1px;text-transform:uppercase;padding:4px 8px;border-radius:4px;cursor:pointer">Remove</button></td>';
+        h += '<td><button onclick="invSmartRemove([\''+d.id+'\'],\'\')" style="background:none;border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1px;text-transform:uppercase;padding:4px 8px;border-radius:4px;cursor:pointer">Remove</button></td>';
       }
       h += '</tr>';
     });
