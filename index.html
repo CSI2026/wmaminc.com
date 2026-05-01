@@ -5931,6 +5931,138 @@ function payrollApplyDeductions(opts){
     return chain;
   }
 
+  // Helper: resolve a serial/IMEI against the company's inventory tables.
+  // Per Calvin's spec (2026-04-30): "when we upload our inventory into this
+  // system we can now find the imei and we will know who has it, and we
+  // will charge that person not the MM,CM, or IBO." So when TC Deductions
+  // has blank Person Assigned Name, we check our own inventory first —
+  // if the device is logged against a specific agent here, charge them.
+  function resolveByInventoryLookup(serial){
+    if(!serial) return null;
+    var s = String(serial).trim();
+    if(!s) return null;
+    // Search each inventory pool. They share roughly the same shape:
+    //   { imei, serial, assignedTo (agentId), assignedToName, status, ... }
+    var pools = [];
+    if(typeof TC_INVENTORY !== 'undefined' && TC_INVENTORY) pools.push(TC_INVENTORY);
+    if(typeof GM_INVENTORY !== 'undefined' && GM_INVENTORY) pools.push(GM_INVENTORY);
+    if(typeof AW_INVENTORY !== 'undefined' && AW_INVENTORY) pools.push(AW_INVENTORY);
+    if(typeof EX_INVENTORY !== 'undefined' && EX_INVENTORY) pools.push(EX_INVENTORY);
+    if(typeof INVENTORY_DEVICES !== 'undefined' && INVENTORY_DEVICES) pools.push(INVENTORY_DEVICES);
+    for(var p=0; p<pools.length; p++){
+      var pool = pools[p];
+      if(!Array.isArray(pool)) continue;
+      for(var i=0; i<pool.length; i++){
+        var dev = pool[i];
+        if(!dev) continue;
+        // Match against any of: imei, serial, sim
+        if(String(dev.imei||'') === s ||
+           String(dev.serial||'') === s ||
+           String(dev.sim||'') === s){
+          // Found the device. Is it assigned to anyone?
+          if(dev.assignedTo){
+            var a = (DB.agents||[]).find(function(x){return x.id === dev.assignedTo;});
+            if(a) return a;
+          }
+          // Found device but not assigned to a specific agent — return null
+          // so caller falls through to market chain (CM/MM/IBO).
+          return null;
+        }
+      }
+    }
+    return null;
+  }
+
+  // Helper: resolve a market string (from carrier file's "Team DD" / "Team Name"
+  // column, e.g. "TC Tulsa (WIL)-01") to a cascade chain of who absorbs an
+  // unassigned device cost.
+  //
+  // Per Calvin's spec: "If no name is assigned look at market. Then charge
+  // the IBO, CM, or MM" — priority order.
+  //
+  // Strategy:
+  //   1. Find agents whose teamName / market field matches the city in the
+  //      market string (e.g., "Tulsa" → all agents with cm-oklahoma model).
+  //   2. Filter to leadership roles in priority order: IBO first
+  //      (tcModel='tc-cm-consolidated'), then CM (role='Campaign Manager'),
+  //      then MM (role='Market Manager').
+  //   3. Return as a chain so cascade can walk it (IBO → CM → MM, falling
+  //      through if higher priority absorbed nothing this week).
+  function resolveMarketChain(marketStr){
+    if(!marketStr) return [];
+    var clean = String(marketStr).trim().toLowerCase();
+
+    // Extract city/region keywords from the market string. TC files use formats
+    // like "TC Tulsa (WIL)-01" or "TC Tulsa (WIL)-02". We strip carrier prefix,
+    // parenthesized codes, and trailing numeric suffixes to get the core name.
+    var keywords = clean
+      .replace(/^(tc|gm|aw|sl|gen)\s+/i, '')          // drop carrier prefix
+      .replace(/\([^)]*\)/g, '')                       // drop (WIL) etc
+      .replace(/[-_\s]+\d+\s*$/, '')                  // drop -01, -02 etc
+      .replace(/\b(team|market)\b/gi, '')             // drop generic words
+      .trim();
+
+    // Try to find agents whose team identifier matches. We look at multiple
+    // attribution paths: cmModel name, agent.team field, agent.market field.
+    function agentMatchesMarket(a){
+      if(!a) return false;
+      var hits = [];
+      if(a.cmModel)            hits.push(String(a.cmModel).toLowerCase());
+      if(a.team)               hits.push(String(a.team).toLowerCase());
+      if(a.market)             hits.push(String(a.market).toLowerCase());
+      if(a.assignedMarket)     hits.push(String(a.assignedMarket).toLowerCase());
+      // Match if any of these contain the market keyword
+      // e.g. cmModel="cm-oklahoma" matches market="Oklahoma" or "Tulsa OK"
+      // We also do a reverse contains check.
+      for(var i=0;i<hits.length;i++){
+        if(hits[i].indexOf(keywords) >= 0) return true;
+        if(keywords && keywords.indexOf(hits[i].replace(/^cm-/,'')) >= 0) return true;
+      }
+      return false;
+    }
+
+    // Special case for Tulsa/Oklahoma market: cm-oklahoma model
+    var isTulsaMarket = /tulsa|oklahoma/i.test(marketStr);
+
+    var candidates = (DB.agents || []).filter(function(a){
+      if(!a || a.active === false) return false;
+      if(agentMatchesMarket(a)) return true;
+      // Tulsa fallback: anyone with cm-oklahoma model
+      if(isTulsaMarket && a.cmModel === 'cm-oklahoma') return true;
+      return false;
+    });
+
+    // Build chain: IBO → CM → MM (per Calvin's priority: charge IBO first)
+    var chain = [];
+    var seen  = {};
+
+    // 1. IBO (tcModel='tc-cm-consolidated' — like Juan Rincon)
+    candidates.forEach(function(a){
+      if(a.tcModel === 'tc-cm-consolidated' && !seen[a.id]){
+        chain.push({aid: a.id, role: 'IBO', name: a.name});
+        seen[a.id] = true;
+      }
+    });
+
+    // 2. Campaign Manager (Tanita for cm-oklahoma)
+    candidates.forEach(function(a){
+      if(a.role === 'Campaign Manager' && !seen[a.id]){
+        chain.push({aid: a.id, role: 'Campaign Manager', name: a.name});
+        seen[a.id] = true;
+      }
+    });
+
+    // 3. Market Manager (if separate from CM)
+    candidates.forEach(function(a){
+      if(a.role === 'Market Manager' && !seen[a.id]){
+        chain.push({aid: a.id, role: 'Market Manager', name: a.name});
+        seen[a.id] = true;
+      }
+    });
+
+    return chain;
+  }
+
   var audit = [];        // every deduction/credit, with full trail
   var unresolved = [];   // entries where name didn't match or lookup failed
 
@@ -5958,11 +6090,51 @@ function payrollApplyDeductions(opts){
   // ── PHASE 1: Apply deductions with cascade ────────────────────────
   deductions.forEach(function(d){
     var agent = resolveAgent(d.agentName);
-    if(!agent){
+    var chain;
+    var sourceLabel;  // for audit trail — who the deduction was originally attributed to
+    var resolvedVia  = '';
+
+    if(agent){
+      // Normal case: deduction has a named agent on the carrier file
+      chain = getCascadeChain(agent);
+      sourceLabel = agent.name;
+      resolvedVia = 'named on file';
+    } else if(d.unassigned || !d.agentName){
+      // Per Calvin's locked spec (2026-04-30):
+      // 1. First check inventory by Serial/IMEI — if device is logged
+      //    against an agent in our system, charge them (the file shows
+      //    blank because the device never moved over to a customer
+      //    record on the carrier side, but we know who has it).
+      // 2. If inventory shows no assignment OR device not in inventory,
+      //    fall to the market chain (team.campaignManager → CM/MM/IBO).
+      var serial = String(d.serial || d.imei || '').trim();
+      var lookupAgent = serial ? resolveByInventoryLookup(serial) : null;
+      if(lookupAgent){
+        agent = lookupAgent;
+        chain = getCascadeChain(agent);
+        sourceLabel = agent.name + ' (via inventory lookup serial '+serial+')';
+        resolvedVia = 'inventory lookup';
+      } else {
+        // Fall back to market chain
+        var teamStr = d.teamName || d.market || '';
+        var marketChain = resolveMarketChain(teamStr);
+        if(!marketChain || !marketChain.length){
+          unresolved.push({
+            kind:'deduction',
+            deduction:d,
+            reason:'unassigned device — no inventory match and no resolvable market chain (team="'+teamStr+'", serial="'+serial+'")'
+          });
+          return;
+        }
+        chain = marketChain;
+        sourceLabel = '(unassigned · '+(teamStr||'unknown market')+')';
+        resolvedVia = 'market chain';
+      }
+    } else {
       unresolved.push({ kind:'deduction', deduction:d, reason:'agent name not matched: '+d.agentName });
       return;
     }
-    var chain = getCascadeChain(agent);
+
     var owed  = d.amountCents;
     var trail = [];
     // Walk the cascade
@@ -5977,7 +6149,7 @@ function payrollApplyDeductions(opts){
           type:        d.type,
           orderNum:    d.orderNum,
           amountCents: pay,
-          fromName:    agent.name,           // the named agent the deduction was attributed to
+          fromName:    sourceLabel,          // named agent OR "(unassigned · market)"
           paidByRole:  link.role,            // who actually absorbed it
           paidByAid:   link.aid
         });
@@ -5985,22 +6157,32 @@ function payrollApplyDeductions(opts){
         owed -= pay;
       }
     }
-    // Anything left becomes carryover debt against the NAMED AGENT
+    // Anything left becomes carryover debt
     if(owed > 0){
-      var nb = ensureBalance(agent.id);
-      nb.carryoverCents += owed;
-      if(!dryRun){
-        payrollAddDebt(agent.id, owed,
-          d.type+(d.orderNum?' #'+d.orderNum:'')+' (uncovered after cascade)', weekId);
+      // For named agents, debt goes to that agent.
+      // For unassigned deductions, debt goes to the LAST link of the market chain
+      // (the highest-up CM/MM/IBO who couldn't cover this week).
+      var debtAid = agent ? agent.id : (chain[chain.length-1] && chain[chain.length-1].aid);
+      var debtName = agent ? agent.name : (chain[chain.length-1] && chain[chain.length-1].name);
+      if(debtAid){
+        var nb = ensureBalance(debtAid);
+        nb.carryoverCents += owed;
+        if(!dryRun){
+          payrollAddDebt(debtAid, owed,
+            d.type+(d.orderNum?' #'+d.orderNum:'')+(agent?' (uncovered after cascade)':' (unassigned · '+(d.market||'')+')'),
+            weekId);
+        }
+        trail.push({aid: debtAid, name: debtName, role: 'CARRYOVER DEBT', paidCents: owed});
       }
-      trail.push({aid: agent.id, name: agent.name, role: 'CARRYOVER DEBT', paidCents: owed});
     }
     audit.push({
       kind:        'deduction',
       type:        d.type,
       orderNum:    d.orderNum,
-      agentName:   d.agentName,
-      agentId:     agent.id,
+      agentName:   d.agentName || '',
+      agentId:     agent ? agent.id : null,
+      unassigned:  !agent,
+      market:      d.market || '',
       amountCents: d.amountCents,
       isTribal:    d.isTribal,
       trail:       trail
@@ -7035,10 +7217,40 @@ function ppTotalChargebacks(rows){
 // Returns same shape as parseGenMobilePayEmail:
 //   { periodStart, periodEnd, rows:{code:{...}}, errors, invoice:{...} }
 function parseTruConnectFile(arrayBuffer){
+  // ════════════════════════════════════════════════════════════════════
+  // TruConnect file parser — REWRITTEN 2026-04-30 from real file inspection
+  // (WIL-Invoice_294.xlsx + Calvin's TC Deductions sample).
+  //
+  // Each tab has a UNIQUE column layout. Don't share rules across tabs.
+  // Calvin's TC files always carry these tabs (some empty if no data):
+  //
+  //   "Invoice"                          — company totals + AW Period
+  //   "TC Pay Summary"                   — activations
+  //   "TC Cancels-14 Day Chargeback"     — 14-day cancellations
+  //   "TC Device Upgrades"               — upgrade fees ($10 each)
+  //   "Port In Spif"                     — port credits ($7 to agent)
+  //   "TC Credits"                       — aging phone CREDITS (refunds)
+  //   "TC Deductions"                    — aging phone DEDUCTIONS (charges)
+  //   plus GEN/AW/SL backup tabs (handled separately by other parsers)
+  //
+  // Returns: { periodStart, periodEnd, rows:{}, deductions:[], credits:[],
+  //            errors:[], invoice:{}, summary:{} }
+  // ════════════════════════════════════════════════════════════════════
   if(typeof XLSX === 'undefined'){
     return { errors:['SheetJS (XLSX) library not loaded — cannot parse xlsx files.'], rows:{} };
   }
-  var result = { periodStart:'', periodEnd:'', rows:{}, errors:[], invoice:null };
+
+  var result = {
+    periodStart: '',
+    periodEnd:   '',
+    rows:        {},     // { agentName: { activations, details, ... } }
+    deductions:  [],     // [ { type, agentName, teamName, amountCents, orderNum, ... } ]
+    credits:     [],     // [ { type, agentName, teamName, amountCents, ... } ]
+    errors:      [],
+    invoice:     null,
+    sourceFile:  'TruConnect xlsx'
+  };
+
   var wb;
   try{
     wb = XLSX.read(arrayBuffer, {type:'array', cellDates:false});
@@ -7047,433 +7259,307 @@ function parseTruConnectFile(arrayBuffer){
     return result;
   }
 
-  // ── SHEET 1: Invoice — company totals + pay period. ────────────
-  var invName = wb.SheetNames.find(function(n){return /invoice/i.test(n);});
-  if(invName){
-    var invSheet = wb.Sheets[invName];
-    var invRows  = XLSX.utils.sheet_to_json(invSheet, {header:1, defval:''});
-    var invoice  = {
-      nladLifeline:  0,
-      tribalLifeline:0,
-      tcPlus:        0,
-      portInSpif:    0,
-      cancels14Day:  0,
-      deviceUpgrades:0,
-      agingDeduct:   0,
-      agingCredit:   0,
-      tcTotal:       0
+  // ── HELPERS ───────────────────────────────────────────────────────
+
+  // Find a sheet whose tab name matches a regex. Returns {name, rows} or null.
+  function loadSheet(rx){
+    var nm = wb.SheetNames.find(function(n){ return rx.test(n); });
+    if(!nm) return null;
+    var s = wb.Sheets[nm];
+    return {
+      name: nm,
+      rows: XLSX.utils.sheet_to_json(s, { header:1, defval:'' })
     };
-    invRows.forEach(function(row){
-      var firstCell  = String(row[0]||'').trim();
-      var lastCellNum = row[row.length-1];
-      // AW Period line appears as: ["", "AW Period", "4/13/26-4/19/26"] or similar
-      var joined = row.map(function(c){return String(c||'');}).join(' ');
-      var periodMatch = joined.match(/AW\s*Period.*?(\d+\/\d+\/\d+)\s*-\s*(\d+\/\d+\/\d+)/i);
-      if(periodMatch){
-        result.periodStart = ppNormalizeDate(periodMatch[1]);
-        result.periodEnd   = ppNormalizeDate(periodMatch[2]);
+  }
+
+  // Parse a money cell — returns CENTS (integer). Handles:
+  //   numeric (40, -40, 12.5)
+  //   string ("$80.00", "(80)" parens=negative, "-80")
+  //   blank/null → 0
+  function parseMoneyCents(v){
+    if(v === '' || v === null || v === undefined) return 0;
+    if(typeof v === 'number') return Math.round(v * 100);
+    var s = String(v).trim();
+    if(!s) return 0;
+    var neg = /^\(.*\)$/.test(s);
+    s = s.replace(/[(),$\s]/g, '');
+    var n = parseFloat(s);
+    if(isNaN(n)) return 0;
+    return Math.round((neg ? -Math.abs(n) : n) * 100);
+  }
+
+  // Boolean from "YES"/"Y"/"1"/true vs "NO"/"N"/"0"/false/blank.
+  function parseYN(v){
+    if(v === true) return true;
+    if(v === false || v === null || v === undefined || v === '') return false;
+    var s = String(v).trim().toUpperCase();
+    return s === 'Y' || s === 'YES' || s === '1' || s === 'TRUE';
+  }
+
+  // Get a clean string from a cell (trimmed, never null/undefined).
+  function asStr(v){
+    if(v === null || v === undefined) return '';
+    return String(v).trim();
+  }
+
+  // ── SHEET: "Invoice" — company totals & period date ───────────────
+  // Header is unstructured. Key rows have label in col D (idx 3) and
+  // value in col E (idx 4). We pull AW Period and known total labels.
+  var invSheet = loadSheet(/^\s*invoice\s*$/i);
+  if(invSheet){
+    var invoice = {
+      nladLifeline: 0, tribalLifeline: 0, tcPlus: 0,
+      portInSpif: 0, cancels14Day: 0, deviceUpgrades: 0,
+      agingDeduct: 0, agingCredit: 0, tcTotal: 0
+    };
+    invSheet.rows.forEach(function(r){
+      if(!r) return;
+      // Invoice tab uses TWO label columns:
+      //   Col A — line item categories ("TC Plus", "Port In Spif",
+      //           "TC Cancels-14 Day Chargeback", "TC Total" etc.)
+      //   Col D — header info ("Invoice Date", "AW Period")
+      // Values are in col E (idx 4) for both.
+      var labelA = asStr(r[0]);   // col A
+      var labelD = asStr(r[3]);   // col D
+      var value  = r[4];           // col E
+      var label  = labelA || labelD;
+      if(!label) return;
+      if(/AW Period/i.test(label) && value){
+        var m = String(value).match(/(\d+\/\d+\/\d+)\s*[-\u2013]\s*(\d+\/\d+\/\d+)/);
+        if(m){ result.periodStart = m[1]; result.periodEnd = m[2]; }
+        else  { result.periodStart = String(value); }
       }
-      // Label-based total extractions. TC uses 'Tribal-Lifeline', 'TC Plus',
-      // 'Port In Spif', 'TC Cancels-14 Day Chargeback', 'TC Device Upgrades',
-      // 'TC Aging Phone Deductions', 'TC Aging Phone Credits', 'TC Total'.
-      var searchLabel = '';
-      for(var c=0; c<row.length; c++){
-        var cell = String(row[c]||'').trim();
-        if(cell){ searchLabel = cell; break; }
-      }
-      // Find the rightmost numeric cell on this row.
-      var rightNum = 0, found = false;
-      for(var c2=row.length-1; c2>=0; c2--){
-        var v = row[c2];
-        if(v === '' || v === null || v === undefined) continue;
-        var n = parseFloat(v);
-        if(!isNaN(n)){ rightNum = n; found = true; break; }
-      }
-      if(!found) return;
-      if(/NLAD-Lifeline/i.test(joined))           invoice.nladLifeline   = rightNum;
-      else if(/Tribal-Lifeline/i.test(joined) && !/invoice total/i.test(joined)) invoice.tribalLifeline = rightNum;
-      else if(/^TC Plus$/i.test(searchLabel) || /^\s*TC Plus\s*$/i.test(searchLabel)) invoice.tcPlus = rightNum;
-      else if(/Port In Spif/i.test(joined))       invoice.portInSpif     = rightNum;
-      else if(/14 Day Chargeback/i.test(joined))  invoice.cancels14Day   = rightNum;
-      else if(/Device Upgrades/i.test(joined))    invoice.deviceUpgrades = rightNum;
-      else if(/Aging Phone Deductions/i.test(joined)) invoice.agingDeduct = rightNum;
-      else if(/Aging Phone Credits/i.test(joined))    invoice.agingCredit = rightNum;
-      else if(/^\s*TC Total\s*$/i.test(searchLabel))  invoice.tcTotal    = rightNum;
+      if(/^\s*NLAD.*Lifeline\s*$/i.test(label)) invoice.nladLifeline = Number(value)||0;
+      if(/^\s*Tribal.*Lifeline\s*$/i.test(label)) invoice.tribalLifeline = Number(value)||0;
+      if(/^\s*TC\s*Plus\s*$/i.test(label)) invoice.tcPlus = Number(value)||0;
+      if(/Port.*Spif/i.test(label)) invoice.portInSpif = Number(value)||0;
+      if(/Cancels.*14|14.*Chargeback/i.test(label)) invoice.cancels14Day = Number(value)||0;
+      if(/Device.*Upgrade/i.test(label)) invoice.deviceUpgrades = Number(value)||0;
+      if(/Aging.*Phone.*Deduct/i.test(label)) invoice.agingDeduct = Number(value)||0;
+      if(/Aging.*Phone.*Credit/i.test(label)) invoice.agingCredit = Number(value)||0;
+      if(/^\s*TC\s*Total\s*$/i.test(label)) invoice.tcTotal = Number(value)||0;
     });
     result.invoice = invoice;
   }
 
-  // ── SHEET 2: TC Pay Summary — per-activation rows. ─────────────
-  // SOFT SKIP: if the file doesn't have a Pay Summary sheet (e.g., a
-  // deductions-only file with just Invoice + chargeback/aging tabs),
-  // we skip activation parsing and fall through to the deduction/credit
-  // parsers below. Files that contain ONLY deductions are valid inputs.
-  var payName = wb.SheetNames.find(function(n){return /pay\s*summary/i.test(n);})
-             || wb.SheetNames.find(function(n){return /summary/i.test(n);});
-  if(payName){
-    var paySheet = wb.Sheets[payName];
-    var payData  = XLSX.utils.sheet_to_json(paySheet, {header:1, defval:''});
-    if(!payData.length){
-      result.errors.push('TC Pay Summary sheet "'+payName+'" is empty — skipping activation parsing.');
-    } else {
-      // Locate header row (contains "Agent Name").
-      var headerIdx = -1, headers = null;
-      for(var i=0; i<Math.min(10, payData.length); i++){
-        var r = payData[i];
-        if(r && r.some && r.some(function(c){return /Agent\s*Name/i.test(String(c));})){
-          headerIdx = i; headers = r.map(function(c){return String(c||'').trim();}); break;
-        }
-      }
-      if(headerIdx < 0){
-        result.errors.push('Could not find header row with "Agent Name" in TC Pay Summary — skipping activation parsing.');
-      } else {
-        // Map column indexes by header name (case/whitespace tolerant).
-        var colIdx = function(names){
-          for(var j=0; j<headers.length; j++){
-            var h = headers[j].toLowerCase();
-            for(var k=0; k<names.length; k++){
-              if(h === names[k].toLowerCase()) return j;
-            }
-          }
-          return -1;
+  // ── SHEET: "TC Pay Summary" — activations ─────────────────────────
+  // Headers (row 1, 0-indexed cols):
+  //   0=ISO Name, 1=Date, 2=First Call Date, 3=First Approval Date,
+  //   4=Person ID, 5=Order DD: Order Number, 6=Agent Name,
+  //   7=State, 8=Rate Plan, 9=Team Name, 10=Status, 11=Tribal,
+  //   12=My TC App, 13=TC Plus, 14=ISO Pay Rate, 15=TC Plus, 16=Total
+  var paySheet = loadSheet(/TC\s*Pay\s*Summary/i);
+  if(paySheet){
+    paySheet.rows.slice(1).forEach(function(r){
+      if(!r || r.length === 0) return;
+      var name = asStr(r[6]);   // col G
+      if(!name || /^total/i.test(name)) return;
+      if(!result.rows[name]){
+        result.rows[name] = {
+          agentCode: name,
+          teamName:  asStr(r[9]),
+          state:     asStr(r[7]),
+          activations: { Total:0, Tribal:0, MyTcApp:0, TcPlus:0 },
+          grossCents: 0,
+          details:    [],
+          chargebacks: [],
+          chargebackTotal: 0
         };
-        var iDate       = colIdx(['Date']);
-        var iPersonId   = colIdx(['Person ID','PersonID']);
-        var iOrderNum   = colIdx(['Order DD: Order Number','Order Number']);
-        var iAgentName  = colIdx(['Agent Name']);
-        var iState      = colIdx(['State']);
-        var iRatePlan   = colIdx(['Rate Plan']);
-        var iTeamName   = colIdx(['Team Name']);
-        var iStatus     = colIdx(['Status']);
-        var iTribal     = colIdx(['Tribal']);
-        var iMyTcApp    = colIdx(['My TC App','MyTCApp']);
-        var iTcPlus     = colIdx(['TC Plus']);
-        var iIsoRate    = colIdx(['ISO Pay Rate','ISO Rate']);
-        var iTcPlusAmt  = headers.lastIndexOf ? headers.length - headers.slice().reverse().findIndex(function(h){return h.toLowerCase()==='tc plus';}) - 1 : -1;
-        // ^ 'TC Plus' appears twice in headers (boolean, then rate). Take the last occurrence for the rate.
-        var iTotal      = colIdx(['Total']);
-
-        if(iAgentName < 0){
-          result.errors.push('TC Pay Summary is missing "Agent Name" column — skipping activation parsing.');
-        } else {
-          // Aggregate rows by Agent Name (the TC code field will match this string).
-          payData.slice(headerIdx+1).forEach(function(r){
-            if(!r || !r.length) return;
-            var name = String(r[iAgentName]||'').trim();
-            if(!name) return;
-            // Skip accidental blank/summary rows.
-            if(/^total/i.test(name)) return;
-
-            if(!result.rows[name]){
-              result.rows[name] = {
-                agentCode:   name,  // the TC "code" IS the agent name string in agentCodes.TruConnect
-                teamName:    String(r[iTeamName]||'').trim(),
-                state:       String(r[iState]||'').trim(),
-                activations: {
-                  Total:   0,   // count of activations
-                  Tribal:  0,   // count with Tribal=Y
-                  MyTcApp: 0,   // count with My TC App=Y
-                  TcPlus:  0    // count with TC Plus=Y
-                },
-                grossCents:  0,  // sum of ISO Pay Rate + TC Plus rate from each row (pre-P&L use)
-                details:     [],
-                chargebacks: [],
-                chargebackTotal: 0
-              };
-            }
-            var row = result.rows[name];
-            row.activations.Total++;
-            if(/^Y(ES)?$/i.test(String(r[iTribal]||'').trim()))  row.activations.Tribal++;
-            if(/^Y(ES)?$/i.test(String(r[iMyTcApp]||'').trim())) row.activations.MyTcApp++;
-            if(/^Y(ES)?$/i.test(String(r[iTcPlus]||'').trim()))  row.activations.TcPlus++;
-
-            var iso = parseFloat(r[iIsoRate]) || 0;
-            var tcp = (iTcPlusAmt >= 0 && iTcPlusAmt !== iTcPlus) ? (parseFloat(r[iTcPlusAmt]) || 0) : 0;
-            var tot = parseFloat(r[iTotal]) || (iso + tcp);
-            row.grossCents += Math.round(tot * 100);
-
-            row.details.push({
-              date:      ppExcelDateToStr(r[iDate]),
-              personId:  String(r[iPersonId]||''),
-              orderNum:  String(r[iOrderNum]||''),
-              state:     String(r[iState]||''),
-              ratePlan:  String(r[iRatePlan]||''),
-              team:      String(r[iTeamName]||''),
-              tribal:    /^Y(ES)?$/i.test(String(r[iTribal]||'').trim()),
-              myTcApp:   /^Y(ES)?$/i.test(String(r[iMyTcApp]||'').trim()),
-              tcPlus:    /^Y(ES)?$/i.test(String(r[iTcPlus]||'').trim()),
-              isoRate:   iso,
-              tcPlusAmt: tcp,
-              total:     tot
-            });
-          });
-        }
       }
-    }
-  }
-  // (No else / no early return — flow continues to deduction & credit parsing
-  // below, which can run independently of TC Pay Summary presence.)
+      var row = result.rows[name];
+      row.activations.Total++;
+      if(parseYN(r[11])) row.activations.Tribal++;
+      if(parseYN(r[12])) row.activations.MyTcApp++;
+      if(parseYN(r[13])) row.activations.TcPlus++;
 
-  // ── DEDUCTION & CREDIT TABS (Calvin 2026-04-30) ──────────────────
-  //
-  // The TC excel file may contain any of these tabs IF they apply to
-  // the week. Parser tolerates absence — if a tab isn't present, skip
-  // it. Each parsed entry gets attributed to a named agent for later
-  // cascade processing.
-  //
-  // Locked spec:
-  //   • TC Cancels 14 day chargeback → debit agent $28 (Tribal) / $10 (NLAD).
-  //     Cascade up the chain if agent has insufficient pay.
-  //   • TC Aging Phone Deduction → debit agent the EXACT row amount
-  //     (device cost — could be $45, $80, etc). Cascade.
-  //   • TC Device Upgrades → debit agent the EXACT row amount. Cascade.
-  //   • Port Spif → credit agent $7 per port row.
-  //   • TC Aging Phone Credit → reverse earlier Aging Phone Deduction.
-  //     Lookup who originally paid; refund them.
-  result.deductions = [];   // [{type, agentName, amountCents, orderNum, date, isTribal, raw}]
-  result.credits    = [];   // [{type, agentName, amountCents, orderNum, date, raw}]
+      var iso = Number(r[14])||0;
+      var tcp = Number(r[15])||0;
+      var tot = Number(r[16]) || (iso+tcp);
+      row.grossCents += Math.round(tot * 100);
 
-  // Helper: find a sheet by regex match against tab name (case-insensitive)
-  function findSheet(rx){
-    var nm = wb.SheetNames.find(function(n){return rx.test(n);});
-    if(!nm) return null;
-    return { name:nm, data: XLSX.utils.sheet_to_json(wb.Sheets[nm], {header:1, defval:''}) };
+      row.details.push({
+        date:      ppExcelDateToStr(r[1]),
+        personId:  asStr(r[4]),
+        orderNum:  asStr(r[5]),
+        state:     asStr(r[7]),
+        ratePlan:  asStr(r[8]),
+        team:      asStr(r[9]),
+        tribal:    parseYN(r[11]),
+        myTcApp:   parseYN(r[12]),
+        tcPlus:    parseYN(r[13]),
+        isoRate:   iso,
+        tcPlusAmt: tcp,
+        total:     tot
+      });
+    });
   }
 
-  // Helper: locate a row that contains the header by a marker phrase
-  function findHeaderRow(data, markerRx){
-    for(var i=0; i<Math.min(15, data.length); i++){
-      var r = data[i];
-      if(r && r.some && r.some(function(c){return markerRx.test(String(c||''));})){
-        return { idx:i, headers: r.map(function(c){return String(c||'').trim();}) };
-      }
-    }
-    return null;
+  // ── SHEET: "TC Cancels-14 Day Chargeback" — 14-day cancels ────────
+  // Headers (0-indexed):
+  //   0=ISO Name, 1=Date, 2=First Call Date, 3=First Approval Date,
+  //   4=Removal Date, 5=Days Active, 6=Person ID,
+  //   7=Order DD: Order Number, 8=Agent Name, 9=State, 10=Rate Plan,
+  //   11=Team Name, 12=Status, 13=Tribal, 14=My TC App, 15=TC Plus,
+  //   16=ISO Pay Rate, 17=ISO TC Plus Pay Rate, 18=Total
+  // Calvin's spec: charge agent $28 (Tribal) or $10 (NLAD), NOT the carrier's $40
+  var cancelSheet = loadSheet(/Cancels.*14.*Chargeback/i);
+  if(cancelSheet){
+    cancelSheet.rows.slice(1).forEach(function(r){
+      if(!r || r.length === 0) return;
+      var name = asStr(r[8]);   // col I
+      if(!name || /^total/i.test(name)) return;
+      var isTribal = parseYN(r[13]);
+      result.deductions.push({
+        type:        '14-day Cancel',
+        agentName:   name,
+        teamName:    asStr(r[11]),
+        orderNum:    asStr(r[7]),
+        date:        ppExcelDateToStr(r[1]),
+        removalDate: ppExcelDateToStr(r[4]),
+        isTribal:    isTribal,
+        amountCents: isTribal ? 2800 : 1000,
+        carrierTotal: Number(r[18])||0,    // typically -40 (informational)
+        rawSheet:    cancelSheet.name
+      });
+    });
   }
 
-  // Helper: find column index by header-name patterns (returns -1 if missing)
-  // (Named colByPattern to avoid colliding with the inner colIdx defined inside
-  // the TC Pay Summary parser block above, which has a different signature.)
-  function colByPattern(headers, candidates){
-    for(var i=0;i<headers.length;i++){
-      for(var j=0;j<candidates.length;j++){
-        if(new RegExp('^\\s*'+candidates[j]+'\\s*$','i').test(headers[i])) return i;
-      }
-    }
-    return -1;
+  // ── SHEET: "TC Device Upgrades" ───────────────────────────────────
+  // Headers (0-indexed):
+  //   0=ISO Name, 1=Team DD, 2=Purchase Order Number,
+  //   3=Serial Number, 4=Enrollment Number,
+  //   5=Person Assigned, 6=Date Sold, 7=Product: Product Name,
+  //   8=Product: Upgrade Cost (NEGATIVE)
+  // Calvin's spec: charge agent abs(I) = exact upgrade cost
+  var upgSheet = loadSheet(/TC\s*Device\s*Upgrade/i);
+  if(upgSheet){
+    upgSheet.rows.slice(1).forEach(function(r){
+      if(!r || r.length === 0) return;
+      var name = asStr(r[5]);   // col F
+      if(!name || /^total/i.test(name)) return;
+      var rawCost = Number(r[8])||0;
+      if(rawCost === 0) return;
+      result.deductions.push({
+        type:        'Device Upgrade',
+        agentName:   name,
+        teamName:    asStr(r[1]),
+        orderNum:    asStr(r[4]),         // enrollment#
+        poNumber:    asStr(r[2]),
+        serial:      asStr(r[3]),
+        productName: asStr(r[7]),
+        date:        ppExcelDateToStr(r[6]),
+        amountCents: Math.abs(Math.round(rawCost * 100)),
+        isTribal:    null,
+        rawSheet:    upgSheet.name
+      });
+    });
   }
 
-  // Helper: parse money cell (handles "$", "(123)" parens-as-negative, blanks)
-  function parseMoney(v){
-    if(v === '' || v === null || v === undefined) return 0;
-    var s = String(v).trim();
-    if(!s) return 0;
-    // Parens means negative
-    var neg = /^\(.*\)$/.test(s);
-    s = s.replace(/[(),$\s]/g,'');
-    var n = parseFloat(s);
-    if(isNaN(n)) return 0;
-    return Math.round((neg ? -Math.abs(n) : n) * 100);  // cents
+  // ── SHEET: "Port In Spif" ─────────────────────────────────────────
+  // Headers (0-indexed):
+  //   0=ISO Name, 1=Person ID, 2=Order DD: Order Number,
+  //   3=Team Name, 4=Client ID, 5=Agent Name, 6=Status,
+  //   7=Date, 8=Application ID, 9=State, 10=Number Ported,
+  //   11=Number Ported Date, 12=Total
+  // Calvin's spec: agent gets $7 (Calvin keeps $5 of the $12 carrier pays)
+  var portSheet = loadSheet(/Port\s*In\s*Spif/i);
+  if(portSheet){
+    portSheet.rows.slice(1).forEach(function(r){
+      if(!r || r.length === 0) return;
+      var name = asStr(r[5]);   // col F
+      if(!name || /^total/i.test(name)) return;
+      result.credits.push({
+        type:        'Port Spif',
+        agentName:   name,
+        teamName:    asStr(r[3]),
+        orderNum:    asStr(r[2]),
+        date:        ppExcelDateToStr(r[7]),
+        amountCents: 700,                       // $7 flat to agent
+        rawSheet:    portSheet.name,
+        carrierTotal: Number(r[12])||0          // typically 12 (informational)
+      });
+    });
   }
 
-  // ── TAB: TC Cancels 14 day chargeback ─────────────────────────────
-  // Per Calvin: debit agent $28 (Tribal) or $10 (NLAD). The spreadsheet
-  // typically has Order Number, Date, Agent Name, Tribal flag (Y/N),
-  // and sometimes an Amount column (which we IGNORE per spec — we use
-  // the ceiling instead).
-  try{
-    var cancelSheet = findSheet(/cancel.*14|14.*chargeback|cancels.*chargeback/i);
-    if(cancelSheet){
-      var hdr = findHeaderRow(cancelSheet.data, /agent.*name|order|tribal/i);
-      if(hdr){
-        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colByPattern(hdr.headers, ['Date','Activation Date','Cancel Date']);
-        var iTribal= colByPattern(hdr.headers, ['Tribal']);
-        var iRatePlan = colByPattern(hdr.headers, ['Rate Plan','RatePlan']);
-        cancelSheet.data.slice(hdr.idx+1).forEach(function(r){
-          if(!r || !r.length) return;
-          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
-          if(!name || /^total/i.test(name)) return;
-          var orderNum = iOrder>=0 ? String(r[iOrder]||'').trim() : '';
-          var date     = iDate>=0  ? ppExcelDateToStr(r[iDate])     : '';
-          var tribalFlag = iTribal>=0 ? /^Y(ES)?$/i.test(String(r[iTribal]||'').trim()) : null;
-          // If tribal column missing, infer from rate plan if possible
-          var isTribal = (tribalFlag !== null) ? tribalFlag :
-                         (iRatePlan>=0 ? /tribal/i.test(String(r[iRatePlan]||'')) : false);
-          // Locked spec: $28 for Tribal cancel, $10 for NLAD cancel
-          var amountCents = isTribal ? 2800 : 1000;
-          result.deductions.push({
-            type:        '14-day Cancel',
-            agentName:   name,
-            amountCents: amountCents,
-            orderNum:    orderNum,
-            date:        date,
-            isTribal:    isTribal,
-            raw:         { sheet: cancelSheet.name, row: r }
-          });
-        });
-      } else {
-        result.errors.push('Cancel sheet "'+cancelSheet.name+'" found but header row could not be located.');
-      }
-    }
-  }catch(e){
-    result.errors.push('Cancel sheet parse failed: '+e.message);
+  // ── SHEET: "TC Credits" — aging phone CREDITS (refunds) ───────────
+  // Headers (0-indexed):
+  //   0=ISO Name, 1=Inventory: Lot Name, 2=Serial Number,
+  //   3=Status, 4=Person Assigned, 5=Enrollment Number,
+  //   6=Team DD, 7=Carrier, 8=Location, 9=P.O. Due Date,
+  //   10=Date Sold, 11=Scheduled Deducted Date (US),
+  //   12=Scheduled Credit Date (US), 13=Actual Credited Date (US),
+  //   14=Deducted, 15=Credited (positive amount), 16=Purchase Order Number,
+  //   17=Comments, 18=RMA Credit Date, 19=RMA Requested,
+  //   20=RMA Credit Amount, 21=Order Source, 22=Device Cost,
+  //   23=Original Purchase Order Number
+  // Calvin's spec: refund the FULL amount to whoever originally paid (lookup by order/serial)
+  var creditSheet = loadSheet(/^\s*TC\s*Credits\s*$/i);
+  if(creditSheet){
+    creditSheet.rows.slice(1).forEach(function(r){
+      if(!r || r.length === 0) return;
+      var name = asStr(r[4]);   // col E
+      if(!name || /^total/i.test(name)) return;
+      var creditedAmt = Number(r[15])||0;
+      if(creditedAmt === 0) return;
+      result.credits.push({
+        type:           'Aging Phone Credit',
+        agentName:      name,
+        teamName:       asStr(r[6]),
+        orderNum:       asStr(r[5]),    // enrollment number
+        serial:         asStr(r[2]),
+        poNumber:       asStr(r[16]),
+        origPoNumber:   asStr(r[23]),
+        date:           ppExcelDateToStr(r[13]),
+        amountCents:    Math.abs(Math.round(creditedAmt * 100)),
+        requiresLookup: true,
+        deviceCost:     Number(r[22])||0,
+        rawSheet:       creditSheet.name
+      });
+    });
   }
 
-  // ── TAB: TC Aging Phone Deduction ─────────────────────────────────
-  // Per Calvin: debit agent the EXACT amount on the row (device cost,
-  // varies widely). Need an agent name + amount column.
-  try{
-    var agingDed = findSheet(/aging.*phone.*deduct|aging.*deduct/i);
-    if(agingDed){
-      var hdr = findHeaderRow(agingDed.data, /agent.*name|amount|cost/i);
-      if(hdr){
-        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iAmt   = colByPattern(hdr.headers, ['Amount','Cost','Deduction','Charge']);
-        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colByPattern(hdr.headers, ['Date','Deduction Date']);
-        var iIMEI  = colByPattern(hdr.headers, ['IMEI','Device IMEI','Serial']);
-        var iModel = colByPattern(hdr.headers, ['Model','Device','Phone Model']);
-        agingDed.data.slice(hdr.idx+1).forEach(function(r){
-          if(!r || !r.length) return;
-          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
-          if(!name || /^total/i.test(name)) return;
-          var amt = iAmt>=0 ? parseMoney(r[iAmt]) : 0;
-          if(amt === 0) return;
-          // Per spec, deduction amount on this tab is positive cost — make it positive cents
-          var amountCents = Math.abs(amt);
-          result.deductions.push({
-            type:        'Aging Phone',
-            agentName:   name,
-            amountCents: amountCents,
-            orderNum:    iOrder>=0 ? String(r[iOrder]||'').trim() : '',
-            date:        iDate>=0  ? ppExcelDateToStr(r[iDate])     : '',
-            imei:        iIMEI>=0  ? String(r[iIMEI]||'').trim()    : '',
-            model:       iModel>=0 ? String(r[iModel]||'').trim()   : '',
-            isTribal:    null,
-            raw:         { sheet: agingDed.name, row: r }
-          });
-        });
-      } else {
-        result.errors.push('Aging Phone Deduction sheet "'+agingDed.name+'" found but header row could not be located.');
-      }
-    }
-  }catch(e){
-    result.errors.push('Aging Phone Deduction parse failed: '+e.message);
-  }
-
-  // ── TAB: TC Device Upgrades ───────────────────────────────────────
-  // Per Calvin: debit agent the EXACT amount on the row.
-  try{
-    var devUpg = findSheet(/device\s*upgrade/i);
-    if(devUpg){
-      var hdr = findHeaderRow(devUpg.data, /agent.*name|amount|upgrade/i);
-      if(hdr){
-        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iAmt   = colByPattern(hdr.headers, ['Amount','Cost','Upgrade Cost','Charge']);
-        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colByPattern(hdr.headers, ['Date','Upgrade Date']);
-        var iIMEI  = colByPattern(hdr.headers, ['IMEI','Device IMEI','Serial']);
-        var iModel = colByPattern(hdr.headers, ['Model','Device','Phone Model']);
-        devUpg.data.slice(hdr.idx+1).forEach(function(r){
-          if(!r || !r.length) return;
-          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
-          if(!name || /^total/i.test(name)) return;
-          var amt = iAmt>=0 ? parseMoney(r[iAmt]) : 0;
-          if(amt === 0) return;
-          var amountCents = Math.abs(amt);
-          result.deductions.push({
-            type:        'Device Upgrade',
-            agentName:   name,
-            amountCents: amountCents,
-            orderNum:    iOrder>=0 ? String(r[iOrder]||'').trim() : '',
-            date:        iDate>=0  ? ppExcelDateToStr(r[iDate])     : '',
-            imei:        iIMEI>=0  ? String(r[iIMEI]||'').trim()    : '',
-            model:       iModel>=0 ? String(r[iModel]||'').trim()   : '',
-            isTribal:    null,
-            raw:         { sheet: devUpg.name, row: r }
-          });
-        });
-      } else {
-        result.errors.push('Device Upgrades sheet "'+devUpg.name+'" found but header row could not be located.');
-      }
-    }
-  }catch(e){
-    result.errors.push('Device Upgrades parse failed: '+e.message);
-  }
-
-  // ── TAB: Port Spif ────────────────────────────────────────────────
-  // Per Calvin: $7 per port to the agent. Tab might list amount per row
-  // or just count the rows — we use $7 flat per row.
-  try{
-    var portSheet = findSheet(/port.*spif|portin.*spif/i);
-    if(portSheet){
-      var hdr = findHeaderRow(portSheet.data, /agent.*name|order/i);
-      if(hdr){
-        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colByPattern(hdr.headers, ['Date']);
-        portSheet.data.slice(hdr.idx+1).forEach(function(r){
-          if(!r || !r.length) return;
-          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
-          if(!name || /^total/i.test(name)) return;
-          result.credits.push({
-            type:        'Port Spif',
-            agentName:   name,
-            amountCents: 700,  // $7 per port
-            orderNum:    iOrder>=0 ? String(r[iOrder]||'').trim() : '',
-            date:        iDate>=0  ? ppExcelDateToStr(r[iDate])     : '',
-            raw:         { sheet: portSheet.name, row: r }
-          });
-        });
-      } else {
-        result.errors.push('Port Spif sheet "'+portSheet.name+'" found but header row could not be located.');
-      }
-    }
-  }catch(e){
-    result.errors.push('Port Spif parse failed: '+e.message);
-  }
-
-  // ── TAB: TC Aging Phone Credit ───────────────────────────────────
-  // Per Calvin: reverses an earlier Aging Phone Deduction. We look up
-  // who actually paid for the deduction (might be agent or cascaded TL/CM).
-  // Lookup happens later in the cascade engine — here we just capture
-  // the row data so the engine can match it to a historical payment.
-  try{
-    var agingCred = findSheet(/aging.*phone.*credit|aging.*credit/i);
-    if(agingCred){
-      var hdr = findHeaderRow(agingCred.data, /agent.*name|amount|credit/i);
-      if(hdr){
-        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iAmt   = colByPattern(hdr.headers, ['Amount','Cost','Credit','Refund']);
-        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colByPattern(hdr.headers, ['Date','Credit Date']);
-        var iIMEI  = colByPattern(hdr.headers, ['IMEI','Device IMEI','Serial']);
-        agingCred.data.slice(hdr.idx+1).forEach(function(r){
-          if(!r || !r.length) return;
-          var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
-          if(!name || /^total/i.test(name)) return;
-          var amt = iAmt>=0 ? parseMoney(r[iAmt]) : 0;
-          if(amt === 0) return;
-          result.credits.push({
-            type:        'Aging Phone Credit',
-            agentName:   name,
-            amountCents: Math.abs(amt),
-            orderNum:    iOrder>=0 ? String(r[iOrder]||'').trim() : '',
-            date:        iDate>=0  ? ppExcelDateToStr(r[iDate])     : '',
-            imei:        iIMEI>=0  ? String(r[iIMEI]||'').trim()    : '',
-            // Flag: this credit needs historical lookup of who originally paid
-            requiresLookup: true,
-            raw:         { sheet: agingCred.name, row: r }
-          });
-        });
-      } else {
-        result.errors.push('Aging Phone Credit sheet "'+agingCred.name+'" found but header row could not be located.');
-      }
-    }
-  }catch(e){
-    result.errors.push('Aging Phone Credit parse failed: '+e.message);
+  // ── SHEET: "TC Deductions" — aging phone DEDUCTIONS (charges) ─────
+  // Headers (0-indexed):
+  //   0=ISO Name, 1=Team DD, 2=Shipped to State,
+  //   3=Inventory: Lot Name, 4=Product: Product Name, 5=Serial Number,
+  //   6=Status, 7=Person Assigned Name, 8=P.O. Shipped Date,
+  //   9=P.O. Due Date, 10=Order DD, 11=Order Date Sold (US),
+  //   12=Date Sold, 13=Product: Cost,
+  //   14=Scheduled Deducted Date (US), 15=Actual Deducted Date (US),
+  //   16=Deducted (NEGATIVE — take abs()), 17=Purchase Order Number,
+  //   18=Comments, 19=First Call Made, 20=First Call Date,
+  //   21=Order Source, 22=Device Cost,
+  //   23=Shipped Date (US), 24=Due Date (US)
+  // Calvin's spec:
+  //   - If Person Assigned Name is populated → charge that agent (cascade)
+  //   - If BLANK → look up team in DB.teams, charge its campaignManager directly
+  //   - Use abs(col Q "Deducted") for amount
+  var deductSheet = loadSheet(/^\s*TC\s*Deductions\s*$/i);
+  if(deductSheet){
+    deductSheet.rows.slice(1).forEach(function(r){
+      if(!r || r.length === 0) return;
+      var name = asStr(r[7]);   // col H — may be BLANK
+      var teamName = asStr(r[1]); // col B (Team DD)
+      var rawDeducted = Number(r[16])||0;
+      if(rawDeducted === 0) return;
+      // Skip if no team AND no agent — there's nothing to attribute
+      if(!name && !teamName) return;
+      result.deductions.push({
+        type:           'Aging Phone',
+        agentName:      name,                // may be empty string
+        teamName:       teamName,
+        orderNum:       asStr(r[17]),        // PO Number — used for credit lookup
+        poNumber:       asStr(r[17]),
+        serial:         asStr(r[5]),
+        productName:    asStr(r[4]),
+        status:         asStr(r[6]),
+        date:           ppExcelDateToStr(r[15]),
+        amountCents:    Math.abs(Math.round(rawDeducted * 100)),
+        unassigned:     !name,               // flag: lookup market chain at apply time
+        deviceCost:     Number(r[22])||0,
+        rawSheet:       deductSheet.name
+      });
+    });
   }
 
   return result;
