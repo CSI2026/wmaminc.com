@@ -1811,6 +1811,9 @@ function clearAllStorageData(){
 }
 function saveToStorage(){
   try {
+    // Calvin 2026-04-30: ensure all role:'IBO' agents have correct comp models
+    // applied before persisting. Catches manual edits that bypass the panel.
+    try { if(typeof syncIboModels === 'function') syncIboModels(); } catch(e){ console.warn('[saveToStorage] syncIboModels failed:', e); }
     localStorage.setItem('wmam_agents',    JSON.stringify(DB.agents));
     localStorage.setItem('wmam_nextId',    DB.nextId);
     localStorage.setItem('wmam_teams',     JSON.stringify(LIFELINE_TEAMS));
@@ -1886,6 +1889,16 @@ function loadFromStorage(){
       if(ejsP && typeof emailjs !== 'undefined'){ try { emailjs.init(ejsP); } catch(e){} }
     }
   } catch(e){ console.warn('Storage load failed:', e); }
+
+  // Calvin 2026-04-30: post-load IBO sync.
+  // Run after everything else so all required arrays are populated.
+  // - syncIboModels: ensures every role:'IBO' agent has correct cmModel/tcModel
+  //   (catches data drift from manual edits, imports, or older app versions)
+  // - ensureIboDownlinePackage: seeds the auto-suggested onboarding package
+  //   that contains ONLY a BG check (no banking, no comp agreement) for
+  //   agents under an IBO upline. Idempotent: skips if already present.
+  try { if(typeof syncIboModels === 'function') syncIboModels(); } catch(e){ console.warn('[loadFromStorage] syncIboModels failed:', e); }
+  try { if(typeof ensureIboDownlinePackage === 'function') ensureIboDownlinePackage(); } catch(e){ console.warn('[loadFromStorage] ensureIboDownlinePackage failed:', e); }
 }
 
 // ══════════════════════
@@ -4886,7 +4899,18 @@ function ppKnownCampaigns(){
 //  Five cmModel values:
 //   • 'none'              — no override (Standard market — default)
 //   • 'ibo-consolidated'  — Juan: ALL deals route to IBO at IBO rates
-//   • 'ibo-tiered'        — Stephanie: agents flat $8/$20, mgr keeps diff
+//                            (auto-applied when role:'IBO' — see
+//                            applyIboModelsIfIBO helper)
+//   • 'ibo-tiered'        — Stephanie-Flat (legacy id, kept for storage
+//                            compatibility): Stephanie is a Campaign
+//                            Manager (NOT an IBO). Her agents are paid
+//                            FLAT $8 NLAD / $20 Tribal (lower than the
+//                            standard sliding $9-$11 / $29-$34 used by
+//                            Brandon & Tanita). Stephanie keeps the
+//                            difference up to her tier rate. This is
+//                            her negotiated comp style. Internal rate
+//                            buckets named 'iboTiered*' for legacy
+//                            reasons — do not confuse with IBO model.
 //   • 'cm-difference'     — Brandon: agents standard sliding NLAD + flat
 //                            $24 Tribal, CM keeps max(0, $13/$34 − paid)
 //   • 'cm-oklahoma'       — Tanita: agents standard sliding both ways,
@@ -5088,6 +5112,22 @@ function gmCalculateWeek(weekRows){
     var cm = gmMarketCM(team);
     var cmModel = gmCmModelOf(cm);
 
+    // Calvin 2026-04-30 — IBO upline override.
+    // An IBO can sit ABOVE a CM in the org chart (rare but possible).
+    // If this market's CM is NOT themselves an IBO, walk up the CM's
+    // upline. If we find an IBO, redirect ALL pay to that IBO at IBO
+    // rates — the underlying CM gets $0, same as everyone else under
+    // the IBO. This is the locked rule: WE NEVER PAY ANYONE BELOW
+    // AN IBO. Only the IBO is paid (or charged for chargebacks).
+    if(cm && cm.role !== 'IBO' && typeof agentIsUnderIBO === 'function'){
+      var iboAbove = agentIsUnderIBO(cm.id);
+      if(iboAbove){
+        cm      = iboAbove;
+        cmModel = 'ibo-consolidated';
+        console.log('[GM engine] IBO upline detected for market "'+(team?team.name:teamId)+'" — routing all pay to IBO '+iboAbove.name+' (was CM '+(team?team.campaignManager:'?')+')');
+      }
+    }
+
     // ────────── PATH: ibo-consolidated (Juan) ──────────
     if(cmModel === 'ibo-consolidated'){
       var iboId = cm.id;
@@ -5117,7 +5157,14 @@ function gmCalculateWeek(weekRows){
       return;
     }
 
-    // ────────── PATH: ibo-tiered (Stephanie) ──────────
+    // ────────── PATH: ibo-tiered (Stephanie-Flat) ──────────
+    // STEPHANIE IS A CAMPAIGN MANAGER, NOT AN IBO. The cmModel string
+    // 'ibo-tiered' is a legacy identifier kept for storage compatibility
+    // (renaming would break existing records). Her agents are paid flat
+    // rates ($8 NLAD / $20 Tribal — lower than standard sliding) and
+    // Stephanie keeps the difference between her tier rate and the
+    // agent flat. NO IBO logic applies here. Email/BYOD bonuses go to
+    // the personal enroller (universal rule).
     if(cmModel === 'ibo-tiered'){
       var mgrId = cm.id;
       // Manager's Tribal tier determined by MARKET total Tribal
@@ -6375,6 +6422,20 @@ function tcCalculateWeek(weekRows){
     var team = t.team;
     var cm = tcMarketCM(team);
     var tcModel = tcCmModelOf(cm);
+
+    // Calvin 2026-04-30 — IBO upline override (mirrors GM engine).
+    // If this market's CM is NOT themselves an IBO but an IBO sits
+    // above them in the chain, redirect ALL TC pay to the IBO at
+    // tc-cm-consolidated rates ($25 flat NLAD / Tribal). Locked rule:
+    // we never pay anyone below an IBO. Only the IBO is paid.
+    if(cm && cm.role !== 'IBO' && typeof agentIsUnderIBO === 'function'){
+      var iboAbove = agentIsUnderIBO(cm.id);
+      if(iboAbove){
+        cm      = iboAbove;
+        tcModel = 'tc-cm-consolidated';
+        console.log('[TC engine] IBO upline detected for market "'+(team?team.name:teamId)+'" — routing all pay to IBO '+iboAbove.name+' (was CM '+(team?team.campaignManager:'?')+')');
+      }
+    }
 
     // ────────── PATH: tc-cm-consolidated (Juan) ──────────
     // ALL activations route to the CM at flat $25 NLAD / $25 Tribal.
@@ -14717,6 +14778,576 @@ function ocpExportBackup(){
   a.click();
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  OWNER INVENTORY DELETE — testing/cleanup tool (Calvin only)
+//  Built 2026-04-30 per Calvin's spec.
+//
+//  Purpose: lets owner directly delete specific IMEIs/SIMs from a chosen
+//  campaign's inventory. Used for testing weekend-style: upload fake
+//  inventory, play with the system, then nuke it cleanly.
+//
+//  Spec (LOCKED):
+//   - Owner-only (isOwner check)
+//   - Per-campaign: pick GM / Assurance / TC / Excess / Legacy ONE at a time
+//   - Three selection modes (toggleable in same panel):
+//       1. Checkbox list (with search + status filter)
+//       2. Paste IMEIs/SIMs (one per line)
+//       3. Filter (holder/status) then "select all matching"
+//   - Pre-flight: BLOCK if any selected device is in a pending transfer.
+//     Show which IMEIs are blocked, tell user to clear those transfers first.
+//   - Confirmation: must type DELETE (uppercase) to proceed
+//   - HARD delete: no log, no audit trail, gone forever
+//   - Lives ALONGSIDE the existing invRequestDeletion → invApproveDeletion
+//     queue (Inventory Dept submits requests for owner to approve). That
+//     flow is untouched. This is a separate, owner-direct tool.
+// ════════════════════════════════════════════════════════════════════════
+
+// Module-scoped state for the owner delete panel — fresh on every entry
+var OWNER_INV_DELETE = {
+  campaign:    null,      // 'Gen Mobile' | 'Assurance' | 'TruConnect' | 'Excess' | 'Legacy'
+  mode:        'list',    // 'list' | 'paste' | 'filter'
+  selectedIds: {},        // {deviceId: true}
+  searchQuery: '',
+  statusFilter:'all',     // 'all' | 'unassigned' | 'assigned' | 'sold' | 'activated'
+  holderFilter:'all',     // 'all' | <agentId>
+  pasteText:   '',
+  feedback:    ''
+};
+
+// Reset state when entering the panel fresh
+function ownerInvDeleteReset(){
+  OWNER_INV_DELETE = {
+    campaign:    null,
+    mode:        'list',
+    selectedIds: {},
+    searchQuery: '',
+    statusFilter:'all',
+    holderFilter:'all',
+    pasteText:   '',
+    feedback:    ''
+  };
+}
+
+// Get the device pool for the chosen campaign. Legacy = INVENTORY_DEVICES.
+function ownerInvDevicePool(campaign){
+  if(campaign === 'Legacy') return (typeof INVENTORY_DEVICES !== 'undefined' && INVENTORY_DEVICES) ? INVENTORY_DEVICES : [];
+  var cfg = campaignCfg(campaign);
+  if(!cfg) return [];
+  return cfg.inventory() || [];
+}
+
+// Get the transfers list for the chosen campaign. Legacy has no transfers.
+function ownerInvTransferPool(campaign){
+  if(campaign === 'Legacy') return [];
+  var cfg = campaignCfg(campaign);
+  if(!cfg || !cfg.transfers) return [];
+  return cfg.transfers() || [];
+}
+
+// Set chosen campaign and reset selection
+function ownerInvDeleteSetCampaign(campaign){
+  OWNER_INV_DELETE.campaign    = campaign || null;
+  OWNER_INV_DELETE.selectedIds = {};
+  OWNER_INV_DELETE.feedback    = '';
+  gotoPanel('owner-inv-delete');
+}
+
+// Switch between list / paste / filter selection modes
+function ownerInvDeleteSetMode(mode){
+  OWNER_INV_DELETE.mode = mode;
+  OWNER_INV_DELETE.feedback = '';
+  gotoPanel('owner-inv-delete');
+}
+
+// Toggle a single device id in the selection set
+function ownerInvDeleteToggle(deviceId){
+  if(OWNER_INV_DELETE.selectedIds[deviceId]) delete OWNER_INV_DELETE.selectedIds[deviceId];
+  else OWNER_INV_DELETE.selectedIds[deviceId] = true;
+  // Update the selected-count display in place without re-rendering whole panel
+  var countEl = document.getElementById('ownerInvDelCount');
+  if(countEl) countEl.textContent = Object.keys(OWNER_INV_DELETE.selectedIds).length;
+}
+
+// Select all currently-visible (after search+filter) devices in list mode
+function ownerInvDeleteSelectAllVisible(){
+  var pool   = ownerInvDevicePool(OWNER_INV_DELETE.campaign);
+  var visible = ownerInvFilterDevices(pool);
+  visible.forEach(function(d){ OWNER_INV_DELETE.selectedIds[d.id] = true; });
+  gotoPanel('owner-inv-delete');
+}
+
+function ownerInvDeleteClearAll(){
+  OWNER_INV_DELETE.selectedIds = {};
+  gotoPanel('owner-inv-delete');
+}
+
+// Apply search + status + holder filters to a device list
+function ownerInvFilterDevices(devices){
+  var q = (OWNER_INV_DELETE.searchQuery || '').toLowerCase().trim();
+  var sf = OWNER_INV_DELETE.statusFilter || 'all';
+  var hf = OWNER_INV_DELETE.holderFilter || 'all';
+  return devices.filter(function(d){
+    if(!d) return false;
+    if(sf !== 'all'){
+      var s = d.status || 'unassigned';
+      // normalize: 'uploaded' counts as 'unassigned' bucket (matches inventorySummary)
+      if(sf === 'unassigned' && !(s==='unassigned' || s==='uploaded' || s==='available' || !d.status)) return false;
+      if(sf === 'assigned'   && s !== 'assigned')  return false;
+      if(sf === 'sold'       && !(s==='sold' || d.soldAt)) return false;
+      if(sf === 'activated'  && s !== 'activated') return false;
+    }
+    if(hf !== 'all'){
+      var holderId = d.holderId || d.assignedTo || d.mmId || null;
+      if(String(holderId) !== String(hf)) return false;
+    }
+    if(q){
+      var imei = (d.imei||'').toLowerCase();
+      var sim  = (d.sim||'').toLowerCase();
+      var name = (d.assignedToName||d.mmName||'').toLowerCase();
+      if(imei.indexOf(q)<0 && sim.indexOf(q)<0 && name.indexOf(q)<0) return false;
+    }
+    return true;
+  });
+}
+
+// Capture filter changes from the form — called on input events
+function ownerInvDeleteUpdateFilter(field, value){
+  if(field === 'search')  OWNER_INV_DELETE.searchQuery  = value;
+  if(field === 'status')  OWNER_INV_DELETE.statusFilter = value;
+  if(field === 'holder')  OWNER_INV_DELETE.holderFilter = value;
+  if(field === 'paste')   OWNER_INV_DELETE.pasteText    = value;
+  // Live-rerender for non-paste fields so the count updates
+  if(field !== 'paste') gotoPanel('owner-inv-delete');
+}
+
+// Resolve pasted IMEI/SIM list to selected device ids in current campaign.
+// Returns { matched: [deviceId,...], unmatched: ['IMEI1234',...] }
+function ownerInvResolvePastedList(){
+  var pool = ownerInvDevicePool(OWNER_INV_DELETE.campaign);
+  var raw = (OWNER_INV_DELETE.pasteText || '').split(/\r?\n/);
+  var lines = [];
+  raw.forEach(function(l){
+    var t = (l||'').trim();
+    if(t) lines.push(t);
+  });
+  var matched = [];
+  var unmatched = [];
+  lines.forEach(function(line){
+    var found = pool.find(function(d){
+      return (d.imei && d.imei === line) || (d.sim && d.sim === line);
+    });
+    if(found) matched.push(found.id);
+    else unmatched.push(line);
+  });
+  return {matched:matched, unmatched:unmatched};
+}
+
+// Apply pasted matches to selection
+function ownerInvDeleteApplyPasted(){
+  var res = ownerInvResolvePastedList();
+  res.matched.forEach(function(id){ OWNER_INV_DELETE.selectedIds[id] = true; });
+  if(res.unmatched.length){
+    OWNER_INV_DELETE.feedback = '✓ '+res.matched.length+' matched and added to selection. ⚠ '+res.unmatched.length+' not found in '+OWNER_INV_DELETE.campaign+' inventory: '+res.unmatched.slice(0,5).join(', ')+(res.unmatched.length>5?' …':'');
+  } else {
+    OWNER_INV_DELETE.feedback = '✓ All '+res.matched.length+' IMEI(s)/SIM(s) matched and added to selection.';
+  }
+  gotoPanel('owner-inv-delete');
+}
+
+// Find which selected device ids are currently in a pending transfer.
+// Returns array of {id, imei, transferId, fromName, toName, status}
+function ownerInvFindBlockedByTransfer(){
+  var blocked = [];
+  var transfers = ownerInvTransferPool(OWNER_INV_DELETE.campaign);
+  if(!transfers.length) return blocked;
+  var pendingStatuses = {'pending':1,'pending-approval':1,'pending-agent-signature':1};
+  var pool = ownerInvDevicePool(OWNER_INV_DELETE.campaign);
+  Object.keys(OWNER_INV_DELETE.selectedIds).forEach(function(idStr){
+    var dev = pool.find(function(x){return String(x.id)===String(idStr);});
+    if(!dev) return;
+    transfers.forEach(function(t){
+      if(!t || !pendingStatuses[t.status]) return;
+      var imeiList = t.imeis || (t.devices||[]).map(function(d){return d.imei;});
+      if(imeiList.indexOf(dev.imei) >= 0){
+        blocked.push({id:dev.id, imei:dev.imei, transferId:t.id, fromName:t.fromName, toName:t.toName, status:t.status});
+      }
+    });
+  });
+  return blocked;
+}
+
+// THE delete action — runs after DELETE typed and confirmed
+function ownerInvDeleteCommit(){
+  var u = DB.current;
+  if(!isOwner(u)){ alert('Owner only.'); return; }
+  if(!OWNER_INV_DELETE.campaign){ alert('Pick a campaign first.'); return; }
+  var ids = Object.keys(OWNER_INV_DELETE.selectedIds);
+  if(!ids.length){ alert('No devices selected.'); return; }
+
+  // Confirm typed DELETE
+  var typed = (document.getElementById('ownerInvDelConfirm')||{value:''}).value || '';
+  if(typed !== 'DELETE'){
+    OWNER_INV_DELETE.feedback = '⚠ You must type the word DELETE (uppercase) to confirm.';
+    gotoPanel('owner-inv-delete');
+    return;
+  }
+
+  // Pre-flight: block on pending transfers
+  var blocked = ownerInvFindBlockedByTransfer();
+  if(blocked.length){
+    var msg = '🛑 '+blocked.length+' selected IMEI(s) are in pending transfers and cannot be deleted:\n\n';
+    blocked.slice(0,10).forEach(function(b){
+      msg += '  • '+b.imei+' (transfer '+b.fromName+' → '+b.toName+', status: '+b.status+')\n';
+    });
+    if(blocked.length>10) msg += '  … and '+(blocked.length-10)+' more\n';
+    msg += '\nClear those transfers first (Inventory → Pending Transfers), then return here.';
+    alert(msg);
+    OWNER_INV_DELETE.feedback = '🛑 '+blocked.length+' IMEI(s) blocked by pending transfers — see alert above.';
+    gotoPanel('owner-inv-delete');
+    return;
+  }
+
+  // Final hard-delete
+  var pool = ownerInvDevicePool(OWNER_INV_DELETE.campaign);
+  var removed = 0;
+  ids.forEach(function(idStr){
+    var idx = pool.findIndex(function(d){return String(d.id)===String(idStr);});
+    if(idx >= 0){
+      pool.splice(idx, 1);
+      removed++;
+    }
+  });
+  // Save to localStorage + Supabase via existing inventory save paths
+  try { saveInventory(); } catch(e){ console.warn('[ownerInvDeleteCommit] saveInventory failed:', e); }
+  try { saveToStorage();  } catch(e){ console.warn('[ownerInvDeleteCommit] saveToStorage failed:', e); }
+
+  // Reset state and show success
+  ownerInvDeleteReset();
+  alert('✅ '+removed+' device(s) hard-deleted from '+ (OWNER_INV_DELETE.campaign||'inventory') +'. No log written (test cleanup mode).');
+  gotoPanel('owner-inv-delete');
+}
+
+// THE PANEL
+function panelOwnerInvDelete(){
+  var u = DB.current;
+  if(!isOwner(u)){
+    return '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div>';
+  }
+  var s = OWNER_INV_DELETE;
+  var h = '';
+
+  // Header banner
+  h += '<div style="background:linear-gradient(135deg,rgba(204,0,0,.10),rgba(204,0,0,.04));border:1.5px solid rgba(204,0,0,.30);border-radius:10px;padding:16px 20px;margin-bottom:20px">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:var(--red);letter-spacing:2px">🗑 OWNER INVENTORY DELETE</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);margin-top:4px;line-height:1.5">'
+    +'Hard-delete specific IMEIs / SIMs from a campaign\'s inventory. <strong>No log, no recovery, gone forever.</strong> Built for test-cleanup. The Inventory Dept\'s deletion-request queue is unaffected.'
+    +'</div></div>';
+
+  // Step 1 — pick campaign
+  h += '<div class="bo-card" style="margin-bottom:16px"><div class="bo-card-head"><div class="bo-card-title">Step 1 · Pick a Campaign</div></div><div style="padding:14px 18px">';
+  h += '<div style="display:flex;flex-wrap:wrap;gap:8px">';
+  var campaigns = activeCampaigns().slice();
+  campaigns.push('Legacy');
+  campaigns.forEach(function(c){
+    var cfg = (c==='Legacy') ? {label:'Legacy (pre-campaign)', icon:'📦', color:'var(--muted)'} : campaignCfg(c);
+    if(!cfg) return;
+    var active = (s.campaign === c);
+    var poolSize = ownerInvDevicePool(c).length;
+    h += '<button onclick="ownerInvDeleteSetCampaign(\''+c+'\')" '
+       + 'style="padding:10px 16px;border:1.5px solid '+(active?'var(--red)':'var(--sand)')+';'
+       + 'background:'+(active?'rgba(204,0,0,.08)':'white')+';color:'+(active?'var(--red)':'var(--brown)')+';'
+       + 'font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1px;text-transform:uppercase;'
+       + 'border-radius:6px;cursor:pointer;font-weight:'+(active?'700':'500')+'">'
+       + (cfg.icon||'📦') + ' ' + (cfg.label||c) + ' <span style="opacity:.6">('+poolSize+')</span></button>';
+  });
+  h += '</div>';
+  h += '</div></div>';
+
+  if(!s.campaign){
+    h += '<div class="bo-card"><div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Pick a campaign above to start selecting devices to delete.</div></div>';
+    return h;
+  }
+
+  var pool = ownerInvDevicePool(s.campaign);
+  var selectedCount = Object.keys(s.selectedIds).length;
+
+  // Step 2 — selection mode tabs
+  h += '<div class="bo-card" style="margin-bottom:16px"><div class="bo-card-head"><div class="bo-card-title">Step 2 · Choose IMEIs / SIMs to Delete</div></div><div style="padding:14px 18px">';
+  h += '<div style="display:flex;gap:6px;margin-bottom:14px;border-bottom:1.5px solid var(--sand);padding-bottom:10px">';
+  ['list','paste','filter'].forEach(function(m){
+    var active = (s.mode === m);
+    var label = (m==='list') ? '☑️ Pick from List' : (m==='paste') ? '📋 Paste IMEIs/SIMs' : '🔍 Filter then Select All';
+    h += '<button onclick="ownerInvDeleteSetMode(\''+m+'\')" '
+       + 'style="padding:8px 14px;border:1.5px solid '+(active?'var(--blue)':'var(--sand)')+';'
+       + 'background:'+(active?'rgba(0,53,148,.08)':'white')+';color:'+(active?'var(--blue)':'var(--brown)')+';'
+       + 'font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1px;text-transform:uppercase;'
+       + 'border-radius:5px 5px 0 0;cursor:pointer;font-weight:'+(active?'700':'500')+'">'
+       + label + '</button>';
+  });
+  h += '</div>';
+
+  // Mode: LIST
+  if(s.mode === 'list'){
+    h += '<div style="display:grid;grid-template-columns:1fr 180px 200px;gap:8px;margin-bottom:12px">';
+    h += '<input type="text" placeholder="Search IMEI / SIM / holder name…" value="'+(s.searchQuery||'').replace(/"/g,'&quot;')+'" '
+       + 'oninput="OWNER_INV_DELETE.searchQuery=this.value;ownerInvDeleteRefreshList()" '
+       + 'style="padding:9px 12px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.85rem">';
+    h += '<select onchange="ownerInvDeleteUpdateFilter(\'status\',this.value)" '
+       + 'style="padding:9px 12px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;background:white">';
+    [{v:'all',l:'All statuses'},{v:'unassigned',l:'Unassigned'},{v:'assigned',l:'Assigned'},{v:'sold',l:'Sold'},{v:'activated',l:'Activated'}].forEach(function(o){
+      h += '<option value="'+o.v+'" '+(s.statusFilter===o.v?'selected':'')+'>'+o.l+'</option>';
+    });
+    h += '</select>';
+    // Holder filter — list of unique holders
+    var holderOptions = {};
+    pool.forEach(function(d){
+      var hid = d.holderId || d.assignedTo || d.mmId;
+      var hn  = d.assignedToName || d.mmName;
+      if(hid && hn) holderOptions[hid] = hn;
+    });
+    h += '<select onchange="ownerInvDeleteUpdateFilter(\'holder\',this.value)" '
+       + 'style="padding:9px 12px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;background:white">';
+    h += '<option value="all" '+(s.holderFilter==='all'?'selected':'')+'>All holders</option>';
+    Object.keys(holderOptions).sort(function(a,b){return holderOptions[a].localeCompare(holderOptions[b]);}).forEach(function(hid){
+      h += '<option value="'+hid+'" '+(String(s.holderFilter)===String(hid)?'selected':'')+'>'+holderOptions[hid]+'</option>';
+    });
+    h += '</select>';
+    h += '</div>';
+
+    var visible = ownerInvFilterDevices(pool);
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted)">'
+       + visible.length + ' device(s) shown · <strong style="color:var(--red)" id="ownerInvDelCount">'+selectedCount+'</strong> selected</div>';
+    h += '<div style="display:flex;gap:6px">';
+    h += '<button onclick="ownerInvDeleteSelectAllVisible()" style="padding:6px 12px;background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.3);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.7rem;border-radius:5px;cursor:pointer">Select All Visible</button>';
+    h += '<button onclick="ownerInvDeleteClearAll()" style="padding:6px 12px;background:rgba(204,0,0,.06);border:1px solid rgba(204,0,0,.25);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.7rem;border-radius:5px;cursor:pointer">Clear Selection</button>';
+    h += '</div></div>';
+
+    h += '<div style="max-height:340px;overflow-y:auto;border:1px solid var(--sand);border-radius:6px">';
+    if(!visible.length){
+      h += '<div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No devices match these filters.</div>';
+    } else {
+      h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+      h += '<thead><tr style="background:rgba(0,53,148,.05);position:sticky;top:0">'
+         + '<th style="padding:8px 10px;text-align:left;width:40px"></th>'
+         + '<th style="padding:8px 10px;text-align:left">IMEI</th>'
+         + '<th style="padding:8px 10px;text-align:left">SIM</th>'
+         + '<th style="padding:8px 10px;text-align:left">Status</th>'
+         + '<th style="padding:8px 10px;text-align:left">Held By</th>'
+         + '</tr></thead><tbody>';
+      visible.slice(0,500).forEach(function(d){
+        var checked = !!s.selectedIds[d.id];
+        var holder = d.assignedToName || d.mmName || '—';
+        h += '<tr style="border-top:1px solid #f0f0f0;'+(checked?'background:rgba(204,0,0,.04)':'')+'">'
+           + '<td style="padding:6px 10px"><input type="checkbox" '+(checked?'checked':'')+' onchange="ownerInvDeleteToggle(\''+d.id+'\')"></td>'
+           + '<td style="padding:6px 10px;font-family:monospace;font-size:.75rem">'+(d.imei||'—')+'</td>'
+           + '<td style="padding:6px 10px;font-family:monospace;font-size:.75rem">'+(d.sim||'—')+'</td>'
+           + '<td style="padding:6px 10px">'+(d.status||'unassigned')+'</td>'
+           + '<td style="padding:6px 10px">'+holder+'</td>'
+           + '</tr>';
+      });
+      h += '</tbody></table>';
+      if(visible.length > 500){
+        h += '<div style="padding:10px;background:rgba(217,119,6,.08);text-align:center;color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem">Showing first 500 of '+visible.length+'. Narrow your filters to see more.</div>';
+      }
+    }
+    h += '</div>';
+  }
+
+  // Mode: PASTE
+  if(s.mode === 'paste'){
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:8px">Paste IMEIs and/or SIMs (one per line). Matches will be added to your current selection. Already-selected devices stay selected.</div>';
+    h += '<textarea oninput="OWNER_INV_DELETE.pasteText=this.value" rows="12" '
+       + 'placeholder="123456789012345&#10;234567890123456&#10;345678901234567" '
+       + 'style="width:100%;padding:12px;border:1.5px solid var(--sand);border-radius:6px;font-family:monospace;font-size:.85rem;resize:vertical">'
+       + (s.pasteText||'').replace(/</g,'&lt;')
+       + '</textarea>';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted)"><strong style="color:var(--red)">'+selectedCount+'</strong> currently selected (across all modes)</div>';
+    h += '<div style="display:flex;gap:6px">';
+    h += '<button onclick="ownerInvDeleteApplyPasted()" class="btn-fire" style="padding:8px 18px;font-size:.76rem">Match & Add to Selection</button>';
+    h += '<button onclick="ownerInvDeleteClearAll()" style="padding:8px 14px;background:rgba(204,0,0,.06);border:1px solid rgba(204,0,0,.25);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.72rem;border-radius:5px;cursor:pointer">Clear Selection</button>';
+    h += '</div></div>';
+  }
+
+  // Mode: FILTER (preview-then-select-all)
+  if(s.mode === 'filter'){
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:10px">Apply filters; preview the matching devices below. Then click <strong>Select All Matching</strong> to mark them for deletion.</div>';
+    h += '<div style="display:grid;grid-template-columns:1fr 200px;gap:8px;margin-bottom:12px">';
+    h += '<select onchange="ownerInvDeleteUpdateFilter(\'status\',this.value)" '
+       + 'style="padding:9px 12px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;background:white">';
+    [{v:'all',l:'All statuses'},{v:'unassigned',l:'Unassigned only'},{v:'assigned',l:'Assigned only'},{v:'sold',l:'Sold only'},{v:'activated',l:'Activated only'}].forEach(function(o){
+      h += '<option value="'+o.v+'" '+(s.statusFilter===o.v?'selected':'')+'>'+o.l+'</option>';
+    });
+    h += '</select>';
+    var holderOptions = {};
+    pool.forEach(function(d){
+      var hid = d.holderId || d.assignedTo || d.mmId;
+      var hn  = d.assignedToName || d.mmName;
+      if(hid && hn) holderOptions[hid] = hn;
+    });
+    h += '<select onchange="ownerInvDeleteUpdateFilter(\'holder\',this.value)" '
+       + 'style="padding:9px 12px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;background:white">';
+    h += '<option value="all" '+(s.holderFilter==='all'?'selected':'')+'>All holders</option>';
+    Object.keys(holderOptions).sort(function(a,b){return holderOptions[a].localeCompare(holderOptions[b]);}).forEach(function(hid){
+      h += '<option value="'+hid+'" '+(String(s.holderFilter)===String(hid)?'selected':'')+'>'+holderOptions[hid]+'</option>';
+    });
+    h += '</select>';
+    h += '</div>';
+
+    var visible = ownerInvFilterDevices(pool);
+    h += '<div style="background:rgba(0,53,148,.05);padding:10px 14px;border-radius:6px;margin-bottom:10px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'
+       + '<strong>'+visible.length+' device(s)</strong> match these filters.'
+       + ' Click below to add ALL of them to your selection.'
+       + '</div>';
+    h += '<button onclick="ownerInvDeleteSelectAllVisible()" class="btn-fire" '+(visible.length?'':'disabled')+' style="padding:9px 22px;'+(visible.length?'':'opacity:.5;cursor:not-allowed')+'">Select All '+visible.length+' Matching</button>';
+    h += ' <button onclick="ownerInvDeleteClearAll()" style="margin-left:8px;padding:9px 16px;background:rgba(204,0,0,.06);border:1px solid rgba(204,0,0,.25);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.74rem;border-radius:5px;cursor:pointer">Clear Selection</button>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-top:10px"><strong style="color:var(--red)">'+selectedCount+'</strong> currently selected (across all modes)</div>';
+  }
+  h += '</div></div>';
+
+  // Feedback area
+  if(s.feedback){
+    h += '<div style="background:rgba(0,53,148,.05);border:1px solid rgba(0,53,148,.2);border-radius:6px;padding:12px 16px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+s.feedback+'</div>';
+  }
+
+  // Step 3 — confirm + delete
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Step 3 · Confirm & Delete</div></div><div style="padding:14px 18px">';
+  if(!selectedCount){
+    h += '<div style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem">Select at least one device above before you can delete.</div>';
+  } else {
+    h += '<div style="background:rgba(204,0,0,.06);border:1.5px solid rgba(204,0,0,.3);border-radius:8px;padding:14px 18px;margin-bottom:12px">'
+       + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;color:var(--red);letter-spacing:2px;margin-bottom:6px">⚠ '+selectedCount+' DEVICE'+(selectedCount===1?'':'S')+' WILL BE PERMANENTLY DELETED</div>'
+       + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.76rem;color:var(--brown);line-height:1.5">From: <strong>'+s.campaign+'</strong> · No backup will be kept · This action cannot be reversed</div>'
+       + '</div>';
+    h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">';
+    h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px">Type <strong style="color:var(--red);letter-spacing:2px">DELETE</strong> to confirm:</label>';
+    h += '<input type="text" id="ownerInvDelConfirm" placeholder="DELETE" autocomplete="off" '
+       + 'style="padding:10px 14px;border:2px solid var(--red);border-radius:6px;font-family:monospace;font-size:.95rem;letter-spacing:3px;text-transform:uppercase;width:160px;text-align:center">';
+    h += '<button onclick="ownerInvDeleteCommit()" '
+       + 'style="background:var(--red);border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.82rem;letter-spacing:2px;text-transform:uppercase;padding:11px 24px;border-radius:6px;cursor:pointer;font-weight:700">'
+       + '🗑 Hard Delete '+selectedCount+' Device'+(selectedCount===1?'':'s')+'</button>';
+    h += '</div>';
+  }
+  h += '</div></div>';
+
+  return h;
+}
+
+// In-place refresh for the device list (used when typing in search box —
+// avoids losing focus by NOT re-rendering the full panel)
+function ownerInvDeleteRefreshList(){
+  // Debounced, simple full re-render. Most users won't type fast enough
+  // to feel any lag, and this guarantees the count + filtered list match.
+  clearTimeout(window._ownerInvDelTimer);
+  window._ownerInvDelTimer = setTimeout(function(){
+    gotoPanel('owner-inv-delete');
+  }, 220);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  IBO DETECTION HELPERS (Calvin 2026-04-30)
+//
+//  An IBO (role:'IBO') is an independent business owner. Per Calvin's spec:
+//   - All sales go to the IBO (already handled by 'ibo-consolidated' cmModel
+//     in the GM engine; mirrored as 'ibo-consolidated' in the TC engine
+//     via the same routing rule)
+//   - All inventory stays under IBO unless transferred to a downline person
+//     they brought in (those people are real agent profiles in our system)
+//   - We NEVER pay anyone in an IBO's downline. Only the IBO is paid/charged.
+//   - Onboarding for IBO downline: BG check + agent codes ONLY.
+//     NO banking form, NO compensation agreement.
+//
+//  An IBO can have a CM, MM, TLs and Field Agents under them. They all get
+//  agent profiles for tracking/reporting/inventory but $0 from us.
+// ════════════════════════════════════════════════════════════════════════
+
+// Walk the upline chain from agentId looking for any agent with role:'IBO'.
+// Returns the IBO agent record if found, else null.
+//
+// Walks via: campaignManagerId → marketManagerId → teamLeaderId chain plus
+// also via team membership (LIFELINE_TEAMS.campaignManager) since some
+// agents have blank explicit fields and rely on team auto-derive.
+//
+// Cycle-safe (max depth 10).
+function agentIsUnderIBO(agentId){
+  if(!agentId || !DB || !DB.agents) return null;
+  var visited = {};
+  var current = DB.agents.find(function(a){return a.id===agentId;});
+  var depth = 0;
+  while(current && !visited[current.id] && depth < 10){
+    visited[current.id] = true;
+    if(current.role === 'IBO') return current;
+    depth++;
+    // Direct upline pointers (preferred — explicit data wins)
+    var nextId = current.campaignManagerId || current.marketManagerId || current.teamLeaderId || null;
+    // Fallback: walk via team membership
+    if(!nextId && typeof LIFELINE_TEAMS !== 'undefined' && Array.isArray(LIFELINE_TEAMS)){
+      var team = LIFELINE_TEAMS.find(function(t){
+        if(!t || !t.active) return false;
+        return Array.isArray(t.members) && t.members.indexOf(current.id) >= 0;
+      });
+      if(team){
+        nextId = team.campaignManager || team.marketManager || team.leader || null;
+      }
+    }
+    if(!nextId || nextId === current.id) break;
+    current = DB.agents.find(function(a){return a.id===nextId;});
+  }
+  return null;
+}
+
+// When an agent is set to role:'IBO', auto-apply the IBO comp models so
+// the engine handles them correctly without manual cmModel/tcModel toggling.
+// Idempotent: safe to call multiple times.
+function applyIboModelsIfIBO(agent){
+  if(!agent) return;
+  if(agent.role === 'IBO'){
+    // Use existing 'ibo-consolidated' string — this is the locked engine
+    // path that routes ALL deals to the IBO at IBO rates with full bonuses.
+    if(agent.cmModel !== 'ibo-consolidated') agent.cmModel = 'ibo-consolidated';
+    // TC mirror: 'tc-cm-consolidated' is Juan's existing TC model that
+    // routes ALL TC deals to him at $25 flat. Same rule, applied by role.
+    if(agent.tcModel !== 'tc-cm-consolidated') agent.tcModel = 'tc-cm-consolidated';
+  }
+}
+
+// Run once at app load and after agent edits — make sure all role:'IBO'
+// agents have correct comp models applied. Catches data drift.
+function syncIboModels(){
+  if(!DB || !DB.agents) return;
+  DB.agents.forEach(function(a){ applyIboModelsIfIBO(a); });
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  IBO DOWNLINE ONBOARDING PACKAGE (Calvin 2026-04-30)
+//
+//  Auto-seeded package for agents who fall under an IBO upline.
+//  Contains ONLY the BG-check preset (preset-bgcheck). No banking,
+//  no comp agreement, no W-9, no I-9.
+//
+//  Agent codes are managed elsewhere (panelAgentCodes), not in this
+//  onboarding flow, so they don't need to be in this package.
+// ════════════════════════════════════════════════════════════════════════
+var IBO_DOWNLINE_PACKAGE_ID = 'pkg-ibo-downline';
+
+function ensureIboDownlinePackage(){
+  if(typeof ONBOARD_PACKAGES === 'undefined' || !Array.isArray(ONBOARD_PACKAGES)) return;
+  var existing = ONBOARD_PACKAGES.find(function(p){return p.id===IBO_DOWNLINE_PACKAGE_ID;});
+  if(existing) return; // Already seeded — don't overwrite (Calvin may have customized)
+  var pkg = {
+    id:          IBO_DOWNLINE_PACKAGE_ID,
+    name:        'IBO Downline (BG Check Only — No Pay Docs)',
+    program:     'Universal',
+    templateIds: ['preset-bgcheck'],
+    notes:       'Auto-seeded package for agents under an IBO upline. WMAM does NOT pay these agents directly — the IBO does. Banking and compensation paperwork is intentionally excluded. The IBO handles all pay arrangements with their downline.',
+    isIboDownline: true,  // marker flag so UI can highlight + auto-suggest
+    autoSeeded:    true   // distinguishes from Calvin-created packages
+  };
+  ONBOARD_PACKAGES.push(pkg);
+  try { saveToStorage(); } catch(e){}
+}
+
 function panelSettings() {
   var u = DB.current;
   if(!u || !canAccess(u,'settings')){
@@ -15070,7 +15701,7 @@ function panelLLTeams() {
                   if(model === 'ibo-consolidated')
                     return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(217,119,6,.15);color:#D97706;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">⭐ IBO Consolidated → '+cm.name+'</div>';
                   if(model === 'ibo-tiered')
-                    return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(8,145,178,.15);color:#0891b2;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">📈 IBO Tiered → '+cm.name+'</div>';
+                    return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(8,145,178,.15);color:#0891b2;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">📈 Stephanie-Flat → '+cm.name+'</div>';
                   if(model === 'cm-difference')
                     return '<div style="margin-top:5px;display:inline-block;padding:2px 8px;border-radius:100px;background:rgba(124,58,237,.15);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;font-weight:700">💵 Difference Override → '+cm.name+'</div>';
                   if(model === 'cm-oklahoma')
@@ -15285,7 +15916,7 @@ function etRefreshCMBadge(){
     color = '#D97706'; icon = '⭐'; label = 'IBO Consolidated';
     desc = 'ALL activations in this market route 100% to '+agent.name+' at $13 NLAD flat / $29-$34 sliding Tribal + bonuses. Other agents get $0 from company.';
   } else if(model === 'ibo-tiered'){
-    color = '#0891b2'; icon = '📈'; label = 'IBO Tiered';
+    color = '#0891b2'; icon = '📈'; label = 'Stephanie-Flat';
     desc = 'Agents in this market earn flat $8 NLAD / $20 Tribal. '+agent.name+' keeps the difference at $13 NLAD / $29-$34 market-tier Tribal + own bonuses.';
   } else if(model === 'cm-difference'){
     color = '#7c3aed'; icon = '💵'; label = 'CM Difference Override';
@@ -17403,6 +18034,7 @@ function gotoPanel(id, params){
     agents:'Manage Agents','ll-teams':'Markets',
     'team-photos':'Team Photos',reports:'Reports',alerts:'Alerts',
     settings:'Settings','owner-control':'Owner Control Panel',
+    'owner-inv-delete':'Owner: Inventory Delete (Test Cleanup)',
     'agent-profile':'My Profile',
     'my-documents':'My Documents & Tasks',
     'campaign-docs':'Campaign Document Manager',
@@ -17442,6 +18074,7 @@ function gotoPanel(id, params){
     alerts:panelAlerts,settings:panelSettings,
     'agent-profile':panelAgentProfile,
     'owner-control':panelOwnerControl,
+    'owner-inv-delete':panelOwnerInvDelete,
     'payroll-upload':panelPayrollUpload,
     'payroll-upload-detect':panelPayrollUploadDetect,
     'payroll-upload-preview':panelPayrollUploadPreview,
@@ -19470,6 +20103,8 @@ function panelOwner(){
   invActions.forEach(function(qa){
     h += '<button onclick="gotoPanel(\'' + qa.panel + '\')" style="background:rgba(5,150,105,.07);border:1px solid rgba(5,150,105,.25);color:#059669;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1px;text-transform:uppercase;padding:9px 16px;border-radius:6px;cursor:pointer;display:flex;align-items:center;gap:6px">' + qa.icon + ' ' + qa.label + '</button>';
   });
+  // Owner-only direct delete tool (red-styled — destructive action)
+  h += '<button onclick="ownerInvDeleteReset();gotoPanel(\'owner-inv-delete\')" style="background:rgba(204,0,0,.06);border:1px solid rgba(204,0,0,.30);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1px;text-transform:uppercase;padding:9px 16px;border-radius:6px;cursor:pointer;display:flex;align-items:center;gap:6px">🗑 Delete Devices (Owner)</button>';
   h += '</div>';
 
   // Group 4: Admin / System
@@ -21763,9 +22398,10 @@ function panelOnboardPackages(){
       packagesForProg.forEach(function(pkg){
         var docCount = (pkg.templateIds||[]).length;
         var assignedCount = ONBOARD_ASSIGNMENTS.filter(function(a){return a.packageId===pkg.id;}).length;
-        h += '<div style="border:1px solid var(--border);border-radius:8px;padding:14px;background:#fafafa">'
+        var iboTag = pkg.isIboDownline ? '<span style="display:inline-block;padding:2px 8px;background:rgba(217,119,6,.15);color:#D97706;border-radius:100px;font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;margin-left:6px">🛡 IBO Downline</span>' : '';
+        h += '<div style="border:1px solid '+(pkg.isIboDownline?'rgba(217,119,6,.4)':'var(--border)')+';border-radius:8px;padding:14px;background:'+(pkg.isIboDownline?'rgba(217,119,6,.04)':'#fafafa')+'">'
           +'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px">'
-          +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;font-weight:700;color:var(--brown);line-height:1.3">'+pkg.name+'</div>'
+          +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;font-weight:700;color:var(--brown);line-height:1.3">'+pkg.name+iboTag+'</div>'
           +'</div>'
           +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-bottom:10px">'+docCount+' '+(docCount===1?'document':'documents')+' · '+assignedCount+' sent</div>'
           +'<div style="display:flex;gap:6px;flex-wrap:wrap">'
@@ -21900,7 +22536,7 @@ function panelOnboardAssign(){
 
   h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:6px">Pick an Agent</label>';
   h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
-  h += '<select id="obAssignAgent" style="flex:1;min-width:240px;padding:10px 14px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;background:white">';
+  h += '<select id="obAssignAgent" onchange="obCheckIboDownline()" style="flex:1;min-width:240px;padding:10px 14px;border:1.5px solid var(--sand);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;background:white">';
   h += '<option value="">— Select an agent —</option>';
   eligible.forEach(function(a){
     h += '<option value="'+a.id+'">'+a.name+' · '+a.role+(a.username?' ('+a.username+')':'')+'</option>';
@@ -21908,6 +22544,9 @@ function panelOnboardAssign(){
   h += '</select>';
   h += '<button onclick="obSendPacket()" class="btn-fire" style="padding:10px 22px">📤 Send Packet</button>';
   h += '</div>';
+
+  // Live IBO downline warning (populated by obCheckIboDownline)
+  h += '<div id="obIboWarning" style="margin-top:12px"></div>';
 
   if(!eligible.length){
     h += '<div style="margin-top:12px;padding:12px;background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.25);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown)">⚠️ No agents available — every active agent already has this package pending.</div>';
@@ -21924,6 +22563,79 @@ function panelOnboardAssign(){
   h += '</ol></div></div>';
 
   return h;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  IBO DOWNLINE DETECTION FOR ONBOARDING (Calvin 2026-04-30)
+//
+//  When Calvin picks an agent in panelOnboardAssign, this fires via
+//  the select's onchange and shows a warning if the agent is under an
+//  IBO upline. Offers a one-click swap to the auto-seeded "IBO Downline"
+//  package (BG check only — no banking, no comp agreement).
+//
+//  Calvin can ignore the warning and send the original package anyway.
+//  This is intentional — sometimes IBOs do want their downline to get
+//  full WMAM paperwork as a courtesy. The warning informs, doesn't block.
+// ════════════════════════════════════════════════════════════════════════
+function obCheckIboDownline(){
+  var sel = document.getElementById('obAssignAgent');
+  var warnEl = document.getElementById('obIboWarning');
+  if(!sel || !warnEl) return;
+  warnEl.innerHTML = '';
+  var agentId = parseInt(sel.value);
+  if(!agentId) return;
+  var agent = DB.agents.find(function(a){return a.id===agentId;});
+  if(!agent) return;
+  // Don't warn on the IBO themselves — they're the top, not downline
+  if(agent.role === 'IBO') return;
+  var ibo = (typeof agentIsUnderIBO === 'function') ? agentIsUnderIBO(agentId) : null;
+  if(!ibo) return;
+
+  // Detected IBO upline — show warning
+  var currentPkgId = window._obAssignPkgId;
+  var iboPkg = ONBOARD_PACKAGES.find(function(p){return p.id===IBO_DOWNLINE_PACKAGE_ID;});
+  var iboPkgName = iboPkg ? iboPkg.name : 'IBO Downline';
+  var alreadyOnIboPkg = (currentPkgId === IBO_DOWNLINE_PACKAGE_ID);
+
+  var html = '<div style="background:rgba(217,119,6,.08);border:1.5px solid rgba(217,119,6,.4);border-radius:8px;padding:14px 18px">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:#D97706;letter-spacing:1.5px;margin-bottom:6px">⚠ IBO DOWNLINE DETECTED</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5;margin-bottom:'+(alreadyOnIboPkg?'0':'10px')+'">'
+    +'<strong>'+agent.name+'</strong> is under <strong>'+ibo.name+'</strong> (IBO). Per company policy, WMAM does NOT pay agents under an IBO — '+ibo.name+' pays them directly. '
+    +'<strong>The standard onboarding packet (with banking + compensation paperwork) should NOT be sent to this agent.</strong>'
+    +'</div>';
+  if(!alreadyOnIboPkg){
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+      +'<button onclick="obSwitchToIboDownlinePackage()" style="background:#D97706;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 18px;border-radius:6px;cursor:pointer;font-weight:700">→ Switch to "'+iboPkgName+'" Package</button>'
+      +'<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">(BG check only · no pay docs)</span>'
+      +'</div>';
+  } else {
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:#059669;font-weight:700">✓ Already using "'+iboPkgName+'" package — safe to send.</div>';
+  }
+  html += '</div>';
+  warnEl.innerHTML = html;
+}
+
+// One-click switch to the IBO Downline package and re-render the panel
+function obSwitchToIboDownlinePackage(){
+  var iboPkg = ONBOARD_PACKAGES.find(function(p){return p.id===IBO_DOWNLINE_PACKAGE_ID;});
+  if(!iboPkg){
+    alert('IBO Downline package not found. It will be auto-seeded on next reload.');
+    if(typeof ensureIboDownlinePackage === 'function') ensureIboDownlinePackage();
+    return;
+  }
+  // Remember which agent was selected so the user doesn't lose it on re-render
+  var sel = document.getElementById('obAssignAgent');
+  window._obAssignKeepAgentId = sel ? sel.value : null;
+  window._obAssignPkgId = IBO_DOWNLINE_PACKAGE_ID;
+  gotoPanel('onboard-assign');
+  // Re-select the agent and re-fire the IBO check
+  setTimeout(function(){
+    if(window._obAssignKeepAgentId){
+      var sel2 = document.getElementById('obAssignAgent');
+      if(sel2){ sel2.value = window._obAssignKeepAgentId; obCheckIboDownline(); }
+      window._obAssignKeepAgentId = null;
+    }
+  }, 50);
 }
 
 // ── PANEL: AGENT SIGNATURE BLOCKING SCREEN ──
@@ -28138,7 +28850,7 @@ function patternLabel(code){
   if(!code || code === 'none') return '— No override —';
   var map = {
     'ibo-consolidated': '⭐ IBO Consolidated ($13 NLAD / sliding Tribal flat)',
-    'ibo-tiered':       '📈 IBO Tiered (Agents flat $8/$20, you keep diff)',
+    'ibo-tiered':       '📈 Stephanie Flat-Rate Override (Agents flat $8/$20, CM keeps diff)',
     'cm-difference':    '💵 CM Difference (max $13/$34 leftover per deal)',
     'cm-oklahoma':      '🌾 CM Oklahoma Hybrid (+$1 NLAD flat, $34 Tribal diff)',
     'tc-cm-difference': '💵 TC CM Difference (Tanita\'s pattern)',
@@ -38099,7 +38811,7 @@ function aaCMModelChanged(){
     desc = '<strong>IBO Consolidated:</strong> ALL activations from any market that lists me as Campaign Manager route 100% to me. I get $13 NLAD flat, $29-$34 sliding Tribal, +$1 email, +$5 BYOD. Other agents in those markets receive $0 from the company.';
   } else if(v === 'ibo-tiered'){
     color = '#0891b2'; icon = '📈';
-    desc = '<strong>IBO Tiered:</strong> Agents in my markets earn flat $8 NLAD / $20 Tribal. They keep their own bonuses. I get personal $13 NLAD / $29-$34 (sliding on market total) Tribal + my own bonuses, PLUS the difference on every agent enrollment.';
+    desc = '<strong>Stephanie Flat-Rate Override:</strong> Agents in my markets earn flat $8 NLAD / $20 Tribal. They keep their own bonuses. I get personal $13 NLAD / $29-$34 (sliding on market total) Tribal + my own bonuses, PLUS the difference on every agent enrollment. (Note: this is a CM-only model. IBOs use IBO Consolidated.)';
   } else if(v === 'cm-difference'){
     color = '#7c3aed'; icon = '💵';
     desc = '<strong>CM Difference Override:</strong> Agents in my markets earn standard sliding NLAD ($9/$11) and FLAT $24 Tribal. TL/MM get $1/each. I get max(0, $13 − everyone else paid) NLAD and max(0, $34 − everyone else paid) Tribal per enrollment. Personal deals: full $13/$34.';
