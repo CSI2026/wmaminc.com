@@ -6928,9 +6928,23 @@ function ppDetectCarriers(input){
     try{
       if(typeof XLSX !== 'undefined'){
         var wb = XLSX.read(ab, { type:'array' });
-        var hasTC = wb.SheetNames.some(function(n){return /TC\s*Pay\s*Summary/i.test(n);});
-        var hasInvoice = wb.SheetNames.some(function(n){return /^Invoice$/i.test(n);});
-        if(hasTC || hasInvoice){
+        // Recognize TC if ANY of the known sheets are present.
+        // A file might be activations-only (Pay Summary + Invoice), or
+        // deductions-only (Invoice + chargeback/aging tabs), or both.
+        var tcSheetPatterns = [
+          /TC\s*Pay\s*Summary/i,
+          /^\s*Invoice\s*$/i,
+          /TC\s*Cancels.*chargeback/i,
+          /14\s*day.*chargeback/i,
+          /TC\s*Aging.*Phone.*Deduct/i,
+          /TC\s*Aging.*Phone.*Credit/i,
+          /TC\s*Device\s*Upgrade/i,
+          /Port.*Spif/i
+        ];
+        var isTC = wb.SheetNames.some(function(n){
+          return tcSheetPatterns.some(function(rx){ return rx.test(n); });
+        });
+        if(isTC){
           var tc = parseTruConnectFile(ab);
           if(tc){
             detections.push({ carrier:'TruConnect', source:'xlsx', parsed:tc, confirmed:true,
@@ -7090,114 +7104,115 @@ function parseTruConnectFile(arrayBuffer){
   }
 
   // ── SHEET 2: TC Pay Summary — per-activation rows. ─────────────
+  // SOFT SKIP: if the file doesn't have a Pay Summary sheet (e.g., a
+  // deductions-only file with just Invoice + chargeback/aging tabs),
+  // we skip activation parsing and fall through to the deduction/credit
+  // parsers below. Files that contain ONLY deductions are valid inputs.
   var payName = wb.SheetNames.find(function(n){return /pay\s*summary/i.test(n);})
              || wb.SheetNames.find(function(n){return /summary/i.test(n);});
-  if(!payName){
-    result.errors.push('Could not find "TC Pay Summary" sheet in the file.');
-    return result;
-  }
-  var paySheet = wb.Sheets[payName];
-  var payData  = XLSX.utils.sheet_to_json(paySheet, {header:1, defval:''});
-  if(!payData.length){
-    result.errors.push('TC Pay Summary sheet is empty.');
-    return result;
-  }
+  if(payName){
+    var paySheet = wb.Sheets[payName];
+    var payData  = XLSX.utils.sheet_to_json(paySheet, {header:1, defval:''});
+    if(!payData.length){
+      result.errors.push('TC Pay Summary sheet "'+payName+'" is empty — skipping activation parsing.');
+    } else {
+      // Locate header row (contains "Agent Name").
+      var headerIdx = -1, headers = null;
+      for(var i=0; i<Math.min(10, payData.length); i++){
+        var r = payData[i];
+        if(r && r.some && r.some(function(c){return /Agent\s*Name/i.test(String(c));})){
+          headerIdx = i; headers = r.map(function(c){return String(c||'').trim();}); break;
+        }
+      }
+      if(headerIdx < 0){
+        result.errors.push('Could not find header row with "Agent Name" in TC Pay Summary — skipping activation parsing.');
+      } else {
+        // Map column indexes by header name (case/whitespace tolerant).
+        var colIdx = function(names){
+          for(var j=0; j<headers.length; j++){
+            var h = headers[j].toLowerCase();
+            for(var k=0; k<names.length; k++){
+              if(h === names[k].toLowerCase()) return j;
+            }
+          }
+          return -1;
+        };
+        var iDate       = colIdx(['Date']);
+        var iPersonId   = colIdx(['Person ID','PersonID']);
+        var iOrderNum   = colIdx(['Order DD: Order Number','Order Number']);
+        var iAgentName  = colIdx(['Agent Name']);
+        var iState      = colIdx(['State']);
+        var iRatePlan   = colIdx(['Rate Plan']);
+        var iTeamName   = colIdx(['Team Name']);
+        var iStatus     = colIdx(['Status']);
+        var iTribal     = colIdx(['Tribal']);
+        var iMyTcApp    = colIdx(['My TC App','MyTCApp']);
+        var iTcPlus     = colIdx(['TC Plus']);
+        var iIsoRate    = colIdx(['ISO Pay Rate','ISO Rate']);
+        var iTcPlusAmt  = headers.lastIndexOf ? headers.length - headers.slice().reverse().findIndex(function(h){return h.toLowerCase()==='tc plus';}) - 1 : -1;
+        // ^ 'TC Plus' appears twice in headers (boolean, then rate). Take the last occurrence for the rate.
+        var iTotal      = colIdx(['Total']);
 
-  // Locate header row (contains "Agent Name").
-  var headerIdx = -1, headers = null;
-  for(var i=0; i<Math.min(10, payData.length); i++){
-    var r = payData[i];
-    if(r && r.some && r.some(function(c){return /Agent\s*Name/i.test(String(c));})){
-      headerIdx = i; headers = r.map(function(c){return String(c||'').trim();}); break;
-    }
-  }
-  if(headerIdx < 0){
-    result.errors.push('Could not find header row with "Agent Name" in TC Pay Summary.');
-    return result;
-  }
+        if(iAgentName < 0){
+          result.errors.push('TC Pay Summary is missing "Agent Name" column — skipping activation parsing.');
+        } else {
+          // Aggregate rows by Agent Name (the TC code field will match this string).
+          payData.slice(headerIdx+1).forEach(function(r){
+            if(!r || !r.length) return;
+            var name = String(r[iAgentName]||'').trim();
+            if(!name) return;
+            // Skip accidental blank/summary rows.
+            if(/^total/i.test(name)) return;
 
-  // Map column indexes by header name (case/whitespace tolerant).
-  function colIdx(names){
-    for(var j=0; j<headers.length; j++){
-      var h = headers[j].toLowerCase();
-      for(var k=0; k<names.length; k++){
-        if(h === names[k].toLowerCase()) return j;
+            if(!result.rows[name]){
+              result.rows[name] = {
+                agentCode:   name,  // the TC "code" IS the agent name string in agentCodes.TruConnect
+                teamName:    String(r[iTeamName]||'').trim(),
+                state:       String(r[iState]||'').trim(),
+                activations: {
+                  Total:   0,   // count of activations
+                  Tribal:  0,   // count with Tribal=Y
+                  MyTcApp: 0,   // count with My TC App=Y
+                  TcPlus:  0    // count with TC Plus=Y
+                },
+                grossCents:  0,  // sum of ISO Pay Rate + TC Plus rate from each row (pre-P&L use)
+                details:     [],
+                chargebacks: [],
+                chargebackTotal: 0
+              };
+            }
+            var row = result.rows[name];
+            row.activations.Total++;
+            if(/^Y(ES)?$/i.test(String(r[iTribal]||'').trim()))  row.activations.Tribal++;
+            if(/^Y(ES)?$/i.test(String(r[iMyTcApp]||'').trim())) row.activations.MyTcApp++;
+            if(/^Y(ES)?$/i.test(String(r[iTcPlus]||'').trim()))  row.activations.TcPlus++;
+
+            var iso = parseFloat(r[iIsoRate]) || 0;
+            var tcp = (iTcPlusAmt >= 0 && iTcPlusAmt !== iTcPlus) ? (parseFloat(r[iTcPlusAmt]) || 0) : 0;
+            var tot = parseFloat(r[iTotal]) || (iso + tcp);
+            row.grossCents += Math.round(tot * 100);
+
+            row.details.push({
+              date:      ppExcelDateToStr(r[iDate]),
+              personId:  String(r[iPersonId]||''),
+              orderNum:  String(r[iOrderNum]||''),
+              state:     String(r[iState]||''),
+              ratePlan:  String(r[iRatePlan]||''),
+              team:      String(r[iTeamName]||''),
+              tribal:    /^Y(ES)?$/i.test(String(r[iTribal]||'').trim()),
+              myTcApp:   /^Y(ES)?$/i.test(String(r[iMyTcApp]||'').trim()),
+              tcPlus:    /^Y(ES)?$/i.test(String(r[iTcPlus]||'').trim()),
+              isoRate:   iso,
+              tcPlusAmt: tcp,
+              total:     tot
+            });
+          });
+        }
       }
     }
-    return -1;
   }
-  var iDate       = colIdx(['Date']);
-  var iPersonId   = colIdx(['Person ID','PersonID']);
-  var iOrderNum   = colIdx(['Order DD: Order Number','Order Number']);
-  var iAgentName  = colIdx(['Agent Name']);
-  var iState      = colIdx(['State']);
-  var iRatePlan   = colIdx(['Rate Plan']);
-  var iTeamName   = colIdx(['Team Name']);
-  var iStatus     = colIdx(['Status']);
-  var iTribal     = colIdx(['Tribal']);
-  var iMyTcApp    = colIdx(['My TC App','MyTCApp']);
-  var iTcPlus     = colIdx(['TC Plus']);
-  var iIsoRate    = colIdx(['ISO Pay Rate','ISO Rate']);
-  var iTcPlusAmt  = headers.lastIndexOf ? headers.length - headers.slice().reverse().findIndex(function(h){return h.toLowerCase()==='tc plus';}) - 1 : -1;
-  // ^ 'TC Plus' appears twice in headers (boolean, then rate). Take the last occurrence for the rate.
-  var iTotal      = colIdx(['Total']);
-
-  if(iAgentName < 0){
-    result.errors.push('TC Pay Summary is missing "Agent Name" column.');
-    return result;
-  }
-
-  // Aggregate rows by Agent Name (the TC code field will match this string).
-  payData.slice(headerIdx+1).forEach(function(r){
-    if(!r || !r.length) return;
-    var name = String(r[iAgentName]||'').trim();
-    if(!name) return;
-    // Skip accidental blank/summary rows.
-    if(/^total/i.test(name)) return;
-
-    if(!result.rows[name]){
-      result.rows[name] = {
-        agentCode:   name,  // the TC "code" IS the agent name string in agentCodes.TruConnect
-        teamName:    String(r[iTeamName]||'').trim(),
-        state:       String(r[iState]||'').trim(),
-        activations: {
-          Total:   0,   // count of activations
-          Tribal:  0,   // count with Tribal=Y
-          MyTcApp: 0,   // count with My TC App=Y
-          TcPlus:  0    // count with TC Plus=Y
-        },
-        grossCents:  0,  // sum of ISO Pay Rate + TC Plus rate from each row (pre-P&L use)
-        details:     [],
-        chargebacks: [],
-        chargebackTotal: 0
-      };
-    }
-    var row = result.rows[name];
-    row.activations.Total++;
-    if(/^Y(ES)?$/i.test(String(r[iTribal]||'').trim()))  row.activations.Tribal++;
-    if(/^Y(ES)?$/i.test(String(r[iMyTcApp]||'').trim())) row.activations.MyTcApp++;
-    if(/^Y(ES)?$/i.test(String(r[iTcPlus]||'').trim()))  row.activations.TcPlus++;
-
-    var iso = parseFloat(r[iIsoRate]) || 0;
-    var tcp = (iTcPlusAmt >= 0 && iTcPlusAmt !== iTcPlus) ? (parseFloat(r[iTcPlusAmt]) || 0) : 0;
-    var tot = parseFloat(r[iTotal]) || (iso + tcp);
-    row.grossCents += Math.round(tot * 100);
-
-    row.details.push({
-      date:      ppExcelDateToStr(r[iDate]),
-      personId:  String(r[iPersonId]||''),
-      orderNum:  String(r[iOrderNum]||''),
-      state:     String(r[iState]||''),
-      ratePlan:  String(r[iRatePlan]||''),
-      team:      String(r[iTeamName]||''),
-      tribal:    /^Y(ES)?$/i.test(String(r[iTribal]||'').trim()),
-      myTcApp:   /^Y(ES)?$/i.test(String(r[iMyTcApp]||'').trim()),
-      tcPlus:    /^Y(ES)?$/i.test(String(r[iTcPlus]||'').trim()),
-      isoRate:   iso,
-      tcPlusAmt: tcp,
-      total:     tot
-    });
-  });
+  // (No else / no early return — flow continues to deduction & credit parsing
+  // below, which can run independently of TC Pay Summary presence.)
 
   // ── DEDUCTION & CREDIT TABS (Calvin 2026-04-30) ──────────────────
   //
@@ -7237,7 +7252,9 @@ function parseTruConnectFile(arrayBuffer){
   }
 
   // Helper: find column index by header-name patterns (returns -1 if missing)
-  function colIdx(headers, candidates){
+  // (Named colByPattern to avoid colliding with the inner colIdx defined inside
+  // the TC Pay Summary parser block above, which has a different signature.)
+  function colByPattern(headers, candidates){
     for(var i=0;i<headers.length;i++){
       for(var j=0;j<candidates.length;j++){
         if(new RegExp('^\\s*'+candidates[j]+'\\s*$','i').test(headers[i])) return i;
@@ -7269,11 +7286,11 @@ function parseTruConnectFile(arrayBuffer){
     if(cancelSheet){
       var hdr = findHeaderRow(cancelSheet.data, /agent.*name|order|tribal/i);
       if(hdr){
-        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colIdx(hdr.headers, ['Date','Activation Date','Cancel Date']);
-        var iTribal= colIdx(hdr.headers, ['Tribal']);
-        var iRatePlan = colIdx(hdr.headers, ['Rate Plan','RatePlan']);
+        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colByPattern(hdr.headers, ['Date','Activation Date','Cancel Date']);
+        var iTribal= colByPattern(hdr.headers, ['Tribal']);
+        var iRatePlan = colByPattern(hdr.headers, ['Rate Plan','RatePlan']);
         cancelSheet.data.slice(hdr.idx+1).forEach(function(r){
           if(!r || !r.length) return;
           var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
@@ -7312,12 +7329,12 @@ function parseTruConnectFile(arrayBuffer){
     if(agingDed){
       var hdr = findHeaderRow(agingDed.data, /agent.*name|amount|cost/i);
       if(hdr){
-        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iAmt   = colIdx(hdr.headers, ['Amount','Cost','Deduction','Charge']);
-        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colIdx(hdr.headers, ['Date','Deduction Date']);
-        var iIMEI  = colIdx(hdr.headers, ['IMEI','Device IMEI','Serial']);
-        var iModel = colIdx(hdr.headers, ['Model','Device','Phone Model']);
+        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iAmt   = colByPattern(hdr.headers, ['Amount','Cost','Deduction','Charge']);
+        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colByPattern(hdr.headers, ['Date','Deduction Date']);
+        var iIMEI  = colByPattern(hdr.headers, ['IMEI','Device IMEI','Serial']);
+        var iModel = colByPattern(hdr.headers, ['Model','Device','Phone Model']);
         agingDed.data.slice(hdr.idx+1).forEach(function(r){
           if(!r || !r.length) return;
           var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
@@ -7353,12 +7370,12 @@ function parseTruConnectFile(arrayBuffer){
     if(devUpg){
       var hdr = findHeaderRow(devUpg.data, /agent.*name|amount|upgrade/i);
       if(hdr){
-        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iAmt   = colIdx(hdr.headers, ['Amount','Cost','Upgrade Cost','Charge']);
-        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colIdx(hdr.headers, ['Date','Upgrade Date']);
-        var iIMEI  = colIdx(hdr.headers, ['IMEI','Device IMEI','Serial']);
-        var iModel = colIdx(hdr.headers, ['Model','Device','Phone Model']);
+        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iAmt   = colByPattern(hdr.headers, ['Amount','Cost','Upgrade Cost','Charge']);
+        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colByPattern(hdr.headers, ['Date','Upgrade Date']);
+        var iIMEI  = colByPattern(hdr.headers, ['IMEI','Device IMEI','Serial']);
+        var iModel = colByPattern(hdr.headers, ['Model','Device','Phone Model']);
         devUpg.data.slice(hdr.idx+1).forEach(function(r){
           if(!r || !r.length) return;
           var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
@@ -7394,9 +7411,9 @@ function parseTruConnectFile(arrayBuffer){
     if(portSheet){
       var hdr = findHeaderRow(portSheet.data, /agent.*name|order/i);
       if(hdr){
-        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colIdx(hdr.headers, ['Date']);
+        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colByPattern(hdr.headers, ['Date']);
         portSheet.data.slice(hdr.idx+1).forEach(function(r){
           if(!r || !r.length) return;
           var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
@@ -7428,11 +7445,11 @@ function parseTruConnectFile(arrayBuffer){
     if(agingCred){
       var hdr = findHeaderRow(agingCred.data, /agent.*name|amount|credit/i);
       if(hdr){
-        var iAgent = colIdx(hdr.headers, ['Agent Name','Agent','ISO Name']);
-        var iAmt   = colIdx(hdr.headers, ['Amount','Cost','Credit','Refund']);
-        var iOrder = colIdx(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
-        var iDate  = colIdx(hdr.headers, ['Date','Credit Date']);
-        var iIMEI  = colIdx(hdr.headers, ['IMEI','Device IMEI','Serial']);
+        var iAgent = colByPattern(hdr.headers, ['Agent Name','Agent','ISO Name']);
+        var iAmt   = colByPattern(hdr.headers, ['Amount','Cost','Credit','Refund']);
+        var iOrder = colByPattern(hdr.headers, ['Order Number','Order #','OrderNum','Order']);
+        var iDate  = colByPattern(hdr.headers, ['Date','Credit Date']);
+        var iIMEI  = colByPattern(hdr.headers, ['IMEI','Device IMEI','Serial']);
         agingCred.data.slice(hdr.idx+1).forEach(function(r){
           if(!r || !r.length) return;
           var name = iAgent>=0 ? String(r[iAgent]||'').trim() : '';
