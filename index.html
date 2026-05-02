@@ -34396,8 +34396,12 @@ function migrateLifelineTeamsToMarkets(){
   try {
     if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return 0;
     var migrated = 0;
+    // Build a map: oldLegacyId → newMarketsId so we can rewrite agent.team
+    // values in a second pass.
+    var idMap = {};
     LIFELINE_TEAMS.forEach(function(t){
       if(!t || !t.name) return;
+      var oldId = t.id; // string like 'team-tulsa-ok'
       // Find existing MARKETS row by name (case-insensitive)
       var existing = (MARKETS||[]).find(function(m){
         return (m.name||'').toLowerCase().trim() === (t.name||'').toLowerCase().trim();
@@ -34409,25 +34413,26 @@ function migrateLifelineTeamsToMarkets(){
         if(!existing.city  && t.city)  existing.city  = t.city;
         if(!existing.state && t.state) existing.state = t.state;
         // Backfill legacyId so old agent.team='team-...' references resolve
-        if(!existing.legacyId && t.id) existing.legacyId = t.id;
+        if(!existing.legacyId && oldId) existing.legacyId = oldId;
         // If section has no placement and team had one, copy it in
         if(!ll.mmId && t.marketManager)   ll.mmId  = t.marketManager;
         if(!ll.cmId && t.campaignManager) ll.cmId  = t.campaignManager;
         if(!ll.tlIds.length && t.leader)  ll.tlIds = [t.leader];
         ll.active = true;
-        // Re-mirror to top-level
         ensureMarketSections(existing);
+        // Map: any agent whose team===oldId should be rewritten to market-N
+        if(oldId) idMap[oldId] = 'market-' + existing.id;
+        // Calvin 2026-05-02: Also rewrite the LIFELINE_TEAMS row's id to
+        // match the new MARKETS id format so legacy readers (notifications,
+        // team rooms, panelMyTeam) keep working with consistent ids.
+        t.id = 'market-' + existing.id;
         return;
       }
       // Create fresh MARKETS row
       var nextId = (typeof MARKET_NEXT_ID !== 'undefined') ? MARKET_NEXT_ID++ : ((MARKETS||[]).length + 1);
       var rec = {
         id: nextId,
-        // Calvin 2026-05-02: store the legacy LIFELINE_TEAMS id so existing
-        // agent records with team:'team-tulsa-ok' still resolve correctly
-        // after migration. Lookups (marketGetById, marketResolveByAnyRef)
-        // accept either the numeric id or the legacy string id.
-        legacyId: t.id || null,
+        legacyId: oldId || null,
         name: t.name,
         city: t.city || '',
         state: t.state || '',
@@ -34447,7 +34452,6 @@ function migrateLifelineTeamsToMarkets(){
           internet: _emptyProgramSection(),
           aca:      _emptyProgramSection()
         },
-        // legacy mirror (keep in sync via ensureMarketSections)
         topRole: 'cm',
         cmId: t.campaignManager || null,
         mmId: t.marketManager   || null,
@@ -34455,11 +34459,40 @@ function migrateLifelineTeamsToMarkets(){
         tlIds: t.leader ? [t.leader] : []
       };
       MARKETS.push(rec);
+      // Map oldId → new market-N for agent rewrite pass
+      if(oldId) idMap[oldId] = 'market-' + rec.id;
+      // Rewrite the LIFELINE_TEAMS row's id so legacy readers stay consistent
+      t.id = 'market-' + rec.id;
       migrated++;
     });
-    if(migrated > 0){
-      console.log('[migrateLifelineTeamsToMarkets] Migrated '+migrated+' team(s) into MARKETS.');
+
+    // ── Pass 2: rewrite agent.team values that point to legacy string ids ──
+    var agentsRewritten = 0;
+    if(DB && Array.isArray(DB.agents) && Object.keys(idMap).length){
+      DB.agents.forEach(function(a){
+        if(!a) return;
+        if(a.team && idMap[a.team]){
+          a.team = idMap[a.team];
+          agentsRewritten++;
+        }
+      });
+    }
+
+    // ── Pass 3: rewrite TEAM_MSGS keys (team rooms) so messages stay attached ──
+    if(typeof TEAM_MSGS === 'object' && TEAM_MSGS && Object.keys(idMap).length){
+      Object.keys(idMap).forEach(function(oldId){
+        if(TEAM_MSGS.hasOwnProperty(oldId)){
+          var newId = idMap[oldId];
+          if(!TEAM_MSGS[newId]) TEAM_MSGS[newId] = TEAM_MSGS[oldId];
+          delete TEAM_MSGS[oldId];
+        }
+      });
+    }
+
+    if(migrated > 0 || agentsRewritten > 0){
+      console.log('[migrateLifelineTeamsToMarkets] Migrated '+migrated+' team(s) into MARKETS, rewrote '+agentsRewritten+' agent placement(s).');
       if(typeof saveInventory === 'function') saveInventory();
+      if(typeof saveToStorage === 'function') saveToStorage();
     }
     // Always run section-ensurer on every existing market
     (MARKETS||[]).forEach(ensureMarketSections);
