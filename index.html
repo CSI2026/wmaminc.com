@@ -10990,6 +10990,35 @@ function agentIdsInMyOrgEffective(user){
 // Determine the effective "holder" of a device. Returns an agent ID, or
 // null if the device is genuinely unassigned (no recipient, no mm, no
 // assignedTo). This is what visibility uses to decide who sees the device.
+// ── Calvin 2026-05-02: union ALL inventory pools ──
+// Many dashboard/summary functions originally read only INVENTORY_DEVICES
+// (legacy pool). After campaign-specific pools (GM_INVENTORY, TC_INVENTORY,
+// AW_INVENTORY, EX_INVENTORY) were introduced, devices assigned through
+// the new flow live in those pools and were invisible to the legacy
+// readers — agents saw "0 devices" on their dashboard even after a
+// successful assignment. This helper returns the union so every reader
+// sees every device. Use this instead of INVENTORY_DEVICES directly when
+// you need to find devices by holder/status/etc.
+function unionAllInventoryPools(){
+  var out = [];
+  if(typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
+    for(var i=0;i<INVENTORY_DEVICES.length;i++) out.push(INVENTORY_DEVICES[i]);
+  }
+  if(typeof GM_INVENTORY !== 'undefined' && Array.isArray(GM_INVENTORY)){
+    for(var i=0;i<GM_INVENTORY.length;i++) out.push(GM_INVENTORY[i]);
+  }
+  if(typeof TC_INVENTORY !== 'undefined' && Array.isArray(TC_INVENTORY)){
+    for(var i=0;i<TC_INVENTORY.length;i++) out.push(TC_INVENTORY[i]);
+  }
+  if(typeof AW_INVENTORY !== 'undefined' && Array.isArray(AW_INVENTORY)){
+    for(var i=0;i<AW_INVENTORY.length;i++) out.push(AW_INVENTORY[i]);
+  }
+  if(typeof EX_INVENTORY !== 'undefined' && Array.isArray(EX_INVENTORY)){
+    for(var i=0;i<EX_INVENTORY.length;i++) out.push(EX_INVENTORY[i]);
+  }
+  return out;
+}
+
 function deviceHolderId(device){
   if(!device) return null;
   if(device.assignedTo)          return device.assignedTo;
@@ -17977,11 +18006,18 @@ function canIApprove(req){
 // Count agent current inventory for a specific carrier/campaign
 function agentInvCount(agentId, carrier, type){
   // type: 'phone','upsell','sim','tablet' or null for all
-  return INVENTORY_DEVICES.filter(function(d){
-    var matchAgent   = d.holderId===agentId && d.status==='assigned';
-    var matchCarrier = !carrier || (d.carrier||'').toLowerCase()===(carrier||'').toLowerCase();
+  // Calvin 2026-05-02: was reading only INVENTORY_DEVICES (legacy pool)
+  // and matching only holderId. After campaign-specific pools were added,
+  // devices assigned via invAssignCommit live in GM_INVENTORY etc. and
+  // use assignedTo. This now unions all pools and matches either holder.
+  return unionAllInventoryPools().filter(function(d){
+    var matchAgent   = (d.holderId===agentId || d.assignedTo===agentId)
+                       && (d.status==='assigned' || d.status==='activated');
+    if(!matchAgent) return false;
+    var devCarrier = d.carrier || d.campaign || '';
+    var matchCarrier = !carrier || devCarrier.toLowerCase()===(carrier||'').toLowerCase();
     var matchType    = !type || (d.type||'').toLowerCase()===(type||'').toLowerCase();
-    return matchAgent && matchCarrier && matchType;
+    return matchCarrier && matchType;
   }).length;
 }
 
@@ -18043,11 +18079,14 @@ function invExpiryBar(d){
 
 // Get inventory summary for an agent: {carrier: {phones, sims, upsell, tablets, expiringSoon}}
 function agentInvSummary(agentId){
+  // Calvin 2026-05-02: union all pools so devices assigned via the
+  // campaign-pool path (GM_INVENTORY etc.) also count.
   var summary = {};
-  INVENTORY_DEVICES.filter(function(d){
-    return d.holderId===agentId && d.status==='assigned';
+  unionAllInventoryPools().filter(function(d){
+    return (d.holderId===agentId || d.assignedTo===agentId)
+        && (d.status==='assigned' || d.status==='activated');
   }).forEach(function(d){
-    var c = d.carrier||'Unknown';
+    var c = d.carrier || d.campaign || 'Unknown';
     if(!summary[c]) summary[c]={phones:0,sims:0,upsell:0,tablets:0,expiringSoon:0,critical:0};
     var t = (d.type||'phone').toLowerCase();
     if(t==='phone')   summary[c].phones++;
@@ -18080,20 +18119,21 @@ function teamInvSummary(leaderId){
 
 // Find low-performer inventory to redistribute
 function findRedistributableInventory(campaign, excludeAgentId){
-  // Returns devices from low performers or expiring soon that can be transferred
+  // Calvin 2026-05-02: union all pools so campaign-pool devices are seen
   var carrier = campaign;
-  return INVENTORY_DEVICES.filter(function(d){
-    if(d.holderId===excludeAgentId) return false;
-    if(d.status!=='assigned') return false;
-    if((d.carrier||'').toLowerCase()!==(carrier||'').toLowerCase()) return false;
-    var holder = DB.agents.find(function(a){return a.id===d.holderId;});
+  return unionAllInventoryPools().filter(function(d){
+    var hid = d.holderId || d.assignedTo;
+    if(hid===excludeAgentId) return false;
+    if(d.status!=='assigned' && d.status!=='activated') return false;
+    var devCarrier = d.carrier || d.campaign || '';
+    if(devCarrier.toLowerCase()!==(carrier||'').toLowerCase()) return false;
+    var holder = DB.agents.find(function(a){return a.id===hid;});
     if(!holder||!holder.active) return false;
     var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
-    // Include if expiring in <=15 days OR holder has low sales
     var isExpiring = dr!==null && dr<=15;
     var isLowPerformer = (holder.sales||0) < 20;
     return isExpiring || isLowPerformer;
-  }).slice(0,30); // cap at 30
+  }).slice(0,30);
 }
 
 // Notify full approval chain for a request + SMS
@@ -18150,12 +18190,14 @@ function checkInventoryExpiryAlerts(){
   try{ if(localStorage.getItem(alertKey)) return; }catch(e){}
 
   var critical = [], warning = [];
-  INVENTORY_DEVICES.forEach(function(d){
+  // Calvin 2026-05-02: union all pools so alerts also fire for devices
+  // assigned via campaign-pool path (GM_INVENTORY etc.)
+  unionAllInventoryPools().forEach(function(d){
     if(d.status!=='assigned') return;
     var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
     if(dr===null) return;
-    // Filter to this manager's scope
-    var holder = DB.agents.find(function(a){return a.id===d.holderId;});
+    var hid = d.holderId || d.assignedTo;
+    var holder = DB.agents.find(function(a){return a.id===hid;});
     if(!holder) return;
     var inScope = isOwner(u)||isInventory(u)||
       holder.teamLeaderId===u.id||holder.marketManagerId===u.id||
