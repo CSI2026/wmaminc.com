@@ -1931,6 +1931,11 @@ function loadFromStorage(){
       window._ejsConfig = { pubKey: ejsP||'', serviceId: ejsS||'', templateId: ejsT||'' };
       if(ejsP && typeof emailjs !== 'undefined'){ try { emailjs.init(ejsP); } catch(e){} }
     }
+    // Calvin 2026-05-02: Run LIFELINE_TEAMS → MARKETS migration on every
+    // load. Idempotent — only adds rows that don't already exist by name.
+    if(typeof migrateLifelineTeamsToMarkets === 'function'){
+      migrateLifelineTeamsToMarkets();
+    }
   } catch(e){ console.warn('Storage load failed:', e); }
 
   // Calvin 2026-04-30: post-load IBO sync.
@@ -9210,7 +9215,25 @@ var COMPLETION_NEXT_ID = 1;
 //  Only entities that exist in the chain get notified. Gaps don't break
 //  the walk — we just skip and notify whoever's there.
 // ══════════════════════════════════════════════════════════════
-var MARKETS = [];           // [{id, name, cmId, mmId, iboId, tlIds:[], notes, active, createdAt, updatedAt}]
+// ── MARKETS (Calvin 2026-05-02 RESHAPE) ──
+// A market is a CITY/TERRITORY. Each market has three program sections —
+// Lifeline, Internet, ACA — with their own CM/MM/TL slots. Agents are
+// eligible for a section only if they work that program.
+//
+// Schema:
+//   {
+//     id, name, city, state, notes, active, createdAt, updatedAt,
+//     programs: {
+//       lifeline: { topRole:'cm'|'ibo', cmId, mmId, iboId, tlIds:[], active:bool },
+//       internet: { topRole:'cm'|'ibo', cmId, mmId, iboId, tlIds:[], active:bool },
+//       aca:      { topRole:'cm'|'ibo', cmId, mmId, iboId, tlIds:[], active:bool }
+//     }
+//   }
+//
+// Legacy top-level cmId/mmId/iboId/tlIds also kept on each record for
+// back-compat with code that hasn't been re-pointed yet — those mirror
+// the LIFELINE program section so old callers keep working.
+var MARKETS = [];
 var MARKET_NEXT_ID = 1;
 
 var CODED_CAMPAIGNS = ['Gen Mobile','TruConnect','Assurance','Excess','Chuzo','Astound','ACA'];
@@ -11830,6 +11853,10 @@ async function loadFromSupabase(){
     // Seed defaults if empty
     if(DB.agents.length === 0){ await seedDefaultAgents();
       DB.agents.forEach(function(a){ normalizeAgentSales(a); }); }
+    // Calvin 2026-05-02: Run LIFELINE_TEAMS → MARKETS migration. Idempotent.
+    if(typeof migrateLifelineTeamsToMarkets === 'function'){
+      migrateLifelineTeamsToMarkets();
+    }
   } catch(e){
     console.warn('Supabase load failed, using local:', e);
     loadFromStorage();
@@ -17155,8 +17182,7 @@ function buildNav(u){
   if(canAccess(u,'agents')){
     var manageDrop = boDropBtn('agents','👤 Agents')
       +boDropBtn('applications','📋 Applications')
-      +boDropBtn('ll-teams','📍 LL Teams')
-      +(canAccess(u,'markets-admin') ? boDropBtn('markets-admin','🗺️ Markets Roster') : '')
+      +(canAccess(u,'markets-admin') ? boDropBtn('markets-admin','🗺️ Markets') : '')
       +(canAccess(u,'org-tree') ? boDropBtn('org-tree','🌳 Visual Org Tree') : '')
       +boDropBtn('reports','📊 Reports')
       +(canAccess(u,'agent-codes')   ? boDropBtn('agent-codes','🔑 Agent Codes')    : '')
@@ -18397,7 +18423,7 @@ function gotoPanel(id, params){
     'daily-audit':panelDailyAudit,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
-    agents:panelAgents,'ll-teams':panelLLTeams,
+    agents:panelAgents,'ll-teams':panelMarketsAdmin,
     'team-photos':panelTeamPhotos,reports:panelReports,
     alerts:panelAlerts,settings:panelSettings,
     'agent-profile':panelAgentProfile,
@@ -18855,7 +18881,7 @@ function panelBO(){
       }
       if(canAccess(u,'agents'))          hubCards.push({icon:'👤',label:'Agents',             desc:'View & edit agent profiles',    panel:'agents',       color:'#003594'});
       if(canAccess(u,'applications'))    hubCards.push({icon:'📥',label:'Applications',       desc:'Incoming candidate applications',panel:'applications', color:'#059669'});
-      if(canAccess(u,'ll-teams'))        hubCards.push({icon:'📍',label:'Markets',            desc:'Create & manage markets',        panel:'ll-teams',     color:'#D97706'});
+      if(canAccess(u,'markets-admin'))   hubCards.push({icon:'🗺️',label:'Markets',            desc:'Create & manage markets',        panel:'markets-admin',     color:'#D97706'});
       if(canAccess(u,'reports'))         hubCards.push({icon:'📊',label:'Reports',            desc:'Sales and activity reports',     panel:'reports',      color:'#7c3aed'});
       if(canAccess(u,'campaign-docs'))   hubCards.push({icon:'📄',label:'Campaign Documents', desc:'Per-campaign docs for agents',   panel:'campaign-docs',color:'#059669'});
 
@@ -20355,7 +20381,7 @@ function panelOwner(){
   var stats = [
     {label:'Sales Agents',      val:salesActive.length, sub:inactive.length+' inactive',    color:'var(--blue)',  panel:'agents'},
     {label:'Total Enrollments', val:totalSales,          sub:'All programs',                 color:'var(--red)',   panel:'reports'},
-    {label:'Active Teams',      val:activeTeams.length,  sub:LIFELINE_TEAMS.length+' total', color:'var(--blue)',  panel:'ll-teams'},
+    {label:'Active Markets',    val:(typeof marketActiveList==='function'?marketActiveList().length:0), sub:(MARKETS||[]).length+' total', color:'var(--blue)',  panel:'markets-admin'},
     {label:'Managers',          val:managers.length,     sub:leaders.length+' team leaders', color:'var(--blue)',  panel:'agents'},
     {label:'Lifeline',          val:llSales,             sub:llAgents.length+' agents',      color:'#059669',      panel:'lb'},
     {label:'Internet',          val:intSales,            sub:intAgents.length+' agents',     color:'#2563eb',      panel:'lb'},
@@ -20391,7 +20417,7 @@ function panelOwner(){
   h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">';
   var peopleActions = [
     {panel:'agents',      icon:'👥', label:'Manage Agents'},
-    {panel:'ll-teams',    icon:'📍', label:'Markets'},
+    {panel:'markets-admin',icon:'🗺️',label:'Markets'},
     {panel:'myteam',      icon:'🤝', label:'My Team'},
     {panel:'team-photos', icon:'📸', label:'Team Photos'},
     {panel:'recruit-tracker',icon:'🎯',label:'Recruit Tracker'},
@@ -34286,37 +34312,179 @@ function marketActiveList(){
   } catch(e){ return []; }
 }
 
-// ── Calvin 2026-05-02: market liveness ──
-// A market's status reflects whether it has someone to receive inventory:
-//   'live'     — has an MM. Inventory flows directly to them.
-//   'partial'  — has a CM or IBO but no MM. Inventory falls back to CM/IBO.
-//   'inactive' — no MM, no CM, no IBO. Needs setup before it can receive.
-// The market stays in dropdowns regardless; this just drives a status
-// badge on the Markets Roster + an upload-time fallback chain.
-function marketLiveStatus(market){
-  if(!market) return 'inactive';
-  if(market.mmId)  return 'live';
-  if(market.cmId)  return 'partial';
-  if(market.iboId) return 'partial';
+// ── Calvin 2026-05-02: Program-aware market helpers ──
+// Each market has three program sections (lifeline / internet / aca).
+// These helpers walk the section structure consistently.
+
+// Default empty program section
+function _emptyProgramSection(){
+  return { topRole: 'cm', cmId: null, mmId: null, iboId: null, tlIds: [], active: false };
+}
+
+// Ensure a market has the program-section structure. Mutates if needed.
+// Mirrors top-level legacy fields into the lifeline section so old code
+// keeps working until everything is re-pointed.
+function ensureMarketSections(m){
+  if(!m) return null;
+  if(!m.programs) m.programs = {};
+  ['lifeline','internet','aca'].forEach(function(p){
+    if(!m.programs[p]) m.programs[p] = _emptyProgramSection();
+    if(!Array.isArray(m.programs[p].tlIds)) m.programs[p].tlIds = [];
+  });
+  // First-time migration: if legacy top-level fields exist and lifeline
+  // section is empty, copy them in. (Old data was Lifeline-only.)
+  var ll = m.programs.lifeline;
+  var hasLegacy = (m.cmId || m.mmId || m.iboId || (Array.isArray(m.tlIds) && m.tlIds.length));
+  var llEmpty   = !ll.cmId && !ll.mmId && !ll.iboId && !ll.tlIds.length;
+  if(hasLegacy && llEmpty){
+    ll.topRole = m.topRole || (m.iboId ? 'ibo' : 'cm');
+    ll.cmId    = m.cmId    || null;
+    ll.mmId    = m.mmId    || null;
+    ll.iboId   = m.iboId   || null;
+    ll.tlIds   = Array.isArray(m.tlIds) ? m.tlIds.slice() : [];
+    ll.active  = true;
+  }
+  // Mirror lifeline section back into top-level fields so legacy callers
+  // continue to read placement correctly. Other sections (internet/aca)
+  // do NOT mirror up because the legacy fields can only hold one set.
+  m.cmId    = ll.cmId;
+  m.mmId    = ll.mmId;
+  m.iboId   = ll.iboId;
+  m.tlIds   = ll.tlIds.slice();
+  m.topRole = ll.topRole;
+  return m;
+}
+
+// Get a specific program's section. Always returns a section (creates if needed).
+function marketProgram(m, program){
+  if(!m) return _emptyProgramSection();
+  ensureMarketSections(m);
+  var key = (program||'').toLowerCase();
+  if(key === 'lifeline' || key === 'internet' || key === 'aca'){
+    return m.programs[key];
+  }
+  // Default to lifeline for legacy callers
+  return m.programs.lifeline;
+}
+
+// Liveness status of a SECTION:
+//   'live'     — has MM
+//   'partial'  — has CM/IBO but no MM
+//   'inactive' — no top placement at all
+function programSectionStatus(section){
+  if(!section || section.active === false) return 'inactive';
+  if(section.mmId) return 'live';
+  if(section.cmId || section.iboId) return 'partial';
   return 'inactive';
 }
 
-// Recipient resolver for a market — used by every "who gets this device?"
-// path. Order:
-//   1. Market Manager of this market
-//   2. Campaign Manager of this market
-//   3. IBO of this market
-//   4. null (caller must handle "no one to assign to")
-function marketResolveRecipient(market){
+// Liveness of a whole market: 'live' if any program section is live,
+// 'partial' if any has top-only, 'inactive' if none configured.
+function marketLiveStatus(market){
+  if(!market) return 'inactive';
+  ensureMarketSections(market);
+  var anyLive = false, anyPartial = false;
+  ['lifeline','internet','aca'].forEach(function(p){
+    var s = programSectionStatus(market.programs[p]);
+    if(s === 'live') anyLive = true;
+    else if(s === 'partial') anyPartial = true;
+  });
+  if(anyLive) return 'live';
+  if(anyPartial) return 'partial';
+  return 'inactive';
+}
+
+// Recipient resolver — walks MM → CM → IBO of a SPECIFIC program section.
+// Use this when routing program-specific inventory (e.g. Gen Mobile is
+// Lifeline; uploads should land with the Lifeline section's MM).
+function marketResolveRecipient(market, program){
   if(!market) return null;
+  ensureMarketSections(market);
+  var section = marketProgram(market, program || 'lifeline');
   function _agent(id){
     if(!id) return null;
     return (DB.agents||[]).find(function(a){ return a.id === id && a.active; }) || null;
   }
-  return _agent(market.mmId)
-      || _agent(market.cmId)
-      || _agent(market.iboId)
+  return _agent(section.mmId)
+      || _agent(section.cmId)
+      || _agent(section.iboId)
       || null;
+}
+
+// ── ONE-TIME LIFELINE_TEAMS → MARKETS MIGRATION ──
+// Calvin 2026-05-02: When LL Teams is removed, fold any seed/Supabase
+// LIFELINE_TEAMS data into MARKETS so nothing is lost. Idempotent —
+// safe to run on every load. Each LIFELINE_TEAMS row becomes a MARKETS
+// record with its placement landing in the LIFELINE program section.
+function migrateLifelineTeamsToMarkets(){
+  try {
+    if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return 0;
+    var migrated = 0;
+    LIFELINE_TEAMS.forEach(function(t){
+      if(!t || !t.name) return;
+      // Find existing MARKETS row by name (case-insensitive)
+      var existing = (MARKETS||[]).find(function(m){
+        return (m.name||'').toLowerCase().trim() === (t.name||'').toLowerCase().trim();
+      });
+      if(existing){
+        // Update if data missing
+        ensureMarketSections(existing);
+        var ll = existing.programs.lifeline;
+        if(!existing.city  && t.city)  existing.city  = t.city;
+        if(!existing.state && t.state) existing.state = t.state;
+        // If section has no placement and team had one, copy it in
+        if(!ll.mmId && t.marketManager)   ll.mmId  = t.marketManager;
+        if(!ll.cmId && t.campaignManager) ll.cmId  = t.campaignManager;
+        if(!ll.tlIds.length && t.leader)  ll.tlIds = [t.leader];
+        ll.active = true;
+        // Re-mirror to top-level
+        ensureMarketSections(existing);
+        return;
+      }
+      // Create fresh MARKETS row
+      var nextId = (typeof MARKET_NEXT_ID !== 'undefined') ? MARKET_NEXT_ID++ : ((MARKETS||[]).length + 1);
+      var rec = {
+        id: nextId,
+        name: t.name,
+        city: t.city || '',
+        state: t.state || '',
+        notes: '',
+        active: t.active !== false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        programs: {
+          lifeline: {
+            topRole: 'cm',
+            cmId: t.campaignManager || null,
+            mmId: t.marketManager   || null,
+            iboId: null,
+            tlIds: t.leader ? [t.leader] : [],
+            active: true
+          },
+          internet: _emptyProgramSection(),
+          aca:      _emptyProgramSection()
+        },
+        // legacy mirror (keep in sync via ensureMarketSections)
+        topRole: 'cm',
+        cmId: t.campaignManager || null,
+        mmId: t.marketManager   || null,
+        iboId: null,
+        tlIds: t.leader ? [t.leader] : []
+      };
+      MARKETS.push(rec);
+      migrated++;
+    });
+    if(migrated > 0){
+      console.log('[migrateLifelineTeamsToMarkets] Migrated '+migrated+' team(s) into MARKETS.');
+      if(typeof saveInventory === 'function') saveInventory();
+    }
+    // Always run section-ensurer on every existing market
+    (MARKETS||[]).forEach(ensureMarketSections);
+    return migrated;
+  } catch(e){
+    console.warn('[migrateLifelineTeamsToMarkets] failed:', e);
+    return 0;
+  }
 }
 
 function marketGetById(id){
@@ -34387,7 +34555,7 @@ function panelMarketsAdmin(){
     var h = panelHeader('🗺️ Markets Roster');
 
     h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
-    h += '<strong>Markets are positions, not people.</strong> Each market has a <strong>top role</strong> (CM <em>or</em> IBO — never both), one <strong>MM</strong>, and any number of <strong>TLs</strong>. Field Agents are placed under a TL via their own profile. Slots can be empty until you onboard someone — empty slots are fine. Single-market roles (MM, TL) only show in dropdowns if they\'re unplaced; CMs and IBOs can run multiple markets.';
+    h += '<strong>One market per city/territory. Three programs each.</strong> Each market runs <strong>Lifeline</strong>, <strong>Internet</strong>, and/or <strong>ACA</strong> — each program section has its own CM/MM/TLs (since they\'re different businesses). A market can be live in one program and dormant in another. Click <em>Edit</em> to manage all three sections in one place.';
     h += '</div>';
 
     h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">';
@@ -34405,70 +34573,81 @@ function panelMarketsAdmin(){
       if(b.active === false && a.active !== false) return -1;
       return (a.name||'').localeCompare(b.name||'');
     });
-    h += '<div class="bo-card" style="padding:0;overflow:hidden"><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">';
+    h += '<div class="bo-card" style="padding:0;overflow:hidden"><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
     h += '<thead><tr style="background:var(--cream);border-bottom:2px solid var(--sand)">';
-    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Market</th>';
-    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Top (CM/IBO)</th>';
-    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">MM</th>';
-    h += '<th style="padding:12px 14px;text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">TLs</th>';
-    h += '<th style="padding:12px 14px;text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Members</th>';
-    h += '<th style="padding:12px 14px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Status</th>';
-    h += '<th style="padding:12px 14px;text-align:right;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Actions</th>';
+    h += '<th style="padding:12px 14px;text-align:left;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Market</th>';
+    h += '<th style="padding:12px 10px;text-align:center;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:#0a3d91">📞 Lifeline</th>';
+    h += '<th style="padding:12px 10px;text-align:center;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:#0891b2">🌐 Internet</th>';
+    h += '<th style="padding:12px 10px;text-align:center;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:#dc2626">❤️ ACA</th>';
+    h += '<th style="padding:12px 14px;text-align:center;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Status</th>';
+    h += '<th style="padding:12px 14px;text-align:right;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Actions</th>';
     h += '</tr></thead><tbody>';
 
-    sorted.forEach(function(m){
-      var cm = m.cmId  ? (DB.agents||[]).find(function(a){ return a.id === m.cmId; })  : null;
-      var mm = m.mmId  ? (DB.agents||[]).find(function(a){ return a.id === m.mmId; })  : null;
-      var ibo= m.iboId ? (DB.agents||[]).find(function(a){ return a.id === m.iboId; }) : null;
-      var tlCount = (m.tlIds||[]).length;
-      // Members count = Field Agents whose teamLeaderId is one of this market's TLs
-      var memberCount = 0;
-      if(tlCount > 0){
-        memberCount = (DB.agents||[]).filter(function(a){
-          return a.active && a.role === 'Field Agent' && a.teamLeaderId && (m.tlIds||[]).indexOf(a.teamLeaderId) >= 0;
-        }).length;
-      }
-      var isActive = m.active !== false;
-      var liveStatus = (typeof marketLiveStatus === 'function') ? marketLiveStatus(m) : (m.mmId ? 'live' : 'inactive');
-      var rowOpacity = isActive ? '1' : '0.55';
-      // Top column: show whichever of CM/IBO is set; reflects topRole choice
-      var topCol;
-      if(m.topRole === 'ibo' || (!m.topRole && ibo)){
-        topCol = ibo ? _escapeHtml(ibo.name)+' <span style="color:var(--muted);font-size:.64rem">(IBO)</span>'
-                     : '<span style="color:var(--muted);font-style:italic;font-size:.74rem">— IBO slot empty —</span>';
+    function _agentName(id){
+      if(!id) return null;
+      var a = (DB.agents||[]).find(function(x){ return x.id === id; });
+      return a ? a.name : null;
+    }
+
+    function _renderProgramCell(m, programKey){
+      var s = marketProgram(m, programKey);
+      var status = programSectionStatus(s);
+      // Tiny stack of names with role tags
+      var top  = _agentName(s.iboId) ? _agentName(s.iboId) + ' (IBO)'
+               : _agentName(s.cmId)  ? _agentName(s.cmId)  + ' (CM)'
+               : null;
+      var mm   = _agentName(s.mmId);
+      var tlN  = (s.tlIds||[]).length;
+      // Indicator dot color
+      var dot = status === 'live'    ? '#15803d'
+              : status === 'partial' ? '#D97706'
+              :                        '#cbd5d1';
+      var html = '<div style="display:flex;align-items:center;gap:6px;justify-content:center"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+'"></span>';
+      if(status === 'inactive'){
+        html += '<span style="color:var(--muted);font-style:italic;font-size:.72rem">empty</span>';
       } else {
-        topCol = cm ? _escapeHtml(cm.name)+' <span style="color:var(--muted);font-size:.64rem">(CM)</span>'
-                    : '<span style="color:var(--muted);font-style:italic;font-size:.74rem">— CM slot empty —</span>';
+        var lines = [];
+        if(top) lines.push('<span style="color:var(--brown);font-size:.74rem;font-weight:700">'+_escapeHtml(top)+'</span>');
+        if(mm)  lines.push('<span style="color:var(--brown);font-size:.7rem">MM: '+_escapeHtml(mm)+'</span>');
+        if(tlN) lines.push('<span style="color:var(--muted);font-size:.66rem">'+tlN+' TL'+(tlN===1?'':'s')+'</span>');
+        if(!lines.length) lines.push('<span style="color:var(--muted);font-style:italic;font-size:.72rem">— no MM —</span>');
+        html += '<div style="display:flex;flex-direction:column;align-items:flex-start;gap:1px">'+lines.join('')+'</div>';
       }
-      var mmCol = mm ? _escapeHtml(mm.name)
-                     : '<span style="color:var(--muted);font-style:italic;font-size:.74rem">— empty —</span>';
+      html += '</div>';
+      return html;
+    }
+
+    sorted.forEach(function(m){
+      ensureMarketSections(m);
+      var isActive = m.active !== false;
+      var liveStatus = marketLiveStatus(m);
+      var rowOpacity = isActive ? '1' : '0.55';
 
       h += '<tr style="border-bottom:1px solid var(--sand);opacity:'+rowOpacity+'">';
-      // Market name with city/state subtitle
       var locSub = '';
       if(m.city || m.state){
-        locSub = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px">'+_escapeHtml((m.city||'') + (m.city&&m.state?', ':'') + (m.state||''))+'</div>';
+        locSub = '<div style="font-size:.7rem;color:var(--muted);margin-top:2px">'+_escapeHtml((m.city||'') + (m.city&&m.state?', ':'') + (m.state||''))+'</div>';
       }
-      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif"><strong>'+_escapeHtml(m.name||'—')+'</strong>'+locSub+'</td>';
-      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+topCol+'</td>';
-      h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+mmCol+'</td>';
-      h += '<td style="padding:10px 14px;text-align:center;font-family:Bebas Neue,sans-serif;font-size:1rem;color:'+(tlCount>0?'var(--brown)':'var(--muted)')+';letter-spacing:1px">'+tlCount+'</td>';
-      h += '<td style="padding:10px 14px;text-align:center;font-family:Bebas Neue,sans-serif;font-size:1rem;color:'+(memberCount>0?'var(--brown)':'var(--muted)')+';letter-spacing:1px">'+memberCount+'</td>';
-      // Status badge
+      h += '<td style="padding:10px 14px"><strong style="font-size:.86rem">'+_escapeHtml(m.name||'—')+'</strong>'+locSub+'</td>';
+      h += '<td style="padding:8px 10px">'+_renderProgramCell(m, 'lifeline')+'</td>';
+      h += '<td style="padding:8px 10px">'+_renderProgramCell(m, 'internet')+'</td>';
+      h += '<td style="padding:8px 10px">'+_renderProgramCell(m, 'aca')+'</td>';
+
+      // Overall market status
       var badgeBg, badgeFg, badgeText;
       if(!isActive){
         badgeBg = 'rgba(115,115,115,.12)'; badgeFg = 'var(--muted)'; badgeText = '⏸ paused';
       } else if(liveStatus === 'live'){
         badgeBg = 'rgba(20,83,45,.1)';  badgeFg = '#15803d'; badgeText = '✓ live';
       } else if(liveStatus === 'partial'){
-        badgeBg = 'rgba(217,119,6,.12)'; badgeFg = '#D97706'; badgeText = '⚠ no MM';
+        badgeBg = 'rgba(217,119,6,.12)'; badgeFg = '#D97706'; badgeText = '⚠ partial';
       } else {
         badgeBg = 'rgba(204,0,0,.1)';   badgeFg = 'var(--red)'; badgeText = '⚠ needs setup';
       }
-      h += '<td style="padding:10px 14px"><span title="'+(liveStatus==='partial'?'No Market Manager assigned — inventory falls back to CM/IBO':liveStatus==='inactive'?'No MM, CM, or IBO assigned — assign someone before this market can receive inventory':'')+'" style="background:'+badgeBg+';color:'+badgeFg+';font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:4px;font-weight:700;white-space:nowrap">'+badgeText+'</span></td>';
+      h += '<td style="padding:10px 14px;text-align:center"><span style="background:'+badgeBg+';color:'+badgeFg+';font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:4px;font-weight:700;white-space:nowrap">'+badgeText+'</span></td>';
       h += '<td style="padding:10px 14px;text-align:right;white-space:nowrap">';
-      h += '<button onclick="marketEdit('+m.id+')" style="background:var(--blue);color:white;border:none;padding:5px 12px;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;margin-right:4px">Edit</button>';
-      h += '<button onclick="marketToggleActive('+m.id+')" style="background:white;color:var(--brown);border:1px solid var(--sand);padding:5px 12px;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">'+(isActive?'Pause':'Activate')+'</button>';
+      h += '<button onclick="marketEdit('+m.id+')" style="background:var(--blue);color:white;border:none;padding:5px 12px;border-radius:4px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;margin-right:4px">Edit</button>';
+      h += '<button onclick="marketToggleActive('+m.id+')" style="background:white;color:var(--brown);border:1px solid var(--sand);padding:5px 12px;border-radius:4px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">'+(isActive?'Pause':'Activate')+'</button>';
       h += '</td>';
       h += '</tr>';
     });
@@ -34476,21 +34655,25 @@ function panelMarketsAdmin(){
     return h;
   } catch(e){
     console.warn('[panelMarketsAdmin] failed safely:', e);
-    return panelHeader('🗺️ Markets Roster') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load.</div></div>';
+    return panelHeader('🗺️ Markets Roster') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load: '+_escapeHtml((e&&e.message)||'unknown')+'</div></div>';
   }
 }
 
 // ════════════════════════════════════════════════════════════════════════
-//  MARKET EDIT MODAL (Calvin 2026-05-02 REBUILD)
+//  MARKET EDIT MODAL (Calvin 2026-05-02 PROGRAM-AWARE REBUILD)
 //
-//  Design: a market is a STRUCTURE OF POSITIONS, not a list of people.
-//  Each market has slots: 1 top (CM OR IBO, mutually exclusive), 1 MM,
-//  N TLs. Field Agents are not slots — they are members via their own
-//  teamLeaderId pointing at a TL in this market.
+//  A market is a CITY/TERRITORY. Each market has three program sections —
+//  Lifeline, Internet, ACA — each with its own CM/MM/TL slots. The edit
+//  modal has 3 tabs (one per program) so admins manage all three in one
+//  place but they're cleanly separated.
 //
-//  Position dropdowns show only agents with the right role. Single-market
-//  roles (MM, TL) hide agents already placed on a DIFFERENT market.
-//  Multi-market roles (CM, IBO) show all eligible agents.
+//  Eligibility:
+//    • Single-market roles (MM, TL) — only show if agent is unplaced on
+//      that program in any other market. (Same person CAN be MM of
+//      Tulsa Lifeline AND MM of Tulsa Internet — different programs.)
+//    • Multi-market roles (CM, IBO) — always eligible.
+//    • All position dropdowns also filter by the agent's `programs` array
+//      — only show people who actually work that program.
 // ════════════════════════════════════════════════════════════════════════
 function marketEdit(id){
   try {
@@ -34498,137 +34681,59 @@ function marketEdit(id){
     if(!canManageMarkets(u)){ alert('Permission denied.'); return; }
     var m = id ? marketGetById(id) : null;
     var isNew = !m;
-    if(!m) m = { id: 0, name:'', city:'', state:'', cmId:null, mmId:null, iboId:null, tlIds:[], notes:'', active:true, topRole:'cm' };
-    // Default to 'cm' top role for legacy records that don't have one
-    if(!m.topRole) m.topRole = m.iboId ? 'ibo' : 'cm';
+    if(!m) m = { id: 0, name:'', city:'', state:'', notes:'', active:true, programs:{lifeline:_emptyProgramSection(),internet:_emptyProgramSection(),aca:_emptyProgramSection()} };
+    ensureMarketSections(m);
 
-    // ── Eligibility helpers ──
-    // Returns true if an agent of role X is "free" to be assigned to this
-    // market (or is already on this market).
-    // Single-market roles: MM, TL, FA  → must be unplaced or here already.
-    // Multi-market roles: CM, IBO       → always eligible.
-    function _isPlacedOnAnotherMarket(agentId, slot){
-      if(!agentId || !MARKETS) return false;
-      return MARKETS.some(function(other){
-        if(other.id === m.id) return false;
-        if(slot === 'mm' && other.mmId === agentId) return true;
-        if(slot === 'tl' && Array.isArray(other.tlIds) && other.tlIds.indexOf(agentId) >= 0) return true;
-        return false;
-      });
-    }
-    function eligibleAgents(slot){
-      var roleMatch;
-      if(slot === 'cm') roleMatch = 'Campaign Manager';
-      else if(slot === 'mm') roleMatch = 'Market Manager';
-      else if(slot === 'ibo') roleMatch = 'IBO';
-      else if(slot === 'tl') roleMatch = 'Team Leader';
-      else return [];
-      var pool = (DB.agents||[]).filter(function(a){
-        if(!a.active) return false;
-        if(a.role !== roleMatch) return false;
-        // For single-market roles, exclude anyone already placed on a different market
-        if(slot === 'mm' || slot === 'tl'){
-          if(_isPlacedOnAnotherMarket(a.id, slot)) return false;
-        }
-        return true;
-      }).sort(function(a,b){ return a.name.localeCompare(b.name); });
-      return pool;
-    }
-    function agentOptions(slot, selectedId){
-      var pool = eligibleAgents(slot);
-      var html = '<option value="">— pick a position holder —</option>';
-      pool.forEach(function(a){
-        html += '<option value="'+a.id+'"'+(selectedId===a.id?' selected':'')+'>'+_escapeHtml(a.name)+'</option>';
-      });
-      // If currently selected agent is somehow no longer eligible (e.g. role
-      // changed since this market was set up), still show them with a flag
-      if(selectedId && !pool.some(function(a){ return a.id === selectedId; })){
-        var stale = (DB.agents||[]).find(function(a){ return a.id === selectedId; });
-        if(stale){
-          html += '<option value="'+stale.id+'" selected>⚠ '+_escapeHtml(stale.name)+' (role changed — reassign or clear)</option>';
-        }
-      }
-      return html;
-    }
+    // Initialize working state — clone of programs for the modal session
+    window._meWorking = {
+      id: m.id,
+      name: m.name || '',
+      city: m.city || '',
+      state: m.state || '',
+      notes: m.notes || '',
+      active: m.active !== false,
+      programs: {
+        lifeline: Object.assign({}, m.programs.lifeline, { tlIds: (m.programs.lifeline.tlIds||[]).slice() }),
+        internet: Object.assign({}, m.programs.internet, { tlIds: (m.programs.internet.tlIds||[]).slice() }),
+        aca:      Object.assign({}, m.programs.aca,      { tlIds: (m.programs.aca.tlIds||[]).slice() })
+      },
+      activeTab: 'lifeline'
+    };
 
     var h = '';
-    h += '<div id="marketEditModal" style="position:fixed;inset:0;z-index:5000;background:rgba(0,0,0,0.5);display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto" onclick="if(event.target===this)marketEditCancel()">';
-    h += '<div style="background:white;border-radius:10px;max-width:680px;width:100%;padding:0;box-shadow:0 20px 60px rgba(0,0,0,.3)" onclick="event.stopPropagation()">';
+    h += '<div id="marketEditModal" style="position:fixed;inset:0;z-index:5000;background:rgba(0,0,0,0.5);display:flex;align-items:flex-start;justify-content:center;padding:30px 20px;overflow-y:auto" onclick="if(event.target===this)marketEditCancel()">';
+    h += '<div style="background:white;border-radius:10px;max-width:760px;width:100%;padding:0;box-shadow:0 20px 60px rgba(0,0,0,.3)" onclick="event.stopPropagation()">';
     h += '<div style="background:var(--brown);color:white;padding:14px 20px;border-radius:10px 10px 0 0;display:flex;justify-content:space-between;align-items:center">';
     h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px">'+(isNew?'+ New Market':'Edit Market: '+_escapeHtml(m.name))+'</div>';
     h += '<button onclick="marketEditCancel()" style="background:transparent;border:none;color:white;font-size:1.4rem;cursor:pointer;padding:0;line-height:1">&times;</button>';
     h += '</div>';
-    h += '<div style="padding:20px 24px">';
+    h += '<div style="padding:18px 22px">';
 
-    h += '<input type="hidden" id="meId" value="'+m.id+'">';
-
-    // Identity row: Name + City + State
-    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Market Name *</label>';
+    // Identity row
+    h += '<div class="f-field" style="margin-bottom:12px"><label class="f-label">Market Name *</label>';
     h += '<input id="meName" type="text" class="f-input" value="'+_escapeAttr(m.name)+'" placeholder="e.g., Tulsa OK, Dallas TX A, Houston-1"></div>';
 
-    h += '<div style="display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-bottom:18px">';
+    h += '<div style="display:grid;grid-template-columns:2fr 1fr;gap:10px;margin-bottom:14px">';
     h += '<div class="f-field" style="margin:0"><label class="f-label">City</label>';
-    h += '<input id="meCity" type="text" class="f-input" value="'+_escapeAttr(m.city||'')+'" placeholder="e.g., Tulsa"></div>';
+    h += '<input id="meCity" type="text" class="f-input" value="'+_escapeAttr(m.city||'')+'" placeholder="Tulsa"></div>';
     h += '<div class="f-field" style="margin:0"><label class="f-label">State</label>';
-    h += '<input id="meState" type="text" class="f-input" value="'+_escapeAttr(m.state||'')+'" placeholder="e.g., OK" maxlength="2" style="text-transform:uppercase"></div>';
+    h += '<input id="meState" type="text" class="f-input" value="'+_escapeAttr(m.state||'')+'" placeholder="OK" maxlength="2" style="text-transform:uppercase"></div>';
     h += '</div>';
 
-    // ── POSITIONS section ──
-    h += '<div style="background:var(--cream);border:1px solid var(--sand);border-radius:6px;padding:14px 16px;margin-bottom:14px">';
-    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;color:var(--brown);margin-bottom:10px">📍 POSITIONS</div>';
-    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-bottom:14px;line-height:1.5">Pick a person for each role. Leave blank to create the slot empty — assign later as you onboard people.</div>';
-
-    // Top role: CM OR IBO toggle
-    h += '<div class="f-field" style="margin-bottom:12px"><label class="f-label">Top Role *</label>';
-    h += '<div style="display:flex;gap:8px;margin-bottom:8px">';
-    h += '<label style="flex:1;display:flex;align-items:center;gap:6px;padding:8px 12px;background:white;border:2px solid '+(m.topRole==='cm'?'var(--blue)':'var(--sand)')+';border-radius:5px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.82rem"><input type="radio" name="meTopRole" value="cm" '+(m.topRole==='cm'?'checked':'')+' onchange="marketEditTopRole(\'cm\')"> Campaign Manager (CM)</label>';
-    h += '<label style="flex:1;display:flex;align-items:center;gap:6px;padding:8px 12px;background:white;border:2px solid '+(m.topRole==='ibo'?'var(--blue)':'var(--sand)')+';border-radius:5px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.82rem"><input type="radio" name="meTopRole" value="ibo" '+(m.topRole==='ibo'?'checked':'')+' onchange="marketEditTopRole(\'ibo\')"> IBO (Independent)</label>';
-    h += '</div>';
-    // Top role picker (CM or IBO depending on toggle)
-    h += '<div id="meTopHolder">';
-    if(m.topRole === 'ibo'){
-      h += '<select id="meIboId" class="f-input">'+agentOptions('ibo', m.iboId)+'</select>';
-      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">An IBO owns this market and can own multiple markets.</div>';
-    } else {
-      h += '<select id="meCmId" class="f-input">'+agentOptions('cm', m.cmId)+'</select>';
-      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">A CM oversees this market and can oversee multiple markets.</div>';
-    }
-    h += '</div>';
+    // Program tabs
+    h += '<div style="border-bottom:2px solid var(--sand);margin-bottom:14px;display:flex;gap:0">';
+    h += '<button id="meTab-lifeline" onclick="meSwitchTab(\'lifeline\')" type="button" class="me-tab me-tab-active" style="background:none;border:none;border-bottom:3px solid #0a3d91;color:#0a3d91;font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;padding:10px 18px;cursor:pointer;margin-bottom:-2px">📞 LIFELINE</button>';
+    h += '<button id="meTab-internet" onclick="meSwitchTab(\'internet\')" type="button" class="me-tab" style="background:none;border:none;border-bottom:3px solid transparent;color:var(--muted);font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;padding:10px 18px;cursor:pointer;margin-bottom:-2px">🌐 INTERNET</button>';
+    h += '<button id="meTab-aca" onclick="meSwitchTab(\'aca\')" type="button" class="me-tab" style="background:none;border:none;border-bottom:3px solid transparent;color:var(--muted);font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;padding:10px 18px;cursor:pointer;margin-bottom:-2px">❤️ ACA</button>';
     h += '</div>';
 
-    // MM (single market — eligible MMs only)
-    h += '<div class="f-field" style="margin-bottom:12px"><label class="f-label">Market Manager (MM)</label>';
-    h += '<select id="meMmId" class="f-input">'+agentOptions('mm', m.mmId)+'</select>';
-    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">Only MMs not already placed on another market are listed. An MM runs ONE market.</div>';
-    h += '</div>';
+    // Tab content
+    h += '<div id="meTabBody"></div>';
 
-    // TLs (single-market — eligible TLs only)
-    h += '<div class="f-field" style="margin:0"><label class="f-label">Team Leaders <span style="color:var(--muted);font-weight:400;font-size:.7rem">(check all that report to this market\'s MM)</span></label>';
-    h += '<div style="background:white;border:1px solid var(--sand);border-radius:6px;padding:10px;max-height:160px;overflow-y:auto">';
-    var tlPool = eligibleAgents('tl');
-    // Also include TLs already on THIS market (in case role-eligibility skipped them somehow)
-    (m.tlIds||[]).forEach(function(tid){
-      var existing = (DB.agents||[]).find(function(a){ return a.id === tid; });
-      if(existing && !tlPool.some(function(a){ return a.id === tid; })){
-        tlPool.push(existing);
-      }
-    });
-    tlPool.sort(function(a,b){ return a.name.localeCompare(b.name); });
-    if(!tlPool.length){
-      h += '<div style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem;padding:8px;font-style:italic">No unplaced Team Leaders. Create one in Onboarding or move one from another market.</div>';
-    } else {
-      tlPool.forEach(function(a){
-        var checked = (m.tlIds||[]).indexOf(a.id) >= 0;
-        h += '<label style="display:flex;align-items:center;gap:8px;padding:6px 4px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><input type="checkbox" name="meTl" value="'+a.id+'"'+(checked?' checked':'')+'> '+_escapeHtml(a.name)+'</label>';
-      });
-    }
-    h += '</div></div>';
-    h += '</div>'; // end positions card
-
-    // Notes + Active flag
-    h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Notes <span style="color:var(--muted);font-weight:400;font-size:.7rem">(internal, not shown to applicants)</span></label>';
+    // Notes + Active flag (apply to whole market)
+    h += '<div class="f-field" style="margin:14px 0 12px"><label class="f-label">Notes <span style="color:var(--muted);font-weight:400;font-size:.7rem">(internal)</span></label>';
     h += '<textarea id="meNotes" class="f-input" rows="2">'+_escapeHtml(m.notes||'')+'</textarea></div>';
-    h += '<div class="f-field" style="margin-bottom:18px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="meActive" type="checkbox"'+(m.active!==false?' checked':'')+'> <span style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown)">Active <span style="color:var(--muted);font-size:.7rem">(uncheck to hide from application form without deleting)</span></span></label></div>';
+    h += '<div class="f-field" style="margin-bottom:14px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="meActive" type="checkbox"'+(m.active!==false?' checked':'')+'> <span style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown)">Market Active <span style="color:var(--muted);font-size:.7rem">(uncheck to hide market entirely)</span></span></label></div>';
 
     h += '<div style="display:flex;gap:10px;border-top:1px solid var(--sand);padding-top:14px">';
     h += '<button onclick="marketEditSave()" class="btn-fire" style="padding:10px 20px;font-size:.74rem">'+(isNew?'Create Market':'Save Changes')+'</button>';
@@ -34647,26 +34752,199 @@ function marketEdit(id){
     div.innerHTML = h;
     document.body.appendChild(div.firstChild);
 
-    // Stash the agent option HTML for top-role swap
-    window._meCmOptionsHTML  = '<select id="meCmId" class="f-input">' + agentOptions('cm', m.cmId) + '</select><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">A CM oversees this market and can oversee multiple markets.</div>';
-    window._meIboOptionsHTML = '<select id="meIboId" class="f-input">'+ agentOptions('ibo', m.iboId)+'</select><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">An IBO owns this market and can own multiple markets.</div>';
+    // Render initial tab body
+    meRenderTabBody();
   } catch(e){
     console.warn('[marketEdit] failed:', e);
-    alert('Edit failed.');
+    alert('Edit failed: ' + (e && e.message ? e.message : e));
   }
 }
 
-// Toggle between CM-top and IBO-top in the Edit Market modal.
-// Mutually exclusive — picking one clears the other.
-function marketEditTopRole(role){
+// Switch active program tab in the edit modal
+function meSwitchTab(programKey){
+  if(!window._meWorking) return;
+  // Capture current tab's input values into _meWorking BEFORE switching
+  meCaptureTabBody();
+  window._meWorking.activeTab = programKey;
+  // Update tab styles
+  ['lifeline','internet','aca'].forEach(function(p){
+    var btn = document.getElementById('meTab-'+p);
+    if(!btn) return;
+    if(p === programKey){
+      btn.classList.add('me-tab-active');
+      btn.style.borderBottomColor = (p==='lifeline')?'#0a3d91':(p==='internet'?'#0891b2':'#dc2626');
+      btn.style.color = (p==='lifeline')?'#0a3d91':(p==='internet'?'#0891b2':'#dc2626');
+    } else {
+      btn.classList.remove('me-tab-active');
+      btn.style.borderBottomColor = 'transparent';
+      btn.style.color = 'var(--muted)';
+    }
+  });
+  meRenderTabBody();
+}
+
+// Capture form values into _meWorking before re-rendering
+function meCaptureTabBody(){
+  if(!window._meWorking) return;
+  var program = window._meWorking.activeTab;
+  var section = window._meWorking.programs[program];
+  if(!section) return;
+  // Active flag for the section
+  var actEl = document.getElementById('meSecActive');
+  if(actEl) section.active = !!actEl.checked;
+  // Top role
+  var topRoleEl = document.querySelector('input[name="meTopRole"]:checked');
+  if(topRoleEl) section.topRole = topRoleEl.value;
+  // Top role holder
+  if(section.topRole === 'cm'){
+    var cmEl = document.getElementById('meCmId');
+    if(cmEl) section.cmId = parseInt(cmEl.value, 10) || null;
+    section.iboId = null;
+  } else {
+    var iboEl = document.getElementById('meIboId');
+    if(iboEl) section.iboId = parseInt(iboEl.value, 10) || null;
+    section.cmId = null;
+  }
+  // MM
+  var mmEl = document.getElementById('meMmId');
+  if(mmEl) section.mmId = parseInt(mmEl.value, 10) || null;
+  // TLs
+  section.tlIds = [];
+  document.querySelectorAll('input[name="meTl"]:checked').forEach(function(cb){
+    var n = parseInt(cb.value, 10);
+    if(!isNaN(n)) section.tlIds.push(n);
+  });
+}
+
+// Render current tab body from _meWorking
+function meRenderTabBody(){
+  var w = window._meWorking; if(!w) return;
+  var program = w.activeTab;
+  var section = w.programs[program];
+  var body = document.getElementById('meTabBody');
+  if(!body) return;
+
+  // Eligibility helpers
+  var programLabel = program === 'lifeline' ? 'Lifeline' : (program === 'internet' ? 'Internet' : 'ACA');
+
+  function _agentWorksProgram(a){
+    // Office staff don't work programs; sales roles do
+    if(!a || !a.active) return false;
+    if(['Field Agent','Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(a.role) < 0) return false;
+    var aPrograms = Array.isArray(a.programs) ? a.programs : (a.program ? [a.program] : []);
+    return aPrograms.indexOf(programLabel) >= 0;
+  }
+  function _isPlacedOnAnotherMarketSameProgram(agentId, slot){
+    if(!agentId || !MARKETS) return false;
+    return MARKETS.some(function(other){
+      if(other.id === w.id) return false;
+      var otherSection = (other.programs && other.programs[program]) || null;
+      if(!otherSection) return false;
+      if(slot === 'mm' && otherSection.mmId === agentId) return true;
+      if(slot === 'tl' && Array.isArray(otherSection.tlIds) && otherSection.tlIds.indexOf(agentId) >= 0) return true;
+      return false;
+    });
+  }
+  function eligibleAgents(slot){
+    var roleMatch;
+    if(slot === 'cm') roleMatch = 'Campaign Manager';
+    else if(slot === 'mm') roleMatch = 'Market Manager';
+    else if(slot === 'ibo') roleMatch = 'IBO';
+    else if(slot === 'tl') roleMatch = 'Team Leader';
+    else return [];
+    return (DB.agents||[]).filter(function(a){
+      if(!a.active || a.role !== roleMatch) return false;
+      if(!_agentWorksProgram(a)) return false;
+      // Single-market roles per program: MM and TL
+      if(slot === 'mm' || slot === 'tl'){
+        if(_isPlacedOnAnotherMarketSameProgram(a.id, slot)) return false;
+      }
+      return true;
+    }).sort(function(a,b){ return a.name.localeCompare(b.name); });
+  }
+  function agentOptions(slot, selectedId){
+    var pool = eligibleAgents(slot);
+    var html = '<option value="">— pick —</option>';
+    pool.forEach(function(a){
+      html += '<option value="'+a.id+'"'+(selectedId===a.id?' selected':'')+'>'+_escapeHtml(a.name)+'</option>';
+    });
+    if(selectedId && !pool.some(function(a){ return a.id === selectedId; })){
+      var stale = (DB.agents||[]).find(function(a){ return a.id === selectedId; });
+      if(stale){
+        html += '<option value="'+stale.id+'" selected>⚠ '+_escapeHtml(stale.name)+' (no longer eligible — clear or fix role/programs)</option>';
+      }
+    }
+    return html;
+  }
+
+  var h = '';
+  h += '<div style="background:var(--cream);border:1px solid var(--sand);border-radius:6px;padding:14px 16px">';
+
+  // Section active toggle
+  h += '<div style="margin-bottom:12px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="meSecActive" type="checkbox"'+(section.active!==false?' checked':'')+'> <span style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown)"><strong>Run '+programLabel+' in this market</strong> <span style="color:var(--muted);font-size:.7rem">(uncheck if this market doesn\'t do '+programLabel+')</span></span></label></div>';
+
+  // Top role: CM OR IBO toggle
+  h += '<div class="f-field" style="margin-bottom:12px"><label class="f-label">Top Role for '+programLabel+'</label>';
+  h += '<div style="display:flex;gap:8px;margin-bottom:8px">';
+  h += '<label style="flex:1;display:flex;align-items:center;gap:6px;padding:8px 12px;background:white;border:2px solid '+(section.topRole==='cm'?'var(--blue)':'var(--sand)')+';border-radius:5px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.82rem"><input type="radio" name="meTopRole" value="cm" '+(section.topRole==='cm'?'checked':'')+' onchange="meTopRoleChanged()"> Campaign Manager</label>';
+  h += '<label style="flex:1;display:flex;align-items:center;gap:6px;padding:8px 12px;background:white;border:2px solid '+(section.topRole==='ibo'?'var(--blue)':'var(--sand)')+';border-radius:5px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.82rem"><input type="radio" name="meTopRole" value="ibo" '+(section.topRole==='ibo'?'checked':'')+' onchange="meTopRoleChanged()"> IBO</label>';
+  h += '</div>';
+  h += '<div id="meTopHolder">';
+  if(section.topRole === 'ibo'){
+    h += '<select id="meIboId" class="f-input">'+agentOptions('ibo', section.iboId)+'</select>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">An IBO owns this program in this market. Can own multiple markets.</div>';
+  } else {
+    h += '<select id="meCmId" class="f-input">'+agentOptions('cm', section.cmId)+'</select>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">A CM oversees this program in this market. Can oversee multiple markets.</div>';
+  }
+  h += '</div></div>';
+
+  // MM
+  h += '<div class="f-field" style="margin-bottom:12px"><label class="f-label">Market Manager (MM)</label>';
+  h += '<select id="meMmId" class="f-input">'+agentOptions('mm', section.mmId)+'</select>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">Only MMs not already running '+programLabel+' in another market are listed.</div>';
+  h += '</div>';
+
+  // TLs
+  h += '<div class="f-field" style="margin:0"><label class="f-label">Team Leaders <span style="color:var(--muted);font-weight:400;font-size:.7rem">(check all that work '+programLabel+' in this market)</span></label>';
+  h += '<div style="background:white;border:1px solid var(--sand);border-radius:6px;padding:10px;max-height:160px;overflow-y:auto">';
+  var tlPool = eligibleAgents('tl');
+  // Always include TLs already on this section (in case eligibility skipped them)
+  (section.tlIds||[]).forEach(function(tid){
+    var existing = (DB.agents||[]).find(function(a){ return a.id === tid; });
+    if(existing && !tlPool.some(function(a){ return a.id === tid; })){
+      tlPool.push(existing);
+    }
+  });
+  tlPool.sort(function(a,b){ return a.name.localeCompare(b.name); });
+  if(!tlPool.length){
+    h += '<div style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem;padding:8px;font-style:italic">No unplaced Team Leaders working '+programLabel+'. Onboard one or move from another market.</div>';
+  } else {
+    tlPool.forEach(function(a){
+      var checked = (section.tlIds||[]).indexOf(a.id) >= 0;
+      h += '<label style="display:flex;align-items:center;gap:8px;padding:6px 4px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><input type="checkbox" name="meTl" value="'+a.id+'"'+(checked?' checked':'')+'> '+_escapeHtml(a.name)+'</label>';
+    });
+  }
+  h += '</div></div>';
+
+  h += '</div>';
+  body.innerHTML = h;
+
+  // Stash options HTML for top-role toggle
+  window._meCmOptionsHTML  = '<select id="meCmId" class="f-input">' + agentOptions('cm', section.cmId) + '</select><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">A CM oversees this program in this market. Can oversee multiple markets.</div>';
+  window._meIboOptionsHTML = '<select id="meIboId" class="f-input">'+ agentOptions('ibo', section.iboId)+'</select><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">An IBO owns this program in this market. Can own multiple markets.</div>';
+}
+
+function meTopRoleChanged(){
+  var radio = document.querySelector('input[name="meTopRole"]:checked');
+  if(!radio) return;
   var holder = document.getElementById('meTopHolder');
   if(!holder) return;
-  if(role === 'ibo'){
-    holder.innerHTML = window._meIboOptionsHTML || '<select id="meIboId" class="f-input"><option value="">— none —</option></select>';
+  if(radio.value === 'ibo'){
+    holder.innerHTML = window._meIboOptionsHTML || '<select id="meIboId" class="f-input"><option value="">— pick —</option></select>';
   } else {
-    holder.innerHTML = window._meCmOptionsHTML || '<select id="meCmId" class="f-input"><option value="">— none —</option></select>';
+    holder.innerHTML = window._meCmOptionsHTML || '<select id="meCmId" class="f-input"><option value="">— pick —</option></select>';
   }
-  // Update the radio button card highlight too
   document.querySelectorAll('input[name="meTopRole"]').forEach(function(r){
     var label = r.closest('label');
     if(label) label.style.borderColor = r.checked ? 'var(--blue)' : 'var(--sand)';
@@ -34676,65 +34954,53 @@ function marketEditTopRole(role){
 function marketEditCancel(){
   var el = document.getElementById('marketEditModal');
   if(el) el.remove();
+  window._meWorking = null;
 }
 
 function marketEditSave(){
   try {
     var u = DB.current;
     if(!canManageMarkets(u)){ alert('Permission denied.'); return; }
-    var id = parseInt((document.getElementById('meId')||{}).value, 10) || 0;
+    var w = window._meWorking; if(!w){ alert('Modal state lost.'); return; }
+    // Capture current tab into working state
+    meCaptureTabBody();
+
     var name = ((document.getElementById('meName')||{}).value||'').trim();
     var city = ((document.getElementById('meCity')||{}).value||'').trim();
     var state = ((document.getElementById('meState')||{}).value||'').trim().toUpperCase();
-    // Top role mutually exclusive: read radio
-    var topRoleEl = document.querySelector('input[name="meTopRole"]:checked');
-    var topRole = topRoleEl ? topRoleEl.value : 'cm';
-    var cmId = null, iboId = null;
-    if(topRole === 'cm'){
-      cmId = parseInt((document.getElementById('meCmId')||{}).value, 10) || null;
-      iboId = null; // mutually exclusive
-    } else {
-      iboId = parseInt((document.getElementById('meIboId')||{}).value, 10) || null;
-      cmId = null; // mutually exclusive
-    }
-    var mmId = parseInt((document.getElementById('meMmId')||{}).value, 10) || null;
     var notes = ((document.getElementById('meNotes')||{}).value||'').trim();
     var active = !!(document.getElementById('meActive')||{}).checked;
-    var tlIds = [];
-    document.querySelectorAll('input[name="meTl"]:checked').forEach(function(cb){
-      var n = parseInt(cb.value, 10);
-      if(!isNaN(n)) tlIds.push(n);
-    });
 
     var errEl = document.getElementById('meError');
     if(!name){
       if(errEl){ errEl.textContent = '⚠ Market name is required.'; errEl.style.display = 'block'; }
       return;
     }
-    var dupe = (MARKETS||[]).find(function(m){ return m.id !== id && (m.name||'').toLowerCase() === name.toLowerCase(); });
+    var dupe = (MARKETS||[]).find(function(m){ return m.id !== w.id && (m.name||'').toLowerCase() === name.toLowerCase(); });
     if(dupe){
-      if(errEl){ errEl.textContent = '⚠ A market with that name already exists.'; errEl.style.display = 'block'; }
+      if(errEl){ errEl.textContent = '⚠ A market named "'+name+'" already exists.'; errEl.style.display = 'block'; }
       return;
     }
 
     var now = new Date().toISOString();
-    if(id){
-      var m = marketGetById(id);
+    if(w.id){
+      var m = marketGetById(w.id);
       if(!m){ alert('Market not found.'); return; }
       m.name = name; m.city = city; m.state = state;
-      m.topRole = topRole;
-      m.cmId = cmId; m.iboId = iboId; m.mmId = mmId; m.tlIds = tlIds;
-      m.notes = notes; m.active = active; m.updatedAt = now;
+      m.notes = notes; m.active = active;
+      m.programs = w.programs;
+      m.updatedAt = now;
+      ensureMarketSections(m);
       console.log('[marketEditSave] updated market #'+m.id+': '+name);
     } else {
       var rec = {
         id: MARKET_NEXT_ID++,
         name: name, city: city, state: state,
-        topRole: topRole,
-        cmId: cmId, mmId: mmId, iboId: iboId,
-        tlIds: tlIds, notes: notes, active: active,
+        notes: notes, active: active,
+        programs: w.programs,
         createdAt: now, updatedAt: now
       };
+      ensureMarketSections(rec);
       MARKETS.push(rec);
       console.log('[marketEditSave] created market #'+rec.id+': '+name);
     }
@@ -34751,12 +35017,10 @@ function marketToggleActive(id){
   try {
     var u = DB.current;
     if(!canManageMarkets(u)){ alert('Permission denied.'); return; }
-    var m = marketGetById(id);
-    if(!m){ alert('Market not found.'); return; }
+    var m = marketGetById(id); if(!m){ alert('Market not found.'); return; }
     m.active = (m.active === false) ? true : false;
     m.updatedAt = new Date().toISOString();
     saveInventory();
-    console.log('[marketToggleActive] market #'+m.id+' → '+(m.active?'active':'inactive'));
     gotoPanel('markets-admin');
   } catch(e){ console.warn('[marketToggleActive] failed:', e); }
 }
@@ -34777,13 +35041,7 @@ function marketDelete(id){
   } catch(e){ console.warn('[marketDelete] failed:', e); }
 }
 
-// ════════════════════════════════════════════════════════════════════════
-//  END SHIP A8
-// ════════════════════════════════════════════════════════════════════════
 
-// ════════════════════════════════════════════════════════════════════════
-//  SHIP A9 — APPLICATION FORM WIRING
-//
 //  Public-facing application modal already exists. We're rewiring it to:
 //   1) Read from the MARKETS roster on open (auto-syncs with admin panel)
 //   2) Show TL dropdown when the picked market has TLs
@@ -34932,8 +35190,8 @@ function appNotifyChain(applicant, marketId, selectedTlId){
 
 // Lifeline carrier list for campaign multi-select (strict order)
 var AP_PROGRAM_CAMPAIGNS = {
-  'Lifeline': ['Gen Mobile','TruConnect','Assurance Wireless','Excess Telecom','Chuzo'],
-  'Internet': ['Astound','Spectrum','Saraplus'],
+  'Lifeline': ['Gen Mobile','TruConnect','Assurance Wireless','Excess Telecom'],
+  'Internet': ['Astound','Spectrum','Saraplus','Chuzo'],
   'ACA':      ['ACA Marketplace']
 };
 
