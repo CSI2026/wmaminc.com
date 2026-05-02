@@ -9944,12 +9944,27 @@ function invCleanMarket(campaign, rawTeamName){
 }
 
 function gmCleanMarket(rawTeamName){
-  if(!rawTeamName) return 'Unknown';
-  var mapped = GM_MARKET_MAP[rawTeamName.trim()];
+  // ── Calvin 2026-05-01 fix supporting issue #4 ──
+  // Was returning 'Unknown' when the team name didn't match GM_MARKET_MAP
+  // exactly. That caused IMEIs to show "Unknown" in the IMEI/SIM search
+  // and broke transfers that filter by market.
+  //
+  // New behavior: ALWAYS try to derive a usable market name. The lookup
+  // map wins, then a normalized auto-clean (strips MMG/CIR/branch
+  // prefixes), and only if the team name itself is truly empty do we
+  // return a placeholder. Using the raw team name beats 'Unknown' because
+  // at least the user can see it and recognize it.
+  if(!rawTeamName || !String(rawTeamName).trim()) return 'Unassigned';
+  var trimmed = String(rawTeamName).trim();
+  var mapped = GM_MARKET_MAP[trimmed];
   if(mapped) return mapped;
-  // Auto-clean: strip "MMG CIR " prefix
-  var cleaned = rawTeamName.trim().replace(/^MMG\s+CIR\s+/i,'').trim();
-  return cleaned || rawTeamName.trim();
+  // Auto-clean: strip "MMG CIR " prefix, also handle "MMG ", "CIR " variants
+  var cleaned = trimmed
+    .replace(/^MMG\s+CIR\s+/i,'')
+    .replace(/^MMG\s+/i,'')
+    .replace(/^CIR\s+/i,'')
+    .trim();
+  return cleaned || trimmed;
 }
 
 // ── Parse Gen Mobile Shipments (Inventory) CSV ──
@@ -9980,6 +9995,47 @@ function parseGMInventoryCSV(text){
   return rows;
 }
 
+// ── Auto-assign resolver (Calvin 2026-05-01, updated) ──
+// Given a device's market, find the right person to auto-assign it to:
+//   1. The Market Manager assigned to that market (via MARKETS roster)
+//   2. Failing that, the Gen Mobile Campaign Manager (Tanita Flowers)
+// Returns {agent, source:'mm-of-market'|'cm-fallback'|'hard-fallback', market}
+// or null if literally no agent is available.
+function gmResolveAutoAssignee(marketName){
+  // Step 1: Try to find the MM for this specific market
+  if(marketName && typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+    var marketRow = MARKETS.find(function(m){
+      if(!m || m.active === false) return false;
+      return (m.name || '').toLowerCase().trim() === marketName.toLowerCase().trim();
+    });
+    if(marketRow && marketRow.mmId){
+      var mm = (DB.agents||[]).find(function(a){
+        return a.id === marketRow.mmId && a.active;
+      });
+      if(mm) return { agent: mm, source: 'mm-of-market', market: marketRow };
+    }
+  }
+  // Step 2: Fallback to the Gen Mobile Campaign Manager
+  var cm = (DB.agents||[]).find(function(a){
+    if(!a.active) return false;
+    if(a.role !== 'Campaign Manager') return false;
+    var hasGM = a.agentCodes && a.agentCodes.hasOwnProperty('Gen Mobile');
+    var isOklahoma = a.cmModel === 'cm-oklahoma';
+    return hasGM || isOklahoma;
+  });
+  if(cm) return { agent: cm, source: 'cm-fallback', market: null };
+  // Step 3: Hard fallback — Tanita id 2 if she exists
+  var tanita = (DB.agents||[]).find(function(a){ return a.id === 2; });
+  if(tanita) return { agent: tanita, source: 'hard-fallback', market: null };
+  return null;
+}
+
+// Legacy alias kept so any prior caller still resolves to the GM CM.
+function gmDefaultRecipient(){
+  var r = gmResolveAutoAssignee(null);
+  return r ? r.agent : null;
+}
+
 // ── Process Gen Mobile Inventory Upload ──
 // Returns {newDevices, duplicates, unknownMarkets, marketBreakdown}
 function processGMInventoryUpload(csvText, batchId){
@@ -9989,6 +10045,17 @@ function processGMInventoryUpload(csvText, batchId){
 
   var newDevices=[], duplicates=[], unknownMarkets={};
   var marketBreakdown={};
+
+  // ── Calvin 2026-05-01: per-MARKET auto-assignment ──
+  // Each device's market is resolved, then we look up the MM of that
+  // market and assign the device to them. If no MM exists for the
+  // market, fall back to the Gen Mobile CM (Tanita). This is per-row
+  // so a single CSV with devices for multiple markets distributes
+  // correctly across MMs.
+  var nowISO = new Date().toISOString();
+  var nowDate = nowISO.slice(0,10);
+  // Track per-market routing for the upload report
+  var routingReport = {}; // {market: {mm: name, count: N, source: '...'}}
 
   rows.forEach(function(row){
     var imei = row['IMEI']||'';
@@ -10017,6 +10084,37 @@ function processGMInventoryUpload(csvText, batchId){
       return;
     }
 
+    var uploadExpiry = (typeof window._gmExpiryOverride === 'string' && window._gmExpiryOverride)
+                       ? window._gmExpiryOverride
+                       : new Date(Date.now() + 30*86400000).toISOString().slice(0,10);
+
+    // Resolve auto-recipient for THIS device's market
+    var resolution = gmResolveAutoAssignee(market);
+    var autoAgent = resolution ? resolution.agent : null;
+    if(resolution){
+      var key = market + ' → ' + autoAgent.name;
+      routingReport[key] = (routingReport[key] || 0) + 1;
+    }
+
+    // ── Calvin 2026-05-02: cap working expiry to recipient role + 30-day ceiling ──
+    // The Inv Dept's calendar pick IS still preserved as originalExpiryDate
+    // for the audit record, but the working expiryDate visible to the
+    // recipient is computed via the central resolver. This applies even
+    // on auto-assign-at-upload so a 90-day calendar pick can't bypass
+    // the 30-day ceiling. If no auto recipient (rare — no MM, no CM),
+    // we keep the upload date as-is (capped at 30 by the resolver too).
+    var workingExpiry;
+    if(autoAgent){
+      workingExpiry = (typeof resolveTransferExpiry === 'function')
+                       ? resolveTransferExpiry(uploadExpiry, autoAgent.role, Date.now())
+                       : uploadExpiry;
+    } else {
+      // No recipient — clamp to 30-day ceiling regardless of calendar pick
+      workingExpiry = (typeof resolveTransferExpiry === 'function')
+                       ? resolveTransferExpiry(uploadExpiry, 'Market Manager', Date.now())
+                       : uploadExpiry;
+    }
+
     newDevices.push({
       id:            'gm-'+(new Date().getTime())+'-'+Math.random().toString(36).substr(2,6),
       imei:          imei,
@@ -10024,6 +10122,8 @@ function processGMInventoryUpload(csvText, batchId){
       model:         model,
       sku:           sku,
       devType:       devType, // 'free' or 'upsell'
+      type:          'phone', // generic type tag for legacy filters
+      campaign:      'Gen Mobile',
       devCost:       0, // cost comes from activation report
       market:        market,
       teamName:      teamName,
@@ -10032,31 +10132,53 @@ function processGMInventoryUpload(csvText, batchId){
       vendorDueDate: dueDate,
       trackingNumber:tracking,
       boxNumber:     boxNum,
-      status:        'unassigned',
-      assignedTo:    null,
-      assignedToName:'',
-      assignedAt:    null,
-      mmId:          null,
+      // ── Auto-assign per market ──
+      status:        autoAgent ? 'assigned'    : 'unassigned',
+      assignedTo:    autoAgent ? autoAgent.id   : null,
+      assignedToName:autoAgent ? autoAgent.name : '',
+      assignedAt:    autoAgent ? nowISO : null,
+      assignedDate:  autoAgent ? nowDate : null,
+      holderId:      autoAgent ? autoAgent.id   : null,
+      holderName:    autoAgent ? autoAgent.name : '',
+      recipientId:   autoAgent ? autoAgent.id   : null,
+      recipientName: autoAgent ? autoAgent.name : '',
+      mmId:          autoAgent ? autoAgent.id   : null,
+      mmName:        autoAgent ? autoAgent.name : '',
       mmExpiresAt:   null,
       tlExpiresAt:   null,
       agentExpiresAt:null,
       activatedAt:   null,
       activatedBy:   '',
-      // Calvin 2026-04-30: stamp upload-time expiry. Uses _gmExpiryOverride
-      // (set by the upload UI) if present, otherwise defaults to 30 days
-      // from upload. Expiry shows on dashboards immediately and is also
-      // re-set when the device gets assigned to MM/TL/agent (with their
-      // role-specific clocks).
-      expiryDate:    (typeof window._gmExpiryOverride === 'string' && window._gmExpiryOverride)
-                       ? window._gmExpiryOverride
-                       : new Date(Date.now() + 30*86400000).toISOString().slice(0,10),
+      // ── Expiry: working expiryDate (capped) + immutable original (audit) ──
+      expiryDate:         workingExpiry,
+      originalExpiryDate: uploadExpiry,
       uploadBatchId: batchId,
-      uploadedAt:    new Date().toISOString(),
-      chainOfCustody:[]
+      uploadedAt:    nowISO,
+      chainOfCustody: autoAgent ? [{
+        from:    'Inventory Upload',
+        fromId:  null,
+        to:      autoAgent.name,
+        toId:    autoAgent.id,
+        at:      nowISO,
+        type:    'upload-auto-assign',
+        reason:  resolution.source === 'mm-of-market'
+                   ? 'Initial upload — auto-assigned to Market Manager of '+market
+                   : (resolution.source === 'cm-fallback'
+                       ? 'Initial upload — no MM for '+market+', auto-assigned to Campaign Manager'
+                       : 'Initial upload — assigned via hard fallback'),
+        by:      (DB.current && DB.current.name) || 'system',
+        byId:    (DB.current && DB.current.id) || null
+      }] : []
     });
   });
 
-  return {newDevices:newDevices, duplicates:duplicates, unknownMarkets:unknownMarkets, marketBreakdown:marketBreakdown};
+  return {
+    newDevices: newDevices,
+    duplicates: duplicates,
+    unknownMarkets: unknownMarkets,
+    marketBreakdown: marketBreakdown,
+    routingReport: routingReport
+  };
 }
 
 // ── Process Gen Mobile Activation Report CSV ──
@@ -10237,26 +10359,38 @@ function gmEnsureMarket(market){
 // Assign unassigned devices to Market Manager (set mmExpiresAt countdown)
 function gmAssignToMM(imeis, mmId, market){
   var mm = DB.agents.find(function(a){return a.id===mmId;}); if(!mm) return 0;
-  var cfg = gmEnsureMarket(market);
   var now = new Date();
+  var todayMs = now.getTime();
   var assigned=0;
   imeis.forEach(function(imei){
     var dev = GM_INVENTORY.find(function(d){return d.imei===imei;});
     if(!dev) return;
-    var exp = new Date(now.getTime()+cfg.mmDays*86400000).toISOString();
+    // ── Calvin 2026-05-02: apply role-based cap ──
+    // MM-level assign: recipient gets min(sender remaining, 30, 30-day ceiling).
+    // Defer to resolveTransferExpiry so this stays in sync with every
+    // other transfer/assign path in the system.
+    var senderExpiry = dev.expiryDate || dev.originalExpiryDate || null;
+    var newExpiry = (typeof resolveTransferExpiry === 'function')
+                     ? resolveTransferExpiry(senderExpiry, mm.role || 'Market Manager', todayMs)
+                     : new Date(todayMs + 30*86400000).toISOString().slice(0,10);
+    dev.expiryDate   = newExpiry;
     dev.mmId         = mmId;
     dev.mmName       = mm.name;
-    dev.mmExpiresAt  = exp;
     dev.status       = 'assigned';
     dev.assignedTo   = mmId;
     dev.assignedToName = mm.name;
     dev.assignedAt   = now.toISOString();
-    dev.chainOfCustody.push({from:'Inventory',to:mm.name,toId:mmId,at:now.toISOString(),type:'mm-assign'});
+    // Keep holderId/holderName in sync with assignedTo so devicesHeldBy
+    // reads consistently across all consumers.
+    dev.holderId     = mmId;
+    dev.holderName   = mm.name;
+    if(!dev.chainOfCustody) dev.chainOfCustody = [];
+    dev.chainOfCustody.push({from:'Inventory',to:mm.name,toId:mmId,at:now.toISOString(),type:'mm-assign',priorExpiry:senderExpiry,newExpiry:newExpiry});
     assigned++;
   });
   saveInventory();
   // Check day-10 and day-5 alerts for all assigned devices
-  gmScheduleExpiryAlerts();
+  if(typeof gmScheduleExpiryAlerts === 'function') gmScheduleExpiryAlerts();
   return assigned;
 }
 
@@ -11146,15 +11280,39 @@ function invValidateTransfer(campaign, imeis, fromId){
   var pendingImeis = {};
   pending.forEach(function(t){ (t.imeis||[]).forEach(function(i){pendingImeis[i]=t;}); });
 
+  // ── Calvin 2026-05-01 fix ──
+  // Was reading only the campaign-specific pool. Devices in legacy
+  // INVENTORY_DEVICES (uploaded before campaign-pools existed) were
+  // reported as 'not-found' and blocked from transfer. Now also
+  // searches INVENTORY_DEVICES filtered to this campaign.
+  function _findDevice(imei){
+    var dev = pool.find(function(d){return d.imei===imei;});
+    if(dev) return dev;
+    if(typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
+      dev = INVENTORY_DEVICES.find(function(d){
+        return d.imei===imei && (d.campaign===campaign || !d.campaign);
+      });
+      if(dev) return dev;
+    }
+    return null;
+  }
+
   var errors = [];
   imeis.forEach(function(imei){
-    var dev = pool.find(function(d){return d.imei===imei;});
+    var dev = _findDevice(imei);
     if(!dev)                                       errors.push({imei:imei, type:'not-found'});
-    else if(dev.assignedTo !== fromId && dev.mmId !== fromId) errors.push({imei:imei, type:'not-held-by-sender', currentHolder:dev.assignedToName});
+    else if(dev.assignedTo !== fromId && dev.holderId !== fromId && dev.mmId !== fromId) errors.push({imei:imei, type:'not-held-by-sender', currentHolder:(dev.assignedToName||dev.holderName||'unassigned')});
     else if(pendingImeis[imei])                    errors.push({imei:imei, type:'already-in-pending-transfer', transferId:pendingImeis[imei].id});
     else if(dev.status === 'activated')            errors.push({imei:imei, type:'already-activated'});
   });
   return {passed: errors.length===0, errors:errors};
+}
+
+// Calvin 2026-05-01: per-market filter on the All Inventory dashboard.
+// Stores the selection on a window field so it survives re-renders.
+function invDashSetMarketFilter(value){
+  window._invDashMarketFilter = value || '';
+  if(typeof gotoPanel === 'function') gotoPanel('inv-dashboard');
 }
 
 function devicesHeldBy(agentId, type){
@@ -16925,6 +17083,7 @@ function buildNav(u){
     // Legacy data already in INVENTORY_DEVICES stays visible — only the
     // entry points that would create NEW legacy data are hidden.
     var invDrop = boDropBtn('inv-dashboard','📊 All Inventory (All Campaigns)')
+      +boDropBtn('inv-my-inventory','📱 My Inventory & Transfer Tool')
       +boDropBtn('inv-requests','📋 Pending Requests')
       +boDropBtn('pickup-confirmations','📦 Pickup Confirmations')
       +boDropBtn('discrepancy-tickets','🎫 Discrepancy Tickets')
@@ -16941,8 +17100,16 @@ function buildNav(u){
     });
     h += boGroupDrop('dd-inv','📦 Inventory ▾', invDrop);
   } else {
-    // MM / CM / TL / Sales Agent — show dropdown items for each campaign they can see
+    // MM / CM / TL / Sales Agent — show dropdown items for each campaign they can see.
+    // Calvin 2026-05-02: prepend the unified "My Inventory" entry for every
+    // sales role so they have a single place to see all devices they hold
+    // across campaigns and use the transfer tool. devicesHeldBy is per-user
+    // so no leakage — they only see their own devices.
     var campaignNavItems = '';
+    if(typeof isSalesRole === 'function' && isSalesRole(u)){
+      campaignNavItems += boDropBtn('inv-my-inventory','📱 My Inventory & Transfer Tool');
+      campaignNavItems += '<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
+    }
     activeCampaigns().forEach(function(c){
       if(!canAccess(u, campaignCfg(c).id+'-inventory') && c!=='Gen Mobile') return; // only Gen Mobile gate is wired into canAccess
       // Check visibility for non-Gen-Mobile campaigns via coding
@@ -24195,6 +24362,7 @@ function invAssignCommit(deviceIds){
     var prevHolderId   = d.assignedTo || d.holderId || d.mmId || null;
 
     // Set every holder field consumers might read
+    var senderExpiry = d.expiryDate || d.originalExpiryDate || null;
     d.assignedTo       = recipient.id;
     d.assignedToName   = recipient.name;
     d.assignedAt       = nowISO;
@@ -24204,16 +24372,17 @@ function invAssignCommit(deviceIds){
     d.recipientId      = recipient.id;
     d.recipientName    = recipient.name;
     d.status           = 'assigned';
-    d.expiryDate       = expiryDate;
-    // MM/CM-specific fields used by Gen Mobile pipeline
+    // ── Calvin 2026-05-02: apply role-based cap on assign ──
+    // Replaces "preserve original expiry" rule. Recipient gets
+    // min(sender remaining, role cap, 30-day ceiling).
+    // For brand-new uploads (no prior holder), senderExpiry is the
+    // device's upload-time expiry, which the resolver clamps to 30.
+    d.expiryDate = resolveTransferExpiry(senderExpiry, recipient.role, now.getTime());
+    // MM identity fields (used by GM dashboards) — keep these because
+    // they identify "which MM owns this device", separate from expiry.
     if(recipient.role === 'Market Manager' || recipient.role === 'Campaign Manager' || recipient.role === 'IBO'){
       d.mmId          = recipient.id;
       d.mmName        = recipient.name;
-      d.mmExpiresAt   = expiryISO;
-    } else if(recipient.role === 'Team Leader'){
-      d.tlExpiresAt   = expiryISO;
-    } else {
-      d.agentExpiresAt= expiryISO;
     }
 
     // Audit trail
@@ -24227,7 +24396,9 @@ function invAssignCommit(deviceIds){
       type:    'owner-assign',
       reason:  reason,
       by:      u.name,
-      byId:    u.id
+      byId:    u.id,
+      priorExpiry: senderExpiry,
+      newExpiry:   d.expiryDate
     });
     assigned++;
   });
@@ -24508,7 +24679,38 @@ function panelInvDashboard(){
     // Reset bulk-select state on every render so stale selections from
     // a previous panel visit don't carry over
     if(typeof invAssignClearSelection === 'function') invAssignClearSelection();
-    var sortedDevs = devices.slice().sort(function(a,b){
+
+    // ── Calvin 2026-05-01 fix for issue #5 ──
+    // Per-market filter. Reads window._invDashMarketFilter as the active
+    // selection. Re-renders the panel when the user changes it. Also
+    // exposes "All Markets" / "Unassigned (no market)" buckets.
+    var allMarkets = {};
+    devices.forEach(function(d){
+      var m = d.market || '';
+      if(m) allMarkets[m] = (allMarkets[m]||0) + 1;
+    });
+    var marketKeys = Object.keys(allMarkets).sort();
+    var activeFilter = (typeof window._invDashMarketFilter === 'string') ? window._invDashMarketFilter : '';
+    h += '<div style="margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
+    h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Filter by market</label>';
+    h += '<select id="invDashMarketFilter" onchange="invDashSetMarketFilter(this.value)" style="padding:7px 10px;border:1.5px solid var(--sand);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;min-width:200px">';
+    h += '<option value="">— All Markets —</option>';
+    marketKeys.forEach(function(m){
+      var sel = (activeFilter === m) ? ' selected' : '';
+      h += '<option value="'+_escapeAttr(m)+'"'+sel+'>'+_escapeHtml(m)+' ('+allMarkets[m]+')</option>';
+    });
+    h += '</select>';
+    if(activeFilter){
+      h += '<button onclick="invDashSetMarketFilter(\'\')" style="background:rgba(204,0,0,.06);border:1px solid rgba(204,0,0,.25);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">✕ Clear filter</button>';
+    }
+    h += '</div>';
+
+    // Apply the filter before sorting
+    var filteredDevs = activeFilter
+      ? devices.filter(function(d){ return d.market === activeFilter; })
+      : devices.slice();
+
+    var sortedDevs = filteredDevs.sort(function(a,b){
       var da=invDaysRemaining(a.expiryDate,a.assignedDate);
       var db2=invDaysRemaining(b.expiryDate,b.assignedDate);
       if(da===null&&db2===null) return 0;
@@ -24524,11 +24726,11 @@ function panelInvDashboard(){
     h += '<button onclick="invAssignClearSelection()" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer">Clear</button>';
     h += '</div>';
 
-    h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">All Inventory (Most Urgent First)</div>';
-    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">'+total+' devices total</div></div>';
+    h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">All Inventory (Most Urgent First)'+(activeFilter?' — '+_escapeHtml(activeFilter):'')+'</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">'+sortedDevs.length+' device(s)'+(activeFilter?' in '+_escapeHtml(activeFilter):' total')+(activeFilter && total!==sortedDevs.length?' &middot; '+total+' across all markets':'')+'</div></div>';
     h += '<div style="overflow-x:auto"><table><thead><tr>';
     if(isInvRole) h += '<th style="width:30px"></th>';
-    h += '<th>IMEI</th><th>Type</th><th>Campaign</th><th>Status</th><th>Holder</th><th>Expiry</th><th>Time Left</th>';
+    h += '<th>IMEI</th><th>Type</th><th>Campaign</th><th>Market</th><th>Status</th><th>Holder</th><th>Expiry</th><th>Time Left</th>';
     if(isInvRole) h += '<th></th>';
     h += '</tr></thead><tbody>';
     sortedDevs.slice(0,50).forEach(function(d){
@@ -24542,6 +24744,7 @@ function panelInvDashboard(){
       h += '<td style="font-family:monospace;font-size:.75rem">'+d.imei+'</td>';
       h += '<td style="font-size:.78rem;text-transform:capitalize">'+d.type+'</td>';
       h += '<td style="font-size:.78rem">'+d.campaign+'</td>';
+      h += '<td style="font-size:.78rem">'+_escapeHtml(d.market||'\u2014')+'</td>';
       h += '<td><span style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;color:'+statusColor+'">'+d.status+'</span></td>';
       // Show holderName when assigned, otherwise a friendlier label
       // explaining why it's unassigned. Easier to scan a long table
@@ -24561,13 +24764,16 @@ function panelInvDashboard(){
       }
       h += '</tr>';
     });
-    if(devices.length > 50) h += '<tr><td colspan="9" style="text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);padding:10px">Showing 50 of '+devices.length+' — Export to Excel for full list</td></tr>';
+    if(sortedDevs.length > 50) h += '<tr><td colspan="10" style="text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);padding:10px">Showing 50 of '+sortedDevs.length+' — '+(activeFilter?'use the market filter to narrow further or ':'')+'export to Excel for full list</td></tr>';
     h += '</tbody></table></div></div>';
   }
 
   return h;
 }
 
+// Calvin 2026-05-01: market filter setter for panelInvDashboard. Stored
+// on window so it survives panel re-render (the panel reads it on next
+// render). Re-renders the panel after setting.
 function panelInvUpload(){
   var u = DB.current;
   if(!canAccess(u,'inv-upload'))
@@ -24788,7 +24994,7 @@ function panelMyInventory(){
     h += '</div>';
     h += '<div style="overflow-x:auto"><table><thead><tr>'
        +'<th style="width:30px"><input type="checkbox" id="invMineAllCb" onchange="invMineToggleAll(this)" style="cursor:pointer"></th>'
-       +'<th>IMEI</th><th>Type</th><th>Campaign</th><th>Status</th><th>Expiry</th><th>Time Left</th><th>Cost</th><th></th>'
+       +'<th>IMEI</th><th>Type</th><th>Campaign</th><th>Market</th><th>Status</th><th>Expiry</th><th>Time Left</th><th>Cost</th><th></th>'
        +'</tr></thead><tbody>';
     myDevices.forEach(function(d){
       var days = invDaysRemaining(d.expiryDate, d.assignedDate || d.assignedAt);
@@ -24802,6 +25008,7 @@ function panelMyInventory(){
         + '<td style="font-family:monospace;font-size:.78rem">'+d.imei+'</td>'
         + '<td style="font-size:.78rem">'+(d.type || d.devType || '—')+'</td>'
         + '<td style="font-size:.78rem">'+(d.campaign || 'Gen Mobile')+'</td>'
+        + '<td style="font-size:.78rem">'+(d.market || '\u2014')+'</td>'
         + '<td style="font-size:.78rem">'+d.status+'</td>'
         + '<td style="font-size:.75rem">'+(d.expiryDate||'\u2014')+'</td>'
         + '<td>'+invExpiryBadge(d)+invExpiryBar(d)+'</td>'
@@ -27014,38 +27221,47 @@ function gmConfirmInventoryUpload(batchId){
   if(!pending||pending.batchId!==batchId){ alert('Session expired. Please re-upload the file.'); return; }
   pending.devices.forEach(function(d){ GM_INVENTORY.push(d); });
 
-  // ── Auto-assign newly uploaded devices to the MM who owns that market (if any) ──
-  var autoAssignSummary = {}; // {mmName: {count, market}}
-  var marketsInBatch = [...new Set(pending.devices.map(function(d){return d.market;}))];
-  marketsInBatch.forEach(function(market){
-    var owningMm = DB.agents.find(function(a){
-      return a.active && a.role==='Market Manager' && mmMarkets(a).indexOf(market)>=0;
-    });
-    if(!owningMm) return;
-    var imeisForMarket = pending.devices.filter(function(d){return d.market===market;}).map(function(d){return d.imei;});
-    if(imeisForMarket.length){
-      gmAssignToMM(imeisForMarket, owningMm.id, market);
-      autoAssignSummary[owningMm.name] = autoAssignSummary[owningMm.name] ||
-        {count:0, markets:[]};
-      autoAssignSummary[owningMm.name].count += imeisForMarket.length;
-      if(autoAssignSummary[owningMm.name].markets.indexOf(market)<0){
-        autoAssignSummary[owningMm.name].markets.push(market);
-      }
-      // Notify the MM
-      pushNotification({
-        toIds:[owningMm.id], toRoles:[], icon:'📦',
-        title:'New Inventory Assigned — '+market,
-        body:imeisForMarket.length+' device(s) just arrived for '+market+'. 30-day countdown has started — distribute to your team.',
-        panel:'gm-inventory', priority:'high'
-      });
+  // ── Calvin 2026-05-01 (updated) ──
+  // The parser (processGMInventoryUpload) ALREADY auto-assigns each device
+  // per its market via gmResolveAutoAssignee (MM-of-market → CM fallback).
+  // Here we just summarize who got what and notify recipients. We don't
+  // double-assign. If the parser couldn't resolve a recipient (no MM, no
+  // CM), the device lands as 'unassigned' and shows on the dashboard for
+  // manual placement.
+  var autoAssignSummary = {}; // {recipientName: {count, markets:[]}}
+  var unassignedCount = 0;
+  pending.devices.forEach(function(d){
+    if(!d.assignedToName){
+      unassignedCount++;
+      return;
+    }
+    var key = d.assignedToName;
+    if(!autoAssignSummary[key]) autoAssignSummary[key] = {count:0, markets:[], recipientId:d.assignedTo};
+    autoAssignSummary[key].count++;
+    if(autoAssignSummary[key].markets.indexOf(d.market) < 0){
+      autoAssignSummary[key].markets.push(d.market);
     }
   });
 
-  // Notify any Gen Mobile Campaign Managers so they see the new batch across all markets
+  // Notify each recipient
+  Object.keys(autoAssignSummary).forEach(function(name){
+    var s = autoAssignSummary[name];
+    pushNotification({
+      toIds:[s.recipientId], toRoles:[], icon:'📦',
+      title:'New Inventory Assigned — '+s.markets.join(', '),
+      body:s.count+' device(s) just arrived for '+s.markets.join(', ')+'. Open My Inventory to review or distribute.',
+      panel:'inv-my-inventory', priority:'high'
+    });
+  });
+
+  // Notify any Gen Mobile Campaign Managers so they see the batch
+  var marketsInBatch = [...new Set(pending.devices.map(function(d){return d.market;}))];
   var gmCMs = DB.agents.filter(function(a){
     return a.active && a.role==='Campaign Manager' && (cmCampaign(a)==='Gen Mobile' || cmCampaign(a)==='');
   });
   gmCMs.forEach(function(cm){
+    // Don't double-notify a CM who already got their personal assignment notice
+    if(autoAssignSummary[cm.name]) return;
     pushNotification({
       toIds:[cm.id], toRoles:[], icon:'📦',
       title:'Gen Mobile — New Inventory Uploaded',
@@ -27064,7 +27280,10 @@ function gmConfirmInventoryUpload(batchId){
         return '<strong>'+n+'</strong> ('+autoAssignSummary[n].count+' devices, '+autoAssignSummary[n].markets.join(', ')+')';
       }).join(' · ') + '</div>';
   }
-  if(preview) preview.innerHTML = '<div style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:6px;padding:12px 16px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#059669">✓ '+pending.devices.length+' devices added to Gen Mobile inventory.'+extra+' Go to <strong>Gen Mobile Inventory</strong> to assign or distribute any unassigned markets.</div>';
+  if(unassignedCount > 0){
+    extra += '<div style="margin-top:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#D97706">⚠ '+unassignedCount+' device(s) could not be auto-assigned (no MM or CM found for their market). Assign manually from the dashboard.</div>';
+  }
+  if(preview) preview.innerHTML = '<div style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:6px;padding:12px 16px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#059669">✓ '+pending.devices.length+' devices added to Gen Mobile inventory.'+extra+'</div>';
   cdFlash(pending.devices.length+' devices uploaded');
 }
 
@@ -28089,6 +28308,65 @@ function invAcceptCommit(){
   invFinalizeTransferAccept(campaign, transferId, /*skipSig*/ false);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  EXPIRY RESOLVER (Calvin 2026-05-02)
+//
+//  Central rule for "what is the recipient's expiry after this transfer?"
+//  Used by EVERY downstream assign + transfer-accept path so the cap is
+//  consistent across the whole system.
+//
+//  Rules:
+//   1. Role-based caps measured from TODAY (the assignment date):
+//        Campaign Manager   30 days
+//        IBO                30 days
+//        Market Manager     30 days
+//        Team Leader        14 days
+//        Field Agent        14 days
+//        any other          14 days
+//   2. ABSOLUTE ceiling: 30 days, no matter what. Even if Inv Dept set
+//      90 days at upload, no recipient can carry more than 30.
+//   3. Never extend — recipient's deadline ≤ sender's deadline. If the
+//      sender has 9 days left, the recipient gets 9 (not a fresh 14).
+//   4. Owner-direct assignments from Inv Dept (nobody held the device
+//      before) use the original upload expiry, capped at 30.
+//
+//  Returns ISO date string YYYY-MM-DD.
+// ════════════════════════════════════════════════════════════════════════
+function resolveTransferExpiry(senderExpiryDate, recipientRole, todayMs){
+  var ABSOLUTE_CEILING_DAYS = 30;
+  var ROLE_CAPS = {
+    'Campaign Manager': 30,
+    'IBO':              30,
+    'Market Manager':   30,
+    'Team Leader':      14,
+    'Field Agent':      14
+  };
+  var roleCap = ROLE_CAPS[recipientRole];
+  if(typeof roleCap !== 'number') roleCap = 14; // sane default for unknown roles
+  // Sender's remaining days (relative to today)
+  var t0 = (typeof todayMs === 'number') ? todayMs : Date.now();
+  var senderRemainingDays = null;
+  if(senderExpiryDate){
+    try {
+      var senderMs = new Date(senderExpiryDate).getTime();
+      if(!isNaN(senderMs)){
+        senderRemainingDays = Math.ceil((senderMs - t0) / 86400000);
+      }
+    } catch(e){}
+  }
+  // Final allowed days = min of (role cap, sender remaining, absolute ceiling).
+  // If sender has no expiry, just use role cap clamped by ceiling.
+  var allowedDays;
+  if(senderRemainingDays === null){
+    allowedDays = Math.min(roleCap, ABSOLUTE_CEILING_DAYS);
+  } else {
+    allowedDays = Math.min(roleCap, senderRemainingDays, ABSOLUTE_CEILING_DAYS);
+  }
+  // Floor at 0 so we never produce a date in the past
+  if(allowedDays < 0) allowedDays = 0;
+  return new Date(t0 + allowedDays*86400000).toISOString().slice(0,10);
+}
+
 // Finalize the device handover (extracted from old invAcceptTransfer body)
 function invFinalizeTransferAccept(campaign, transferId, skipSig){
   var cfg = campaignCfg(campaign); if(!cfg) return;
@@ -28097,9 +28375,16 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
 
   var pool = cfg.inventory();
   var now = new Date();
+  var todayMs = now.getTime();
+  // Resolve the recipient role ONCE (same for every device in the batch)
+  var to = DB.agents.find(function(a){return a.id===req.toId;});
+  var recipientRole = to ? to.role : 'Field Agent';
   req.devices.forEach(function(rd){
     var dev = pool.find(function(d){return d.imei===rd.imei;});
     if(!dev) return;
+    // Snapshot sender's expiry BEFORE we overwrite anything — this is
+    // the basis for the cap calculation.
+    var senderExpiry = dev.expiryDate || dev.originalExpiryDate || null;
     dev.assignedTo     = req.toId;
     dev.assignedToName = req.toName;
     dev.holderId       = req.toId;
@@ -28108,21 +28393,16 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
     dev.assignedDate   = now.toISOString().slice(0,10);
     dev.status         = 'assigned';
     if(!dev.chainOfCustody) dev.chainOfCustody=[];
-    dev.chainOfCustody.push({from:req.fromName, fromId:req.fromId, to:req.toName, toId:req.toId, at:now.toISOString(), type:'transfer-accepted-esign', reason:req.reason, signed:!skipSig});
-    // Reset appropriate expiry based on new holder role
-    var to = DB.agents.find(function(a){return a.id===req.toId;});
+    dev.chainOfCustody.push({from:req.fromName, fromId:req.fromId, to:req.toName, toId:req.toId, at:now.toISOString(), type:'transfer-accepted-esign', reason:req.reason, signed:!skipSig, priorExpiry:senderExpiry});
+    // ── Calvin 2026-05-02: apply role-based cap on every transfer accept ──
+    // Recipient gets min(sender remaining, role cap, 30-day ceiling).
+    // Replaces the prior "preserve original expiry" rule per Calvin's
+    // updated policy: a Field Agent receiving a 60-day device should
+    // not inherit 60 days of dwell time.
+    dev.expiryDate = resolveTransferExpiry(senderExpiry, recipientRole, todayMs);
     if(to){
-      var mcfg = (typeof gmEnsureMarket==='function' && dev.market) ? gmEnsureMarket(dev.market) : {mmDays:30,tlDays:14,agentDays:10};
       if(to.role==='Market Manager' || to.role==='Campaign Manager' || to.role==='IBO'){
         dev.mmId = to.id; dev.mmName = to.name;
-        dev.mmExpiresAt = new Date(now.getTime()+(mcfg.mmDays||30)*86400000).toISOString();
-        dev.expiryDate  = new Date(now.getTime()+(mcfg.mmDays||30)*86400000).toISOString().slice(0,10);
-      } else if(to.role==='Team Leader'){
-        dev.tlExpiresAt = new Date(now.getTime()+(mcfg.tlDays||14)*86400000).toISOString();
-        dev.expiryDate  = new Date(now.getTime()+(mcfg.tlDays||14)*86400000).toISOString().slice(0,10);
-      } else {
-        dev.agentExpiresAt = new Date(now.getTime()+(mcfg.agentDays||10)*86400000).toISOString();
-        dev.expiryDate     = new Date(now.getTime()+(mcfg.agentDays||10)*86400000).toISOString().slice(0,10);
       }
     }
   });
@@ -28170,16 +28450,52 @@ function gmInitiateTransfer(){
   if(!toEl||!toEl.value){ alert('Please select an agent.'); return; }
   if(!imeisEl||!imeisEl.value.trim()){ alert('Please enter at least one IMEI.'); return; }
   var toId  = parseInt(toEl.value);
-  var market = marketEl?marketEl.value:'';
+  var market = marketEl?marketEl.value.trim():'';
   var imeis = imeisEl.value.split('\n').map(function(l){return l.trim();}).filter(Boolean);
   var u = DB.current;
 
-  // Verify all IMEIs exist in the right market
-  var wrongMarket = imeis.filter(function(imei){
-    return !GM_INVENTORY.find(function(d){return d.imei===imei&&d.market===market;});
+  // ── Calvin 2026-05-01 fix for issue #4 ──
+  // Was: GM_INVENTORY.find(d.imei===imei && d.market===market)
+  //      → failed when device lived in INVENTORY_DEVICES (legacy) OR
+  //        when device's market was "Unknown" (gmCleanMarket couldn't
+  //        resolve the team name).
+  // Now: search the UNION of GM_INVENTORY + INVENTORY_DEVICES filtered
+  //      to Gen Mobile, and treat a BLANK market dropdown as "any market"
+  //      so users with "Unknown" market devices can still transfer them.
+  //      The market field is informational only at this stage; the
+  //      triple-check downstream still validates ownership and status.
+  function _findGMDeviceByImei(imei){
+    var hit = GM_INVENTORY.find(function(d){return d.imei===imei;});
+    if(hit) return hit;
+    if(typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
+      hit = INVENTORY_DEVICES.find(function(d){
+        return d.imei===imei && (d.campaign==='Gen Mobile' || !d.campaign);
+      });
+      if(hit) return hit;
+    }
+    return null;
+  }
+  var notFound = [];       // IMEI doesn't exist in any GM-eligible pool
+  var wrongMarket = [];    // IMEI exists but in a different market (only enforced if market is set)
+  imeis.forEach(function(imei){
+    var dev = _findGMDeviceByImei(imei);
+    if(!dev){
+      notFound.push(imei);
+      return;
+    }
+    // Only enforce the market filter if user actually picked one.
+    // Treat 'Unknown' devices as matching any market (so devices with
+    // unresolved market names can still be transferred).
+    if(market && dev.market && dev.market !== 'Unknown' && dev.market !== market){
+      wrongMarket.push(imei + ' (in ' + dev.market + ')');
+    }
   });
+  if(notFound.length){
+    alert('These IMEIs are not in the Gen Mobile inventory at all:\n\n'+notFound.join('\n')+'\n\nCheck for typos, or upload them first via Gen Mobile → Upload CSV.');
+    return;
+  }
   if(wrongMarket.length){
-    alert('These IMEIs not found in '+market+' inventory:\n'+wrongMarket.join('\n'));
+    alert('These IMEIs exist but in a different market than '+market+':\n\n'+wrongMarket.join('\n')+'\n\nLeave the Market dropdown blank to transfer across markets.');
     return;
   }
 
