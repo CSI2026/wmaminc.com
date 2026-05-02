@@ -3722,7 +3722,9 @@ function aaRenderIboMarkets(){
 
   // Build combined options list from BOTH sources:
   //  • Ship A8 Markets Roster (preferred — stored in MARKETS array)
-  //  • Legacy LIFELINE_TEAMS (kept for backward compat)
+  //  Calvin 2026-05-02: legacy LIFELINE_TEAMS injection removed.
+  //  Migrator copies all LIFELINE_TEAMS rows into MARKETS so the dropdown
+  //  only needs to read from MARKETS to avoid duplicates.
   var combinedOptions = [];
   if(typeof marketActiveList === 'function'){
     try {
@@ -3731,10 +3733,6 @@ function aaRenderIboMarkets(){
       });
     } catch(e){}
   }
-  LIFELINE_TEAMS.forEach(function(t){
-    if(t.active === false) return;
-    combinedOptions.push({ id: t.id, label: t.name, source: 'legacy', color: t.color || '#7c3aed' });
-  });
 
   if(!combinedOptions.length){
     list.innerHTML = '<div style="padding:10px 12px;background:white;border:1px dashed rgba(124,58,237,.3);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">No markets exist yet. Click <strong>+ Add Market</strong> to create the first one.</div>';
@@ -3744,14 +3742,10 @@ function aaRenderIboMarkets(){
   var html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px">';
   combinedOptions.forEach(function(opt){
     var checked = assigned.indexOf(opt.id) >= 0;
-    var srcBadge = opt.source === 'roster'
-      ? '<span style="font-size:.55rem;background:rgba(8,145,178,.15);color:#0891b2;padding:1px 4px;border-radius:3px;letter-spacing:.5px;font-weight:700">🗺️</span>'
-      : '<span style="font-size:.55rem;background:rgba(124,58,237,.15);color:#7c3aed;padding:1px 4px;border-radius:3px;letter-spacing:.5px;font-weight:700">📁</span>';
     html += '<label style="display:flex;align-items:center;gap:8px;padding:7px 10px;background:white;border:1.5px solid '+(checked?'#7c3aed':'var(--sand)')+';border-radius:5px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.74rem">'
          +'<input type="checkbox" value="'+opt.id+'" '+(checked?'checked':'')+" onchange=\"aaToggleIboMarket('"+opt.id+"', this.checked)\" style=\"accent-color:#7c3aed;width:14px;height:14px\">"
          +'<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:'+opt.color+'"></span>'
          +'<span>'+opt.label+'</span>'
-         + srcBadge
          +'</label>';
   });
   html += '</div>';
@@ -29991,42 +29985,24 @@ function populateAgentModalDropdowns(agent){
   var teamSel=document.getElementById('aaTeam');
   if(teamSel){
     teamSel.innerHTML='<option value="">— No Team Yet —</option>';
-    // ── Ship A8: Markets Roster entries (preferred) ──
-    // Markets created via Manage → Markets Roster appear at the top with a
-    // 🗺️ marker so onboarding can pick an "officially managed" market that
-    // already has a CM/MM/IBO/TLs assigned. The legacy LIFELINE_TEAMS list
-    // still appears below for any team that hasn't been migrated yet.
+    // Calvin 2026-05-02: Markets Roster is the single source of truth.
+    // Legacy LIFELINE_TEAMS optgroup removed — migrator copies them all
+    // into MARKETS so they appear in the main list, not duplicated.
     if(typeof marketActiveList === 'function'){
       try {
         var mkts = marketActiveList();
         if(mkts && mkts.length){
-          var grpA = document.createElement('optgroup');
-          grpA.label = '🗺️ Managed Markets (from Markets Roster)';
           mkts.forEach(function(m){
             var opt=document.createElement('option');
             opt.value='market-'+m.id;
-            opt.textContent=m.name;
+            var loc = (m.city||m.state) ? ' ('+(m.city||'')+(m.city&&m.state?', ':'')+(m.state||'')+')' : '';
+            opt.textContent=m.name+loc;
             if(agent&&agent.team==='market-'+m.id) opt.selected=true;
-            grpA.appendChild(opt);
+            teamSel.appendChild(opt);
           });
-          teamSel.appendChild(grpA);
         }
       } catch(e){ console.warn('[populateAgentModalDropdowns] markets pull failed:', e); }
     }
-    // ── Legacy LIFELINE_TEAMS (kept for backward compatibility) ──
-    var grpB = document.createElement('optgroup');
-    grpB.label = '📁 Legacy Teams';
-    var legacyCount = 0;
-    LIFELINE_TEAMS.forEach(function(t){
-      if(t.active===false) return;
-      var opt=document.createElement('option');
-      opt.value=t.id;
-      opt.textContent=t.name+' ('+t.city+', '+t.state+')';
-      if(agent&&agent.team===t.id) opt.selected=true;
-      grpB.appendChild(opt);
-      legacyCount++;
-    });
-    if(legacyCount) teamSel.appendChild(grpB);
     // ── "+ Add New Market" jump-link ──
     var addOpt = document.createElement('option');
     addOpt.value = '__add_new_market__';
@@ -34432,6 +34408,8 @@ function migrateLifelineTeamsToMarkets(){
         var ll = existing.programs.lifeline;
         if(!existing.city  && t.city)  existing.city  = t.city;
         if(!existing.state && t.state) existing.state = t.state;
+        // Backfill legacyId so old agent.team='team-...' references resolve
+        if(!existing.legacyId && t.id) existing.legacyId = t.id;
         // If section has no placement and team had one, copy it in
         if(!ll.mmId && t.marketManager)   ll.mmId  = t.marketManager;
         if(!ll.cmId && t.campaignManager) ll.cmId  = t.campaignManager;
@@ -34445,6 +34423,11 @@ function migrateLifelineTeamsToMarkets(){
       var nextId = (typeof MARKET_NEXT_ID !== 'undefined') ? MARKET_NEXT_ID++ : ((MARKETS||[]).length + 1);
       var rec = {
         id: nextId,
+        // Calvin 2026-05-02: store the legacy LIFELINE_TEAMS id so existing
+        // agent records with team:'team-tulsa-ok' still resolve correctly
+        // after migration. Lookups (marketGetById, marketResolveByAnyRef)
+        // accept either the numeric id or the legacy string id.
+        legacyId: t.id || null,
         name: t.name,
         city: t.city || '',
         state: t.state || '',
@@ -35768,15 +35751,13 @@ function apMarketSinglePicker(label, fieldId, hint, currentValue){
   mkts.forEach(function(m){
     var val = 'market-'+m.id;
     var sel = (currentValue === val) ? ' selected' : '';
-    html += '<option value="'+val+'"'+sel+'>'+_escapeHtml(m.name)+'</option>';
+    var loc = (m.city||m.state) ? ' ('+(m.city||'')+(m.city&&m.state?', ':'')+(m.state||'')+')' : '';
+    html += '<option value="'+val+'"'+sel+'>'+_escapeHtml(m.name+loc)+'</option>';
   });
-  if(typeof LIFELINE_TEAMS !== 'undefined'){
-    LIFELINE_TEAMS.forEach(function(t){
-      if(t.active === false) return;
-      var sel = (currentValue === t.id) ? ' selected' : '';
-      html += '<option value="'+_escapeAttr(t.id)+'"'+sel+'>'+_escapeHtml(t.name)+' (legacy)</option>';
-    });
-  }
+  // Calvin 2026-05-02: legacy LIFELINE_TEAMS injection removed.
+  // Migrator already copies any LIFELINE_TEAMS rows into MARKETS so
+  // showing them again here was a duplicate. MARKETS is the single
+  // source of truth for placement.
   html += '</select>';
   html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px">'+_escapeHtml(hint)+'</div>';
   html += '</div>';
@@ -35800,15 +35781,13 @@ function apRenderMarketMultiList(){
   var combined = [];
   if(typeof marketActiveList === 'function'){
     marketActiveList().forEach(function(m){
-      combined.push({id:'market-'+m.id, label:m.name, source:'roster'});
+      var loc = (m.city||m.state) ? ' ('+(m.city||'')+(m.city&&m.state?', ':'')+(m.state||'')+')' : '';
+      combined.push({id:'market-'+m.id, label:m.name+loc, source:'roster'});
     });
   }
-  if(typeof LIFELINE_TEAMS !== 'undefined'){
-    LIFELINE_TEAMS.forEach(function(t){
-      if(t.active === false) return;
-      combined.push({id:t.id, label:t.name, source:'legacy'});
-    });
-  }
+  // Calvin 2026-05-02: legacy LIFELINE_TEAMS injection removed.
+  // Migrator already copies LIFELINE_TEAMS rows into MARKETS, so showing
+  // them here was a duplicate. MARKETS is the single source of truth.
   if(!combined.length){
     list.innerHTML = '<div style="padding:8px 12px;background:white;border:1px dashed var(--sand);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">No markets exist yet. Add one via Markets Roster.</div>';
     return;
@@ -35816,10 +35795,9 @@ function apRenderMarketMultiList(){
   var html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:5px">';
   combined.forEach(function(opt){
     var checked = assigned.indexOf(opt.id) >= 0;
-    var srcBadge = opt.source === 'roster' ? '🗺️' : '📁';
     html += '<label style="display:flex;align-items:center;gap:6px;padding:6px 10px;background:white;border:1.5px solid '+(checked?'var(--blue)':'var(--sand)')+';border-radius:5px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.74rem">'
          + '<input type="checkbox" value="'+_escapeAttr(opt.id)+'" '+(checked?'checked':'')+" onchange=\"apToggleMarket('"+opt.id.replace(/'/g,"\\'")+"', this.checked)\">"
-         + srcBadge + ' ' + _escapeHtml(opt.label)
+         + '🗺️ ' + _escapeHtml(opt.label)
          + '</label>';
   });
   html += '</div>';
