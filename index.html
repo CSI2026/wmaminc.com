@@ -34392,6 +34392,78 @@ function marketResolveRecipient(market, program){
 // LIFELINE_TEAMS data into MARKETS so nothing is lost. Idempotent —
 // safe to run on every load. Each LIFELINE_TEAMS row becomes a MARKETS
 // record with its placement landing in the LIFELINE program section.
+// ── LIFELINE_TEAMS ↔ MARKETS sync (Calvin 2026-05-02) ──
+// Many legacy reader functions (reportingChainFor, panelMyTeam, gmAgentTeam,
+// getTeamSales, agentIsUnderIBO, etc.) look up team membership via
+// LIFELINE_TEAMS[i].members/leader/marketManager/campaignManager. Those
+// fields aren't kept in sync with the new MARKETS placement system, so
+// after migration users see empty teams + can't see inventory in their org.
+//
+// This helper rebuilds LIFELINE_TEAMS[i] mirror fields from MARKETS data:
+//   • leader          ← MARKETS[i].programs.lifeline.tlIds[0] (first TL)
+//   • marketManager   ← MARKETS[i].programs.lifeline.mmId
+//   • campaignManager ← MARKETS[i].programs.lifeline.cmId
+//   • members         ← every agent whose team='market-i' OR who is one of
+//                        the placed CM/MM/TLs OR whose teamLeaderId is one
+//                        of this market's TLs (Field Agents)
+//
+// Called from the migrator AND after every save that changes placement.
+function syncLegacyTeamMembers(){
+  try {
+    if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return 0;
+    if(typeof MARKETS === 'undefined' || !Array.isArray(MARKETS)) return 0;
+    var synced = 0;
+    LIFELINE_TEAMS.forEach(function(t){
+      if(!t) return;
+      // Find matching MARKETS row by either id (post-migration both should
+      // be 'market-N' format) or by name (case-insensitive fallback)
+      var m = MARKETS.find(function(mr){
+        return ('market-'+mr.id) === t.id || mr.legacyId === t.id || (mr.name||'').toLowerCase().trim() === (t.name||'').toLowerCase().trim();
+      });
+      if(!m) return;
+      ensureMarketSections(m);
+      var ll = m.programs.lifeline || {};
+      // Mirror placement fields from Lifeline section (legacy readers expect Lifeline)
+      t.leader          = (ll.tlIds && ll.tlIds.length) ? ll.tlIds[0] : null;
+      t.marketManager   = ll.mmId  || null;
+      t.campaignManager = ll.cmId  || null;
+      // Rebuild members[] from MARKETS placement + agents who report to this market
+      var members = {};
+      // Add the placement holders
+      if(ll.cmId)  members[ll.cmId]  = true;
+      if(ll.mmId)  members[ll.mmId]  = true;
+      if(ll.iboId) members[ll.iboId] = true;
+      (ll.tlIds||[]).forEach(function(tid){ members[tid] = true; });
+      // Add Field Agents whose teamLeaderId is one of this market's TLs
+      // OR whose team=='market-N' string id pointing to this market
+      var marketRefs = ['market-'+m.id];
+      if(m.legacyId) marketRefs.push(m.legacyId);
+      (DB.agents||[]).forEach(function(a){
+        if(!a || !a.active) return;
+        // Field Agent reporting to one of this market's TLs
+        if(a.role === 'Field Agent' && a.teamLeaderId && (ll.tlIds||[]).indexOf(a.teamLeaderId) >= 0){
+          members[a.id] = true;
+        }
+        // Anyone whose team string matches this market
+        if(a.team && marketRefs.indexOf(a.team) >= 0){
+          members[a.id] = true;
+        }
+      });
+      t.members = Object.keys(members).map(function(k){ return parseInt(k,10); }).filter(function(n){ return !isNaN(n); });
+      // Also sync active flag with the market's overall active flag
+      t.active = m.active !== false;
+      synced++;
+    });
+    if(synced > 0){
+      console.log('[syncLegacyTeamMembers] Synced '+synced+' legacy team mirror(s) from MARKETS data.');
+    }
+    return synced;
+  } catch(e){
+    console.warn('[syncLegacyTeamMembers] failed safely:', e);
+    return 0;
+  }
+}
+
 function migrateLifelineTeamsToMarkets(){
   try {
     if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return 0;
@@ -34496,6 +34568,11 @@ function migrateLifelineTeamsToMarkets(){
     }
     // Always run section-ensurer on every existing market
     (MARKETS||[]).forEach(ensureMarketSections);
+    // Calvin 2026-05-02: Always sync legacy LIFELINE_TEAMS members[] from
+    // MARKETS placements. Legacy readers (reportingChainFor, panelMyTeam,
+    // gmAgentTeam, etc.) walk LIFELINE_TEAMS — keep that mirror correct
+    // so users see their teams + can see inventory in their org.
+    if(typeof syncLegacyTeamMembers === 'function') syncLegacyTeamMembers();
     return migrated;
   } catch(e){
     console.warn('[migrateLifelineTeamsToMarkets] failed:', e);
@@ -35072,6 +35149,10 @@ function marketEditSave(){
       console.log('[marketEditSave] created market #'+rec.id+': '+name);
     }
     saveInventory();
+    // Calvin 2026-05-02: re-sync legacy LIFELINE_TEAMS mirror so org-tree
+    // readers see the new placement immediately.
+    if(typeof syncLegacyTeamMembers === 'function') syncLegacyTeamMembers();
+    if(typeof saveToStorage === 'function') saveToStorage();
     marketEditCancel();
     gotoPanel('markets-admin');
   } catch(e){
@@ -36315,6 +36396,10 @@ async function apSavePerson(){
             if(isPicked) mr2.updatedAt = new Date().toISOString();
           });
         }
+        // Calvin 2026-05-02: After any MARKETS placement change, re-sync
+        // the legacy LIFELINE_TEAMS mirror so reportingChainFor / panelMyTeam
+        // / inventoryVisibleTo etc. continue to work for this agent.
+        if(typeof syncLegacyTeamMembers === 'function') syncLegacyTeamMembers();
       }
 
       // Channels — derived from programs + campaigns. Preserve any
@@ -36717,6 +36802,8 @@ function commitPlaceInMarket(agentId){
     if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent);
     if(typeof saveToStorage === 'function') saveToStorage();
     if(typeof saveInventory === 'function') saveInventory();
+    // Calvin 2026-05-02: re-sync legacy LIFELINE_TEAMS mirror
+    if(typeof syncLegacyTeamMembers === 'function') syncLegacyTeamMembers();
 
     closePlaceInMarket();
     alert('✓ '+agent.name+' is now placed.');
