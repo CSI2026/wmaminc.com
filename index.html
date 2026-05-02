@@ -35479,6 +35479,9 @@ function apRefreshCampaigns(){
   area.innerHTML = html;
   apPruneOrphanCampaigns();
   apRefreshCodesArea();
+  // Calvin 2026-05-02: re-render placement section so its no-markets
+  // check refreshes when programs change.
+  if(typeof apRenderPlacement === 'function') apRenderPlacement();
 }
 
 // Drop campaigns from _apForm.campaigns whose parent program is no longer
@@ -35625,16 +35628,38 @@ function apRenderPlacement(){
   if(!body) return;
   if(!role || role === 'Office'){ body.innerHTML = ''; return; }
 
-  // ── Calvin 2026-05-02: Read-only mode for Edit Person ──
-  // When editing an existing agent, show a summary of where they are
-  // currently placed in the org tree + a button to manage placement in
-  // Markets Roster. This is the SINGLE SOURCE OF TRUTH pattern: there's
-  // only one place placement gets edited.
-  // For NEW agents (Add Person), keep the inline pickers so you can place
-  // them inline without bouncing to a second screen.
-  var isEditing = (f.editingId | 0) > 0;
-  if(isEditing){
-    body.innerHTML = apRenderPlacementReadOnly(f, role);
+  // ── Calvin 2026-05-02 (revised) ──
+  // Inline placement pickers for BOTH Add and Edit Person. Single source
+  // of truth is still MARKETS roster — but the UI lets the admin pick the
+  // agent's market right here without bouncing to a second screen.
+  // If no active markets exist for the agent's programs, we BLOCK save
+  // and show a clear "set up a market first" message inline.
+
+  // Check if there are any active markets for the programs this agent works
+  var agentPrograms = f.programs || [];
+  var hasUsableMarket = false;
+  if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS) && agentPrograms.length){
+    hasUsableMarket = MARKETS.some(function(m){
+      if(!m || m.active === false) return false;
+      ensureMarketSections(m);
+      return agentPrograms.some(function(p){
+        var key = p.toLowerCase();
+        var section = m.programs && m.programs[key];
+        return section && section.active !== false;
+      });
+    });
+  } else if(!agentPrograms.length){
+    // No programs picked yet → can't say
+    hasUsableMarket = true; // treat as not-blocking until a program is picked
+  }
+
+  // If programs picked but no markets exist for them → BLOCK save
+  var saveBlocked = (agentPrograms.length > 0) && !hasUsableMarket;
+  apToggleSaveBlock(saveBlocked, agentPrograms);
+
+  if(saveBlocked){
+    // Show a clear "no markets" message instead of pickers
+    body.innerHTML = apRenderNoMarketsBlock(agentPrograms);
     return;
   }
 
@@ -35693,6 +35718,46 @@ function apRenderPlacement(){
   // Multi-select markets (MM/CM/IBO)
   if(role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO'){
     apRenderMarketMultiList();
+  }
+}
+
+// ── No-markets-yet block (Calvin 2026-05-02) ──
+// Shown inside Step 4 when the agent has programs picked but no active
+// markets exist for any of them. Save is blocked until a market is set up.
+function apRenderNoMarketsBlock(programs){
+  var progLabels = programs.join(', ');
+  var html = '';
+  html += '<div style="background:rgba(204,0,0,.06);border:1px solid rgba(204,0,0,.25);border-radius:8px;padding:18px 20px">';
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:#cc0000;margin-bottom:8px">⚠ NO MARKETS SET UP FOR ' + _escapeHtml(progLabels.toUpperCase()) + '</div>';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown);line-height:1.6;margin-bottom:14px">';
+  html += 'There are no active markets configured for the program(s) this person works (<strong>' + _escapeHtml(progLabels) + '</strong>). ';
+  html += 'A market must be set up first before you can place this person.';
+  html += '</div>';
+  html += '<div style="display:flex;gap:10px;align-items:center">';
+  html += '<button type="button" onclick="apJumpToMarketsRoster()" style="background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 18px;border-radius:5px;cursor:pointer;font-weight:700">🗺️ Open Markets Roster →</button>';
+  html += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">Save is blocked until a market is set up for this person.</span>';
+  html += '</div>';
+  html += '</div>';
+  return html;
+}
+
+// Toggle the Save button's blocked state.
+// When blocked: button is disabled + shows a small "fix above" hint.
+function apToggleSaveBlock(blocked, programs){
+  var btn = document.querySelector('#addPersonModal button[onclick*="apSavePerson"]');
+  if(!btn) return;
+  if(blocked){
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    btn.style.cursor = 'not-allowed';
+    btn.dataset.blockReason = 'no-markets-for-programs';
+    btn.title = 'Set up a market for ' + (programs||[]).join(', ') + ' before saving.';
+  } else {
+    btn.disabled = false;
+    btn.style.opacity = '';
+    btn.style.cursor = '';
+    delete btn.dataset.blockReason;
+    btn.title = '';
   }
 }
 
@@ -36133,55 +36198,113 @@ async function apSavePerson(){
       });
       agent.carrier = withCodes.join(',');
 
-      // ── Calvin 2026-05-02: Placement writes ONLY happen on Add Person ──
-      // For edits, placement is read-only in the modal and managed exclusively
-      // in Markets Roster. We skip the writes here so a stale form (which
-      // wouldn't have rendered the pickers in edit mode anyway) cannot
-      // accidentally null out the agent's placement fields. The Markets
-      // Roster handles all placement updates via marketSetCm/MM/IBO/TL.
-      if(editingId === 0){
-        // New person — write placement from the inline pickers
-        agent.team             = f.market   || null;
-        agent.teamLeaderId     = f.parentTL || null;
-        agent.marketManagerId  = f.parentMM || null;
-        agent.campaignManagerId= f.parentCM || null;
-        agent.iboMarkets       = (role === 'IBO' || role === 'Campaign Manager' || role === 'Market Manager')
-                                ? f.iboMarkets.slice()
-                                : [];
-        // Also reflect this placement back into the MARKETS roster so
-        // there's one source of truth. If the user picked a market in the
-        // inline placement step, register them on that market with the
-        // appropriate role.
-        if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
-          // Single-market roles (Field Agent, Team Leader)
-          if(f.market && (role === 'Field Agent' || role === 'Team Leader')){
-            var marketIdNum = parseInt((f.market+'').replace(/^market-/, ''), 10);
-            var marketRow = MARKETS.find(function(m){ return m.id === marketIdNum; });
-            if(marketRow){
+      // ── Calvin 2026-05-02 (revised): Placement writes for Add AND Edit ──
+      // Inline pickers are now visible on both flows. Save updates the
+      // agent's placement fields AND mirrors into the MARKETS roster so
+      // both views stay in sync.
+      agent.team             = f.market   || null;
+      agent.teamLeaderId     = f.parentTL || null;
+      agent.marketManagerId  = f.parentMM || null;
+      agent.campaignManagerId= f.parentCM || null;
+      agent.iboMarkets       = (role === 'IBO' || role === 'Campaign Manager' || role === 'Market Manager')
+                              ? (f.iboMarkets||[]).slice()
+                              : [];
+
+      // Mirror placement into MARKETS roster. For each program the agent
+      // works, write to that program's section. (Most users work Lifeline
+      // only — Lifeline is the default destination if they only have one
+      // program.)
+      if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+        var agentProgs = (f.programs||[]).map(function(p){ return p.toLowerCase(); });
+        if(!agentProgs.length) agentProgs = ['lifeline']; // default
+        // Helper: look up market record by either numeric id or 'market-N' string
+        function _findMarket(ref){
+          if(ref === null || ref === undefined) return null;
+          var n = parseInt((ref+'').replace(/^market-/, ''), 10);
+          if(isNaN(n)) return null;
+          return MARKETS.find(function(m){ return m.id === n; }) || null;
+        }
+        // Single-market roles (Field Agent, Team Leader): write to all
+        // program sections the agent works in this market.
+        if(f.market && (role === 'Field Agent' || role === 'Team Leader')){
+          var mr = _findMarket(f.market);
+          if(mr){
+            ensureMarketSections(mr);
+            agentProgs.forEach(function(prog){
+              if(['lifeline','internet','aca'].indexOf(prog) < 0) return;
+              var sec = mr.programs[prog];
               if(role === 'Team Leader'){
-                if(!Array.isArray(marketRow.tlIds)) marketRow.tlIds = [];
-                if(marketRow.tlIds.indexOf(agent.id) < 0) marketRow.tlIds.push(agent.id);
+                if(!Array.isArray(sec.tlIds)) sec.tlIds = [];
+                if(sec.tlIds.indexOf(agent.id) < 0) sec.tlIds.push(agent.id);
+                sec.active = true;
               }
-              // Field Agents aren't a roster role — they're members of the
-              // market via teamLeaderId / marketManagerId on their own
-              // record. The MARKETS row doesn't track them directly.
-            }
+              // Field Agents aren't roster slots — they're tracked via
+              // their own teamLeaderId and queried on demand.
+            });
+            // Re-mirror legacy fields after section edits
+            ensureMarketSections(mr);
+            mr.updatedAt = new Date().toISOString();
           }
-          // Multi-market roles (MM, CM, IBO)
-          if(f.iboMarkets && f.iboMarkets.length){
-            f.iboMarkets.forEach(function(mid){
-              var marketIdNum2 = parseInt((mid+'').replace(/^market-/, ''), 10);
-              var marketRow2 = MARKETS.find(function(m){ return m.id === marketIdNum2; });
-              if(!marketRow2) return;
-              if(role === 'Market Manager'  && !marketRow2.mmId)  marketRow2.mmId  = agent.id;
-              if(role === 'Campaign Manager'&& !marketRow2.cmId)  marketRow2.cmId  = agent.id;
-              if(role === 'IBO'             && !marketRow2.iboId) marketRow2.iboId = agent.id;
+          // EDIT: clean stale TL placements on OTHER markets (this person
+          // moved markets — remove from where they used to be).
+          if(role === 'Team Leader'){
+            MARKETS.forEach(function(other){
+              if(!other) return;
+              ensureMarketSections(other);
+              ['lifeline','internet','aca'].forEach(function(prog){
+                var s = other.programs[prog];
+                if(!s || !Array.isArray(s.tlIds)) return;
+                if(other.id !== (mr ? mr.id : -1) && s.tlIds.indexOf(agent.id) >= 0){
+                  s.tlIds = s.tlIds.filter(function(x){ return x !== agent.id; });
+                }
+              });
+              ensureMarketSections(other);
             });
           }
         }
+        // Multi-market roles (MM, CM, IBO): write to all picked markets'
+        // appropriate slots, and clear from markets that were unpicked.
+        if(role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO'){
+          var picked = (f.iboMarkets||[]).map(function(x){
+            return parseInt((x+'').replace(/^market-/, ''), 10);
+          }).filter(function(n){ return !isNaN(n); });
+          MARKETS.forEach(function(mr2){
+            if(!mr2) return;
+            ensureMarketSections(mr2);
+            var isPicked = picked.indexOf(mr2.id) >= 0;
+            agentProgs.forEach(function(prog){
+              if(['lifeline','internet','aca'].indexOf(prog) < 0) return;
+              var s = mr2.programs[prog];
+              if(role === 'Market Manager'){
+                if(isPicked && !s.mmId) s.mmId = agent.id;
+                else if(isPicked && s.mmId === agent.id) {/* keep */}
+                else if(!isPicked && s.mmId === agent.id) s.mmId = null;
+                if(isPicked) s.active = true;
+              } else if(role === 'Campaign Manager'){
+                if(isPicked){
+                  s.cmId = agent.id;
+                  s.topRole = 'cm';
+                  s.iboId = null;
+                  s.active = true;
+                } else if(s.cmId === agent.id){
+                  s.cmId = null;
+                }
+              } else if(role === 'IBO'){
+                if(isPicked){
+                  s.iboId = agent.id;
+                  s.topRole = 'ibo';
+                  s.cmId = null;
+                  s.active = true;
+                } else if(s.iboId === agent.id){
+                  s.iboId = null;
+                }
+              }
+            });
+            ensureMarketSections(mr2);
+            if(isPicked) mr2.updatedAt = new Date().toISOString();
+          });
+        }
       }
-      // For edits: placement is preserved as-is on the agent record.
-      // Markets Roster is the canonical place to change CM/MM/TL/IBO.
 
       // Channels — derived from programs + campaigns. Preserve any
       // non-program-derived channels (team channels, role channels) so
@@ -36245,12 +36368,17 @@ async function apSavePerson(){
     var emailNote = (isNew && agent.email) ? '\n\n📧 Welcome email sent to '+agent.email+' with login info and onboarding documents to sign.' : '';
     alert('✓ ' + agent.name + ' ' + verb + '.' + emailNote);
 
-    // ── Calvin 2026-05-02: Step 2 of onboarding ──
-    // For NEW sales-role agents (Field Agent / TL / MM / CM / IBO), auto-open
-    // the "Place in Market" modal as the second step. Office staff and edits
-    // skip this since they don't need market placement.
-    if(isNew && (role === 'Field Agent' || role === 'Team Leader' || role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO')){
-      // Small delay so the previous modal close animation finishes
+    // ── Calvin 2026-05-02 (revised): Step 2 only when truly needed ──
+    // Inline placement pickers are now in Step 4 of the modal itself.
+    // We only fall back to opening the auto-Step-2 modal if the new
+    // agent saved without any placement (e.g. user closed Step 4 without
+    // touching it). Edits skip this — they explicitly pick placement
+    // inline, no second modal.
+    var needsPlacement = isNew
+      && (role === 'Field Agent' || role === 'Team Leader' || role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO')
+      && !agent.team
+      && !(agent.iboMarkets && agent.iboMarkets.length);
+    if(needsPlacement){
       setTimeout(function(){
         try {
           if(typeof openPlaceInMarket === 'function') openPlaceInMarket(agent.id);
