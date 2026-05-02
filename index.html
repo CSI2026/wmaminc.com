@@ -9995,27 +9995,34 @@ function parseGMInventoryCSV(text){
   return rows;
 }
 
-// ── Auto-assign resolver (Calvin 2026-05-01, updated) ──
-// Given a device's market, find the right person to auto-assign it to:
-//   1. The Market Manager assigned to that market (via MARKETS roster)
-//   2. Failing that, the Gen Mobile Campaign Manager (Tanita Flowers)
-// Returns {agent, source:'mm-of-market'|'cm-fallback'|'hard-fallback', market}
-// or null if literally no agent is available.
+// ── Auto-assign resolver (Calvin 2026-05-02) ──
+// Given a device's market name, find who should receive it on upload.
+// Priority order:
+//   1. Market Manager of that market
+//   2. Campaign Manager of that market
+//   3. IBO of that market
+//   4. Hard fallback: any GM Campaign Manager (legacy safety net)
+// Returns {agent, source:'mm'|'cm'|'ibo'|'hard-fallback', market}
+// or null if literally no agent can be resolved.
 function gmResolveAutoAssignee(marketName){
-  // Step 1: Try to find the MM for this specific market
+  // Find the MARKETS row by name
   if(marketName && typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
     var marketRow = MARKETS.find(function(m){
       if(!m || m.active === false) return false;
       return (m.name || '').toLowerCase().trim() === marketName.toLowerCase().trim();
     });
-    if(marketRow && marketRow.mmId){
-      var mm = (DB.agents||[]).find(function(a){
-        return a.id === marketRow.mmId && a.active;
-      });
-      if(mm) return { agent: mm, source: 'mm-of-market', market: marketRow };
+    if(marketRow && typeof marketResolveRecipient === 'function'){
+      var rec = marketResolveRecipient(marketRow);
+      if(rec){
+        var src = (rec.id === marketRow.mmId) ? 'mm'
+                : (rec.id === marketRow.cmId) ? 'cm'
+                : (rec.id === marketRow.iboId) ? 'ibo'
+                : 'mm';
+        return { agent: rec, source: src, market: marketRow };
+      }
     }
   }
-  // Step 2: Fallback to the Gen Mobile Campaign Manager
+  // Hard fallback: any active CM tied to Gen Mobile
   var cm = (DB.agents||[]).find(function(a){
     if(!a.active) return false;
     if(a.role !== 'Campaign Manager') return false;
@@ -10023,8 +10030,8 @@ function gmResolveAutoAssignee(marketName){
     var isOklahoma = a.cmModel === 'cm-oklahoma';
     return hasGM || isOklahoma;
   });
-  if(cm) return { agent: cm, source: 'cm-fallback', market: null };
-  // Step 3: Hard fallback — Tanita id 2 if she exists
+  if(cm) return { agent: cm, source: 'hard-fallback', market: null };
+  // Hardest fallback: Tanita id 2
   var tanita = (DB.agents||[]).find(function(a){ return a.id === 2; });
   if(tanita) return { agent: tanita, source: 'hard-fallback', market: null };
   return null;
@@ -10161,11 +10168,13 @@ function processGMInventoryUpload(csvText, batchId){
         toId:    autoAgent.id,
         at:      nowISO,
         type:    'upload-auto-assign',
-        reason:  resolution.source === 'mm-of-market'
+        reason:  resolution.source === 'mm'
                    ? 'Initial upload — auto-assigned to Market Manager of '+market
-                   : (resolution.source === 'cm-fallback'
-                       ? 'Initial upload — no MM for '+market+', auto-assigned to Campaign Manager'
-                       : 'Initial upload — assigned via hard fallback'),
+                   : (resolution.source === 'cm'
+                       ? 'Initial upload — auto-assigned to Campaign Manager of '+market+' (no MM)'
+                       : (resolution.source === 'ibo'
+                           ? 'Initial upload — auto-assigned to IBO of '+market+' (no MM, no CM)'
+                           : 'Initial upload — assigned via hard fallback (no MM, CM, or IBO for '+market+')')),
         by:      (DB.current && DB.current.name) || 'system',
         byId:    (DB.current && DB.current.id) || null
       }] : []
@@ -34277,6 +34286,39 @@ function marketActiveList(){
   } catch(e){ return []; }
 }
 
+// ── Calvin 2026-05-02: market liveness ──
+// A market's status reflects whether it has someone to receive inventory:
+//   'live'     — has an MM. Inventory flows directly to them.
+//   'partial'  — has a CM or IBO but no MM. Inventory falls back to CM/IBO.
+//   'inactive' — no MM, no CM, no IBO. Needs setup before it can receive.
+// The market stays in dropdowns regardless; this just drives a status
+// badge on the Markets Roster + an upload-time fallback chain.
+function marketLiveStatus(market){
+  if(!market) return 'inactive';
+  if(market.mmId)  return 'live';
+  if(market.cmId)  return 'partial';
+  if(market.iboId) return 'partial';
+  return 'inactive';
+}
+
+// Recipient resolver for a market — used by every "who gets this device?"
+// path. Order:
+//   1. Market Manager of this market
+//   2. Campaign Manager of this market
+//   3. IBO of this market
+//   4. null (caller must handle "no one to assign to")
+function marketResolveRecipient(market){
+  if(!market) return null;
+  function _agent(id){
+    if(!id) return null;
+    return (DB.agents||[]).find(function(a){ return a.id === id && a.active; }) || null;
+  }
+  return _agent(market.mmId)
+      || _agent(market.cmId)
+      || _agent(market.iboId)
+      || null;
+}
+
 function marketGetById(id){
   try {
     var n = parseInt(id, 10);
@@ -34382,6 +34424,7 @@ function panelMarketsAdmin(){
         return t ? t.name : null;
       }).filter(Boolean);
       var isActive = m.active !== false;
+      var liveStatus = (typeof marketLiveStatus === 'function') ? marketLiveStatus(m) : (m.mmId ? 'live' : 'inactive');
       var rowOpacity = isActive ? '1' : '0.55';
       h += '<tr style="border-bottom:1px solid var(--sand);opacity:'+rowOpacity+'">';
       h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif"><strong>'+_escapeHtml(m.name||'—')+'</strong></td>';
@@ -34391,7 +34434,22 @@ function panelMarketsAdmin(){
                  : '<span style="color:var(--muted);font-style:italic">none</span>';
       h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+midCol+'</td>';
       h += '<td style="padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown)">'+(tlNames.length ? _escapeHtml(tlNames.join(', ')) : '<span style="color:var(--muted);font-style:italic">none</span>')+'</td>';
-      h += '<td style="padding:10px 14px"><span style="background:'+(isActive?'rgba(20,83,45,.1);color:#15803d':'rgba(115,115,115,.12);color:var(--muted)')+';font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:4px;font-weight:700">'+(isActive?'active':'inactive')+'</span></td>';
+      // ── Calvin 2026-05-02: status badge reflects MM presence ──
+      // 'live'    = has MM (inventory flows directly)
+      // 'partial' = has CM/IBO but no MM (inventory falls back to CM/IBO)
+      // 'needs setup' = no MM, no CM, no IBO
+      // 'paused'  = market manually deactivated
+      var badgeBg, badgeFg, badgeText;
+      if(!isActive){
+        badgeBg = 'rgba(115,115,115,.12)'; badgeFg = 'var(--muted)'; badgeText = '⏸ paused';
+      } else if(liveStatus === 'live'){
+        badgeBg = 'rgba(20,83,45,.1)';  badgeFg = '#15803d'; badgeText = '✓ live';
+      } else if(liveStatus === 'partial'){
+        badgeBg = 'rgba(217,119,6,.12)'; badgeFg = '#D97706'; badgeText = '⚠ no MM';
+      } else {
+        badgeBg = 'rgba(204,0,0,.1)';   badgeFg = 'var(--red)'; badgeText = '⚠ needs setup';
+      }
+      h += '<td style="padding:10px 14px"><span title="'+(liveStatus==='partial'?'No Market Manager assigned — inventory falls back to CM/IBO':liveStatus==='inactive'?'No MM, CM, or IBO assigned — assign someone before this market can receive inventory':'')+'" style="background:'+badgeBg+';color:'+badgeFg+';font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:4px;font-weight:700">'+badgeText+'</span></td>';
       h += '<td style="padding:10px 14px;text-align:right">';
       h += '<button onclick="marketEdit('+m.id+')" style="background:var(--blue);color:white;border:none;padding:5px 12px;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;margin-right:4px">Edit</button>';
       h += '<button onclick="marketToggleActive('+m.id+')" style="background:white;color:var(--brown);border:1px solid var(--sand);padding:5px 12px;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer">'+(isActive?'Deactivate':'Activate')+'</button>';
@@ -35047,12 +35105,99 @@ function apRefreshCodesArea(){
 }
 
 // ── PLACEMENT ──
+// ── Read-only placement summary (Edit Person mode, Calvin 2026-05-02) ──
+// Shows where this agent currently sits in the org tree based on the
+// MARKETS roster (the single source of truth). The user can SEE their
+// placement but must go to Markets Roster to change it.
+function apRenderPlacementReadOnly(f, role){
+  var agentId = f.editingId | 0;
+  if(!agentId) return '';
+  // Find every market this agent is associated with in the MARKETS roster.
+  var assignedMarkets = [];
+  if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+    MARKETS.forEach(function(m){
+      if(!m) return;
+      var hits = [];
+      if(m.cmId  === agentId) hits.push('CM');
+      if(m.mmId  === agentId) hits.push('MM');
+      if(m.iboId === agentId) hits.push('IBO');
+      if(Array.isArray(m.tlIds) && m.tlIds.indexOf(agentId) >= 0) hits.push('TL');
+      if(hits.length){
+        assignedMarkets.push({ market: m, roles: hits });
+      }
+    });
+  }
+
+  var html = '<div style="background:rgba(8,145,178,.04);border:1px solid rgba(8,145,178,.18);border-radius:8px;padding:14px 18px;margin-bottom:12px">';
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;color:#0891b2;margin-bottom:8px">📍 CURRENT PLACEMENT</div>';
+
+  if(assignedMarkets.length === 0){
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.86rem;color:var(--muted);font-style:italic;line-height:1.6">';
+    html += 'Not yet assigned to any market in the Markets Roster.';
+    html += '<br><span style="color:var(--brown)">Use the button below to add this person to one or more markets.</span>';
+    html += '</div>';
+  } else {
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown);line-height:1.7">';
+    assignedMarkets.forEach(function(entry){
+      var roleBadges = entry.roles.map(function(r){
+        var bg, fg;
+        if(r === 'CM') { bg = 'rgba(8,145,178,.12)'; fg = '#0891b2'; }
+        else if(r === 'IBO') { bg = 'rgba(124,58,237,.12)'; fg = '#7c3aed'; }
+        else if(r === 'MM')  { bg = 'rgba(20,83,45,.12)';  fg = '#15803d'; }
+        else                 { bg = 'rgba(217,119,6,.12)'; fg = '#D97706'; }
+        return '<span style="background:'+bg+';color:'+fg+';font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:2px 8px;border-radius:4px;font-weight:700;margin-left:6px">'+r+'</span>';
+      }).join('');
+      html += '<div style="padding:6px 0;border-bottom:1px solid rgba(8,145,178,.1)">📍 <strong>'+_escapeHtml(entry.market.name)+'</strong>'+roleBadges+'</div>';
+    });
+    html += '</div>';
+  }
+
+  html += '<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">';
+  html += '<button type="button" onclick="apJumpToMarketsRoster()" style="background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 16px;border-radius:5px;cursor:pointer">🗺️ Manage Placement in Markets Roster →</button>';
+  html += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">Placement is managed in one place: the Markets Roster.</span>';
+  html += '</div>';
+  html += '</div>';
+
+  // Hint about role
+  var hint = '';
+  if(role === 'Field Agent')        hint = 'Field Agents are placed under a TL or directly under an MM in a market.';
+  else if(role === 'Team Leader')   hint = 'Team Leaders are listed in the "TLs" section of a market.';
+  else if(role === 'Market Manager')hint = 'Market Managers are assigned to one or more markets in Markets Roster.';
+  else if(role === 'Campaign Manager') hint = 'Campaign Managers are listed at the top of one or more markets.';
+  else if(role === 'IBO')           hint = 'IBOs are listed at the top of their own markets in the Markets Roster.';
+  if(hint){
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);font-style:italic">'+hint+'</div>';
+  }
+  return html;
+}
+
+// Jump to Markets Roster from inside the Edit Person modal.
+function apJumpToMarketsRoster(){
+  if(!confirm('Open Markets Roster to manage this person\'s placement?\n\nYour identity/role/program changes here will be lost. Save them first if you need to keep them.')) return;
+  closeModal('addPersonModal');
+  if(typeof gotoPanel === 'function') gotoPanel('markets-admin');
+}
+
 function apRenderPlacement(){
   var f = window._apForm; if(!f) return;
   var role = f.role;
   var body = document.getElementById('apPlacementBody');
   if(!body) return;
   if(!role || role === 'Office'){ body.innerHTML = ''; return; }
+
+  // ── Calvin 2026-05-02: Read-only mode for Edit Person ──
+  // When editing an existing agent, show a summary of where they are
+  // currently placed in the org tree + a button to manage placement in
+  // Markets Roster. This is the SINGLE SOURCE OF TRUTH pattern: there's
+  // only one place placement gets edited.
+  // For NEW agents (Add Person), keep the inline pickers so you can place
+  // them inline without bouncing to a second screen.
+  var isEditing = (f.editingId | 0) > 0;
+  if(isEditing){
+    body.innerHTML = apRenderPlacementReadOnly(f, role);
+    return;
+  }
+
   var html = '';
   switch(role){
     case 'Field Agent':
@@ -35548,15 +35693,55 @@ async function apSavePerson(){
       });
       agent.carrier = withCodes.join(',');
 
-      // Placement — always trust f.* (which only got populated if the
-      // picker was rendered for this role)
-      agent.team             = f.market   || null;
-      agent.teamLeaderId     = f.parentTL || null;
-      agent.marketManagerId  = f.parentMM || null;
-      agent.campaignManagerId= f.parentCM || null;
-      agent.iboMarkets       = (role === 'IBO' || role === 'Campaign Manager' || role === 'Market Manager')
-                              ? f.iboMarkets.slice()
-                              : [];
+      // ── Calvin 2026-05-02: Placement writes ONLY happen on Add Person ──
+      // For edits, placement is read-only in the modal and managed exclusively
+      // in Markets Roster. We skip the writes here so a stale form (which
+      // wouldn't have rendered the pickers in edit mode anyway) cannot
+      // accidentally null out the agent's placement fields. The Markets
+      // Roster handles all placement updates via marketSetCm/MM/IBO/TL.
+      if(editingId === 0){
+        // New person — write placement from the inline pickers
+        agent.team             = f.market   || null;
+        agent.teamLeaderId     = f.parentTL || null;
+        agent.marketManagerId  = f.parentMM || null;
+        agent.campaignManagerId= f.parentCM || null;
+        agent.iboMarkets       = (role === 'IBO' || role === 'Campaign Manager' || role === 'Market Manager')
+                                ? f.iboMarkets.slice()
+                                : [];
+        // Also reflect this placement back into the MARKETS roster so
+        // there's one source of truth. If the user picked a market in the
+        // inline placement step, register them on that market with the
+        // appropriate role.
+        if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+          // Single-market roles (Field Agent, Team Leader)
+          if(f.market && (role === 'Field Agent' || role === 'Team Leader')){
+            var marketIdNum = parseInt((f.market+'').replace(/^market-/, ''), 10);
+            var marketRow = MARKETS.find(function(m){ return m.id === marketIdNum; });
+            if(marketRow){
+              if(role === 'Team Leader'){
+                if(!Array.isArray(marketRow.tlIds)) marketRow.tlIds = [];
+                if(marketRow.tlIds.indexOf(agent.id) < 0) marketRow.tlIds.push(agent.id);
+              }
+              // Field Agents aren't a roster role — they're members of the
+              // market via teamLeaderId / marketManagerId on their own
+              // record. The MARKETS row doesn't track them directly.
+            }
+          }
+          // Multi-market roles (MM, CM, IBO)
+          if(f.iboMarkets && f.iboMarkets.length){
+            f.iboMarkets.forEach(function(mid){
+              var marketIdNum2 = parseInt((mid+'').replace(/^market-/, ''), 10);
+              var marketRow2 = MARKETS.find(function(m){ return m.id === marketIdNum2; });
+              if(!marketRow2) return;
+              if(role === 'Market Manager'  && !marketRow2.mmId)  marketRow2.mmId  = agent.id;
+              if(role === 'Campaign Manager'&& !marketRow2.cmId)  marketRow2.cmId  = agent.id;
+              if(role === 'IBO'             && !marketRow2.iboId) marketRow2.iboId = agent.id;
+            });
+          }
+        }
+      }
+      // For edits: placement is preserved as-is on the agent record.
+      // Markets Roster is the canonical place to change CM/MM/TL/IBO.
 
       // Channels — derived from programs + campaigns. Preserve any
       // non-program-derived channels (team channels, role channels) so
