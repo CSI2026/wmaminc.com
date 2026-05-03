@@ -10590,6 +10590,9 @@ function processGMActivationCSV(csvText){
     var disconnDate= row['Disconnect Date']||'';
     var disconnRsn = row['Disconnect Reason']||'';
     var planName   = row['Plan Name']||'';
+    var custLast   = row['Last Name']||'';
+    var custCity   = row['Customer Address: City']||'';
+    var custState  = row['Customer Address: State/Region']||'';
     var market     = gmCleanMarket(teamName);
 
     if(!imei) return;
@@ -10629,6 +10632,9 @@ function processGMActivationCSV(csvText){
       disconnectDate:  disconnDate,
       disconnectReason:disconnRsn,
       planName:    planName,
+      customerLastName: custLast,
+      customerCity:     custCity,
+      customerState:    custState,
       isChargeback:isChargeback,
       uploadedAt:  new Date().toISOString()
     };
@@ -10658,8 +10664,15 @@ function processGMActivationCSV(csvText){
 }
 
 // ── Apply activation upload — mark devices sold, update agent sales ──
+// Calvin 2026-05-03: When an activation IMEI isn't in GM_INVENTORY, we
+// now create a skeleton device record (status='activated') so the
+// reconciliation math works. Flagged with _phantomFromActivation:true
+// so the Inv Dept can see these devices were activated without ever
+// being in our shipments file (likely shipped before our records start
+// or imported from another system). They count toward "activated" but
+// also surface in a dedicated "Phantom Activations" report.
 function applyGMActivations(activations, uploadBatchId){
-  var updated=0, notInInv=0;
+  var updated=0, notInInv=0, phantomCreated=0;
   activations.forEach(function(act){
     // Mark device as activated in GM_INVENTORY
     var dev = GM_INVENTORY.find(function(d){return d.imei===act.imei;});
@@ -10667,10 +10680,64 @@ function applyGMActivations(activations, uploadBatchId){
       dev.status      = 'activated';
       dev.activatedAt = act.activationDate;
       dev.activatedBy = act.agentUsername;
-      dev.devCost     = act.devCost;
+      dev.activatedById = act.agentId || null;
+      dev.activatedByName = act.agentName || '';
+      // Carry forward activation-only data so the dashboard can show it
+      dev.planName        = act.planName || dev.planName || '';
+      dev.tribal          = !!act.tribal;
+      dev.commEligible    = !!act.commEligible;
+      dev.disconnectDate  = act.disconnectDate || '';
+      dev.disconnectReason= act.disconnectReason || '';
+      dev.customerLastName= act.customerLastName || '';
+      // Cost: prefer the existing inventory cost (more accurate), fall back to activation
+      if(!dev.devCost && act.devCost) dev.devCost = act.devCost;
       updated++;
     } else {
+      // ── Phantom activation: IMEI not in our shipments ──
+      // Create a skeleton record so the math reconciles. Marked so
+      // Inv Dept can see what's happening.
       notInInv++;
+      var phantom = {
+        id:              'gm-phantom-'+(new Date().getTime())+'-'+Math.random().toString(36).substr(2,6),
+        imei:            act.imei,
+        sim:             act.sim || '',
+        model:           act.model || '',
+        sku:             '',
+        devType:         (act.devType||'').toLowerCase(),
+        type:            (act.devType||'').toLowerCase() === 'sim' ? 'sim' : 'phone',
+        campaign:        'Gen Mobile',
+        devCost:         act.devCost || 0,
+        market:          act.market || 'Unknown',
+        teamName:        act.teamName || '',
+        status:          'activated',
+        assignedTo:      act.agentId || null,
+        assignedToName:  act.agentName || act.agentUsername || '',
+        holderId:        act.agentId || null,
+        holderName:      act.agentName || act.agentUsername || '',
+        activatedAt:     act.activationDate,
+        activatedBy:     act.agentUsername,
+        activatedById:   act.agentId || null,
+        activatedByName: act.agentName || '',
+        planName:        act.planName || '',
+        tribal:          !!act.tribal,
+        commEligible:    !!act.commEligible,
+        disconnectDate:  act.disconnectDate || '',
+        disconnectReason:act.disconnectReason || '',
+        customerLastName:act.customerLastName || '',
+        // ── Phantom flag ──
+        _phantomFromActivation: true,
+        _phantomBatchId:        uploadBatchId,
+        uploadedAt:      new Date().toISOString(),
+        chainOfCustody: [{
+          from: 'Activation Report (no shipment record)',
+          to:   act.agentName || act.agentUsername || 'Unknown',
+          at:   act.activationDate,
+          type: 'phantom-activation',
+          reason: 'IMEI in activations but not in shipments — auto-created'
+        }]
+      };
+      GM_INVENTORY.push(phantom);
+      phantomCreated++;
     }
     // Add to activations list
     act.uploadBatchId = uploadBatchId;
@@ -10689,7 +10756,7 @@ function applyGMActivations(activations, uploadBatchId){
   });
   saveInventory();
   saveToStorage();
-  return {updated:updated, notInInv:notInInv};
+  return {updated:updated, notInInv:notInInv, phantomCreated:phantomCreated};
 }
 
 // ── GM Transfer helpers ──
@@ -28036,6 +28103,21 @@ function panelGMInventory(){
   h += '<div class="bo-stat"><div class="bs-label">Expiring ≤10 Days</div><div class="bs-val" style="color:#CC0000">'+expiring+'</div><div class="bs-sub">Urgent action needed</div></div>';
   h += '</div>';
 
+  // ── Phantom-activation banner (Calvin 2026-05-03) ──
+  // When activations come in for IMEIs we never had a shipment record
+  // for, we auto-create skeleton records flagged _phantomFromActivation.
+  // Surface the count so Inv Dept can investigate (likely shipped before
+  // we started tracking, or imported from another system).
+  var phantomCount = all.filter(function(d){return d._phantomFromActivation;}).length;
+  if(phantomCount > 0 && isInv){
+    h += '<div style="background:rgba(217,119,6,.06);border:1.5px solid rgba(217,119,6,.4);border-radius:8px;padding:12px 18px;margin-bottom:18px;display:flex;align-items:center;gap:14px">';
+    h += '<div style="font-size:1.5rem">⚠️</div>';
+    h += '<div style="flex:1">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:2px;color:#D97706">'+phantomCount+' Phantom Activations Detected</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);margin-top:3px;line-height:1.5">These IMEIs appeared on your activations report but were never in your shipments file. They\'ve been auto-created in inventory with status=activated so the math reconciles. Check that you uploaded the right shipments file, or accept that these are older devices from before tracking.</div>';
+    h += '</div></div>';
+  }
+
   // Quick actions
   h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">';
   if(isInv) h += '<button onclick="gotoPanel(\'gm-upload\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">⬆ Upload CSV</button>';
@@ -28043,15 +28125,18 @@ function panelGMInventory(){
   if(isInv) h += '<button onclick="gmOpenMarketSettings()" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 20px;border-radius:4px;cursor:pointer">⚙️ Market Settings</button>';
   h += '</div>';
 
-  // Market breakdown
+  // Market breakdown — now includes reconciliation math per Calvin 2026-05-03
+  // Columns: Shipped (assigned+unassigned, status≠activated), Activated,
+  //          Remaining (=Shipped-Activated), Phantom (activated-w/o-shipment)
   var marketGroups = {};
   all.forEach(function(d){
-    if(!marketGroups[d.market]) marketGroups[d.market]={total:0,unassigned:0,assigned:0,activated:0,expiring:0};
+    if(!marketGroups[d.market]) marketGroups[d.market]={total:0,unassigned:0,assigned:0,activated:0,expiring:0,phantom:0,remaining:0};
     var mg = marketGroups[d.market];
     mg.total++;
     if(d.status==='unassigned') mg.unassigned++;
     else if(d.status==='assigned') mg.assigned++;
     else if(d.status==='activated') mg.activated++;
+    if(d._phantomFromActivation) mg.phantom++;
     var dys=gmDeviceDaysLeft(d); if(dys!==null&&dys>=0&&dys<=10) mg.expiring++;
   });
 
@@ -28064,6 +28149,27 @@ function panelGMInventory(){
     h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">MM: '+cfg.mmDays+'d · TL: '+cfg.tlDays+'d · Agent: '+cfg.agentDays+'d · Upsell req: '+(cfg.upsellPct||30)+'%</div></div>';
     if(mg.expiring>0) h += '<span style="background:rgba(204,0,0,.1);border:1px solid rgba(204,0,0,.3);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.62rem;font-weight:700;padding:4px 10px;border-radius:100px">⚠️ '+mg.expiring+' expiring</span>';
     h += '</div>';
+
+    // ── Reconciliation row (Calvin 2026-05-03) ──
+    // Visualizes the math agencies need: how many devices were shipped,
+    // how many are activated/sold, and how many are still in play.
+    // Phantom devices (activated without matching shipment record) are
+    // separated out so the discrepancy is visible to Inv Dept.
+    var mgShipped   = mg.assigned + mg.unassigned + mg.activated; // total devices we know about
+    var mgRemaining = mg.assigned + mg.unassigned;                // not yet activated
+    var mgPhantom   = mg.phantom;                                  // activated, never shipped to us
+    h += '<div style="background:linear-gradient(90deg,rgba(0,53,148,.04),transparent);border-bottom:1px solid var(--sand);padding:10px 20px;display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+    h += '<div style="font-size:.6rem;letter-spacing:2px;color:var(--blue);font-weight:700;text-transform:uppercase">Reconciliation</div>';
+    h += '<div><span style="color:var(--muted);font-size:.66rem;text-transform:uppercase;letter-spacing:1px">Shipped</span> <strong style="color:var(--brown);font-size:.95rem;margin-left:4px">'+mgShipped+'</strong></div>';
+    h += '<div style="color:var(--muted)">−</div>';
+    h += '<div><span style="color:var(--muted);font-size:.66rem;text-transform:uppercase;letter-spacing:1px">Activated</span> <strong style="color:#059669;font-size:.95rem;margin-left:4px">'+mg.activated+'</strong></div>';
+    h += '<div style="color:var(--muted)">=</div>';
+    h += '<div><span style="color:var(--muted);font-size:.66rem;text-transform:uppercase;letter-spacing:1px">Remaining</span> <strong style="color:var(--blue);font-size:1.05rem;margin-left:4px">'+mgRemaining+'</strong></div>';
+    if(mgPhantom > 0){
+      h += '<div style="margin-left:auto;background:rgba(217,119,6,.1);border:1px solid rgba(217,119,6,.4);border-radius:4px;padding:4px 10px;color:#D97706;font-size:.7rem"><strong>⚠ '+mgPhantom+'</strong> phantom (activated w/o shipment record)</div>';
+    }
+    h += '</div>';
+
     h += '<div style="padding:12px 20px;display:flex;gap:20px;flex-wrap:wrap;align-items:center">';
     h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem"><span style="color:var(--muted)">Total: </span><strong>'+mg.total+'</strong></div>';
     h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem"><span style="color:var(--muted)">Unassigned: </span><strong style="color:#D97706">'+mg.unassigned+'</strong></div>';
@@ -28268,6 +28374,22 @@ function gmProcessInventoryUpload(){
     var batchId = 'gmb-'+Date.now();
     var csvText = e.target.result;
 
+    // ── Calvin 2026-05-03: Auto-detect file type ──
+    // If the CSV header includes "Activation Date" or "Street Agent (Short)"
+    // it's an Activations file mistakenly uploaded via the Inventory button.
+    // Warn and offer to route to activations upload instead.
+    var firstLine = (csvText.split('\n')[0]||'').toLowerCase();
+    if(firstLine.indexOf('activation date') >= 0 || firstLine.indexOf('street agent') >= 0){
+      var preview = document.getElementById('gm-inv-preview');
+      var msg = '<div style="background:rgba(204,0,0,.06);border:2px solid #CC0000;border-radius:8px;padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.55">';
+      msg += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:#CC0000;letter-spacing:2px;margin-bottom:8px">🛑 WRONG UPLOAD TYPE</div>';
+      msg += 'This looks like an <strong>Activations</strong> CSV (it has "Activation Date" / "Street Agent" columns), not a Shipments CSV. You picked the <strong>Inventory Upload</strong> button.<br><br>';
+      msg += 'Use the <strong style="color:#059669">✅ Activation Upload</strong> button on the right side of this page instead. That will mark devices as activated/sold and credit the agents.';
+      msg += '</div>';
+      if(preview) preview.innerHTML = msg;
+      return;
+    }
+
     // ── Calvin 2026-05-03: vendor-date urgency check ──
     // Before processing, scan the CSV for any vendor "Due Date" sooner
     // than 30 days. If found AND no explicit override is set, prompt
@@ -28455,7 +28577,26 @@ function gmProcessActivationUpload(){
   var reader = new FileReader();
   reader.onload = function(e){
     var batchId = 'gmab-'+Date.now();
-    var result = processGMActivationCSV(e.target.result);
+    var csvText = e.target.result;
+
+    // ── Calvin 2026-05-03: Auto-detect file type ──
+    // If header looks like a Shipments CSV (has "SO Number" + "Dev. Cost"
+    // but no "Activation Date"), warn — they're using the wrong button.
+    var firstLine = (csvText.split('\n')[0]||'').toLowerCase();
+    var hasActDate    = firstLine.indexOf('activation date') >= 0;
+    var hasSONumber   = firstLine.indexOf('so number') >= 0;
+    if(!hasActDate && hasSONumber){
+      var preview = document.getElementById('gm-act-preview');
+      var msg = '<div style="background:rgba(204,0,0,.06);border:2px solid #CC0000;border-radius:8px;padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.55">';
+      msg += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:#CC0000;letter-spacing:2px;margin-bottom:8px">🛑 WRONG UPLOAD TYPE</div>';
+      msg += 'This looks like a <strong>Shipments</strong> CSV (it has "SO Number" but no "Activation Date" column), not an Activations CSV. You picked the <strong>Activation Upload</strong> button.<br><br>';
+      msg += 'Use the <strong style="color:var(--blue)">📦 Inventory Upload</strong> button on the left side of this page instead. That will load these as new devices in inventory.';
+      msg += '</div>';
+      if(preview) preview.innerHTML = msg;
+      return;
+    }
+
+    var result = processGMActivationCSV(csvText);
     var html='';
 
     // ══ TRIPLE-CHECK on activation upload ══
@@ -28574,7 +28715,18 @@ function gmConfirmActivationUpload(batchId){
   var result = applyGMActivations(pending.activations, batchId);
   window._gmPendingActivations = null;
   var preview = document.getElementById('gm-act-preview');
-  if(preview) preview.innerHTML = '<div style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:6px;padding:12px 16px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#059669">✓ '+pending.activations.length+' activations applied. '+result.updated+' devices marked as activated. All agent dashboards and leaderboards updated.</div>';
+  if(preview){
+    var msg = '<div style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:6px;padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.6">';
+    msg += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:#059669;margin-bottom:8px">✓ APPLIED — INVENTORY RECONCILED</div>';
+    msg += '<div><strong>'+pending.activations.length+'</strong> activations processed</div>';
+    msg += '<div><strong style="color:#059669">'+result.updated+'</strong> existing devices flipped to status=activated</div>';
+    if(result.phantomCreated > 0){
+      msg += '<div style="color:#D97706;margin-top:4px"><strong>⚠ '+result.phantomCreated+'</strong> phantom records auto-created (these IMEIs were activated but had no matching shipment record). See the orange banner on the Inventory dashboard for details.</div>';
+    }
+    msg += '<div style="margin-top:8px;color:var(--muted);font-size:.74rem">Open <a href="#" onclick="gotoPanel(\'gm-inventory\');return false" style="color:var(--blue);text-decoration:underline">Gen Mobile Inventory</a> to see updated reconciliation per market.</div>';
+    msg += '</div>';
+    preview.innerHTML = msg;
+  }
   cdFlash('Activations applied — dashboards updated');
 }
 
