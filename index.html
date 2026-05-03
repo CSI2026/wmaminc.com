@@ -11141,13 +11141,35 @@ function legacyScopedDevices(user){
 
 // Combined count + urgent count summary for a user (used by dashboard widgets)
 function inventorySummary(user){
-  // Pull devices from ALL campaigns the user can see, not just Gen Mobile
-  var gm = invScopedDevicesAllCampaigns(user);
-  var lg = legacyScopedDevices(user);
-  var total = gm.length + lg.length;
-  // Per Calvin's rule: a device with status='uploaded' or 'unassigned' is
-  // considered "available stock" for the recipient until it's transferred
-  // down or marked sold. Sold/activated/expired are separate buckets.
+  // Calvin 2026-05-02: Despite the legacy variable name 'gm', this is
+  // all-campaign data — invScopedDevicesAllCampaigns walks every active
+  // campaign (Gen Mobile, TruConnect, Assurance, Excess), and we union
+  // legacy + everything held by the user. The dashboard card uses this
+  // for ALL inventory the user can see, not just Gen Mobile.
+  var all = invScopedDevicesAllCampaigns(user);
+  var lg  = legacyScopedDevices(user);
+
+  // ── GUARANTEE user sees devices they hold ──
+  // invScopedDevices gates campaign visibility on agentCodedOn — meaning
+  // an agent with a device assigned but no campaign code would see ZERO
+  // inventory on their dashboard. That's wrong: holding a device is a
+  // stronger signal than coding. Always include any device where the user
+  // is the holder/assignee, even if scoped query missed it.
+  if(user && user.id && typeof devicesHeldBy === 'function'){
+    var held = devicesHeldBy(user.id, null) || [];
+    var seen = {};
+    all.forEach(function(d){ if(d && d.id) seen[d.id] = true; });
+    lg.forEach(function(d){ if(d && d.id) seen[d.id] = true; });
+    held.forEach(function(d){
+      if(!d || !d.id) return;
+      if(seen[d.id]) return;
+      if(!d.campaign && d.carrier) d.campaign = d.carrier;
+      all.push(d);
+      seen[d.id] = true;
+    });
+  }
+
+  var total = all.length + lg.length;
   function _isAvailableStatus(s){
     return s === 'unassigned' || s === 'uploaded' || s === 'available' || !s;
   }
@@ -11157,27 +11179,46 @@ function inventorySummary(user){
   function _isSoldStatus(d){
     return d && (d.status === 'sold' || d.soldAt);
   }
-  var sold       = gm.filter(_isSoldStatus).length + lg.filter(_isSoldStatus).length;
-  var assigned   = gm.filter(function(d){return _isAssignedStatus(d.status);}).length
+  // Generic days-left: prefer gmDeviceDaysLeft if available, otherwise
+  // compute from device.expiryDate. Works for all carriers.
+  function _daysLeft(d){
+    if(!d) return null;
+    if(typeof gmDeviceDaysLeft === 'function'){
+      var x = gmDeviceDaysLeft(d);
+      if(x !== null && !isNaN(x)) return x;
+    }
+    return invDaysRemaining(d.expiryDate, d.assignedDate);
+  }
+
+  var sold       = all.filter(_isSoldStatus).length + lg.filter(_isSoldStatus).length;
+  var assigned   = all.filter(function(d){return _isAssignedStatus(d.status);}).length
                  + lg.filter(function(d){return _isAssignedStatus(d.status);}).length;
-  var unassigned = gm.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length
+  var unassigned = all.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length
                  + lg.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length;
-  var activated  = gm.filter(function(d){return d.status==='activated';}).length;
-  var expiring5  = gm.filter(function(d){
-    var dy = (typeof gmDeviceDaysLeft === 'function') ? gmDeviceDaysLeft(d) : null;
-    return dy!==null && dy>=0 && dy<=5;
-  }).length;
-  var expiring10 = gm.filter(function(d){
-    var dy = (typeof gmDeviceDaysLeft === 'function') ? gmDeviceDaysLeft(d) : null;
-    return dy!==null && dy>=0 && dy<=10;
-  }).length;
-  var expired    = gm.filter(function(d){
-    var dy = (typeof gmDeviceDaysLeft === 'function') ? gmDeviceDaysLeft(d) : null;
-    return dy!==null && dy<0 && d.status==='assigned';
-  }).length;
+  var activated  = all.filter(function(d){return d.status==='activated';}).length
+                 + lg.filter(function(d){return d.status==='activated';}).length;
+  // Expiry stats now include legacy devices too
+  function _isExpiringDays(d, lo, hi){
+    var dy = _daysLeft(d);
+    return dy!==null && dy>=lo && dy<=hi;
+  }
+  var expiring5  = all.filter(function(d){return _isExpiringDays(d,0,5);}).length
+                 + lg.filter(function(d){return _isExpiringDays(d,0,5);}).length;
+  var expiring10 = all.filter(function(d){return _isExpiringDays(d,0,10);}).length
+                 + lg.filter(function(d){return _isExpiringDays(d,0,10);}).length;
+  var expired    = all.filter(function(d){
+                     var dy = _daysLeft(d);
+                     return dy!==null && dy<0 && d.status==='assigned';
+                   }).length
+                 + lg.filter(function(d){
+                     var dy = _daysLeft(d);
+                     return dy!==null && dy<0 && d.status==='assigned';
+                   }).length;
   return {
     total:total, assigned:assigned, unassigned:unassigned, activated:activated, sold:sold,
-    expiring5:expiring5, expiring10:expiring10, expired:expired, gm:gm, legacy:lg
+    expiring5:expiring5, expiring10:expiring10, expired:expired,
+    // Keep legacy keys 'gm' and 'legacy' for any consumer that destructures them
+    gm:all, legacy:lg, all:all
   };
 }
 
@@ -19894,13 +19935,20 @@ function panelBO(){
     }
   }
 
-  // ─── INVENTORY AT A GLANCE (MM/CM/TL/Sales agents — only if they have Gen Mobile visibility) ───
-  if((u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='Team Leader' || isSalesRole(u))
-     && canAccess(u,'gm-inventory')){
+  // ─── INVENTORY AT A GLANCE ───
+  // Calvin 2026-05-02: removed the canAccess(gm-inventory) gate. If the
+  // user is HOLDING any device (assignment in their possession), they need
+  // to see it on the dashboard. Visibility is enforced inside
+  // inventorySummary; if it returns 0 devices, the card simply doesn't
+  // render.
+  if(u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='Team Leader' || isSalesRole(u)){
     var invSum = inventorySummary(u);
     if(invSum.total>0 || invSum.expiring10>0){
       var invTitle  = isSalesRole(u) && u.role!=='Team Leader' ? 'My Inventory' : 'Team Inventory';
-      var invTarget = isSalesRole(u) && u.role!=='Team Leader' ? 'gm-agent-inv' : 'gm-inventory';
+      // Calvin 2026-05-02: Both link targets are pan-campaign now.
+      // Sales agents → inv-my-inventory (their devices across all campaigns)
+      // Managers     → inv-dashboard   (All Inventory across all campaigns)
+      var invTarget = isSalesRole(u) && u.role!=='Team Leader' ? 'inv-my-inventory' : 'inv-dashboard';
       html += '<div class="bo-card" style="margin-bottom:20px">';
       html += '<div class="bo-card-head" style="border-left:4px solid var(--blue)">';
       html += '<div class="bo-card-title">📱 '+invTitle+' — At a Glance</div>';
