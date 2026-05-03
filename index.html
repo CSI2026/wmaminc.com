@@ -11278,6 +11278,111 @@ function inventorySummary(user){
   };
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  PIPELINE BREAKDOWN — Calvin 2026-05-03
+//  For a manager (CM/IBO/MM/TL), splits the inventory they can see into
+//  buckets by who currently holds it. Returns:
+//    {
+//      mine:       devices in user's own possession (held by user.id)
+//      mms:        devices held by MMs in user's org   (CM only)
+//      tls:        devices held by TLs in user's org   (CM/MM)
+//      agents:     devices held by Field Agents
+//      unassigned: devices in pool with no holder yet  (CM only)
+//      total:      sum across buckets (== inventorySummary.total)
+//    }
+//  Each bucket entry has {count, urgent5, holders:[{id,name,count,urgent}]}
+//  This drives the dashboard "Pipeline" card and the Distribute panel.
+// ════════════════════════════════════════════════════════════════════════
+function inventoryPipelineBreakdown(user){
+  var empty = {count:0, urgent5:0, holders:[]};
+  var out = {
+    mine:       {count:0, urgent5:0, holders:[]},
+    mms:        {count:0, urgent5:0, holders:[]},
+    tls:        {count:0, urgent5:0, holders:[]},
+    agents:     {count:0, urgent5:0, holders:[]},
+    unassigned: {count:0, urgent5:0, holders:[]},
+    total: 0
+  };
+  if(!user) return out;
+
+  var sum = inventorySummary(user);
+  var devices = (sum.all||[]).concat(sum.legacy||[]);
+  out.total = devices.length;
+
+  // Map agentId -> agent for fast lookup
+  var byId = {};
+  DB.agents.forEach(function(a){ byId[a.id] = a; });
+
+  // Helper: classify a holder agent into bucket name
+  function bucketFor(holder){
+    if(!holder) return 'unassigned';
+    if(holder.id === user.id) return 'mine';
+    if(holder.role === 'Market Manager') return 'mms';
+    if(holder.role === 'Team Leader') return 'tls';
+    if(holder.role === 'Campaign Manager' || holder.role === 'IBO') return 'mms'; // bucket CMs/IBOs with MMs for "managers above agents"
+    return 'agents'; // Field Agents and any other sales role
+  }
+
+  // Helper: days-left (works across all carriers)
+  function daysLeft(d){
+    if(!d) return null;
+    if(typeof gmDeviceDaysLeft === 'function'){
+      var x = gmDeviceDaysLeft(d);
+      if(x !== null && !isNaN(x)) return x;
+    }
+    return invDaysRemaining(d.expiryDate, d.assignedDate);
+  }
+
+  // Per-holder accumulator
+  var perHolder = {}; // holderId -> {bucket, name, count, urgent5}
+
+  devices.forEach(function(d){
+    if(!d) return;
+    if(d.status === 'sold' || d.soldAt) return;       // Excluded — sold isn't in play
+    if(d.status === 'activated') return;              // Excluded — activated is downstream
+
+    var hid = (typeof deviceHolderId === 'function') ? deviceHolderId(d) : (d.assignedTo || d.holderId || null);
+    var holder = hid ? byId[hid] : null;
+    var bucket = bucketFor(holder);
+    var dy = daysLeft(d);
+    var urg = (dy !== null && dy >= 0 && dy <= 5) ? 1 : 0;
+
+    out[bucket].count++;
+    out[bucket].urgent5 += urg;
+
+    if(hid){
+      var key = String(hid);
+      if(!perHolder[key]){
+        perHolder[key] = {
+          id: hid,
+          bucket: bucket,
+          name: (holder && holder.name) || d.assignedToName || d.holderName || ('Agent #'+hid),
+          role: (holder && holder.role) || '',
+          count: 0,
+          urgent5: 0
+        };
+      }
+      perHolder[key].count++;
+      perHolder[key].urgent5 += urg;
+    }
+  });
+
+  // Slot per-holder lists into their bucket, sorted urgent-first then count
+  Object.keys(perHolder).forEach(function(k){
+    var h = perHolder[k];
+    out[h.bucket].holders.push(h);
+  });
+  ['mine','mms','tls','agents','unassigned'].forEach(function(b){
+    out[b].holders.sort(function(a,b){
+      if(b.urgent5 !== a.urgent5) return b.urgent5 - a.urgent5;
+      return b.count - a.count;
+    });
+  });
+
+  return out;
+}
+
+
 // Global total devices available across ALL campaigns + legacy — for owner dashboard stat card
 function globalInventoryTotal(){
   var out = 0;
@@ -18500,6 +18605,7 @@ function gotoPanel(id, params){
     'tc-inventory':'TruConnect Inventory','tc-upload':'TruConnect Upload','tc-transfers':'TruConnect Transfers',
     'ex-inventory':'Excess Telecom Inventory','ex-upload':'Excess Upload','ex-transfers':'Excess Transfers',
     'inv-export':'Export to Excel','inv-my-inventory':'My Inventory',
+    'inv-distribute':'Distribute Inventory',
     'inv-request':'Inventory Request','inv-audit':'Inventory Audit',
     'supply-mgmt':'Supply Management','pending-transfers':'Pending Transfers',
     'agent-codes':'Agent Codes','goal-settings':'Goals & Minimums',
@@ -18526,6 +18632,7 @@ function gotoPanel(id, params){
     'inv-dashboard':panelInvDashboard,'inv-upload':panelInvUpload,
     'inv-transfer':panelInvTransfer,'inv-requests':panelInvRequests,
     'inv-export':panelInvExport,'inv-my-inventory':panelMyInventory,
+    'inv-distribute':panelDistribute,
     'inv-hub':panelInvHub,
     'gm-inventory':panelGMInventory,'gm-upload':panelGMUpload,
     'gm-transfers':panelGMTransfers,'gm-agent-inv':panelGMAgentInventory,
@@ -20009,17 +20116,30 @@ function panelBO(){
   // ─── INVENTORY AT A GLANCE ───
   // Calvin 2026-05-03: NO ROLE GATE. Show this card whenever the user
   // can see inventory (visibility is enforced inside inventorySummary).
-  // This way Owner, Inv Dept, and every sales role gets the dashboard
-  // widget without us trying to enumerate every valid role variant.
+  // Now includes a "pipeline" row showing held/distributed by org level
+  // and a Distribute action when the user is holding devices.
   {
     var invSum = inventorySummary(u);
     if(invSum.total>0 || invSum.expiring10>0){
       var invTitle  = isSalesRole(u) && u.role!=='Team Leader' ? 'My Inventory' : 'Team Inventory';
       var invTarget = isSalesRole(u) && u.role!=='Team Leader' ? 'inv-my-inventory' : 'inv-dashboard';
+      var pipeline  = (typeof inventoryPipelineBreakdown === 'function') ? inventoryPipelineBreakdown(u) : null;
+      var iHoldCount = pipeline ? pipeline.mine.count : 0;
+
       html += '<div class="bo-card" style="margin-bottom:20px">';
       html += '<div class="bo-card-head" style="border-left:4px solid var(--blue)">';
       html += '<div class="bo-card-title">📱 '+invTitle+' — At a Glance</div>';
+      html += '<div style="display:flex;gap:8px;align-items:center">';
+      // Distribute button — appears whenever the user is holding devices.
+      // Field Agents get the regular "transfer my inventory" flow; managers
+      // get the dedicated panelDistribute view that shows their full downline.
+      if(iHoldCount > 0){
+        var distTarget = (u.role === 'Field Agent') ? 'inv-my-inventory' : 'inv-distribute';
+        var distLabel  = (u.role === 'Field Agent') ? '📤 Transfer Mine ('+iHoldCount+')' : '📤 Distribute ('+iHoldCount+')';
+        html += '<button onclick="gotoPanel(\''+distTarget+'\')" style="background:var(--blue);border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:600">'+distLabel+'</button>';
+      }
       html += '<button onclick="gotoPanel(\''+invTarget+'\')" style="background:none;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;padding:5px 12px;border-radius:100px;cursor:pointer">Open Full View →</button>';
+      html += '</div>';
       html += '</div>';
 
       if(invSum.expiring5>0){
@@ -20039,29 +20159,57 @@ function panelBO(){
       }
       html += '</div>';
 
-      // Quick agent breakdown for MM/TL only
-      if(u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='Team Leader'){
-        var agentHoldings = {};
-        invSum.gm.filter(function(d){return d.status==='assigned' && d.assignedTo && d.assignedTo!==u.id;}).forEach(function(d){
-          if(!agentHoldings[d.assignedTo]) agentHoldings[d.assignedTo]={name:d.assignedToName,market:d.market,count:0,urgent:0};
-          agentHoldings[d.assignedTo].count++;
-          var dy = gmDeviceDaysLeft(d);
-          if(dy!==null && dy>=0 && dy<=5) agentHoldings[d.assignedTo].urgent++;
-        });
-        var holderIds = Object.keys(agentHoldings);
-        if(holderIds.length){
-          html += '<div style="padding:0 20px 14px">';
-          html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Held By Team</div>';
-          html += '<div style="display:flex;flex-wrap:wrap;gap:8px">';
-          holderIds.forEach(function(aid){
-            var info = agentHoldings[aid];
-            var bg = info.urgent>0?'rgba(204,0,0,.08)':'rgba(0,53,148,.06)';
-            var bd = info.urgent>0?'rgba(204,0,0,.3)':'rgba(0,53,148,.2)';
-            html += '<button onclick="gmOpenAgentDetail('+aid+',\''+info.market+'\')" style="background:'+bg+';border:1px solid '+bd+';color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;padding:6px 12px;border-radius:20px;cursor:pointer">';
-            html += info.name+' ('+info.count+(info.urgent>0?' 🔥':'')+')</button>';
-          });
-          html += '</div></div>';
+      // ── PIPELINE BREAKDOWN ──
+      // Calvin 2026-05-03: For managers (CM/MM/TL), show how the inventory
+      // is split across the org chain — held by me, by my MMs, by my TLs,
+      // by my agents, and any unassigned-in-pool. Each segment shows
+      // count + urgent (≤5 days) badge if applicable.
+      if(pipeline && pipeline.total > 0 && (u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='IBO' || u.role==='Team Leader')){
+        var seg = function(label, bucket, color, helpClass){
+          if(bucket.count === 0 && !helpClass) return '';
+          var urgentBadge = bucket.urgent5 > 0
+            ? '<span style="background:#CC0000;color:white;font-size:.55rem;padding:2px 6px;border-radius:8px;letter-spacing:1px;margin-left:6px">🔥 '+bucket.urgent5+'</span>'
+            : '';
+          var clickable = bucket.count > 0 && (u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='IBO');
+          var cursorStyle = clickable ? 'cursor:pointer' : '';
+          var clickHandler = clickable ? 'onclick="gotoPanel(\'inv-distribute\')"' : '';
+          return '<div '+clickHandler+' style="flex:1;min-width:90px;background:'+color+'08;border:1px solid '+color+'30;border-left:3px solid '+color+';border-radius:6px;padding:10px 12px;'+cursorStyle+'">'
+            + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:3px">'+label+'</div>'
+            + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:'+color+';line-height:1">'+bucket.count+urgentBadge+'</div>'
+            + '</div>';
+        };
+        html += '<div style="padding:0 20px 14px">';
+        html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Pipeline — Where Inventory Sits</div>';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        html += seg('I Hold', pipeline.mine, '#003594');
+        if(u.role==='Campaign Manager' || u.role==='IBO'){
+          html += seg('MMs Hold', pipeline.mms, '#7C3AED');
         }
+        html += seg('TLs Hold', pipeline.tls, '#D97706');
+        html += seg('Agents Hold', pipeline.agents, '#059669');
+        if((u.role==='Campaign Manager' || u.role==='IBO') && pipeline.unassigned.count > 0){
+          html += seg('Unassigned', pipeline.unassigned, '#6B7280');
+        }
+        html += '</div>';
+        // Holder chip drilldown — show top 6 holders across all buckets
+        var allHolders = []
+          .concat(pipeline.mms.holders)
+          .concat(pipeline.tls.holders)
+          .concat(pipeline.agents.holders);
+        if(allHolders.length){
+          html += '<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">';
+          allHolders.slice(0,8).forEach(function(h){
+            var bg = h.urgent5>0?'rgba(204,0,0,.08)':'rgba(0,53,148,.05)';
+            var bd = h.urgent5>0?'rgba(204,0,0,.3)':'rgba(0,53,148,.18)';
+            var roleTag = h.role ? ' · '+h.role.replace('Field Agent','FA').replace('Team Leader','TL').replace('Market Manager','MM').replace('Campaign Manager','CM') : '';
+            html += '<span style="background:'+bg+';border:1px solid '+bd+';color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.7rem;padding:5px 10px;border-radius:14px">'+h.name+roleTag+' <strong style="color:var(--blue)">×'+h.count+'</strong>'+(h.urgent5>0?' 🔥':'')+'</span>';
+          });
+          if(allHolders.length > 8){
+            html += '<span style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.7rem;padding:5px 10px">+'+(allHolders.length-8)+' more…</span>';
+          }
+          html += '</div>';
+        }
+        html += '</div>';
       }
       html += '</div>';
     }
@@ -25272,6 +25420,219 @@ function panelMyInventory(){
   h = panelHeader('📱 My Inventory') + h;
   return h;
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  panelDistribute — Calvin 2026-05-03
+//  Manager-facing view that shows what they're holding and where it can
+//  go in their downline. CMs see all MMs/TLs/agents in their org. MMs
+//  see their TLs and agents. TLs see their agents. Each downline row
+//  shows current holdings + a quick-distribute button that uses the
+//  existing invAssignOpen modal.
+// ════════════════════════════════════════════════════════════════════════
+function panelDistribute(){
+  var u = DB.current;
+
+  // Gate: only managers and Inv Dept can distribute. Field Agents use
+  // the regular My Inventory panel for transfers.
+  var canDistribute = (
+    u.role === 'Campaign Manager' ||
+    u.role === 'IBO' ||
+    u.role === 'Market Manager' ||
+    u.role === 'Team Leader' ||
+    isOwner(u) ||
+    isInventory(u)
+  );
+  if(!canDistribute){
+    var locked = panelHeader('📤 Distribute Inventory');
+    locked += '<div class="bo-card"><div style="padding:32px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">'
+      + '<div style="font-size:2.4rem;margin-bottom:8px">🔒</div>'
+      + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px;color:var(--muted)">Manager / Leader Access Only</div>'
+      + '<div style="font-size:.8rem;margin-top:8px">Distribution is for routing inventory down the org chain. As a Field Agent, transfer your devices via <a href="#" onclick="gotoPanel(\'inv-my-inventory\');return false" style="color:var(--blue)">My Inventory</a>.</div>'
+      + '</div></div>';
+    return locked;
+  }
+
+  // Pull pipeline + my held devices
+  var pipeline = inventoryPipelineBreakdown(u);
+  var myDevices = devicesHeldBy(u.id, null);
+
+  // Build downline target list: every active person under me, ordered by
+  // org level (MM → TL → Field Agent), with their current holding count.
+  var orgIds = (typeof agentIdsInMyOrgEffective === 'function')
+    ? agentIdsInMyOrgEffective(u)
+    : [u.id];
+  var roleOrder = {'Market Manager':1,'Team Leader':2,'IBO':1,'Campaign Manager':1,'Field Agent':3};
+  var targets = orgIds
+    .map(function(id){
+      var a = DB.agents.find(function(x){return x.id===id;});
+      if(!a || !a.active || a.id === u.id) return null;
+      if(typeof isSalesRole === 'function' && !isSalesRole(a)) return null;
+      var heldCount = devicesHeldBy(a.id, null).length;
+      return { agent: a, heldCount: heldCount };
+    })
+    .filter(function(x){return x;})
+    .sort(function(a,b){
+      var ra = roleOrder[a.agent.role]||9, rb = roleOrder[b.agent.role]||9;
+      if(ra !== rb) return ra - rb;
+      return a.agent.name.localeCompare(b.agent.name);
+    });
+
+  var h = panelHeader('📤 Distribute Inventory');
+
+  // ── Pipeline summary strip ──
+  h += '<div class="bo-card" style="margin-bottom:16px">';
+  h += '<div class="bo-card-head" style="border-left:4px solid var(--blue)">';
+  h += '<div class="bo-card-title">Pipeline Summary</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);letter-spacing:1px">'+pipeline.total+' total in your org</div>';
+  h += '</div>';
+  h += '<div style="padding:14px 20px;display:flex;gap:10px;flex-wrap:wrap">';
+  function pipeChip(label, n, color, urg){
+    var urgBadge = urg > 0 ? '<span style="background:#CC0000;color:white;font-size:.55rem;padding:2px 6px;border-radius:8px;letter-spacing:1px;margin-left:6px">🔥 '+urg+'</span>' : '';
+    return '<div style="flex:1;min-width:100px;background:'+color+'08;border:1px solid '+color+'30;border-left:3px solid '+color+';border-radius:6px;padding:10px 12px">'
+      + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:3px">'+label+'</div>'
+      + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:'+color+';line-height:1">'+n+urgBadge+'</div>'
+      + '</div>';
+  }
+  h += pipeChip('I Hold', pipeline.mine.count, '#003594', pipeline.mine.urgent5);
+  if(u.role === 'Campaign Manager' || u.role === 'IBO') h += pipeChip('MMs Hold', pipeline.mms.count, '#7C3AED', pipeline.mms.urgent5);
+  h += pipeChip('TLs Hold', pipeline.tls.count, '#D97706', pipeline.tls.urgent5);
+  h += pipeChip('Agents Hold', pipeline.agents.count, '#059669', pipeline.agents.urgent5);
+  if((u.role === 'Campaign Manager' || u.role === 'IBO') && pipeline.unassigned.count > 0) h += pipeChip('Unassigned', pipeline.unassigned.count, '#6B7280', pipeline.unassigned.urgent5);
+  h += '</div>';
+  h += '</div>';
+
+  // ── Two-column layout: my held devices (left) + downline targets (right) ──
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+
+  // LEFT: Devices I'm holding, with checkboxes
+  h += '<div class="bo-card">';
+  h += '<div class="bo-card-head" style="border-left:4px solid #003594">';
+  h += '<div class="bo-card-title">I\'m Holding ('+myDevices.length+')</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);letter-spacing:1px">Pick devices, then send to a target →</div>';
+  h += '</div>';
+  if(!myDevices.length){
+    h += '<div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:6px">📭</div>You are not holding any devices to distribute.</div>';
+  } else {
+    h += '<div style="padding:10px 16px;background:rgba(0,53,148,.04);border-bottom:1px solid var(--sand);display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
+    h += '<input type="checkbox" id="invDistAllCb" onchange="invDistToggleAll(this)" style="cursor:pointer">';
+    h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">Select all</span>';
+    h += '<span style="margin-left:auto;font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--blue)" id="invDistSelCount">0</span>';
+    h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">selected</span>';
+    h += '</div>';
+    h += '<div style="max-height:480px;overflow-y:auto"><table style="width:100%"><thead><tr>'
+      + '<th style="width:30px"></th><th>IMEI</th><th>Campaign</th><th>Status</th><th>Days Left</th>'
+      + '</tr></thead><tbody>';
+    myDevices.forEach(function(d){
+      var days = invDaysRemaining(d.expiryDate, d.assignedDate || d.assignedAt);
+      var rowBg = days!==null && days<=5 ? 'rgba(204,0,0,.05)' : (days!==null && days<=10 ? 'rgba(217,119,6,.05)' : '');
+      var dayColor = days===null?'var(--muted)':(days<0?'#CC0000':(days<=5?'#CC0000':(days<=10?'#D97706':'#059669')));
+      h += '<tr style="background:'+rowBg+'">'
+        + '<td><input type="checkbox" class="inv-dist-row-cb" data-id="'+d.id+'" onchange="invDistToggleSelect(this)" style="cursor:pointer"></td>'
+        + '<td style="font-family:monospace;font-size:.76rem">'+(d.imei||'\u2014')+'</td>'
+        + '<td style="font-size:.75rem">'+(d.campaign||d.carrier||'\u2014')+'</td>'
+        + '<td style="font-size:.75rem">'+d.status+'</td>'
+        + '<td style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:'+dayColor+'">'+(days===null?'—':days)+'</td>'
+        + '</tr>';
+    });
+    h += '</tbody></table></div>';
+  }
+  h += '</div>';
+
+  // RIGHT: Downline targets, click to send selected devices
+  h += '<div class="bo-card">';
+  h += '<div class="bo-card-head" style="border-left:4px solid #059669">';
+  h += '<div class="bo-card-title">Send To ('+targets.length+' in your downline)</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);letter-spacing:1px">Click a target to assign selected devices</div>';
+  h += '</div>';
+  if(!targets.length){
+    h += '<div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:6px">👥</div>No active agents in your downline yet.</div>';
+  } else {
+    h += '<div style="max-height:540px;overflow-y:auto;padding:8px 0">';
+    var lastRole = null;
+    targets.forEach(function(t){
+      var a = t.agent;
+      var roleLabel = a.role.replace('Field Agent','Field Agents').replace('Team Leader','Team Leaders').replace('Market Manager','Market Managers').replace('Campaign Manager','Campaign Managers');
+      if(a.role !== lastRole){
+        h += '<div style="padding:6px 18px;font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:3px;text-transform:uppercase;color:var(--muted);background:rgba(0,53,148,.04);border-top:1px solid var(--sand);border-bottom:1px solid var(--sand);margin-top:2px">'+roleLabel+'</div>';
+        lastRole = a.role;
+      }
+      var holdBadge = t.heldCount > 0
+        ? '<span style="background:rgba(0,53,148,.08);color:var(--blue);font-family:Bebas Neue,sans-serif;font-size:.95rem;padding:2px 8px;border-radius:10px">×'+t.heldCount+'</span>'
+        : '<span style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.7rem">none</span>';
+      h += '<div style="display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--sand)">'
+        + '<div style="flex:1">'
+        + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;font-weight:700;color:var(--brown)">'+a.name+'</div>'
+        + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);letter-spacing:1px">currently holds '+holdBadge+'</div>'
+        + '</div>'
+        + '<button onclick="invDistSendTo('+a.id+')" style="background:var(--blue);border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer">📤 Send →</button>'
+        + '</div>';
+    });
+    h += '</div>';
+  }
+  h += '</div>';
+  h += '</div>';  // grid
+
+  return h;
+}
+
+// ── Distribute panel select-state + actions ──
+window._invDistSelected = window._invDistSelected || {};
+function invDistToggleSelect(cb){
+  var id = cb.getAttribute('data-id');
+  if(!id) return;
+  if(cb.checked) window._invDistSelected[id] = true;
+  else delete window._invDistSelected[id];
+  invDistUpdateCount();
+}
+function invDistToggleAll(masterCb){
+  document.querySelectorAll('.inv-dist-row-cb').forEach(function(c){
+    c.checked = masterCb.checked;
+    var id = c.getAttribute('data-id');
+    if(masterCb.checked) window._invDistSelected[id] = true;
+    else delete window._invDistSelected[id];
+  });
+  invDistUpdateCount();
+}
+function invDistUpdateCount(){
+  var count = Object.keys(window._invDistSelected).length;
+  var el = document.getElementById('invDistSelCount');
+  if(el) el.textContent = count;
+}
+function invDistSendTo(recipientId){
+  var ids = Object.keys(window._invDistSelected);
+  if(!ids.length){
+    alert('Select at least one device to send.');
+    return;
+  }
+  var recipient = DB.agents.find(function(a){return a.id===recipientId;});
+  if(!recipient){
+    alert('Recipient not found.');
+    return;
+  }
+  // Use the existing invAssignOpen modal but pre-select the recipient.
+  // The modal handles all the validation, audit trail, and pool mutation.
+  if(typeof invAssignOpen !== 'function'){
+    alert('Assignment system not loaded — refresh and try again.');
+    return;
+  }
+  invAssignOpen(ids);
+  // After modal opens, pre-select the recipient in its dropdown
+  setTimeout(function(){
+    var sel = document.getElementById('invAssignRecipient');
+    if(sel){
+      sel.value = String(recipientId);
+      // Pre-fill reason for clarity in audit log
+      var reason = document.getElementById('invAssignReason');
+      if(reason && !reason.value){
+        reason.value = 'Distributed from '+(DB.current && DB.current.name || 'manager')+' down to '+recipient.name;
+      }
+    }
+  }, 50);
+  // Clear selection after the modal opens — even if user cancels we want
+  // a clean slate when they come back to the panel.
+  window._invDistSelected = {};
+}
+
 
 // ── Helpers for the bulk-select transfer flow on My Inventory ──
 // Calvin 2026-04-30: bridges the My-Inventory checkboxes into the
