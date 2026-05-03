@@ -11141,35 +11141,61 @@ function legacyScopedDevices(user){
 
 // Combined count + urgent count summary for a user (used by dashboard widgets)
 function inventorySummary(user){
-  // Calvin 2026-05-02: Despite the legacy variable name 'gm', this is
-  // all-campaign data — invScopedDevicesAllCampaigns walks every active
-  // campaign (Gen Mobile, TruConnect, Assurance, Excess), and we union
-  // legacy + everything held by the user. The dashboard card uses this
-  // for ALL inventory the user can see, not just Gen Mobile.
+  // Calvin 2026-05-03: ALWAYS-ON DIAGNOSTIC LOGGING. Until inventory
+  // visibility is rock-solid, every call dumps its trace to console.
+  // To silence later: set window._invDbg = false.
+  var dbg = (window._invDbg !== false);
   var all = invScopedDevicesAllCampaigns(user);
   var lg  = legacyScopedDevices(user);
+  if(dbg) console.log('[invSum] user='+(user&&user.id)+' role='+(user&&user.role)+' scoped='+all.length+' legacy='+lg.length);
 
   // ── GUARANTEE user sees devices they hold ──
-  // invScopedDevices gates campaign visibility on agentCodedOn — meaning
-  // an agent with a device assigned but no campaign code would see ZERO
-  // inventory on their dashboard. That's wrong: holding a device is a
-  // stronger signal than coding. Always include any device where the user
-  // is the holder/assignee, even if scoped query missed it.
   if(user && user.id && typeof devicesHeldBy === 'function'){
     var held = devicesHeldBy(user.id, null) || [];
+    if(dbg) console.log('[invSum] devicesHeldBy('+user.id+'): '+held.length);
     var seen = {};
     all.forEach(function(d){ if(d && d.id) seen[d.id] = true; });
     lg.forEach(function(d){ if(d && d.id) seen[d.id] = true; });
+    var added = 0;
     held.forEach(function(d){
-      if(!d || !d.id) return;
+      if(!d || !d.id){
+        if(dbg) console.log('[invSum] held device skipped: no id —', d);
+        return;
+      }
       if(seen[d.id]) return;
       if(!d.campaign && d.carrier) d.campaign = d.carrier;
       all.push(d);
       seen[d.id] = true;
+      added++;
     });
+    if(dbg && added) console.log('[invSum] added '+added+' held device(s) not in scoped query');
+  }
+
+  // ── ULTIMATE SAFETY NET ──
+  // Brute-force scan EVERY pool for devices where this user is the holder
+  // OR assignedTo OR mmId, regardless of any other filter.
+  if(user && user.id && typeof unionAllInventoryPools === 'function'){
+    var allPools = unionAllInventoryPools();
+    if(dbg) console.log('[invSum] unionAllInventoryPools='+allPools.length+' total devices in system');
+    var seen2 = {};
+    all.forEach(function(d){ if(d && d.id) seen2[d.id] = true; });
+    lg.forEach(function(d){ if(d && d.id) seen2[d.id] = true; });
+    var added2 = 0;
+    allPools.forEach(function(d){
+      if(!d) return;
+      if(d.holderId !== user.id && d.assignedTo !== user.id && d.mmId !== user.id) return;
+      if(d.id && seen2[d.id]) return;
+      if(!d.campaign && d.carrier) d.campaign = d.carrier;
+      all.push(d);
+      if(d.id) seen2[d.id] = true;
+      added2++;
+    });
+    if(dbg && added2) console.log('[invSum] safety net added '+added2+' device(s) by holder match');
   }
 
   var total = all.length + lg.length;
+  if(dbg) console.log('[invSum] FINAL total='+total+' for user='+(user&&user.id));
+
   function _isAvailableStatus(s){
     return s === 'unassigned' || s === 'uploaded' || s === 'available' || !s;
   }
@@ -11179,8 +11205,6 @@ function inventorySummary(user){
   function _isSoldStatus(d){
     return d && (d.status === 'sold' || d.soldAt);
   }
-  // Generic days-left: prefer gmDeviceDaysLeft if available, otherwise
-  // compute from device.expiryDate. Works for all carriers.
   function _daysLeft(d){
     if(!d) return null;
     if(typeof gmDeviceDaysLeft === 'function'){
@@ -11197,7 +11221,6 @@ function inventorySummary(user){
                  + lg.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length;
   var activated  = all.filter(function(d){return d.status==='activated';}).length
                  + lg.filter(function(d){return d.status==='activated';}).length;
-  // Expiry stats now include legacy devices too
   function _isExpiringDays(d, lo, hi){
     var dy = _daysLeft(d);
     return dy!==null && dy>=lo && dy<=hi;
@@ -11217,7 +11240,6 @@ function inventorySummary(user){
   return {
     total:total, assigned:assigned, unassigned:unassigned, activated:activated, sold:sold,
     expiring5:expiring5, expiring10:expiring10, expired:expired,
-    // Keep legacy keys 'gm' and 'legacy' for any consumer that destructures them
     gm:all, legacy:lg, all:all
   };
 }
@@ -11412,37 +11434,26 @@ function invDashSetMarketFilter(value){
 }
 
 function devicesHeldBy(agentId, type){
-  // ── Calvin 2026-04-30 fix ──
-  // Was reading only INVENTORY_DEVICES (legacy) and only matching holderId.
-  // After the new invAssignCommit assigns a campaign-pool device, the
-  // device lives in GM_INVENTORY (or TC/AW/EX) and uses assignedTo as the
-  // holder pointer. The old query missed those entirely, so panelMyInventory
-  // showed "no devices" even after a successful assignment.
-  //
-  // New behavior: union all campaign pools + legacy, match either
-  // holderId OR assignedTo, and accept either 'assigned' or status that
-  // indicates active possession.
+  // Calvin 2026-05-03: rebuilt for correctness.
+  // Returns every device where the given agent is the holder/assignee,
+  // across ALL inventory pools (GM/TC/AW/EX/legacy). We do NOT filter by
+  // status here — if the holder field points to this user, they should
+  // see the device. (Previously this filtered to assigned/activated only,
+  // which silently hid devices in 'available' or other transitional
+  // states. We treat status filtering as a UI concern, not a "do you
+  // possess this" concern.)
+  if(!agentId) return [];
+  var pool = (typeof unionAllInventoryPools === 'function')
+    ? unionAllInventoryPools()
+    : (typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES) ? INVENTORY_DEVICES.slice() : []);
   var out = [];
-  function _scan(pool){
-    if(!pool || !Array.isArray(pool)) return;
-    pool.forEach(function(d){
-      if(!d) return;
-      var heldBy = (d.holderId === agentId) || (d.assignedTo === agentId);
-      if(!heldBy) return;
-      if(d.status !== 'assigned' && d.status !== 'activated') return;
-      if(type && d.type !== type) return;
-      out.push(d);
-    });
+  for(var i=0;i<pool.length;i++){
+    var d = pool[i];
+    if(!d) continue;
+    if(d.holderId !== agentId && d.assignedTo !== agentId) continue;
+    if(type && d.type !== type) continue;
+    out.push(d);
   }
-  if(typeof activeCampaigns === 'function'){
-    activeCampaigns().forEach(function(c){
-      var cfg = (typeof campaignCfg === 'function') ? campaignCfg(c) : null;
-      if(cfg && typeof cfg.inventory === 'function'){
-        try { _scan(cfg.inventory()); } catch(e){}
-      }
-    });
-  }
-  if(typeof INVENTORY_DEVICES !== 'undefined') _scan(INVENTORY_DEVICES);
   return out;
 }
 function daysRemaining(device){
@@ -19936,18 +19947,14 @@ function panelBO(){
   }
 
   // ─── INVENTORY AT A GLANCE ───
-  // Calvin 2026-05-02: removed the canAccess(gm-inventory) gate. If the
-  // user is HOLDING any device (assignment in their possession), they need
-  // to see it on the dashboard. Visibility is enforced inside
-  // inventorySummary; if it returns 0 devices, the card simply doesn't
-  // render.
-  if(u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='Team Leader' || isSalesRole(u)){
+  // Calvin 2026-05-03: NO ROLE GATE. Show this card whenever the user
+  // can see inventory (visibility is enforced inside inventorySummary).
+  // This way Owner, Inv Dept, and every sales role gets the dashboard
+  // widget without us trying to enumerate every valid role variant.
+  {
     var invSum = inventorySummary(u);
     if(invSum.total>0 || invSum.expiring10>0){
       var invTitle  = isSalesRole(u) && u.role!=='Team Leader' ? 'My Inventory' : 'Team Inventory';
-      // Calvin 2026-05-02: Both link targets are pan-campaign now.
-      // Sales agents → inv-my-inventory (their devices across all campaigns)
-      // Managers     → inv-dashboard   (All Inventory across all campaigns)
       var invTarget = isSalesRole(u) && u.role!=='Team Leader' ? 'inv-my-inventory' : 'inv-dashboard';
       html += '<div class="bo-card" style="margin-bottom:20px">';
       html += '<div class="bo-card-head" style="border-left:4px solid var(--blue)">';
@@ -19997,6 +20004,63 @@ function panelBO(){
         }
       }
       html += '</div>';
+    }
+  }
+
+  // ─── BULLETPROOF "MY DEVICES" LIST (Calvin 2026-05-03) ───
+  // Always render a list of devices the user is holding, computed by the
+  // SIMPLEST possible query: scan every pool, return any device where the
+  // user is the holder/assignee. No org-chart logic, no campaign coding,
+  // no scoping — if the data says you have it, you see it.
+  if(isSalesRole(u) || u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='Team Leader'){
+    var bulletproofDevices = [];
+    function _scanPool(pool){
+      if(!pool || !Array.isArray(pool)) return;
+      pool.forEach(function(d){
+        if(!d) return;
+        if(d.holderId === u.id || d.assignedTo === u.id){
+          bulletproofDevices.push(d);
+        }
+      });
+    }
+    _scanPool(typeof INVENTORY_DEVICES !== 'undefined' ? INVENTORY_DEVICES : null);
+    _scanPool(typeof GM_INVENTORY !== 'undefined' ? GM_INVENTORY : null);
+    _scanPool(typeof TC_INVENTORY !== 'undefined' ? TC_INVENTORY : null);
+    _scanPool(typeof AW_INVENTORY !== 'undefined' ? AW_INVENTORY : null);
+    _scanPool(typeof EX_INVENTORY !== 'undefined' ? EX_INVENTORY : null);
+
+    if(bulletproofDevices.length){
+      html += '<div class="bo-card" style="margin-bottom:20px">';
+      html += '<div class="bo-card-head" style="border-left:4px solid #15803d">';
+      html += '<div class="bo-card-title">📦 My Devices ('+bulletproofDevices.length+')</div>';
+      html += '<button onclick="gotoPanel(\'inv-my-inventory\')" style="background:none;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;padding:5px 12px;border-radius:100px;cursor:pointer">Manage / Transfer →</button>';
+      html += '</div>';
+      html += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+      html += '<thead><tr style="background:var(--cream);border-bottom:2px solid var(--sand)">';
+      html += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">IMEI</th>';
+      html += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Campaign</th>';
+      html += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Market</th>';
+      html += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Status</th>';
+      html += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Expires</th>';
+      html += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Days Left</th>';
+      html += '</tr></thead><tbody>';
+      bulletproofDevices.slice(0, 25).forEach(function(d){
+        var dy = (typeof invDaysRemaining === 'function') ? invDaysRemaining(d.expiryDate, d.assignedDate) : null;
+        var dayColor = dy === null ? 'var(--muted)' : (dy < 0 ? '#cc0000' : (dy <= 5 ? '#cc0000' : (dy <= 10 ? '#d97706' : '#059669')));
+        var dayText = dy === null ? '—' : (dy < 0 ? 'EXPIRED' : dy + 'd');
+        html += '<tr style="border-bottom:1px solid var(--sand)">';
+        html += '<td style="padding:8px 12px;font-family:monospace;font-size:.72rem;color:var(--brown)">'+(d.imei||d.id||'—')+'</td>';
+        html += '<td style="padding:8px 12px;font-size:.78rem;color:var(--brown)">'+(d.campaign||d.carrier||'—')+'</td>';
+        html += '<td style="padding:8px 12px;font-size:.78rem;color:var(--brown)">'+(d.market||'—')+'</td>';
+        html += '<td style="padding:8px 12px;font-size:.72rem"><span style="background:rgba(0,53,148,.08);color:var(--blue);padding:2px 8px;border-radius:3px;font-size:.66rem;letter-spacing:1px;text-transform:uppercase">'+(d.status||'—')+'</span></td>';
+        html += '<td style="padding:8px 12px;font-size:.78rem;color:var(--brown)">'+(d.expiryDate||'—')+'</td>';
+        html += '<td style="padding:8px 12px;font-size:.78rem;font-weight:700;color:'+dayColor+'">'+dayText+'</td>';
+        html += '</tr>';
+      });
+      if(bulletproofDevices.length > 25){
+        html += '<tr><td colspan="6" style="padding:10px 12px;text-align:center;color:var(--muted);font-size:.74rem">+ '+(bulletproofDevices.length-25)+' more — click Manage / Transfer above</td></tr>';
+      }
+      html += '</tbody></table></div></div>';
     }
   }
 
