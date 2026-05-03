@@ -28701,10 +28701,112 @@ function gmProcessActivationUpload(){
     if(allActivations.length){
       html += '<button onclick="gmConfirmActivationUpload(\''+batchId+'\')" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:12px;border-radius:6px;cursor:pointer;width:100%">✅ Confirm — Apply '+allActivations.length+' Activations →</button>';
       window._gmPendingActivations = {batchId:batchId, activations:allActivations, chargebacks:result.chargebacks};
+    } else if(result.duplicates.length > 0){
+      // ── Calvin 2026-05-03: All-duplicates state ──
+      // Every IMEI in the upload is already in GM_ACTIVATIONS. Nothing
+      // new to apply, but Inv Dept may want to clear and re-upload to
+      // recover from a split-state bug (activations stored but devices
+      // never flipped to status=activated). Show a clear explanation
+      // and a Reset button gated by confirmation.
+      html += '<div style="background:rgba(0,53,148,.05);border:2px solid rgba(0,53,148,.25);border-radius:8px;padding:16px 18px;margin-top:8px">';
+      html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--blue);letter-spacing:2px;margin-bottom:8px">📋 NOTHING NEW TO APPLY</div>';
+      html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown);line-height:1.55">';
+      html += 'All <strong>'+result.duplicates.length+'</strong> activation row(s) in this file are <strong>already in the system</strong> from a previous upload. There\'s nothing new to confirm.<br><br>';
+      html += '<strong>If the inventory dashboard isn\'t showing them as activated</strong>, that means the previous upload stored the activations but didn\'t flip the device statuses. Check Inventory → Gen Mobile and look at the <em>Reconciliation</em> row for your market. If "Activated" shows 0 but the upload says "Already activated: '+result.duplicates.length+'", you have a split-state issue. Click the Reset button below to clear the stored activations and re-upload from scratch — the apply step will then flip every device correctly.';
+      html += '</div>';
+      html += '<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">';
+      html += '<button onclick="gmResetActivations()" style="background:rgba(204,0,0,.08);border:1.5px solid rgba(204,0,0,.4);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:10px 16px;border-radius:5px;cursor:pointer;font-weight:700">⚠ Reset All Activations & Re-Upload</button>';
+      html += '<button onclick="gotoPanel(\'gm-inventory\')" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.3);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:10px 16px;border-radius:5px;cursor:pointer">Check Inventory Dashboard →</button>';
+      html += '</div>';
+      html += '</div>';
     }
     if(preview) preview.innerHTML = html;
   };
   reader.readAsText(file);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  gmResetActivations() — Calvin 2026-05-03
+//  Owner / Inv Dept only. Clears GM_ACTIVATIONS and resets every device
+//  in GM_INVENTORY currently marked status='activated' back to 'assigned'
+//  (or 'unassigned' if no holder). Also removes phantom records that
+//  came in via activation. After reset, Inv Dept can re-upload the
+//  activations CSV cleanly and the apply step will work correctly.
+//
+//  This is a destructive operation behind a typed confirmation prompt.
+// ════════════════════════════════════════════════════════════════════════
+function gmResetActivations(){
+  var u = DB.current;
+  if(!u || (!isOwner(u) && !isInventory(u))){
+    alert('Only the Owner or Inventory Department can reset activations.');
+    return;
+  }
+  var actCount = (typeof GM_ACTIVATIONS !== 'undefined' && GM_ACTIVATIONS) ? GM_ACTIVATIONS.length : 0;
+  var devCount = GM_INVENTORY.filter(function(d){return d.status === 'activated';}).length;
+  var phantomCount = GM_INVENTORY.filter(function(d){return d._phantomFromActivation;}).length;
+  var msg = '⚠ DESTRUCTIVE RESET\n\n';
+  msg += 'This will:\n';
+  msg += '  • Delete all '+actCount+' stored Gen Mobile activations\n';
+  msg += '  • Reset '+devCount+' device(s) from status=activated back to status=assigned/unassigned\n';
+  msg += '  • Permanently delete '+phantomCount+' phantom records (auto-created from prior activations)\n\n';
+  msg += 'You will need to re-upload the Devices.csv (activations) file afterward.\n\n';
+  msg += 'Type RESET to confirm:';
+  var confirmation = prompt(msg);
+  if(confirmation !== 'RESET'){
+    alert('Reset cancelled. Nothing changed.');
+    return;
+  }
+
+  // Clear GM_ACTIVATIONS
+  if(typeof GM_ACTIVATIONS !== 'undefined' && Array.isArray(GM_ACTIVATIONS)){
+    GM_ACTIVATIONS.length = 0;
+  }
+
+  // Remove phantom records
+  for(var i = GM_INVENTORY.length - 1; i >= 0; i--){
+    if(GM_INVENTORY[i] && GM_INVENTORY[i]._phantomFromActivation){
+      GM_INVENTORY.splice(i, 1);
+    }
+  }
+
+  // Flip activated devices back to assigned/unassigned
+  GM_INVENTORY.forEach(function(d){
+    if(d.status === 'activated'){
+      d.status = (d.holderId || d.assignedTo) ? 'assigned' : 'unassigned';
+      // Clear the activation-only fields
+      d.activatedAt = null;
+      d.activatedBy = '';
+      d.activatedById = null;
+      d.activatedByName = '';
+      d.disconnectDate = '';
+      d.disconnectReason = '';
+    }
+  });
+
+  // Also reset agent monthlySales counts that came from these activations.
+  // Conservative: only zero out the current month's Lifeline counts to
+  // avoid destroying historical data. Calvin can re-upload to repopulate.
+  var thisMonth = new Date().toISOString().slice(0,7);
+  DB.agents.forEach(function(a){
+    if(!a.monthlySales) return;
+    a.monthlySales = a.monthlySales.filter(function(m){
+      // Keep entries that aren't this-month-Lifeline (preserves history)
+      return !(m.month === thisMonth && m.program === 'Lifeline');
+    });
+  });
+
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+
+  var preview = document.getElementById('gm-act-preview');
+  if(preview){
+    preview.innerHTML = '<div style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:6px;padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown);line-height:1.55">' +
+      '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:#059669;margin-bottom:6px">✓ RESET COMPLETE</div>' +
+      'Cleared <strong>'+actCount+'</strong> activations, reset <strong>'+devCount+'</strong> device statuses, removed <strong>'+phantomCount+'</strong> phantoms.<br>' +
+      'Re-upload your Devices.csv (activations file) now and the apply step will flip every device correctly.' +
+      '</div>';
+  }
+  if(typeof cdFlash === 'function') cdFlash('Activations reset — re-upload to recover');
 }
 
 function gmConfirmActivationUpload(batchId){
