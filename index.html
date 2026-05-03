@@ -9396,6 +9396,114 @@ function canGrantDistributePermission(u){
   if(isInventory(u)) return true;
   return false;
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  ALLOWED RECIPIENTS — Calvin 2026-05-03
+//  Builds the set of agent IDs a non-Owner/non-Inv user can transfer
+//  inventory to. Combines THREE sources to be robust against the
+//  multiple ways org placement can be stored:
+//    1. agentIdsInMyOrgEffective (canonical helper)
+//    2. Legacy explicit fields  (campaignManagerId / marketManagerId / teamLeaderId)
+//    3. MARKETS placement       (sec.cmId / iboId / mmId / tlIds + agent.team)
+//  Plus the user's upline (one level up via reportingChainFor) and every
+//  active Owner / Inv Dept member.
+//
+//  Used by both invAssignCommit (to validate a recipient) and
+//  panelDistribute (to render the target list). Single source of truth
+//  prevents the panel from showing a target the commit step rejects.
+// ════════════════════════════════════════════════════════════════════════
+function buildAllowedRecipientSet(user){
+  var allowed = {};
+  if(!user) return allowed;
+
+  // ── 1. Canonical helper ──
+  if(typeof agentIdsInMyOrgEffective === 'function'){
+    (agentIdsInMyOrgEffective(user) || []).forEach(function(id){ allowed[id] = true; });
+  }
+
+  // ── 2. Legacy fields scan ──
+  function _reportsToUser(a, viewer){
+    if(!a || !viewer) return false;
+    var role = viewer.role;
+    if(role === 'Campaign Manager' || role === 'IBO'){
+      if(a.campaignManagerId === viewer.id) return true;
+    }
+    if(role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO'){
+      if(a.marketManagerId === viewer.id) return true;
+    }
+    if(role === 'Team Leader' || role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO'){
+      if(a.teamLeaderId === viewer.id) return true;
+    }
+    if(typeof reportingChainFor === 'function'){
+      var chain = reportingChainFor(a) || {};
+      if(role === 'Campaign Manager' || role === 'IBO'){
+        if(chain.campaignManagerId === viewer.id) return true;
+      }
+      if(role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO'){
+        if(chain.marketManagerId === viewer.id) return true;
+      }
+      if(role === 'Team Leader' || role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO'){
+        if(chain.teamLeaderId === viewer.id) return true;
+      }
+    }
+    return false;
+  }
+  DB.agents.forEach(function(a){
+    if(!a || !a.active || a.id === user.id) return;
+    if(_reportsToUser(a, user)) allowed[a.id] = true;
+  });
+
+  // ── 3. MARKETS placement scan ──
+  if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+    MARKETS.forEach(function(m){
+      if(!m || !m.programs) return;
+      ['lifeline','internet','aca'].forEach(function(progKey){
+        var sec = m.programs[progKey];
+        if(!sec) return;
+        var iAmTopOfSection = (
+          (user.role === 'Campaign Manager' && sec.cmId === user.id) ||
+          (user.role === 'IBO'              && sec.iboId === user.id) ||
+          (user.role === 'Market Manager'   && sec.mmId === user.id) ||
+          (user.role === 'Team Leader'      && Array.isArray(sec.tlIds) && sec.tlIds.indexOf(user.id) >= 0)
+        );
+        if(!iAmTopOfSection) return;
+        if(user.role === 'Campaign Manager' || user.role === 'IBO'){
+          if(sec.mmId && sec.mmId !== user.id) allowed[sec.mmId] = true;
+          (sec.tlIds||[]).forEach(function(tid){ if(tid !== user.id) allowed[tid] = true; });
+        } else if(user.role === 'Market Manager'){
+          (sec.tlIds||[]).forEach(function(tid){ if(tid !== user.id) allowed[tid] = true; });
+        }
+        // Field Agents (and TLs for upper roles) whose team points to this market
+        DB.agents.forEach(function(a){
+          if(!a || !a.active || a.id === user.id) return;
+          if(a.role !== 'Field Agent' && a.role !== 'Team Leader') return;
+          if(user.role === 'Team Leader' && a.role === 'Team Leader') return;
+          var aTeamRef = a.team;
+          if(!aTeamRef) return;
+          var aTeamId = parseInt((aTeamRef+'').replace(/^market-/,''), 10);
+          if(aTeamId === m.id) allowed[a.id] = true;
+        });
+      });
+    });
+  }
+
+  // ── 4. Upline (one level up) ──
+  if(typeof reportingChainFor === 'function'){
+    var rc = reportingChainFor(user) || {};
+    if(rc.teamLeaderId)      allowed[rc.teamLeaderId]      = true;
+    if(rc.marketManagerId)   allowed[rc.marketManagerId]   = true;
+    if(rc.campaignManagerId) allowed[rc.campaignManagerId] = true;
+  }
+
+  // ── 5. Owner + every Inv Dept member (always valid handoff targets) ──
+  DB.agents.forEach(function(a){
+    if(a && a.active && (isOwner(a) || isInventory(a))) allowed[a.id] = true;
+  });
+
+  // Never include self
+  delete allowed[user.id];
+  return allowed;
+}
 function isMgrRole(u)    { return u && (u.role==='Market Manager'||u.role==='Campaign Manager'); }
 
 // ══════════════════════════════════════════════════════════════
@@ -24671,22 +24779,12 @@ function invAssignOpen(deviceIds){
   });
 
   // Calvin 2026-05-03: For non-Owner non-Inv users, narrow the dropdown
-  // to: their downline + upline + Owner + Inv Dept. Same rule the commit
-  // step enforces.
+  // using the shared helper. Single source of truth shared with the
+  // commit gate and the panelDistribute target list.
   var _u = DB.current;
   if(_u && !isOwner(_u) && !(typeof isInventory === 'function' && isInventory(_u))){
-    var allowed = {};
-    var dl = (typeof agentIdsInMyOrgEffective === 'function') ? agentIdsInMyOrgEffective(_u) : [_u.id];
-    dl.forEach(function(id){ allowed[id] = true; });
-    if(typeof reportingChainFor === 'function'){
-      var rc = reportingChainFor(_u) || {};
-      if(rc.teamLeaderId)      allowed[rc.teamLeaderId]      = true;
-      if(rc.marketManagerId)   allowed[rc.marketManagerId]   = true;
-      if(rc.campaignManagerId) allowed[rc.campaignManagerId] = true;
-    }
-    DB.agents.forEach(function(a){
-      if(a && a.active && (isOwner(a) || isInventory(a))) allowed[a.id] = true;
-    });
+    var allowed = (typeof buildAllowedRecipientSet === 'function')
+      ? buildAllowedRecipientSet(_u) : {};
     recipients = recipients.filter(function(a){
       return allowed[a.id] && a.id !== _u.id;
     });
@@ -24800,25 +24898,13 @@ function invAssignCommit(deviceIds){
   if(!recipient){ alert('Recipient not found.'); return; }
 
   // Calvin 2026-05-03: For non-Owner non-Inv users, restrict recipients to
-  // the org chain — both up (upline handoff) and down (distribution).
-  // Plus Owner / Inv Dept are always valid recipients (returning inventory).
+  // the org chain (up + down + Owner/Inv). Uses the shared helper so the
+  // panel and the gate can never disagree.
   if(!isOwner(u) && !isInventory(u)){
-    var allowed = {};
-    // Downline + self
-    var dl = (typeof agentIdsInMyOrgEffective === 'function') ? agentIdsInMyOrgEffective(u) : [u.id];
-    dl.forEach(function(id){ allowed[id] = true; });
-    // Upline (reporting chain)
-    if(typeof reportingChainFor === 'function'){
-      var rc = reportingChainFor(u) || {};
-      if(rc.teamLeaderId)      allowed[rc.teamLeaderId]      = true;
-      if(rc.marketManagerId)   allowed[rc.marketManagerId]   = true;
-      if(rc.campaignManagerId) allowed[rc.campaignManagerId] = true;
-    }
-    // Owner + every Inv Dept member
-    DB.agents.forEach(function(a){
-      if(a && a.active && (isOwner(a) || isInventory(a))) allowed[a.id] = true;
-    });
+    var allowed = (typeof buildAllowedRecipientSet === 'function')
+      ? buildAllowedRecipientSet(u) : {};
     if(!allowed[recipId]){
+      console.warn('[invAssignCommit] BLOCKED — recipient '+recipId+' ('+recipient.name+') not in allowed set. Allowed ids:', Object.keys(allowed));
       alert(recipient.name + ' is outside your reporting chain. You can transfer to your upline, your downline, or back to the Owner / Inventory Dept.');
       return;
     }
@@ -25581,17 +25667,38 @@ function panelDistribute(){
   var pipeline = inventoryPipelineBreakdown(u);
   var myDevices = devicesHeldBy(u.id, null);
 
-  // Build downline target list: every active person under me, ordered by
-  // org level (MM → TL → Field Agent), with their current holding count.
-  var orgIds = (typeof agentIdsInMyOrgEffective === 'function')
-    ? agentIdsInMyOrgEffective(u)
-    : [u.id];
+  // Calvin 2026-05-03: Use the shared buildAllowedRecipientSet helper —
+  // identical to the one invAssignCommit uses to validate the recipient.
+  // This guarantees the panel never shows a target the commit will reject.
+  var allowedSet = (typeof buildAllowedRecipientSet === 'function')
+    ? buildAllowedRecipientSet(u) : {};
+  var dbg = (window._invDbg !== false);
+  if(dbg){
+    var ids = Object.keys(allowedSet).map(function(s){return parseInt(s,10);});
+    console.log('[Distribute] role='+u.role+' id='+u.id+' allowed recipients ('+ids.length+'): '+ids.join(','));
+  }
+
+  // For the "Send To" panel we want only DOWNLINE targets (not upline,
+  // not Owner/Inv) so it focuses on distribution. Filter by org-position.
   var roleOrder = {'Market Manager':1,'Team Leader':2,'IBO':1,'Campaign Manager':1,'Field Agent':3};
-  var targets = orgIds
+  var targets = Object.keys(allowedSet)
+    .map(function(s){ return parseInt(s,10); })
     .map(function(id){
       var a = DB.agents.find(function(x){return x.id===id;});
       if(!a || !a.active || a.id === u.id) return null;
       if(typeof isSalesRole === 'function' && !isSalesRole(a)) return null;
+      // Hide upline (only show people downstream of u)
+      var isUpline = false;
+      if(typeof reportingChainFor === 'function'){
+        var rc = reportingChainFor(u) || {};
+        if(a.id === rc.teamLeaderId || a.id === rc.marketManagerId || a.id === rc.campaignManagerId){
+          isUpline = true;
+        }
+      }
+      if(isUpline) return null;
+      // Hide Owner / Inv Dept (they're available in the dropdown if needed,
+      // but the panel focuses on distributing DOWN)
+      if(isOwner(a) || isInventory(a)) return null;
       var heldCount = devicesHeldBy(a.id, null).length;
       return { agent: a, heldCount: heldCount };
     })
@@ -25601,6 +25708,7 @@ function panelDistribute(){
       if(ra !== rb) return ra - rb;
       return a.agent.name.localeCompare(b.agent.name);
     });
+  if(dbg) console.log('[Distribute] '+targets.length+' active sales targets in panel');
 
   var h = panelHeader('📤 Distribute Inventory');
 
