@@ -1614,6 +1614,21 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
           <div id="apCodesArea"></div>
         </div>
 
+        <!-- ── STEP 6: PERMISSIONS ── (Owner / Inv Dept ONLY can change) -->
+        <div id="apPermissionsSection" style="margin-bottom:18px;padding-top:14px;border-top:1px dashed var(--sand);display:none">
+          <div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:2px;color:var(--brown);margin-bottom:6px">STEP 6 · PERMISSIONS</div>
+          <div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:10px">Special grants you give this person beyond their role. Only the Owner and Inventory Department see this section.</div>
+          <div style="background:rgba(0,53,148,.05);border:1px solid rgba(0,53,148,.2);border-radius:6px;padding:12px 14px">
+            <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-family:Barlow Condensed,sans-serif">
+              <input type="checkbox" id="apCanDistributeInventory" style="margin-top:3px;cursor:pointer" onchange="if(window._apForm){window._apForm.canDistributeInventory = this.checked;}">
+              <span>
+                <span style="font-weight:700;color:var(--brown);font-size:.86rem">📤 Distribute Inventory</span>
+                <span style="display:block;color:var(--muted);font-size:.72rem;margin-top:3px;line-height:1.45">Allows this manager to assign inventory they hold to people in their downline. They will only be able to send to agents in their own org chain — never across teams. Without this, only Owner and Inv Dept can run the Distribute action.</span>
+              </span>
+            </label>
+          </div>
+        </div>
+
         <!-- ── DANGER ZONE (edit mode only) ── -->
         <div id="apDangerZone" style="display:none;margin-top:24px;padding-top:14px;border-top:1px dashed rgba(220,38,38,.3)">
           <details>
@@ -9353,6 +9368,34 @@ function isOnboarding(u){
 }
 function isHRorInv(u)    { return isHR(u)||isInventory(u); }
 function isOfficeRole(u) { return isHR(u)||isInventory(u)||isPayroll(u)||isOnboarding(u); }
+
+// ════════════════════════════════════════════════════════════════════════
+//  DISTRIBUTE-INVENTORY PERMISSION (Calvin 2026-05-03)
+//  Inventory assignment is gated. By default only Owner and Inventory
+//  Dept can call invAssignCommit. Owner/Inv can grant a per-agent flag
+//  `canDistributeInventory:true` to specific managers (CM/IBO/MM/TL) who
+//  need to route inventory down their org chain. The flag does NOT bypass
+//  data-visibility gates — the manager can only assign devices they
+//  already have visibility into via inventoryVisibleTo.
+//
+//  canDistributeInventory(u)        — can this user run invAssignCommit?
+//  canGrantDistributePermission(u)  — can this user toggle the flag on
+//                                     OTHER agents?
+// ════════════════════════════════════════════════════════════════════════
+function canDistributeInventory(u){
+  if(!u) return false;
+  if(isOwner(u)) return true;
+  if(isInventory(u)) return true;
+  // Explicit per-agent grant
+  if(u.canDistributeInventory === true) return true;
+  return false;
+}
+function canGrantDistributePermission(u){
+  if(!u) return false;
+  if(isOwner(u)) return true;
+  if(isInventory(u)) return true;
+  return false;
+}
 function isMgrRole(u)    { return u && (u.role==='Market Manager'||u.role==='Campaign Manager'); }
 
 // ══════════════════════════════════════════════════════════════
@@ -11748,6 +11791,7 @@ async function loadFromSupabase(){
           category:      a.category      || null,
           depts:         safeJSON(a.depts, {}),
           officeManager: a.office_manager === true,
+          canDistributeInventory: a.can_distribute_inventory === true,
           iboMarkets:    safeJSON(a.ibo_markets, []),
           // Gen Mobile pay model — defaults to 'none' if column doesn't exist
           cmModel:       a.cm_model || 'none',
@@ -12114,6 +12158,7 @@ async function saveAgentToSupabase(agent){
     category:       agent.category || null,
     depts:          JSON.stringify(agent.depts || {}),
     office_manager: agent.officeManager === true,
+    can_distribute_inventory: agent.canDistributeInventory === true,
     ibo_markets:    JSON.stringify(agent.iboMarkets || []),
     // Gen Mobile pay model (cmModel). Stored as a string column. Falls
     // back to legacy save if the column doesn't exist in the schema.
@@ -12136,6 +12181,7 @@ async function saveAgentToSupabase(agent){
     delete legacy.category;
     delete legacy.depts;
     delete legacy.office_manager;
+    delete legacy.can_distribute_inventory;
     delete legacy.ibo_markets;
     delete legacy.cm_model;
     delete legacy.tc_model;
@@ -20131,8 +20177,10 @@ function panelBO(){
       html += '<div class="bo-card-title">📱 '+invTitle+' — At a Glance</div>';
       html += '<div style="display:flex;gap:8px;align-items:center">';
       // Distribute button — appears whenever the user is holding devices.
-      // Field Agents get the regular "transfer my inventory" flow; managers
-      // get the dedicated panelDistribute view that shows their full downline.
+      // Field Agents go to My Inventory (single-row Transfer flow). Managers
+      // go to the dedicated Distribute panel which handles both held
+      // transfers and pool distribution. Holders can always transfer their
+      // own held devices (gate in invAssignCommit lets holders pass).
       if(iHoldCount > 0){
         var distTarget = (u.role === 'Field Agent') ? 'inv-my-inventory' : 'inv-distribute';
         var distLabel  = (u.role === 'Field Agent') ? '📤 Transfer Mine ('+iHoldCount+')' : '📤 Distribute ('+iHoldCount+')';
@@ -24621,6 +24669,29 @@ function invAssignOpen(deviceIds){
     if(typeof isSalesRole === 'function' && !isSalesRole(a)) return false;
     return true;
   });
+
+  // Calvin 2026-05-03: For non-Owner non-Inv users, narrow the dropdown
+  // to: their downline + upline + Owner + Inv Dept. Same rule the commit
+  // step enforces.
+  var _u = DB.current;
+  if(_u && !isOwner(_u) && !(typeof isInventory === 'function' && isInventory(_u))){
+    var allowed = {};
+    var dl = (typeof agentIdsInMyOrgEffective === 'function') ? agentIdsInMyOrgEffective(_u) : [_u.id];
+    dl.forEach(function(id){ allowed[id] = true; });
+    if(typeof reportingChainFor === 'function'){
+      var rc = reportingChainFor(_u) || {};
+      if(rc.teamLeaderId)      allowed[rc.teamLeaderId]      = true;
+      if(rc.marketManagerId)   allowed[rc.marketManagerId]   = true;
+      if(rc.campaignManagerId) allowed[rc.campaignManagerId] = true;
+    }
+    DB.agents.forEach(function(a){
+      if(a && a.active && (isOwner(a) || isInventory(a))) allowed[a.id] = true;
+    });
+    recipients = recipients.filter(function(a){
+      return allowed[a.id] && a.id !== _u.id;
+    });
+  }
+
   // Sort: MM/CM first, then TL, then Field Agents, alphabetical within each group
   var roleOrder = {'Campaign Manager':1,'IBO':1,'Market Manager':2,'Team Leader':3,'Field Agent':4};
   recipients.sort(function(a,b){
@@ -24690,8 +24761,35 @@ function invAssignClose(){
 function invAssignCommit(deviceIds){
   var u = DB.current;
   if(!u){ alert('Not signed in.'); return; }
-  if(!isOwner(u) && !(typeof isInventory==='function' && isInventory(u)) && !(typeof canAccess==='function' && canAccess(u,'inventory'))){
-    alert('Inventory Department or Owner only.');
+
+  // Calvin 2026-05-03: Two-mode permission system.
+  //
+  // MODE A — DISTRIBUTOR: Owner / Inv Dept / agent with the
+  //   canDistributeInventory grant. Can assign ANY visible device to
+  //   anyone in their org chain. Owner/Inv can pick any recipient.
+  //
+  // MODE B — HOLDER: An agent without the grant who is the current
+  //   holder of ALL the devices being transferred. They can transfer
+  //   their own held devices to (a) anyone in their reporting chain
+  //   up or down, or (b) Owner / Inv Dept (handing back).
+  //
+  // Either path passes — at least one must succeed for the commit.
+  var modeA = (typeof canDistributeInventory === 'function') && canDistributeInventory(u);
+
+  // Check Mode B: do they hold every device in the request?
+  var holdsAll = true;
+  if(!modeA){
+    for(var hI = 0; hI < deviceIds.length; hI++){
+      var hHit = invFindDeviceAnyPool(deviceIds[hI]);
+      if(!hHit){ holdsAll = false; break; }
+      var hDev = hHit.device || hHit;
+      var hHolder = (typeof deviceHolderId === 'function') ? deviceHolderId(hDev) : (hDev.assignedTo || hDev.holderId || null);
+      if(hHolder !== u.id){ holdsAll = false; break; }
+    }
+  }
+
+  if(!modeA && !holdsAll){
+    alert('You don\'t have permission to assign these device(s). Either you must be the current holder of all selected devices, or you need the "Distribute Inventory" grant from the Owner / Inventory Dept.');
     return;
   }
   var sel = document.getElementById('invAssignRecipient');
@@ -24700,6 +24798,32 @@ function invAssignCommit(deviceIds){
   if(!recipId){ alert('Pick a recipient first.'); return; }
   var recipient = DB.agents.find(function(a){return a.id===recipId;});
   if(!recipient){ alert('Recipient not found.'); return; }
+
+  // Calvin 2026-05-03: For non-Owner non-Inv users, restrict recipients to
+  // the org chain — both up (upline handoff) and down (distribution).
+  // Plus Owner / Inv Dept are always valid recipients (returning inventory).
+  if(!isOwner(u) && !isInventory(u)){
+    var allowed = {};
+    // Downline + self
+    var dl = (typeof agentIdsInMyOrgEffective === 'function') ? agentIdsInMyOrgEffective(u) : [u.id];
+    dl.forEach(function(id){ allowed[id] = true; });
+    // Upline (reporting chain)
+    if(typeof reportingChainFor === 'function'){
+      var rc = reportingChainFor(u) || {};
+      if(rc.teamLeaderId)      allowed[rc.teamLeaderId]      = true;
+      if(rc.marketManagerId)   allowed[rc.marketManagerId]   = true;
+      if(rc.campaignManagerId) allowed[rc.campaignManagerId] = true;
+    }
+    // Owner + every Inv Dept member
+    DB.agents.forEach(function(a){
+      if(a && a.active && (isOwner(a) || isInventory(a))) allowed[a.id] = true;
+    });
+    if(!allowed[recipId]){
+      alert(recipient.name + ' is outside your reporting chain. You can transfer to your upline, your downline, or back to the Owner / Inventory Dept.');
+      return;
+    }
+  }
+
   var reason = (reasonEl && reasonEl.value || '').trim() || 'distribution';
 
   var now      = new Date();
@@ -25432,23 +25556,24 @@ function panelMyInventory(){
 function panelDistribute(){
   var u = DB.current;
 
-  // Gate: only managers and Inv Dept can distribute. Field Agents use
-  // the regular My Inventory panel for transfers.
-  var canDistribute = (
-    u.role === 'Campaign Manager' ||
-    u.role === 'IBO' ||
-    u.role === 'Market Manager' ||
-    u.role === 'Team Leader' ||
-    isOwner(u) ||
-    isInventory(u)
-  );
+  // Gate: Owner / Inv Dept always pass. Managers need the per-agent
+  // canDistributeInventory grant. Field Agents go to My Inventory instead.
+  var canDistribute = (typeof canDistributeInventory === 'function') && canDistributeInventory(u);
   if(!canDistribute){
     var locked = panelHeader('📤 Distribute Inventory');
     locked += '<div class="bo-card"><div style="padding:32px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">'
       + '<div style="font-size:2.4rem;margin-bottom:8px">🔒</div>'
-      + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px;color:var(--muted)">Manager / Leader Access Only</div>'
-      + '<div style="font-size:.8rem;margin-top:8px">Distribution is for routing inventory down the org chain. As a Field Agent, transfer your devices via <a href="#" onclick="gotoPanel(\'inv-my-inventory\');return false" style="color:var(--blue)">My Inventory</a>.</div>'
-      + '</div></div>';
+      + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px;color:var(--muted)">Distribute Permission Required</div>';
+    if(u.role === 'Field Agent'){
+      locked += '<div style="font-size:.8rem;margin-top:8px">Field Agents transfer their devices via <a href="#" onclick="gotoPanel(\'inv-my-inventory\');return false" style="color:var(--blue);text-decoration:underline">My Inventory</a>.</div>';
+    } else {
+      locked += '<div style="font-size:.8rem;margin-top:10px;line-height:1.6;max-width:520px;margin-left:auto;margin-right:auto">'
+        + 'You don\'t currently have the <strong style="color:var(--brown)">Distribute Inventory</strong> permission. '
+        + 'Ask the <strong>Owner</strong> or the <strong>Inventory Department</strong> to grant it on your profile.<br><br>'
+        + 'Once granted, you\'ll be able to assign inventory you hold to anyone in your downline.'
+        + '</div>';
+    }
+    locked += '</div></div>';
     return locked;
   }
 
@@ -35965,6 +36090,7 @@ function _apEmptyForm(){
     role: '',
     officeDepts: { hr:false, inventory:false, payroll:false, onboarding:false, admin:false },
     officeManager: false,
+    canDistributeInventory: false,
     programs: [],
     campaigns: {},
     market: null,
@@ -35990,7 +36116,7 @@ function apResetForm(){
   document.getElementById('apUser').value = '';
   document.getElementById('apPass').value = '';
   document.querySelectorAll('input[name="apProg"]').forEach(function(cb){ cb.checked = false; });
-  ['apOfficeDeptHR','apOfficeDeptInventory','apOfficeDeptPayroll','apOfficeDeptOnboarding','apOfficeDeptAdmin','apOfficeManager'].forEach(function(id){
+  ['apOfficeDeptHR','apOfficeDeptInventory','apOfficeDeptPayroll','apOfficeDeptOnboarding','apOfficeDeptAdmin','apOfficeManager','apCanDistributeInventory'].forEach(function(id){
     var el = document.getElementById(id); if(el) el.checked = false;
   });
   var area = document.getElementById('apCampaignsArea');
@@ -36061,6 +36187,24 @@ function apPickRole(role){
     if(progsSec)    progsSec.style.display    = '';
     if(placeSec)    placeSec.style.display    = '';
   }
+
+  // Calvin 2026-05-03: Show the Permissions section ONLY when:
+  //  (a) the current viewer can grant the permission (Owner / Inv Dept), AND
+  //  (b) the target person is a manager role that could distribute
+  //      (CM / IBO / MM / TL — Field Agents don't get this grant)
+  var permSec = document.getElementById('apPermissionsSection');
+  if(permSec){
+    var canGrant = (typeof canGrantDistributePermission === 'function')
+      && canGrantDistributePermission(DB.current);
+    var targetEligible = (role === 'Campaign Manager' || role === 'IBO' || role === 'Market Manager' || role === 'Team Leader');
+    permSec.style.display = (canGrant && targetEligible) ? '' : 'none';
+    // Sync the checkbox value from the form state
+    var distEl = document.getElementById('apCanDistributeInventory');
+    if(distEl && window._apForm){
+      distEl.checked = !!window._apForm.canDistributeInventory;
+    }
+  }
+
   apRenderPlacement();
   // Re-render campaigns area in case programs were already pre-checked
   apRefreshCampaigns();
@@ -36647,6 +36791,9 @@ function openEditPerson(agentId){
     f.role = ''; // unknown role — user picks a tab
   }
 
+  // Calvin 2026-05-03: load distribute-inventory grant flag
+  f.canDistributeInventory = !!agent.canDistributeInventory;
+
   // Programs
   f.programs = Array.isArray(agent.programs) ? agent.programs.slice()
              : (agent.program ? [agent.program] : []);
@@ -37002,6 +37149,15 @@ async function apSavePerson(){
         }
       });
       agent.channels = derivedChannels;
+    }
+
+    // ── Calvin 2026-05-03: Distribute-inventory grant ──
+    // The flag is editable only by Owner / Inv Dept. If the current user
+    // doesn't have permission to grant it, we leave the agent's existing
+    // value untouched (so a manager editing their own profile cannot
+    // self-grant the permission).
+    if(typeof canGrantDistributePermission === 'function' && canGrantDistributePermission(DB.current)){
+      agent.canDistributeInventory = !!f.canDistributeInventory;
     }
 
     // ── Save to local + Supabase ──
