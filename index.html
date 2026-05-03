@@ -9642,7 +9642,7 @@ function canAccess(u, area){
     // ── TL and above ──
     case 'myteam':           return isMgr || isTL;
     case 'recruit-tracker':  return isMgr || isTL || isOnboarding(u) || hasGrant('onboarding');
-    case 'pending-transfers':return isInventory(u) || hasGrant('inv-dashboard') || isMgr || isTL;
+    case 'pending-transfers':return isInventory(u) || hasGrant('inv-dashboard') || isMgr || isTL || isSalesRole(u);
 
     // ── Campaign-gated inventory panels (Gen Mobile) ──
     case 'gm-inventory':
@@ -19300,6 +19300,47 @@ function panelBO(){
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════════
+  //  TOP-OF-DASHBOARD: MY HELD DEVICES — Calvin 2026-05-03 (UNMISSABLE)
+  //  Renders FIRST, before scoreboard, for any user holding devices.
+  //  Uses the simplest possible query: scan every pool for holderId or
+  //  assignedTo === user.id. No org logic, no scope filters, no campaign
+  //  coding — if the data says you have it, you see it. This guarantees
+  //  that the moment a transfer completes and the recipient lands on their
+  //  dashboard, the device appears at the top.
+  // ══════════════════════════════════════════════════════════════════════
+  if(typeof devicesHeldBy === 'function' && (isSalesRole(u) || u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='Team Leader' || u.role==='IBO')){
+    var topHeld = [];
+    try { topHeld = devicesHeldBy(u.id, null) || []; } catch(e){ console.warn('[panelBO] devicesHeldBy failed:', e); }
+    if(topHeld.length){
+      var canDistTop = (typeof canDistributeInventory === 'function') && canDistributeInventory(u);
+      var hasMgrRole = (u.role==='Campaign Manager' || u.role==='IBO' || u.role==='Market Manager' || u.role==='Team Leader');
+      var topAction = hasMgrRole && canDistTop ? 'inv-distribute' : 'inv-my-inventory';
+      var topActionLabel = hasMgrRole && canDistTop ? 'Distribute' : 'Manage / Transfer';
+      var topUrgent5 = 0;
+      topHeld.forEach(function(d){
+        var dy = (typeof gmDeviceDaysLeft === 'function') ? gmDeviceDaysLeft(d) : null;
+        if(dy === null && typeof invDaysRemaining === 'function') dy = invDaysRemaining(d.expiryDate, d.assignedDate);
+        if(dy !== null && dy >= 0 && dy <= 5) topUrgent5++;
+      });
+
+      var topBg = topUrgent5 > 0 ? 'linear-gradient(90deg,rgba(204,0,0,.08),rgba(204,0,0,.02))' : 'linear-gradient(90deg,rgba(0,53,148,.08),rgba(0,53,148,.02))';
+      var topAccent = topUrgent5 > 0 ? '#CC0000' : '#003594';
+      html += '<div style="background:'+topBg+';border:1px solid '+topAccent+'40;border-left:5px solid '+topAccent+';border-radius:10px;padding:14px 20px;margin-bottom:18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+      html += '<div style="font-size:2rem;line-height:1;flex-shrink:0">📱</div>';
+      html += '<div style="flex:1;min-width:200px">';
+      html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:'+topAccent+'">YOU ARE HOLDING '+topHeld.length+' DEVICE'+(topHeld.length>1?'S':'')+'</div>';
+      var subParts = [];
+      if(topUrgent5 > 0) subParts.push('<strong style="color:#CC0000">🔥 '+topUrgent5+' urgent (≤5 days)</strong>');
+      var imeis = topHeld.slice(0,3).map(function(d){ return d.imei || d.id || '?'; });
+      subParts.push('<span style="font-family:monospace;font-size:.72rem;color:var(--brown)">'+imeis.join(', ')+(topHeld.length>3?', + '+(topHeld.length-3)+' more':'')+'</span>');
+      html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-top:3px;line-height:1.5">'+subParts.join(' &middot; ')+'</div>';
+      html += '</div>';
+      html += '<button onclick="gotoPanel(\''+topAction+'\')" style="background:'+topAccent+';color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer;flex-shrink:0">📤 '+topActionLabel+' →</button>';
+      html += '</div>';
+    }
+  }
+
   // ══════════ SCOREBOARD ══════════
   if(isSalesRole(u)){
     // ── Programs: prefer Supabase programs array, fall back to program field ──
@@ -24854,27 +24895,25 @@ function invAssignClose(){
   if(el) el.remove();
 }
 
-// Commit the assignment. For each device in deviceIds, set all holder
-// fields, status, and append a chainOfCustody entry. Save and re-render.
+// Commit the assignment. Creates a PENDING TRANSFER that requires
+// recipient e-signature before devices change hands. Direction-aware
+// routing: down-the-chain transfers go straight to recipient signature;
+// up-the-chain transfers (agent handing back) require MM approval first.
+//
+// Calvin 2026-05-03: Rebuilt — never mutates the device pool directly.
+// Recipient must always sign for IMEI/cost/expiry/invoice acknowledgment,
+// no matter who initiated the transfer. Money is at stake on every move.
 function invAssignCommit(deviceIds){
   var u = DB.current;
   if(!u){ alert('Not signed in.'); return; }
 
-  // Calvin 2026-05-03: Two-mode permission system.
-  //
+  // ── Permission gate (two modes) ──
   // MODE A — DISTRIBUTOR: Owner / Inv Dept / agent with the
-  //   canDistributeInventory grant. Can assign ANY visible device to
-  //   anyone in their org chain. Owner/Inv can pick any recipient.
-  //
-  // MODE B — HOLDER: An agent without the grant who is the current
-  //   holder of ALL the devices being transferred. They can transfer
-  //   their own held devices to (a) anyone in their reporting chain
-  //   up or down, or (b) Owner / Inv Dept (handing back).
-  //
-  // Either path passes — at least one must succeed for the commit.
+  //   canDistributeInventory grant. Can route any visible device.
+  // MODE B — HOLDER: An agent who is the current holder of every device
+  //   in the request. They can transfer their own held devices to their
+  //   reporting chain (up or down) or to Owner / Inv Dept.
   var modeA = (typeof canDistributeInventory === 'function') && canDistributeInventory(u);
-
-  // Check Mode B: do they hold every device in the request?
   var holdsAll = true;
   if(!modeA){
     for(var hI = 0; hI < deviceIds.length; hI++){
@@ -24885,11 +24924,12 @@ function invAssignCommit(deviceIds){
       if(hHolder !== u.id){ holdsAll = false; break; }
     }
   }
-
   if(!modeA && !holdsAll){
     alert('You don\'t have permission to assign these device(s). Either you must be the current holder of all selected devices, or you need the "Distribute Inventory" grant from the Owner / Inventory Dept.');
     return;
   }
+
+  // ── Read recipient + reason ──
   var sel = document.getElementById('invAssignRecipient');
   var reasonEl = document.getElementById('invAssignReason');
   var recipId = sel ? parseInt(sel.value) : 0;
@@ -24897,141 +24937,215 @@ function invAssignCommit(deviceIds){
   var recipient = DB.agents.find(function(a){return a.id===recipId;});
   if(!recipient){ alert('Recipient not found.'); return; }
 
-  // Calvin 2026-05-03: For non-Owner non-Inv users, restrict recipients to
-  // the org chain (up + down + Owner/Inv). Uses the shared helper so the
-  // panel and the gate can never disagree.
+  // ── Recipient scope check ──
   if(!isOwner(u) && !isInventory(u)){
-    var allowed = (typeof buildAllowedRecipientSet === 'function')
+    var allowedSet = (typeof buildAllowedRecipientSet === 'function')
       ? buildAllowedRecipientSet(u) : {};
-    if(!allowed[recipId]){
-      console.warn('[invAssignCommit] BLOCKED — recipient '+recipId+' ('+recipient.name+') not in allowed set. Allowed ids:', Object.keys(allowed));
+    if(!allowedSet[recipId]){
+      console.warn('[invAssignCommit] BLOCKED — recipient '+recipId+' ('+recipient.name+') not in allowed set');
       alert(recipient.name + ' is outside your reporting chain. You can transfer to your upline, your downline, or back to the Owner / Inventory Dept.');
       return;
     }
   }
-
   var reason = (reasonEl && reasonEl.value || '').trim() || 'distribution';
 
-  var now      = new Date();
-  var nowISO   = now.toISOString();
-  var nowDate  = nowISO.slice(0,10);
-
-  // Block: any device in a pending transfer must be cleared first
+  // ── Resolve devices, group by campaign, block any in pending transfers ──
+  var byCampaign = {};
   var blocked = [];
-  var pendingStatuses = {'pending':1,'pending-approval':1,'pending-agent-signature':1};
+  var notFound = 0;
+  var pendingStatuses = {'pending':1,'pending-approval':1,'pending-mm-approval':1,'pending-agent-signature':1};
+
   deviceIds.forEach(function(id){
     var hit = invFindDeviceAnyPool(id);
-    if(!hit || hit.campaign === 'Legacy') return;
-    var cfg = campaignCfg(hit.campaign);
-    if(!cfg || !cfg.transfers) return;
-    (cfg.transfers()||[]).forEach(function(t){
-      if(!t || !pendingStatuses[t.status]) return;
-      var imeiList = t.imeis || (t.devices||[]).map(function(d){return d.imei;});
-      if(imeiList.indexOf(hit.device.imei) >= 0){
-        blocked.push({imei:hit.device.imei, fromName:t.fromName, toName:t.toName});
-      }
-    });
+    if(!hit){ notFound++; return; }
+    var camp = hit.campaign || hit.device.campaign || hit.device.carrier || 'Gen Mobile';
+    if(camp === 'Legacy' || camp === 'legacy') camp = (hit.device.campaign || hit.device.carrier || 'Gen Mobile');
+    var cfg = (typeof campaignCfg === 'function') ? campaignCfg(camp) : null;
+    if(cfg && cfg.transfers){
+      (cfg.transfers()||[]).forEach(function(t){
+        if(!t || !pendingStatuses[t.status]) return;
+        var imeiList = t.imeis || (t.devices||[]).map(function(d){return d.imei;});
+        if(imeiList.indexOf(hit.device.imei) >= 0){
+          blocked.push({imei:hit.device.imei, fromName:t.fromName, toName:t.toName, status:t.status});
+        }
+      });
+    }
+    if(!byCampaign[camp]) byCampaign[camp] = [];
+    byCampaign[camp].push(hit.device);
   });
+
   if(blocked.length){
-    var msg = '🛑 ' + blocked.length + ' device(s) cannot be assigned — they are in pending transfers:\n\n';
+    var bMsg = '🛑 ' + blocked.length + ' device(s) cannot be transferred — they are already in pending transfers:\n\n';
     blocked.slice(0,10).forEach(function(b){
-      msg += '  • ' + b.imei + '  (' + b.fromName + ' → ' + b.toName + ')\n';
+      bMsg += '  • ' + b.imei + '  (' + b.fromName + ' → ' + b.toName + ', status: ' + b.status + ')\n';
     });
-    if(blocked.length > 10) msg += '  …and ' + (blocked.length - 10) + ' more\n';
-    msg += '\nClear those transfers first, then try again.';
-    alert(msg);
+    if(blocked.length > 10) bMsg += '  …and ' + (blocked.length - 10) + ' more\n';
+    bMsg += '\nClear those transfers first, then try again.';
+    alert(bMsg);
+    return;
+  }
+  if(!Object.keys(byCampaign).length){
+    alert('No devices could be located in any inventory pool.');
     return;
   }
 
-  // Compute the recipient's expiry window (mirrors invAcceptTransfer logic)
-  function _expiryDaysForRecipient(){
-    if(recipient.role === 'Market Manager' || recipient.role === 'Campaign Manager' || recipient.role === 'IBO') return 30;
-    if(recipient.role === 'Team Leader') return 14;
-    return 10; // Field Agent and others
-  }
-  var expiryDays = _expiryDaysForRecipient();
-  var expiryISO  = new Date(now.getTime() + expiryDays*86400000).toISOString();
-  var expiryDate = expiryISO.slice(0,10);
-
-  var assigned = 0, missed = 0;
-  deviceIds.forEach(function(id){
-    var hit = invFindDeviceAnyPool(id);
-    if(!hit){ missed++; return; }
-    var d = hit.device;
-
-    var prevHolder     = d.assignedToName || d.holderName || d.mmName || 'Inventory';
-    var prevHolderId   = d.assignedTo || d.holderId || d.mmId || null;
-
-    // Set every holder field consumers might read
-    var senderExpiry = d.expiryDate || d.originalExpiryDate || null;
-    d.assignedTo       = recipient.id;
-    d.assignedToName   = recipient.name;
-    d.assignedAt       = nowISO;
-    d.assignedDate     = nowDate;
-    d.holderId         = recipient.id;
-    d.holderName       = recipient.name;
-    d.recipientId      = recipient.id;
-    d.recipientName    = recipient.name;
-    d.status           = 'assigned';
-    // ── Calvin 2026-05-02: apply role-based cap on assign ──
-    // Replaces "preserve original expiry" rule. Recipient gets
-    // min(sender remaining, role cap, 30-day ceiling).
-    // For brand-new uploads (no prior holder), senderExpiry is the
-    // device's upload-time expiry, which the resolver clamps to 30.
-    d.expiryDate = resolveTransferExpiry(senderExpiry, recipient.role, now.getTime());
-    // MM identity fields (used by GM dashboards) — keep these because
-    // they identify "which MM owns this device", separate from expiry.
-    if(recipient.role === 'Market Manager' || recipient.role === 'Campaign Manager' || recipient.role === 'IBO'){
-      d.mmId          = recipient.id;
-      d.mmName        = recipient.name;
+  // ── Determine routing direction ──
+  // Direction: DOWN = recipient is in sender's downline (or Owner/Inv sending anywhere)
+  //            UP   = recipient is in sender's upline (handing back) — needs MM approval
+  //            RETURN = sending to Owner / Inv Dept (also needs MM approval)
+  var direction = 'down';
+  if(isOwner(u) || isInventory(u)){
+    // Owner / Inv as sender — always treated as DOWN (no approval needed)
+    direction = 'down';
+  } else if(isOwner(recipient) || isInventory(recipient)){
+    // Returning to Owner / Inv — needs MM approval
+    direction = 'return';
+  } else {
+    // Check if recipient is in sender's downline (DOWN) or upline (UP)
+    var dlSet = (typeof agentIdsInMyOrgEffective === 'function') ? agentIdsInMyOrgEffective(u) : [u.id];
+    var inDownline = dlSet.indexOf(recipient.id) >= 0 && recipient.id !== u.id;
+    if(inDownline){
+      direction = 'down';
+    } else {
+      // Anyone else in the allowed set (upline) — UP direction
+      direction = 'up';
     }
+  }
 
-    // Audit trail
-    if(!d.chainOfCustody) d.chainOfCustody = [];
-    d.chainOfCustody.push({
-      from:    prevHolder,
-      fromId:  prevHolderId,
-      to:      recipient.name,
-      toId:    recipient.id,
-      at:      nowISO,
-      type:    'owner-assign',
-      reason:  reason,
-      by:      u.name,
-      byId:    u.id,
-      priorExpiry: senderExpiry,
-      newExpiry:   d.expiryDate
+  // ── Build pending transfer records (one per campaign) ──
+  // Status:
+  //   - down (Owner/Inv sender, or down-the-chain): 'pending-agent-signature'
+  //     → recipient just needs to sign and it completes
+  //   - up / return (handing back up): 'pending-mm-approval'
+  //     → recipient's reporting MM (or sender's MM) approves first,
+  //       then status flips to 'pending-agent-signature' for the upline
+  //       recipient to acknowledge with e-signature
+  var initStatus = (direction === 'up' || direction === 'return') ? 'pending-mm-approval' : 'pending-agent-signature';
+
+  // Identify the MM that needs to approve an UP transfer. Use the
+  // SENDER's MM (since the sender is the one handing inventory up).
+  // Fall back to the sender's CM/IBO if no MM, or Inv Dept as last
+  // resort.
+  var approverIds = [];
+  if(direction === 'up' || direction === 'return'){
+    var senderChain = (typeof reportingChainFor === 'function') ? reportingChainFor(u) : {};
+    if(senderChain.marketManagerId)        approverIds.push(senderChain.marketManagerId);
+    else if(senderChain.campaignManagerId) approverIds.push(senderChain.campaignManagerId);
+    else {
+      // Sender is at the top — auto-approve (Owner/Inv path)
+      // Actually if we got here without isOwner/isInventory hitting earlier,
+      // then sender is a CM/IBO with no upline. In that case auto-approve.
+      initStatus = 'pending-agent-signature';
+      approverIds = [];
+    }
+    // ALWAYS notify Inv Dept on up-the-chain transfers as a safety net
+    DB.agents.forEach(function(a){
+      if(a && a.active && isInventory(a) && approverIds.indexOf(a.id) < 0){
+        approverIds.push(a.id);
+      }
     });
-    assigned++;
+  }
+
+  var totalCreated = 0, totalDevices = 0;
+  Object.keys(byCampaign).forEach(function(camp){
+    var devs = byCampaign[camp];
+    var cfg = (typeof campaignCfg === 'function') ? campaignCfg(camp) : null;
+    if(!cfg || !cfg.transfers){
+      console.warn('[invAssignCommit] campaign '+camp+' has no transfers store — skipping');
+      return;
+    }
+    var imeis = devs.map(function(d){ return d.imei; });
+    var req = {
+      id:           camp.toLowerCase().replace(/\s+/g,'')+'t-'+Date.now()+'-'+totalCreated,
+      campaign:     camp,
+      fromId:       u.id,
+      fromName:     u.name,
+      fromRole:     u.role,
+      toId:         recipient.id,
+      toName:       recipient.name,
+      toRole:       recipient.role,
+      imeis:        imeis,
+      reason:       reason,
+      status:       initStatus,
+      direction:    direction,
+      createdAt:    new Date().toISOString(),
+      approvedBy:   null,
+      approvedAt:   null,
+      approverIds:  approverIds.slice(),
+      agentSigned:  false,
+      agentSignedAt: null,
+      devices: devs.map(function(d){
+        return {
+          imei:    d.imei,
+          sim:     d.sim||'',
+          model:   d.model||'',
+          devType: d.devType||d.type||'device',
+          devCost: (typeof d.devCost === 'number' && d.devCost>0) ? d.devCost
+                 : (typeof d.cost === 'number' && d.cost>0) ? d.cost
+                 : 25.00,
+          expiryDate: d.expiryDate || null
+        };
+      })
+    };
+    cfg.transfers().push(req);
+    totalCreated++;
+    totalDevices += imeis.length;
+
+    // Notify based on routing
+    if(initStatus === 'pending-agent-signature'){
+      // Direct to recipient — they need to sign
+      if(typeof pushNotification === 'function'){
+        pushNotification({
+          toIds:[recipient.id], toRoles:[], icon:'✍️',
+          title: cfg.label + ' Transfer — SIGNATURE REQUIRED',
+          body: u.name + ' has sent you ' + imeis.length + ' device(s). You must sign for the invoice (IMEI, cost, expiry) before they appear in your inventory.',
+          panel: 'pending-transfers', priority:'high'
+        });
+      }
+    } else {
+      // Pending MM approval — notify approvers
+      approverIds.forEach(function(apId){
+        if(typeof pushNotification === 'function'){
+          pushNotification({
+            toIds:[apId], toRoles:[], icon:'⚖️',
+            title: cfg.label + ' Transfer — Approval Needed',
+            body: u.name + ' is sending ' + imeis.length + ' device(s) up to ' + recipient.name + '. Review in Pending Transfers.',
+            panel: 'pending-transfers', priority:'high'
+          });
+        }
+      });
+      // Also notify the recipient that something's coming once approved
+      if(typeof pushNotification === 'function'){
+        pushNotification({
+          toIds:[recipient.id], toRoles:[], icon:'⏳',
+          title: cfg.label + ' Transfer — Awaiting Approval',
+          body: u.name + ' is sending ' + imeis.length + ' device(s) to you. You\'ll need to sign once it\'s approved.',
+          panel: 'pending-transfers', priority:'normal'
+        });
+      }
+    }
   });
 
   try { if(typeof saveInventory === 'function') saveInventory(); } catch(e){ console.warn('[invAssignCommit] saveInventory failed:', e); }
   try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){ console.warn('[invAssignCommit] saveToStorage failed:', e); }
 
-  // Notify the recipient
-  if(typeof pushNotification === 'function'){
-    try {
-      pushNotification({
-        toIds:[recipient.id], toRoles:[], icon:'📦',
-        title:'Inventory Assigned to You',
-        body: assigned + ' device(s) assigned by ' + u.name + '. ' + expiryDays + '-day clock has started.',
-        panel:'inv-my-inventory', priority:'high'
-      });
-    } catch(e){}
-  }
-
-  // Reset selection state and close modal
   invAssignClose();
   invAssignClearSelection();
 
-  // Re-render current panel and toast
   if(typeof window._currentPanelId === 'string' && typeof gotoPanel === 'function'){
     gotoPanel(window._currentPanelId);
   } else if(typeof gotoPanel === 'function'){
-    gotoPanel('inv-dashboard');
+    gotoPanel('pending-transfers');
   }
   setTimeout(function(){
-    if(typeof cdFlash === 'function') cdFlash('✓ '+assigned+' device(s) assigned to '+recipient.name);
-    else alert('✓ '+assigned+' device(s) assigned to '+recipient.name+(missed?(' ('+missed+' could not be located)'):''));
+    var msg;
+    if(initStatus === 'pending-agent-signature'){
+      msg = '✓ Transfer initiated — '+recipient.name+' must sign for '+totalDevices+' device(s) before they take effect';
+    } else {
+      msg = '✓ Transfer pending approval — your MM will review before '+recipient.name+' is asked to sign';
+    }
+    if(typeof cdFlash === 'function') cdFlash(msg);
+    else alert(msg);
   }, 50);
 }
 
@@ -43317,8 +43431,117 @@ function panelPendingTransfers(){
   var canApprove=isInv||isAdmin||(isMM&&u.canApproveInventory);
   var myIncoming=PENDING_TRANSFERS.filter(function(p){return p.toId===u.id&&p.status==='Awaiting Recipient Signature';});
   var awaitingApproval=canApprove?PENDING_TRANSFERS.filter(function(p){return p.status==='Awaiting Final Approval';}):[];
+
+  // ── Calvin 2026-05-03: Pull pending CAMPAIGN transfers (the new flow
+  // from invAssignCommit). Three buckets:
+  //   1. needsMyMmApproval  — I am the sender's MM and a transfer is
+  //                           waiting on my approval
+  //   2. needsMySignature    — Transfer is addressed to me with status
+  //                           'pending-agent-signature'; I must e-sign
+  //   3. waitingOnOthers     — Transfers I sent that haven't completed
+  //                           (informational)
+  var needsMyMmApproval = [];
+  var needsMySignature  = [];
+  var waitingOnOthers   = [];
+  if(typeof CAMPAIGN_REGISTRY === 'object'){
+    Object.keys(CAMPAIGN_REGISTRY).forEach(function(camp){
+      var cfg = CAMPAIGN_REGISTRY[camp];
+      if(!cfg || !cfg.transfers) return;
+      (cfg.transfers()||[]).forEach(function(t){
+        if(!t) return;
+        var entry = {transfer: t, campaign: camp, label: cfg.label || camp};
+        if(t.status === 'pending-mm-approval'){
+          // Approver list — anyone in approverIds, plus Owner/Inv/Admin
+          var imApprover = false;
+          if(Array.isArray(t.approverIds) && t.approverIds.indexOf(u.id) >= 0) imApprover = true;
+          if(isOwner(u) || isInv || isAdmin) imApprover = true;
+          if(imApprover) needsMyMmApproval.push(entry);
+        } else if(t.status === 'pending-agent-signature' && t.toId === u.id){
+          needsMySignature.push(entry);
+        } else if(t.fromId === u.id && (t.status === 'pending-mm-approval' || t.status === 'pending-agent-signature')){
+          waitingOnOthers.push(entry);
+        }
+      });
+    });
+  }
+
   var h='';
   h += panelHeader('🔄 Pending Transfers');
+
+  // ── Section: SIGNATURE REQUIRED (my incoming campaign transfers) ──
+  if(needsMySignature.length){
+    h += '<div style="background:rgba(204,0,0,.08);border:2px solid #CC0000;border-radius:10px;padding:18px;margin-bottom:18px">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:#CC0000;letter-spacing:2px;margin-bottom:4px">⚠ SIGNATURE REQUIRED — '+needsMySignature.length+' INCOMING</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:12px;line-height:1.5">You have inventory waiting on your e-signature. Until you sign, the devices have NOT moved into your possession. Click Sign to view the invoice (IMEI, type, cost, expiry) and acknowledge receipt.</div>';
+    needsMySignature.forEach(function(entry){
+      var t = entry.transfer;
+      var totalCost = (t.devices||[]).reduce(function(s,d){return s + ((d.devCost && d.devCost>0) ? d.devCost : 25);}, 0);
+      h += '<div style="background:white;border:1px solid rgba(204,0,0,.25);border-radius:8px;padding:14px;margin-bottom:10px">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:8px">';
+      h += '<div>';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:var(--brown)">'+entry.label+' &middot; '+t.imeis.length+' device'+(t.imeis.length===1?'':'s')+'</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-top:2px">From <strong style="color:var(--brown)">'+t.fromName+'</strong> ('+t.fromRole+') &middot; Reason: '+(t.reason||'distribution')+'</div>';
+      h += '</div>';
+      h += '<div style="text-align:right">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Invoice if Unactivated</div>';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:#CC0000;letter-spacing:1px">$'+totalCost.toFixed(2)+'</div>';
+      h += '</div>';
+      h += '</div>';
+      // Show first few IMEIs
+      var imeiPrev = t.imeis.slice(0,4).join(', ');
+      if(t.imeis.length > 4) imeiPrev += ', + '+(t.imeis.length-4)+' more';
+      h += '<div style="background:rgba(0,53,148,.04);border:1px solid rgba(0,53,148,.12);border-radius:5px;padding:8px 12px;font-family:monospace;font-size:.74rem;color:var(--brown);margin-bottom:10px;word-break:break-all">'+imeiPrev+'</div>';
+      h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+      h += '<button onclick="invAcceptTransfer(\''+entry.campaign+'\',\''+t.id+'\')" class="btn-fire" style="flex:1;justify-content:center;padding:11px;font-size:.78rem">✍ Sign Invoice & Accept →</button>';
+      h += '<button onclick="invRejectTransfer(\''+entry.campaign+'\',\''+t.id+'\')" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:11px 18px;border-radius:5px;cursor:pointer">✗ Reject</button>';
+      h += '</div>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // ── Section: MM APPROVAL NEEDED (upline transfers I must approve) ──
+  if(needsMyMmApproval.length){
+    h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid #D97706">';
+    h += '<div class="bo-card-head"><div class="bo-card-title" style="color:#D97706">⚖️ Approval Needed — '+needsMyMmApproval.length+' Awaiting Your Review</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);letter-spacing:1px">Your reports are sending inventory upward. Approve to forward for signature.</div></div>';
+    h += '<div style="padding:12px 18px;display:flex;flex-direction:column;gap:10px">';
+    needsMyMmApproval.forEach(function(entry){
+      var t = entry.transfer;
+      h += '<div style="background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:12px">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;margin-bottom:4px"><strong style="color:var(--brown)">'+t.fromName+'</strong> ('+t.fromRole+') <span style="color:var(--muted)">→</span> <strong style="color:var(--brown)">'+t.toName+'</strong> ('+t.toRole+')</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:8px">'+entry.label+' &middot; '+t.imeis.length+' device(s) &middot; '+(t.reason||'distribution')+'</div>';
+      // Brief IMEI preview
+      var apImeiPrev = t.imeis.slice(0,3).join(', ');
+      if(t.imeis.length > 3) apImeiPrev += ', + '+(t.imeis.length-3)+' more';
+      h += '<div style="font-family:monospace;font-size:.72rem;color:var(--brown);margin-bottom:10px;word-break:break-all">'+apImeiPrev+'</div>';
+      h += '<div style="display:flex;gap:8px">';
+      h += '<button onclick="invApproveTransfer(\''+entry.campaign+'\',\''+t.id+'\')" style="background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.4);color:#059669;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:8px 14px;border-radius:4px;cursor:pointer;font-weight:600">✓ Approve — Forward for Signature</button>';
+      h += '<button onclick="invDenyTransfer(\''+entry.campaign+'\',\''+t.id+'\')" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:8px 14px;border-radius:4px;cursor:pointer">✗ Deny</button>';
+      h += '</div></div>';
+    });
+    h += '</div></div>';
+  }
+
+  // ── Section: WAITING ON OTHERS (informational) ──
+  if(waitingOnOthers.length){
+    h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid var(--muted)">';
+    h += '<div class="bo-card-head"><div class="bo-card-title">⏳ Your Sent Transfers — Waiting</div></div>';
+    h += '<div style="padding:10px 18px"><table style="width:100%;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><thead><tr style="border-bottom:1px solid var(--sand)"><th style="text-align:left;padding:6px 0;color:var(--muted);font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase">To</th><th style="text-align:left;color:var(--muted);font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase">Devices</th><th style="text-align:left;color:var(--muted);font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase">Status</th></tr></thead><tbody>';
+    waitingOnOthers.forEach(function(entry){
+      var t = entry.transfer;
+      var statusLabel = t.status === 'pending-mm-approval' ? 'Awaiting MM approval' : 'Awaiting recipient signature';
+      var statusColor = t.status === 'pending-mm-approval' ? '#D97706' : '#0c4cb8';
+      h += '<tr style="border-bottom:1px solid var(--sand)">';
+      h += '<td style="padding:8px 0;color:var(--brown)"><strong>'+t.toName+'</strong> <span style="color:var(--muted);font-size:.7rem">('+t.toRole+')</span></td>';
+      h += '<td style="padding:8px 0;color:var(--brown)">'+t.imeis.length+' &middot; '+entry.label+'</td>';
+      h += '<td style="padding:8px 0;color:'+statusColor+';font-weight:700">'+statusLabel+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // ── Legacy supply transfer signature card (preserved) ──
   if(myIncoming.length){
     h+='<div style="background:rgba(204,0,0,.06);border:2px solid rgba(204,0,0,.3);border-radius:10px;padding:18px;margin-bottom:18px">';
     h+='<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--red);letter-spacing:2px;margin-bottom:10px">⚠ ACTION REQUIRED — Sign to Confirm Receipt</div>';
@@ -43344,7 +43567,7 @@ function panelPendingTransfers(){
   }
   if(canApprove&&awaitingApproval.length){
     h+='<div class="bo-card" style="margin-bottom:16px;border-left:4px solid #D97706">';
-    h+='<div class="bo-card-head"><div class="bo-card-title" style="color:#D97706">⏳ Awaiting Final Approval ('+awaitingApproval.length+')</div></div>';
+    h+='<div class="bo-card-head"><div class="bo-card-title" style="color:#D97706">⏳ Supply Awaiting Final Approval ('+awaitingApproval.length+')</div></div>';
     h+='<div style="padding:12px 18px;display:flex;flex-direction:column;gap:10px">';
     awaitingApproval.forEach(function(p){
       h+='<div style="background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:12px">';
@@ -43358,10 +43581,80 @@ function panelPendingTransfers(){
     h+='</div></div>';
   }
   var all=PENDING_TRANSFERS.filter(function(p){return p.status==='Approved'||p.status==='Denied'||p.status==='Rejected by Recipient';});
-  if(!myIncoming.length&&!awaitingApproval.length&&!all.length){
+  if(!myIncoming.length&&!awaitingApproval.length&&!all.length&&!needsMySignature.length&&!needsMyMmApproval.length&&!waitingOnOthers.length){
     h+='<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No pending or completed transfers yet.</div>';
   }
   return h;
+}
+
+// ── Calvin 2026-05-03: New approval/deny actions for the campaign-transfer
+// pending-mm-approval flow. invApproveTransfer flips status from
+// 'pending-mm-approval' to 'pending-agent-signature' and notifies the
+// recipient that they need to sign. invDenyTransfer kills the transfer
+// outright and notifies the sender.
+function invApproveTransfer(campaign, transferId){
+  var cfg = (typeof campaignCfg === 'function') ? campaignCfg(campaign) : null;
+  if(!cfg){ alert('Campaign not found.'); return; }
+  var req = (cfg.transfers()||[]).find(function(t){return t.id===transferId;});
+  if(!req){ alert('Transfer not found.'); return; }
+  var u = DB.current;
+  var imApprover = (Array.isArray(req.approverIds) && req.approverIds.indexOf(u.id) >= 0) || isOwner(u) || isInventory(u) || u.role==='admin';
+  if(!imApprover){ alert('You are not authorized to approve this transfer.'); return; }
+  if(req.status !== 'pending-mm-approval'){ alert('This transfer is no longer awaiting approval (status: '+req.status+').'); return; }
+  if(!confirm('Approve this transfer? '+req.fromName+' → '+req.toName+' for '+req.imeis.length+' device(s). After approval, '+req.toName+' will need to e-sign before the devices change hands.')) return;
+
+  req.status     = 'pending-agent-signature';
+  req.approvedBy = u.name;
+  req.approvedById = u.id;
+  req.approvedAt = new Date().toISOString();
+  saveInventory();
+
+  if(typeof pushNotification === 'function'){
+    // Notify recipient to sign
+    pushNotification({
+      toIds:[req.toId], toRoles:[], icon:'✍️',
+      title: cfg.label + ' Transfer — SIGNATURE REQUIRED',
+      body: u.name + ' approved. ' + req.fromName + ' is sending you ' + req.imeis.length + ' device(s). Sign to accept the invoice.',
+      panel:'pending-transfers', priority:'high'
+    });
+    // Notify sender that approval came through
+    pushNotification({
+      toIds:[req.fromId], toRoles:[], icon:'✅',
+      title: cfg.label + ' Transfer Approved',
+      body: u.name + ' approved your transfer to ' + req.toName + '. Now waiting on their signature.',
+      panel:'pending-transfers', priority:'normal'
+    });
+  }
+  if(typeof cdFlash === 'function') cdFlash('✓ Approved — '+req.toName+' will be asked to sign');
+  gotoPanel('pending-transfers');
+}
+
+function invDenyTransfer(campaign, transferId){
+  var cfg = (typeof campaignCfg === 'function') ? campaignCfg(campaign) : null;
+  if(!cfg) return;
+  var req = (cfg.transfers()||[]).find(function(t){return t.id===transferId;});
+  if(!req) return;
+  var u = DB.current;
+  var imApprover = (Array.isArray(req.approverIds) && req.approverIds.indexOf(u.id) >= 0) || isOwner(u) || isInventory(u) || u.role==='admin';
+  if(!imApprover){ alert('You are not authorized to deny this transfer.'); return; }
+  var reason = prompt('Optional reason for denial:');
+  req.status     = 'denied';
+  req.deniedBy   = u.name;
+  req.deniedById = u.id;
+  req.deniedAt   = new Date().toISOString();
+  req.denyReason = reason || '';
+  saveInventory();
+
+  if(typeof pushNotification === 'function'){
+    pushNotification({
+      toIds:[req.fromId], toRoles:[], icon:'❌',
+      title: cfg.label + ' Transfer Denied',
+      body: u.name + ' denied your transfer to ' + req.toName + '.' + (reason ? ' Reason: '+reason : ''),
+      panel:'pending-transfers', priority:'high'
+    });
+  }
+  if(typeof cdFlash === 'function') cdFlash('Transfer denied');
+  gotoPanel('pending-transfers');
 }
 
 function signTransfer(pendingId){
