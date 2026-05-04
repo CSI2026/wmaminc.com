@@ -14082,12 +14082,35 @@ function saveAgentForm(){
     return;
   }
   var progs=[];
+  // ── Calvin 2026-05-03 PRESERVATION RULE ──
+  // Track which programs the form actually rendered checkboxes for.
+  // If a program isn't rendered (e.g. inactive in WMAM_PROGRAMS, or the
+  // form was scoped to a subset), we preserve the agent's existing
+  // membership rather than silently dropping it on save.
+  var renderedProgs = {};
   WMAM_PROGRAMS.filter(function(p){return p.active;}).forEach(function(p){
     var safeId='aaProg'+p.name.replace(/[^a-zA-Z0-9]/g,'');
     var el=document.getElementById(safeId);
     if(!el) el=document.getElementById('aaProg'+p.name); // fallback
-    if(el&&el.checked) progs.push(p.name);
+    if(el){
+      renderedProgs[p.name] = true;
+      if(el.checked) progs.push(p.name);
+    }
   });
+  // PRESERVE: add back any program the agent already has that the form
+  // didn't render. Caller would have to explicitly remove via a UI that
+  // shows the program.
+  var _editingId_pre = parseInt((document.getElementById('aaId')||{value:'0'}).value||'0');
+  if(_editingId_pre > 0){
+    var _existing_pre = DB.agents.find(function(x){return x.id===_editingId_pre;});
+    if(_existing_pre && Array.isArray(_existing_pre.programs)){
+      _existing_pre.programs.forEach(function(pn){
+        if(!renderedProgs[pn] && progs.indexOf(pn) < 0){
+          progs.push(pn);
+        }
+      });
+    }
+  }
   var carriers=getSelectedCarriers();
   var carrier=carriers.join(',');
   // Defensive: aaTeam, aaTeamLeader etc. lived inside the removed addAgentModal.
@@ -14130,7 +14153,48 @@ function saveAgentForm(){
       if(ot){ot.members=ot.members.filter(function(id){return id!==a.id;});if(ot.leader===a.id)ot.leader=null;}
     }
     a.name=name;a.role=role;a.email=email;a.programs=progs;a.program=progs.length>0?progs[0]:'';
-    a.carrier=carrier;a.channels=channels;a.links=links;a.username=uname;a.password=pw;a.team=teamId||null;
+    // ── Calvin 2026-05-03 PRESERVATION RULE for carrier/channels/links ──
+    // Merge form-derived values with the agent's existing record. The form
+    // only renders checkboxes for currently-active programs/carriers/links
+    // — anything outside that set should be preserved untouched.
+    var _existCarriers = (a.carrier||'').split(',').map(function(s){return s.trim();}).filter(Boolean);
+    var _renderedCarrierKeys = ['TruConnect','Gen Mobile','Assurance','Chuzo','Astound','Excess','ACA'];
+    var _renderedCarrierIds  = ['aaCarrierTC','aaCarrierGM','aaCarrierAS','aaCarrierChuzo','aaCarrierAstound','aaCarrierEX','aaCarrierACA'];
+    var _carrierMergeSet = {};
+    carriers.forEach(function(c){ _carrierMergeSet[c] = true; });
+    _existCarriers.forEach(function(c){
+      var idx = _renderedCarrierKeys.indexOf(c);
+      if(idx < 0){ _carrierMergeSet[c] = true; return; }  // not in known set → preserve
+      var domEl = document.getElementById(_renderedCarrierIds[idx]);
+      if(!domEl) _carrierMergeSet[c] = true;  // form didn't render it → preserve
+    });
+    a.carrier = Object.keys(_carrierMergeSet).join(',');
+
+    // Channels: merge form-derived with existing non-derivable channels
+    // (team channels, role-specific channels added outside this form).
+    var _derivableChans = {
+      'national':1,'chat-national':1,'lifeline':1,'chat-lifeline':1,'truconnect':1,
+      'genmobile':1,'assurance':1,'internet':1,'chat-internet':1,'chuzo':1,'astound':1,
+      'excess':1,'aca':1,'chat-aca':1,'chat-chuzo':1,'chat-astound':1,'chat-excess':1
+    };
+    var _chanSet = {};
+    channels.forEach(function(c){ _chanSet[c] = true; });
+    (a.channels||[]).forEach(function(c){
+      if(!_derivableChans[c]) _chanSet[c] = true;  // preserve non-derived channels
+    });
+    a.channels = Object.keys(_chanSet);
+
+    // Links: merge form-checked with any existing links whose checkbox
+    // wasn't rendered in the form.
+    var _linkSet = {};
+    links.forEach(function(l){ _linkSet[l] = true; });
+    (a.links||[]).forEach(function(l){
+      if(LINK_IDS.indexOf(l) < 0){ _linkSet[l] = true; return; }  // unknown link → preserve
+      if(!document.getElementById('lnk-'+l)) _linkSet[l] = true;   // not rendered → preserve
+    });
+    a.links = Object.keys(_linkSet);
+
+    a.username=uname;a.password=pw;a.team=teamId||null;
     a.teamLeaderId=teamLeaderId;a.marketManagerId=marketManagerId;a.campaignManagerId=campaignManagerId;
     try { console.log('[saveAgentForm] EDIT: agent #'+agentId+' a.username="'+a.username+'" a.password.length='+(a.password?a.password.length:0)); } catch(e){}
     // ── Calvin 2026-04-30 fix: PRESERVE-on-edit semantics for category/depts ──
@@ -14191,21 +14255,41 @@ function saveAgentForm(){
     var invApprEl=document.getElementById('aaCanApproveInv');
     if(invApprEl) a.canApproveInventory=invApprEl.checked;
     // ── Markets (Market Manager) / Campaign (Campaign Manager) ──
+    // ── Calvin 2026-05-03 PRESERVATION RULE ──
+    // Role-change wipes are gated by confirm dialogs so a misclick doesn't
+    // silently destroy MM markets or CM campaign assignment.
     if(a.role==='Market Manager'){
-      var mmMarketsSaved = Array.prototype.slice.call(document.querySelectorAll('.aa-market-cb'))
-        .filter(function(cb){return cb.checked;})
-        .map(function(cb){return cb.value;});
-      a.markets = mmMarketsSaved;
+      // Form rendered the markets picker. If at least one box was rendered,
+      // trust the form; otherwise preserve existing.
+      var mmCBs = document.querySelectorAll('.aa-market-cb');
+      if(mmCBs.length > 0){
+        var mmMarketsSaved = Array.prototype.slice.call(mmCBs)
+          .filter(function(cb){return cb.checked;})
+          .map(function(cb){return cb.value;});
+        a.markets = mmMarketsSaved;
+      }
+      // If the form didn't render market checkboxes, preserve a.markets
       if(a.market) delete a.market; // drop legacy single-market field
-    } else {
-      // Role changed away from MM — clear markets
-      if(a.markets) a.markets = [];
+    } else if(Array.isArray(a.markets) && a.markets.length > 0){
+      // Role changed away from MM AND there's existing market data to lose
+      var changeMsg = 'This agent is no longer a Market Manager. Clear their '
+                    + a.markets.length + ' market assignment(s)?\n\n'
+                    + 'Click Cancel to keep the role change but preserve markets.';
+      if(confirm(changeMsg)){
+        a.markets = [];
+      }
     }
     if(a.role==='Campaign Manager'){
       var campEl = document.getElementById('aaCampaign');
-      a.campaign = campEl ? campEl.value : '';
-    } else {
-      if(a.campaign) delete a.campaign;
+      if(campEl){ a.campaign = campEl.value; }
+      // No element = preserve existing
+    } else if(a.campaign){
+      var campChangeMsg = 'This agent is no longer a Campaign Manager. Clear '
+                       + 'their campaign assignment ('+a.campaign+')?\n\n'
+                       + 'Click Cancel to keep the role change but preserve campaign.';
+      if(confirm(campChangeMsg)){
+        delete a.campaign;
+      }
     }
     // canHostCall — only saved if row is visible (owner/admin)
     var callHostSaveEl = document.getElementById('aaCanHostCall');
@@ -14274,6 +14358,14 @@ function saveAgentForm(){
       }
     }
     // Save agent codes from the inline campaign rows — Lifeline + Internet + ACA
+    // ── Calvin 2026-05-03 PRESERVATION RULE ──
+    // Old code unconditionally deleted any agentCodes[camp] when the
+    // checkbox was unchecked OR missing from the DOM. That wiped codes
+    // for campaigns the form didn't render (e.g. editing an FA who has
+    // both TruConnect AND Gen Mobile codes, but the form only renders
+    // one program section). New rule: only touch codes for campaigns
+    // where the DOM element actually exists. Missing DOM = "form didn't
+    // ask about this" = preserve existing data.
     if(!a.agentCodes) a.agentCodes={};
     var codeKeyMapSave = {
       TruConnect:'TC', 'Gen Mobile':'GM', Assurance:'AS', Excess:'EX',
@@ -14288,12 +14380,18 @@ function saveAgentForm(){
       var cbId = key==='CZ'?'aaCarrierChuzo': key==='AS2'?'aaCarrierAstound': key==='ACA'?'aaCarrierACA': 'aaCarrier'+key;
       var cbEl   = document.getElementById(cbId);
       var inp    = document.getElementById(mapEl.codeId);
+      // PRESERVE: if the form didn't render this campaign's checkbox at
+      // all, leave the existing code alone. The user can't have
+      // "unchecked" something the form never showed them.
+      if(!cbEl) return;
       var wasActive = !!(a.agentCodes[camp]&&a.agentCodes[camp].trim());
-      if(cbEl && cbEl.checked && inp){
+      if(cbEl.checked && inp){
         a.agentCodes[camp] = inp.value.trim();
         if(!wasActive && a.agentCodes[camp]) newlyCodedCamps.push(camp);
-      } else {
-        if(!cbEl||!cbEl.checked) delete a.agentCodes[camp];
+      } else if(!cbEl.checked){
+        // Form rendered the checkbox AND user explicitly unchecked it.
+        // This IS an intentional removal.
+        delete a.agentCodes[camp];
       }
     });
     // Notification if new codes were added
@@ -38393,6 +38491,18 @@ function openEditPerson(agentId){
   f.parentMM  = agent.marketManagerId || null;
   f.parentCM  = agent.campaignManagerId || null;
   f.iboMarkets = Array.isArray(agent.iboMarkets) ? agent.iboMarkets.slice() : [];
+  // ── Calvin 2026-05-03 PRESERVATION SNAPSHOT ──
+  // Save the placement state at form-load time. Save will compare to this
+  // to decide whether the user actually changed something or whether the
+  // form just misloaded. See apSavePerson preservation rule for how this
+  // is consumed.
+  f._originalSnapshot = {
+    market:    f.market,
+    parentTL:  f.parentTL,
+    parentMM:  f.parentMM,
+    parentCM:  f.parentCM,
+    iboMarkets: f.iboMarkets.slice()
+  };
   // Legacy alias for any code that still reads window._apStaging
   window._apStaging = { iboMarkets: f.iboMarkets.slice(), proposedCodes: {} };
 
@@ -38543,6 +38653,32 @@ async function apSavePerson(){
     agent.password = pw;
 
     // ── Apply role + category + depts ──
+    // ── Calvin 2026-05-03 SAFETY GATE ──
+    // If this is an EDIT (existing agent) AND the role change would wipe
+    // significant data, require explicit confirmation. New-agent saves
+    // skip this since there's nothing to lose.
+    var isEdit = !!agent.id && agent.id < DB.nextId && (DB.agents||[]).some(function(a){return a.id === agent.id;});
+    if(isEdit && role === 'Office' && agent.category !== 'office'){
+      // Sales → Office switch — would wipe placements, programs, agentCodes
+      var hadPlacements = !!(agent.team || agent.iboMarkets && agent.iboMarkets.length || agent.teamLeaderId || agent.marketManagerId || agent.campaignManagerId);
+      var hadCodes = agent.agentCodes && Object.keys(agent.agentCodes).filter(function(k){return (agent.agentCodes[k]||'').trim();}).length > 0;
+      if(hadPlacements || hadCodes){
+        var msg = '⚠ Switching '+agent.name+' from a sales role to Office will REMOVE:\n\n';
+        if(hadPlacements) msg += '  • All market placements\n';
+        if(hadCodes) msg += '  • All campaign codes (e.g. Gen Mobile portal username)\n';
+        msg += '\nThis cannot be undone via this save. Continue?';
+        if(!confirm(msg)) return;
+      }
+    }
+    if(isEdit && role !== 'Office' && agent.category === 'office'){
+      // Office → Sales switch — would wipe depts
+      var hadDepts = agent.depts && Object.keys(agent.depts).filter(function(k){return agent.depts[k];}).length > 0;
+      if(hadDepts){
+        var msg2 = '⚠ Switching '+agent.name+' from Office to a sales role will REMOVE all department assignments (HR, Inventory, Payroll, Onboarding, Admin). Continue?';
+        if(!confirm(msg2)) return;
+      }
+    }
+
     if(role === 'Office'){
       agent.depts = {};
       ['hr','inventory','payroll','onboarding','admin'].forEach(function(k){
@@ -38559,6 +38695,25 @@ async function apSavePerson(){
       if(typeof isOwner==='function' && isOwner(DB.current)){
         agent.officeManager = !!f.officeManager;
       }
+      // ── Calvin 2026-05-03 PRESERVATION RULE ──
+      // Office staff don't have programs/placement. But if this person was
+      // previously a sales role with real placements, codes, etc., wiping
+      // them silently destroys Calvin's setup. Confirm before destruction.
+      var hadSalesData = (Array.isArray(agent.programs) && agent.programs.length > 0)
+                      || (agent.team || agent.teamLeaderId || agent.marketManagerId || agent.campaignManagerId)
+                      || (agent.iboMarkets && agent.iboMarkets.length)
+                      || (agent.agentCodes && Object.keys(agent.agentCodes).length > 0)
+                      || (agent.carrier);
+      if(hadSalesData){
+        var bits = [];
+        if(Array.isArray(agent.programs) && agent.programs.length) bits.push(agent.programs.length+' programs');
+        if(agent.team) bits.push('market placement');
+        if(agent.iboMarkets && agent.iboMarkets.length) bits.push(agent.iboMarkets.length+' multi-market roles');
+        if(agent.agentCodes && Object.keys(agent.agentCodes).length) bits.push(Object.keys(agent.agentCodes).length+' agent codes');
+        var msg = 'Switching ' + agent.name + ' to Office staff will clear their sales data:\n\n  • '
+                + bits.join('\n  • ') + '\n\nProceed and clear?\n\nClick Cancel to abort the entire save.';
+        if(!confirm(msg)){ return; }
+      }
       // Office staff don't have programs/placement — clear those
       agent.programs = [];
       agent.program  = '';
@@ -38572,8 +38727,16 @@ async function apSavePerson(){
     } else {
       agent.role = role;
       agent.category = (role === 'IBO') ? 'ibo' : 'sales';
-      // If switching FROM office, clear depts + officeManager
+      // ── Calvin 2026-05-03 PRESERVATION RULE ──
+      // If switching FROM office to sales/ibo, depts get cleared. Confirm
+      // first so Calvin doesn't lose someone's HR/Inventory/Payroll access
+      // by accident.
       if(agent.depts && Object.keys(agent.depts).some(function(k){ return agent.depts[k]; })){
+        var deptList = Object.keys(agent.depts).filter(function(k){return agent.depts[k];});
+        var msg2 = 'Switching ' + agent.name + ' away from Office will clear their '
+                 + 'department access: ' + deptList.join(', ') + '.\n\n'
+                 + 'Proceed and clear?\n\nClick Cancel to abort the entire save.';
+        if(!confirm(msg2)){ return; }
         agent.depts = {};
       }
       if(agent.officeManager) agent.officeManager = false;
@@ -38581,31 +38744,86 @@ async function apSavePerson(){
       // Programs + campaigns + codes
       agent.programs = f.programs.slice();
       agent.program  = f.programs[0] || '';
-      // agentCodes: rebuild ENTIRELY from f.campaigns. Key presence = checked.
-      // Empty-string value means "checked but no code yet."
-      agent.agentCodes = {};
-      Object.keys(f.campaigns).forEach(function(camp){
-        agent.agentCodes[camp] = f.campaigns[camp] || '';
+
+      // ── Calvin 2026-05-03 PRESERVATION RULE ──
+      // agentCodes is updated via DELTA MERGE, not a full wipe-and-rebuild.
+      // The form only renders campaigns listed in AP_PROGRAM_CAMPAIGNS; any
+      // codes outside that set (custom campaigns, programs the form didn't
+      // load, codes added programmatically, etc.) would have been silently
+      // erased by the old "agent.agentCodes = {}" approach.
+      //
+      // The merge rule:
+      //   1. Compute the set of campaigns the form ACTUALLY KNEW ABOUT
+      //      (every campaign listed under any of the form's selected programs)
+      //   2. For those known campaigns: form's value wins (presence = checked)
+      //   3. For UNKNOWN campaigns: keep the existing agent.agentCodes value
+      var existingCodes = (agent.agentCodes && typeof agent.agentCodes === 'object')
+                        ? agent.agentCodes : {};
+      var formKnownCampaigns = {};
+      f.programs.forEach(function(prog){
+        ((typeof AP_PROGRAM_CAMPAIGNS !== 'undefined' && AP_PROGRAM_CAMPAIGNS[prog]) || [])
+          .forEach(function(c){ formKnownCampaigns[c] = true; });
       });
-      // Derived carrier — comma-separated list of campaigns with NON-EMPTY codes
-      var withCodes = [];
+      var newCodes = {};
+      // Step 1: preserve unknown campaigns (form had no UI for them)
+      Object.keys(existingCodes).forEach(function(camp){
+        if(!formKnownCampaigns[camp]) newCodes[camp] = existingCodes[camp];
+      });
+      // Step 2: apply form's checked campaigns (presence = checked)
       Object.keys(f.campaigns).forEach(function(camp){
-        var v = (f.campaigns[camp]||'').trim();
+        newCodes[camp] = f.campaigns[camp] || '';
+      });
+      // Step 3: handle UN-checking — if form knew about a campaign but it's
+      // not in f.campaigns, the user explicitly unchecked it. Drop it.
+      // (This is what allows users to remove a code via the UI.)
+      // Already handled by step 2 only writing what's IN f.campaigns; combined
+      // with step 1 only writing UNKNOWN campaigns, anything the form knew
+      // about + was unchecked is correctly dropped.
+      agent.agentCodes = newCodes;
+
+      // Derived carrier — comma-separated list of campaigns with NON-EMPTY codes
+      // (uses the merged result, so unknown-but-coded campaigns still appear)
+      var withCodes = [];
+      Object.keys(agent.agentCodes).forEach(function(camp){
+        var v = (agent.agentCodes[camp]||'').trim();
         if(v) withCodes.push(camp);
       });
       agent.carrier = withCodes.join(',');
 
-      // ── Calvin 2026-05-02 (revised): Placement writes for Add AND Edit ──
-      // Inline pickers are now visible on both flows. Save updates the
-      // agent's placement fields AND mirrors into the MARKETS roster so
-      // both views stay in sync.
-      agent.team             = f.market   || null;
-      agent.teamLeaderId     = f.parentTL || null;
-      agent.marketManagerId  = f.parentMM || null;
-      agent.campaignManagerId= f.parentCM || null;
-      agent.iboMarkets       = (role === 'IBO' || role === 'Campaign Manager' || role === 'Market Manager')
-                              ? (f.iboMarkets||[]).slice()
-                              : [];
+      // ── Calvin 2026-05-03 PRESERVATION RULE (chain pointers + iboMarkets) ──
+      // The form pickers may legitimately be empty (user wants to clear)
+      // OR falsely empty (form misloaded the agent's data). To distinguish:
+      // we snapshot the ORIGINAL chain pointers when the form loads
+      // (in panelAgentMasterProfile), and only overwrite a field on save
+      // if its current form value DIFFERS from the original snapshot.
+      // If the form was misloaded, original==null and form==null → no change.
+      // If user explicitly cleared, original==someValue and form==null → write null.
+      // If user changed, original==X and form==Y → write Y.
+      var orig = (typeof f._originalSnapshot === 'object' && f._originalSnapshot)
+                 ? f._originalSnapshot
+                 : { market:agent.team, parentTL:agent.teamLeaderId,
+                     parentMM:agent.marketManagerId, parentCM:agent.campaignManagerId,
+                     iboMarkets:Array.isArray(agent.iboMarkets)?agent.iboMarkets.slice():[] };
+
+      function _normVal(v){ return (v === '' || v === 0 || v === undefined) ? null : v; }
+      if(_normVal(f.market)   !== _normVal(orig.market))   agent.team              = f.market || null;
+      if(_normVal(f.parentTL) !== _normVal(orig.parentTL)) agent.teamLeaderId      = f.parentTL || null;
+      if(_normVal(f.parentMM) !== _normVal(orig.parentMM)) agent.marketManagerId   = f.parentMM || null;
+      if(_normVal(f.parentCM) !== _normVal(orig.parentCM)) agent.campaignManagerId = f.parentCM || null;
+
+      // iboMarkets: same compare-to-original rule. If form list differs from
+      // original snapshot, honor the form. Otherwise preserve.
+      if(role === 'IBO' || role === 'Campaign Manager' || role === 'Market Manager'){
+        var formIM = Array.isArray(f.iboMarkets) ? f.iboMarkets.slice() : [];
+        var origIM = Array.isArray(orig.iboMarkets) ? orig.iboMarkets.slice() : [];
+        var sameIM = (formIM.length === origIM.length) &&
+                     formIM.every(function(x,i){ return x === origIM[i]; });
+        if(!sameIM){
+          // User actually changed the list — honor it
+          agent.iboMarkets = formIM;
+        }
+        // else: form unchanged from original — preserve agent.iboMarkets as-is
+      }
 
       // Mirror placement into MARKETS roster. For each program the agent
       // works, write to that program's section. (Most users work Lifeline
@@ -38634,9 +38852,16 @@ async function apSavePerson(){
                 if(!Array.isArray(sec.tlIds)) sec.tlIds = [];
                 if(sec.tlIds.indexOf(agent.id) < 0) sec.tlIds.push(agent.id);
                 sec.active = true;
+              } else if(role === 'Field Agent'){
+                // Calvin 2026-05-03: FAs ARE roster slots now. The dashboard
+                // org-walk (agentIdsInMyOrgEffective) reads sec.faIds to roll
+                // up FAs into MM/CM scoreboards. Without this push, editing
+                // an FA's profile (e.g. updating phone) would orphan them
+                // from their MM's dashboard view.
+                if(!Array.isArray(sec.faIds)) sec.faIds = [];
+                if(sec.faIds.indexOf(agent.id) < 0) sec.faIds.push(agent.id);
+                sec.active = true;
               }
-              // Field Agents aren't roster slots — they're tracked via
-              // their own teamLeaderId and queried on demand.
             });
             // Re-mirror legacy fields after section edits
             ensureMarketSections(mr);
@@ -38658,9 +38883,30 @@ async function apSavePerson(){
               ensureMarketSections(other);
             });
           }
+          // Same for FA — remove from OTHER markets' faIds when they switch
+          if(role === 'Field Agent'){
+            MARKETS.forEach(function(other){
+              if(!other) return;
+              ensureMarketSections(other);
+              ['lifeline','internet','aca'].forEach(function(prog){
+                var s = other.programs[prog];
+                if(!s || !Array.isArray(s.faIds)) return;
+                if(other.id !== (mr ? mr.id : -1) && s.faIds.indexOf(agent.id) >= 0){
+                  s.faIds = s.faIds.filter(function(x){ return x !== agent.id; });
+                }
+              });
+              ensureMarketSections(other);
+            });
+          }
         }
         // Multi-market roles (MM, CM, IBO): write to all picked markets'
-        // appropriate slots, and clear from markets that were unpicked.
+        // appropriate slots.
+        // ── Calvin 2026-05-03 PRESERVATION RULE ──
+        // We NEVER silently remove an agent from a market they're already
+        // placed in. The form's f.iboMarkets list might be incomplete (e.g.
+        // form didn't load all their existing markets correctly). Removing
+        // placements requires explicit Calvin action via the placement UI.
+        // This block ONLY adds new placements; existing ones are preserved.
         if(role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO'){
           var picked = (f.iboMarkets||[]).map(function(x){
             return parseInt((x+'').replace(/^market-/, ''), 10);
@@ -38674,8 +38920,9 @@ async function apSavePerson(){
               var s = mr2.programs[prog];
               if(role === 'Market Manager'){
                 if(isPicked && !s.mmId) s.mmId = agent.id;
-                else if(isPicked && s.mmId === agent.id) {/* keep */}
-                else if(!isPicked && s.mmId === agent.id) s.mmId = null;
+                // PRESERVE: do NOT remove this agent as MM if they're not picked.
+                // Old code had: else if(!isPicked && s.mmId === agent.id) s.mmId = null;
+                // That silently wiped placements when the form misloaded.
                 if(isPicked) s.active = true;
               } else if(role === 'Campaign Manager'){
                 if(isPicked){
@@ -38683,18 +38930,16 @@ async function apSavePerson(){
                   s.topRole = 'cm';
                   s.iboId = null;
                   s.active = true;
-                } else if(s.cmId === agent.id){
-                  s.cmId = null;
                 }
+                // PRESERVE: don't auto-clear cmId on unpicked markets.
               } else if(role === 'IBO'){
                 if(isPicked){
                   s.iboId = agent.id;
                   s.topRole = 'ibo';
                   s.cmId = null;
                   s.active = true;
-                } else if(s.iboId === agent.id){
-                  s.iboId = null;
                 }
+                // PRESERVE: don't auto-clear iboId on unpicked markets.
               }
             });
             ensureMarketSections(mr2);
