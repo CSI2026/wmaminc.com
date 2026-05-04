@@ -10328,6 +10328,142 @@ function gmConfirmVendorDatePrompt(){
 //   4. Hard fallback: any GM Campaign Manager (legacy safety net)
 // Returns {agent, source:'mm'|'cm'|'ibo'|'hard-fallback', market}
 // or null if literally no agent can be resolved.
+// ════════════════════════════════════════════════════════════════════════
+//  GM UPLOAD ROUTING — Calvin 2026-05-03
+//  Per Calvin's spec, the routing priority for any uploaded device is:
+//    1. CSV "Name" column → if it matches an active agent, send there
+//    2. Market's MM → if there's an MM on the matched market, send there
+//    3. (DELIBERATELY NO CM FALLBACK) — if no MM, leave UNASSIGNED in pool
+//    4. Hard fallback (last resort, only if everything else fails) → CM
+//  This replaces the old behavior where everything fell to the CM by
+//  default, which was filling Tanita's inventory with devices that
+//  belonged to specific MMs and agents.
+// ════════════════════════════════════════════════════════════════════════
+
+// Normalize a name for fuzzy comparison: lowercase, strip non-alphanumeric.
+function _gmNormalizeName(s){
+  if(!s) return '';
+  return String(s).toLowerCase().replace(/[^a-z0-9]/g,'').trim();
+}
+
+// Try to match a CSV recipient name to an active agent.
+// Strategy: exact normalized match first, then last-name match (within
+// the market context if provided), then prefix match. Returns null if
+// nothing reasonable matches.
+function gmResolveByCSVName(csvName, marketName){
+  if(!csvName) return null;
+  var target = _gmNormalizeName(csvName);
+  if(!target) return null;
+
+  var agents = (DB.agents || []).filter(function(a){ return a && a.active; });
+  if(!agents.length) return null;
+
+  // ── 1. Exact normalized match on full name ──
+  for(var i=0;i<agents.length;i++){
+    if(_gmNormalizeName(agents[i].name) === target) return agents[i];
+  }
+
+  // ── 2. Match on Gen Mobile portal username (agentCodes['Gen Mobile']) ──
+  // CSV "Name" sometimes has the GM portal handle, not the human name.
+  for(var j=0;j<agents.length;j++){
+    var codes = agents[j].agentCodes || {};
+    var gmCode = codes['Gen Mobile'] || '';
+    if(gmCode && _gmNormalizeName(gmCode) === target) return agents[j];
+  }
+
+  // ── 3. Last-name match scoped to MM's market (if provided) ──
+  // "John Smith" in CSV could be one of two Smiths; pick the one in this market.
+  var lastName = csvName.trim().split(/\s+/).pop();
+  var lastNorm = _gmNormalizeName(lastName);
+  if(lastNorm && marketName && typeof MARKETS !== 'undefined'){
+    var mRow = MARKETS.find(function(m){
+      return m && m.active !== false && (m.name||'').toLowerCase().trim() === marketName.toLowerCase().trim();
+    });
+    if(mRow){
+      // Get all agent IDs slotted into this market across any program section
+      var marketAgentIds = {};
+      ['lifeline','internet','aca'].forEach(function(prog){
+        var sec = (mRow.programs && mRow.programs[prog]) || {};
+        if(sec.mmId)  marketAgentIds[sec.mmId] = true;
+        if(sec.tlIds) sec.tlIds.forEach(function(id){ marketAgentIds[id] = true; });
+        if(sec.faIds) sec.faIds.forEach(function(id){ marketAgentIds[id] = true; });
+      });
+      // Also include anyone whose chain points at this market's MM/CM
+      var matchInMarket = agents.filter(function(a){
+        if(!marketAgentIds[a.id]) return false;
+        var ln = _gmNormalizeName((a.name||'').split(/\s+/).pop());
+        return ln === lastNorm;
+      });
+      if(matchInMarket.length === 1) return matchInMarket[0];
+    }
+  }
+
+  // ── 4. Last-name unique match across all agents (no market context) ──
+  if(lastNorm){
+    var lnMatches = agents.filter(function(a){
+      var ln = _gmNormalizeName((a.name||'').split(/\s+/).pop());
+      return ln === lastNorm;
+    });
+    if(lnMatches.length === 1) return lnMatches[0];
+  }
+
+  return null;
+}
+
+// Find ONLY the MM of a market (no fallback to CM/IBO).
+// Returns null if the market has no MM assigned.
+function gmResolveMarketMMOnly(marketName){
+  if(!marketName || typeof MARKETS === 'undefined') return null;
+  var marketRow = MARKETS.find(function(m){
+    if(!m || m.active === false) return false;
+    return (m.name || '').toLowerCase().trim() === marketName.toLowerCase().trim();
+  });
+  if(!marketRow) return null;
+  // Check each program section for an MM, in priority order
+  var sections = ['lifeline','internet','aca'];
+  for(var i=0;i<sections.length;i++){
+    var sec = (marketRow.programs && marketRow.programs[sections[i]]) || {};
+    if(sec.mmId){
+      var mm = (DB.agents||[]).find(function(a){ return a.id === sec.mmId && a.active; });
+      if(mm) return mm;
+    }
+  }
+  return null;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  NEW ROUTING (replaces gmResolveAutoAssignee for fresh uploads)
+//  Returns { agent, source, market } where source is one of:
+//    'csv-name'       — matched the CSV Name column to an active agent
+//    'market-mm'      — fell back to market's MM
+//    'unassigned'     — left in pool (no name match, no MM)
+//    'hard-fallback'  — last resort, used CM (only if forced)
+//  ── CM-VETO ──
+//  If the CSV Name matches the Campaign Manager, we treat that as "no
+//  match" because the CSV often lists the CM as central receiver of the
+//  agency's shipments (Tanita is the GM portal recipient for everything).
+//  Per Calvin's spec, the CM should NEVER be the default end-holder; the
+//  market MM should be used instead. The CM only gets devices via explicit
+//  manual transfer.
+// ════════════════════════════════════════════════════════════════════════
+function gmResolveUploadRecipient(csvName, marketName){
+  // 1. Try CSV Name first
+  var byName = gmResolveByCSVName(csvName, marketName);
+  // CM-veto: if the matched agent is a CM (or IBO), don't auto-assign to them
+  // (per Calvin: CM/IBO is never the default end-holder; they're the central
+  // receiver, not the actual operator)
+  if(byName && byName.role !== 'Campaign Manager' && byName.role !== 'IBO'){
+    return { agent: byName, source: 'csv-name', market: marketName };
+  }
+
+  // 2. Fall back to market's MM
+  var mm = gmResolveMarketMMOnly(marketName);
+  if(mm) return { agent: mm, source: 'market-mm', market: marketName };
+
+  // 3. NO CM FALLBACK — leave unassigned in pool
+  return { agent: null, source: 'unassigned', market: marketName };
+}
+
 function gmResolveAutoAssignee(marketName){
   // Find the MARKETS row by name
   if(marketName && typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
@@ -10458,12 +10594,18 @@ function processGMInventoryUpload(csvText, batchId){
                        ? window._gmExpiryOverride
                        : new Date(Date.now() + 30*86400000).toISOString().slice(0,10);
 
-    // Resolve auto-recipient for THIS device's market
-    var resolution = gmResolveAutoAssignee(market);
+    // Resolve auto-recipient using NEW name-first routing (Calvin 2026-05-03):
+    //   1. Match CSV "Name" column → active agent (agent gets the device)
+    //   2. Fall back to market's MM only (no auto-CM)
+    //   3. Otherwise unassigned in pool
+    var resolution = gmResolveUploadRecipient(recipientName, market);
     var autoAgent = resolution ? resolution.agent : null;
-    if(resolution){
-      var key = market + ' → ' + autoAgent.name;
+    if(resolution && autoAgent){
+      var key = market + ' → ' + autoAgent.name + ' (' + resolution.source + ')';
       routingReport[key] = (routingReport[key] || 0) + 1;
+    } else if(resolution){
+      var ukey = market + ' → UNASSIGNED (no name match, no MM)';
+      routingReport[ukey] = (routingReport[ukey] || 0) + 1;
     }
 
     // ── Calvin 2026-05-03: working expiry with vendor-date floor ──
@@ -10542,13 +10684,13 @@ function processGMInventoryUpload(csvText, batchId){
         toId:    autoAgent.id,
         at:      nowISO,
         type:    'upload-auto-assign',
-        reason:  resolution.source === 'mm'
-                   ? 'Initial upload — auto-assigned to Market Manager of '+market
-                   : (resolution.source === 'cm'
-                       ? 'Initial upload — auto-assigned to Campaign Manager of '+market+' (no MM)'
-                       : (resolution.source === 'ibo'
-                           ? 'Initial upload — auto-assigned to IBO of '+market+' (no MM, no CM)'
-                           : 'Initial upload — assigned via hard fallback (no MM, CM, or IBO for '+market+')')),
+        reason:  resolution.source === 'csv-name'
+                   ? 'Initial upload — matched CSV Name "'+recipientName+'" to '+autoAgent.name
+                   : (resolution.source === 'market-mm'
+                       ? 'Initial upload — auto-assigned to Market Manager of '+market+' (no name match)'
+                       : (resolution.source === 'mm'
+                           ? 'Initial upload — auto-assigned to Market Manager of '+market
+                           : 'Initial upload — fallback assignment for '+market)),
         by:      (DB.current && DB.current.name) || 'system',
         byId:    (DB.current && DB.current.id) || null
       }] : []
@@ -11815,6 +11957,22 @@ function invScopedDevices(user, campaign){
     return inventoryVisibleTo(user, campaign);
   }
 
+  // ── Calvin 2026-05-03 PATCH: HOLDER ALWAYS WINS ──
+  // If user actually HOLDS devices in this campaign (assignedTo or holderId
+  // points at them), they MUST see those devices — regardless of whether
+  // anyone bothered to set their agentCodes[campaign] field. This was the
+  // bug behind "YOU ARE HOLDING 224 DEVICES" banner showing while the
+  // AVAILABLE INVENTORY tile was blank for Jerry McDonald.
+  if(typeof devicesHeldBy === 'function'){
+    var heldInCampaign = devicesHeldBy(user.id, null).filter(function(d){
+      return (d.campaign || d.carrier) === campaign;
+    });
+    if(heldInCampaign.length > 0){
+      // User has skin in this campaign — show full role-scoped view
+      return inventoryVisibleTo(user, campaign);
+    }
+  }
+
   // Sales agents must be coded on the campaign to see any of its inventory.
   // Managers (CM/IBO/MM/TL) can see inventory if THEY OR their reports are coded.
   if(typeof agentCodedOn === 'function'){
@@ -11971,6 +12129,84 @@ function invValidateTransfer(campaign, imeis, fromId){
 function invDashSetMarketFilter(value){
   window._invDashMarketFilter = value || '';
   if(typeof gotoPanel === 'function') gotoPanel('inv-dashboard');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SCOREBOARD INVENTORY — Calvin 2026-05-03
+//  The big center number on the dashboard. Per Calvin's spec:
+//    Field Agent       → their own held devices
+//    Team Leader       → their own + their team agents'
+//    Market Manager    → their own + everyone reporting to them (whole market)
+//    Campaign Mgr/IBO  → everyone in their org including unassigned pool
+//    Owner / Inv Dept  → everything in the system
+//  Returns {available, sold, total} counted across ALL campaigns.
+//  available = devices held by my-scope still in play (status≠activated/sold)
+//  sold      = activated + sold devices held by my-scope
+//  total     = available + sold
+// ════════════════════════════════════════════════════════════════════════
+function scoreboardInventory(user){
+  var out = {available:0, sold:0, total:0};
+  if(!user) return out;
+
+  var pool = (typeof unionAllInventoryPools === 'function')
+    ? unionAllInventoryPools()
+    : (Array.isArray(INVENTORY_DEVICES) ? INVENTORY_DEVICES.slice() : []);
+  if(!pool || !pool.length) return out;
+
+  // ── Determine the set of agent IDs the scoreboard should aggregate ──
+  // Owner / Inv Dept see everything (no filter).
+  var seeAll = isOwner(user) || user.role === 'admin' || isInventory(user)
+            || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(user,'inv-dashboard'));
+
+  var includeUnassigned = false;
+  var scopeIds = null;  // null = no filter (see all)
+  if(!seeAll){
+    if(user.role === 'Campaign Manager' || user.role === 'IBO'){
+      // CM/IBO sees their entire org PLUS unassigned pool
+      scopeIds = (typeof agentIdsInMyOrgEffective === 'function')
+        ? agentIdsInMyOrgEffective(user) : [user.id];
+      includeUnassigned = true;
+    } else if(user.role === 'Market Manager'){
+      // MM sees themselves + everyone reporting to them (whole market)
+      scopeIds = (typeof agentIdsInMyOrgEffective === 'function')
+        ? agentIdsInMyOrgEffective(user) : [user.id];
+      includeUnassigned = false;
+    } else if(user.role === 'Team Leader'){
+      // TL sees themselves + their team's agents
+      scopeIds = (typeof agentIdsInMyOrgEffective === 'function')
+        ? agentIdsInMyOrgEffective(user) : [user.id];
+      includeUnassigned = false;
+    } else {
+      // Field Agent / sales role — only their own
+      scopeIds = [user.id];
+      includeUnassigned = false;
+    }
+  }
+
+  var scopeSet = scopeIds ? scopeIds.reduce(function(m,id){m[id]=true;return m;}, {}) : null;
+
+  pool.forEach(function(d){
+    if(!d) return;
+    var holderId = d.holderId || d.assignedTo || null;
+    var inScope = false;
+    if(seeAll){
+      inScope = true;
+    } else if(holderId && scopeSet && scopeSet[holderId]){
+      inScope = true;
+    } else if(!holderId && includeUnassigned){
+      // Unassigned pool — only CM/IBO get this
+      inScope = true;
+    }
+    if(!inScope) return;
+
+    var st = d.status;
+    var isSold = (st === 'sold' || st === 'activated' || d.soldAt);
+    out.total++;
+    if(isSold) out.sold++;
+    else out.available++;
+  });
+
+  return out;
 }
 
 function devicesHeldBy(agentId, type){
@@ -19661,11 +19897,49 @@ function panelBO(){
     // Group ALL the user's visible devices by expiry-week bucket. Devices
     // with no expiry land in 'no-exp'. Devices grouped by ceil(daysLeft/7)
     // so multiple uploads with similar expiry collapse into one strip.
-    var _allUserDevices = ((_invForUser.all||[]).concat(_invForUser.legacy||[]));
+    // ── Calvin 2026-05-03: Role-scoped device list for buckets ──
+    // The EXPIRES IN buckets must use the SAME role scope as the LED Total
+    // (scoreboardInventory). Previously this read from _invForUser which
+    // is the broader "everything you can SEE" view, causing bucket counts
+    // to exceed the LED total for MMs/CMs/TLs. Now we re-derive the device
+    // list using the same role scope so the bucket counts always sum to
+    // (available count from scoreboardInventory).
+    var _allUserDevices = (function(){
+      var pool = (typeof unionAllInventoryPools === 'function')
+        ? unionAllInventoryPools()
+        : (Array.isArray(INVENTORY_DEVICES) ? INVENTORY_DEVICES.slice() : []);
+      if(!pool || !pool.length) return [];
+
+      var seeAll = isOwner(u) || u.role === 'admin' || isInventory(u)
+                || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(u,'inv-dashboard'));
+      var includeUnassigned = false;
+      var scopeIds = null;
+      if(!seeAll){
+        if(u.role === 'Campaign Manager' || u.role === 'IBO'){
+          scopeIds = (typeof agentIdsInMyOrgEffective === 'function')
+            ? agentIdsInMyOrgEffective(u) : [u.id];
+          includeUnassigned = true;
+        } else if(u.role === 'Market Manager' || u.role === 'Team Leader'){
+          scopeIds = (typeof agentIdsInMyOrgEffective === 'function')
+            ? agentIdsInMyOrgEffective(u) : [u.id];
+        } else {
+          scopeIds = [u.id];
+        }
+      }
+      var scopeSet = scopeIds ? scopeIds.reduce(function(m,id){m[id]=true;return m;}, {}) : null;
+      return pool.filter(function(d){
+        if(!d) return false;
+        var holderId = d.holderId || d.assignedTo || null;
+        if(seeAll) return true;
+        if(holderId && scopeSet && scopeSet[holderId]) return true;
+        if(!holderId && includeUnassigned) return true;
+        return false;
+      });
+    })();
     _allUserDevices.forEach(function(d){
       if(!d) return;
       // Sold/activated devices aren't "inventory in play" — exclude
-      if(d.status === 'sold' || d.soldAt) return;
+      if(d.status === 'sold' || d.status === 'activated' || d.soldAt) return;
       var exp = d.expiryDate || null;
       var key;
       if(!exp){ key = 'no-exp'; }
@@ -19693,13 +19967,18 @@ function panelBO(){
     var hasLifeline = sbProgs.some(function(p){ return p==='Lifeline'||isLifelineCarrier(p); });
     var isMultiProg = sbProgs.length > 1;
 
-    // ── TL/MM team aggregation ──
+    // ── TL/MM team aggregation — Calvin 2026-05-03: TRANSITIVE ──
+    // Use agentIdsInMyOrgEffective so sales aggregation matches the
+    // inventory aggregation (scoreboardInventory). Previously this used
+    // direct-only matching which under-counted sales for MMs/CMs whose
+    // agents reported through TLs (very common).
     var isLdrRole = u.role==='Team Leader'||u.role==='Market Manager'||u.role==='Campaign Manager'||isOwner(u)||u.role==='admin';
     var myTeamAgents = [];
     if(isLdrRole){
+      var orgIds = (typeof agentIdsInMyOrgEffective === 'function')
+        ? agentIdsInMyOrgEffective(u) : [u.id];
       myTeamAgents = DB.agents.filter(function(a){
-        return a.active && isSalesRole(a) && a.id!==u.id &&
-          (a.teamLeaderId===u.id || a.marketManagerId===u.id || a.campaignManagerId===u.id);
+        return a.active && isSalesRole(a) && a.id !== u.id && orgIds.indexOf(a.id) >= 0;
       });
     }
     var teamLabel = u.role==='Team Leader' ? 'TEAM' : 'MARKET';
@@ -20056,25 +20335,31 @@ function panelBO(){
         +'</div>';
     } else {
       // ── Calvin 2026-05-03: Show SOLD breakdown on master dashboard ──
-      // The Gen Mobile tab does this well (Reconciliation row); the master
-      // dashboard now shows the same Available vs Sold split so activated
-      // devices are visible at a glance, not hidden inside the total.
-      // _invForUser comes from inventorySummary(u) and includes:
-      //   total      = every device the user can see (ALL statuses)
-      //   activated  = sold via activation (still on books briefly)
-      //   sold       = fully off books
-      // Available = total - activated - sold (what's still in play to use)
-      var soldCount      = (_invForUser.activated || 0) + (_invForUser.sold || 0);
-      var availableCount = Math.max(0, (_invForUser.total || 0) - soldCount);
+      // Numbers come from scoreboardInventory(u) — role-aware:
+      //   Field Agent  → only what THEY hold
+      //   Team Leader  → self + team
+      //   Market Mgr   → whole market (themselves + all reports)
+      //   Campaign Mgr → entire org including unassigned pool
+      //   Owner/Inv    → everything
+      // This replaces the older _invForUser-based numbers which over-counted
+      // for managers (everything visible) and under-counted when the user
+      // wasn't "coded" on the campaign.
+      var _sb = (function(){
+        try { return scoreboardInventory(u); }
+        catch(e){ console.warn('[panelBO] scoreboardInventory failed:', e); return {available:0, sold:0, total:0}; }
+      })();
+      var soldCount      = _sb.sold;
+      var availableCount = _sb.available;
+      var sbTotal        = _sb.total;
 
       // Has Lifeline — show inventory
       html += '<div style="'+lblSt+'">AVAILABLE</div>';
       html += '<div style="margin:0 auto 3px">'+sbLED(availableCount,44,80,6)+'</div>';
 
       // Sold/Activated breakdown row — this is what the master dashboard was missing
-      if(soldCount > 0 || (_invForUser.total || 0) > 0){
+      if(soldCount > 0 || sbTotal > 0){
         html += '<div style="display:flex;justify-content:center;gap:14px;margin-bottom:8px;font-family:Oswald,Arial,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase">';
-        html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">TOTAL</div><div style="color:#fff;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+(_invForUser.total||0)+'</div></div>';
+        html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">TOTAL</div><div style="color:#fff;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+sbTotal+'</div></div>';
         html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">SOLD</div><div style="color:#5fdc8c;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+soldCount+'</div></div>';
         html += '</div>';
       }
@@ -20182,8 +20467,12 @@ function panelBO(){
 
   // ══════════ TEAM VIEW (TL, MM, Admin see their team) ══════════
   if(isLdr||isAdmin){
+    // Calvin 2026-05-03: TRANSITIVE — use agentIdsInMyOrgEffective so MMs
+    // see TLs' agents and CMs see whole org, matching scoreboardInventory
+    var _orgIds20471 = (typeof agentIdsInMyOrgEffective === 'function')
+      ? agentIdsInMyOrgEffective(u) : [u.id];
     var myTeamAgents = allActive.filter(function(a){
-      return a.teamLeaderId===u.id || a.marketManagerId===u.id || a.campaignManagerId===u.id;
+      return a.id !== u.id && _orgIds20471.indexOf(a.id) >= 0;
     });
     // Also include agents on teams where u is the leader
     LIFELINE_TEAMS.forEach(function(t){
@@ -28138,6 +28427,21 @@ function panelGMInventory(){
     h += '</div></div>';
   }
 
+  // ── Reroute existing inventory button (Calvin 2026-05-03) ──
+  // Owner / Inv Dept only. One-click fix for "everything-is-under-the-CM"
+  // problem caused by older uploads that didn't honor CSV Name routing.
+  // Opens a modal preview before committing.
+  if(isInv){
+    h += '<div style="background:rgba(0,53,148,.04);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:12px 18px;margin-bottom:18px;display:flex;align-items:center;gap:14px">';
+    h += '<div style="font-size:1.5rem">⚙️</div>';
+    h += '<div style="flex:1">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:2px;color:var(--blue)">RE-ROUTE EXISTING INVENTORY</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);margin-top:3px;line-height:1.5">Fixes devices that were assigned to the CM by default in older uploads. Re-runs routing using the CSV Name field → matches each device to the actual recipient (or falls back to the market\'s MM). Devices that have been hand-transferred or are already activated won\'t be touched. Shows a preview before committing.</div>';
+    h += '</div>';
+    h += '<button onclick="gmShowRerouteReport()" style="background:var(--blue);border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 16px;border-radius:5px;cursor:pointer;flex-shrink:0">Preview Reroute →</button>';
+    h += '</div>';
+  }
+
   // Quick actions
   h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">';
   if(isInv) h += '<button onclick="gotoPanel(\'gm-upload\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">⬆ Upload CSV</button>';
@@ -28827,6 +29131,238 @@ function gmResetActivations(){
       '</div>';
   }
   if(typeof cdFlash === 'function') cdFlash('Activations reset — re-upload to recover');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  REROUTE EXISTING INVENTORY — Calvin 2026-05-03
+//  One-time fix for the "everything-is-under-Tanita" problem. Walks every
+//  device in GM_INVENTORY and re-applies the new routing logic:
+//    1. Match gmShipmentRecipient (the original CSV Name) → active agent
+//    2. Fall back to market's MM only (NOT CM)
+//    3. Otherwise leave UNASSIGNED in pool
+//  Devices in non-trivial states (status='activated', 'sold', or already
+//  in a custom transfer chain) are LEFT ALONE — only devices that look
+//  like they're stuck on the CM by default routing get moved.
+//
+//  Returns a report you can preview before committing.
+//
+//  PREVIEW MODE (default): just returns what would change, doesn't move.
+//  COMMIT MODE: actually mutates GM_INVENTORY, saves to Supabase.
+// ════════════════════════════════════════════════════════════════════════
+function gmRerouteExistingInventory(commit){
+  commit = !!commit;
+  var report = {
+    examined: 0,
+    skippedActivated: 0,
+    skippedSold: 0,
+    skippedHandTransferred: 0,
+    skippedAlreadyCorrect: 0,
+    moves: [],     // {imei, from:{id,name}, to:{id,name}, source}
+    unassigned: [],// devices that would be unassigned (no match, no MM)
+    byDestination: {}, // {agentId: {name, count, fromCM: N, fromOther: N}}
+    bySource: {}   // {source: count}
+  };
+
+  // Find the GM Campaign Manager (so we can detect "stuck on CM" devices)
+  var gmCM = (DB.agents||[]).find(function(a){
+    if(!a.active) return false;
+    if(a.role !== 'Campaign Manager') return false;
+    return (a.agentCodes && a.agentCodes['Gen Mobile']) || a.cmModel === 'cm-oklahoma';
+  });
+  var cmId = gmCM ? gmCM.id : null;
+
+  GM_INVENTORY.forEach(function(d){
+    if(!d) return;
+    report.examined++;
+
+    // Skip devices in terminal/transitional states
+    if(d.status === 'activated'){ report.skippedActivated++; return; }
+    if(d.status === 'sold' || d.soldAt){ report.skippedSold++; return; }
+
+    // Skip devices that have been hand-transferred (chain of custody > 1 entry
+    // means a real human intervened; respect that)
+    var coc = Array.isArray(d.chainOfCustody) ? d.chainOfCustody : [];
+    var humanTransfers = coc.filter(function(entry){
+      return entry && entry.type !== 'upload-auto-assign';
+    });
+    if(humanTransfers.length > 0){
+      report.skippedHandTransferred++;
+      return;
+    }
+
+    // Compute the new destination per CURRENT routing rules
+    var resolution = gmResolveUploadRecipient(d.gmShipmentRecipient || '', d.market || '');
+    var newAgent = resolution.agent;
+    var newId = newAgent ? newAgent.id : null;
+    var currentId = d.holderId || d.assignedTo || null;
+
+    if(currentId === newId){
+      report.skippedAlreadyCorrect++;
+      return;
+    }
+
+    var fromAgent = currentId ? (DB.agents||[]).find(function(a){return a.id === currentId;}) : null;
+    var move = {
+      imei: d.imei,
+      market: d.market,
+      csvName: d.gmShipmentRecipient || '',
+      from: { id: currentId, name: fromAgent ? fromAgent.name : (currentId ? 'Agent #'+currentId : 'unassigned') },
+      to:   { id: newId,     name: newAgent ? newAgent.name : 'unassigned' },
+      source: resolution.source,
+      fromWasCM: (currentId === cmId)
+    };
+    report.moves.push(move);
+
+    if(!newId){
+      report.unassigned.push(move);
+    } else {
+      var k = String(newId);
+      if(!report.byDestination[k]){
+        report.byDestination[k] = { name: newAgent.name, count: 0, fromCM: 0, fromOther: 0 };
+      }
+      report.byDestination[k].count++;
+      if(move.fromWasCM) report.byDestination[k].fromCM++;
+      else report.byDestination[k].fromOther++;
+    }
+    report.bySource[resolution.source] = (report.bySource[resolution.source] || 0) + 1;
+
+    // ── COMMIT MODE: actually move the device ──
+    if(commit){
+      d.holderId        = newId;
+      d.assignedTo      = newId;
+      d.assignedToName  = newAgent ? newAgent.name : '';
+      d.holderName      = newAgent ? newAgent.name : '';
+      d.recipientId     = newId;
+      d.recipientName   = newAgent ? newAgent.name : '';
+      d.status          = newId ? 'assigned' : 'unassigned';
+      // Append to chain of custody so we have an audit trail
+      coc.push({
+        from:    fromAgent ? fromAgent.name : 'unassigned',
+        fromId:  currentId,
+        to:      newAgent ? newAgent.name : 'unassigned',
+        toId:    newId,
+        at:      new Date().toISOString(),
+        type:    'reroute-by-csv-name',
+        reason:  'Reroute: ' + (resolution.source === 'csv-name'
+                  ? 'matched CSV Name "'+(d.gmShipmentRecipient||'')+'"'
+                  : (resolution.source === 'market-mm'
+                      ? 'no name match → MM of '+d.market
+                      : 'no name match, no MM → unassigned in pool')),
+        by:      (DB.current && DB.current.name) || 'system',
+        byId:    (DB.current && DB.current.id) || null
+      });
+      d.chainOfCustody = coc;
+    }
+  });
+
+  return report;
+}
+
+// UI: show a preview of what gmRerouteExistingInventory would do.
+// Owner / Inv Dept only. Renders into a modal.
+function gmShowRerouteReport(){
+  var u = DB.current;
+  if(!u || (!isOwner(u) && !isInventory(u))){
+    alert('Only the Owner or Inventory Department can re-route inventory.');
+    return;
+  }
+
+  var report = gmRerouteExistingInventory(false);
+
+  var html = '<div style="background:white;border-radius:12px;padding:24px 28px;max-width:780px;max-height:85vh;overflow-y:auto;font-family:Barlow Condensed,sans-serif;line-height:1.55">';
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;letter-spacing:3px;color:var(--blue);border-bottom:2px solid var(--blue);padding-bottom:10px;margin-bottom:14px">⚙ INVENTORY REROUTE PREVIEW</div>';
+
+  html += '<div style="background:rgba(0,53,148,.05);border:1px solid rgba(0,53,148,.2);border-radius:6px;padding:12px 14px;margin-bottom:14px;font-size:.84rem">';
+  html += '<strong>Examined:</strong> '+report.examined+' devices<br>';
+  html += '<strong>Will move:</strong> <span style="color:#059669;font-weight:700">'+report.moves.length+'</span> devices<br>';
+  html += '<strong>Will be unassigned (no match, no MM):</strong> <span style="color:#D97706">'+report.unassigned.length+'</span><br>';
+  html += '<strong>Skipped (activated):</strong> '+report.skippedActivated+'<br>';
+  html += '<strong>Skipped (sold):</strong> '+report.skippedSold+'<br>';
+  html += '<strong>Skipped (hand-transferred — chain has human moves):</strong> '+report.skippedHandTransferred+'<br>';
+  html += '<strong>Skipped (already on correct holder):</strong> '+report.skippedAlreadyCorrect;
+  html += '</div>';
+
+  // Source breakdown
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:var(--brown);margin-bottom:6px">ROUTING SOURCE BREAKDOWN</div>';
+  html += '<table style="width:100%;border-collapse:collapse;font-size:.82rem;margin-bottom:14px">';
+  html += '<tr style="background:rgba(0,53,148,.06)"><th style="text-align:left;padding:6px 10px;border-bottom:1px solid rgba(0,53,148,.15)">Source</th><th style="text-align:right;padding:6px 10px;border-bottom:1px solid rgba(0,53,148,.15)">Devices</th></tr>';
+  Object.keys(report.bySource).forEach(function(src){
+    var label = src === 'csv-name' ? 'Matched CSV Name → agent'
+              : src === 'market-mm' ? 'Fell back to Market MM'
+              : src === 'unassigned' ? 'Left unassigned (no MM)'
+              : src;
+    html += '<tr><td style="padding:5px 10px;border-bottom:1px solid rgba(0,0,0,.05)">'+label+'</td><td style="text-align:right;padding:5px 10px;border-bottom:1px solid rgba(0,0,0,.05);font-family:monospace;font-weight:700">'+report.bySource[src]+'</td></tr>';
+  });
+  html += '</table>';
+
+  // Destination breakdown
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:var(--brown);margin-bottom:6px">DESTINATION BREAKDOWN</div>';
+  html += '<table style="width:100%;border-collapse:collapse;font-size:.82rem;margin-bottom:14px">';
+  html += '<tr style="background:rgba(0,53,148,.06)"><th style="text-align:left;padding:6px 10px;border-bottom:1px solid rgba(0,53,148,.15)">Recipient</th><th style="text-align:right;padding:6px 10px;border-bottom:1px solid rgba(0,53,148,.15)">Total</th><th style="text-align:right;padding:6px 10px;border-bottom:1px solid rgba(0,53,148,.15)">From CM</th><th style="text-align:right;padding:6px 10px;border-bottom:1px solid rgba(0,53,148,.15)">From Other</th></tr>';
+  var dests = Object.keys(report.byDestination).map(function(k){return Object.assign({id:k}, report.byDestination[k]);});
+  dests.sort(function(a,b){ return b.count - a.count; });
+  dests.slice(0,30).forEach(function(d){
+    html += '<tr><td style="padding:5px 10px;border-bottom:1px solid rgba(0,0,0,.05)">'+d.name+'</td><td style="text-align:right;padding:5px 10px;border-bottom:1px solid rgba(0,0,0,.05);font-family:monospace;font-weight:700">'+d.count+'</td><td style="text-align:right;padding:5px 10px;border-bottom:1px solid rgba(0,0,0,.05);font-family:monospace;color:#D97706">'+d.fromCM+'</td><td style="text-align:right;padding:5px 10px;border-bottom:1px solid rgba(0,0,0,.05);font-family:monospace;color:var(--muted)">'+d.fromOther+'</td></tr>';
+  });
+  html += '</table>';
+  if(dests.length > 30){
+    html += '<div style="font-size:.74rem;color:var(--muted);margin-bottom:14px">+'+(dests.length-30)+' more recipients not shown</div>';
+  }
+
+  // Sample of moves (first 20)
+  if(report.moves.length){
+    html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:var(--brown);margin-bottom:6px">SAMPLE MOVES (first 20 of '+report.moves.length+')</div>';
+    html += '<div style="font-family:monospace;font-size:.72rem;background:rgba(0,0,0,.03);padding:10px 12px;border-radius:5px;margin-bottom:14px;max-height:240px;overflow-y:auto">';
+    report.moves.slice(0,20).forEach(function(m){
+      html += '<div style="margin-bottom:3px">';
+      html += '<span style="color:var(--muted)">'+m.market+'</span> · ';
+      html += '<span>'+m.from.name+'</span> → <strong>'+m.to.name+'</strong>';
+      html += ' <span style="color:var(--muted);font-size:.92em">['+m.source+(m.csvName?' "'+m.csvName+'"':'')+']</span>';
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+
+  html += '<div style="display:flex;gap:10px;margin-top:14px;justify-content:flex-end">';
+  html += '<button onclick="document.getElementById(\'gm-reroute-modal\').remove()" style="background:rgba(0,0,0,.05);border:1px solid rgba(0,0,0,.15);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer">Cancel</button>';
+  if(report.moves.length){
+    html += '<button onclick="gmCommitReroute()" style="background:#059669;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">✓ Commit '+report.moves.length+' Moves</button>';
+  } else {
+    html += '<button disabled style="background:rgba(0,0,0,.1);border:none;color:rgba(0,0,0,.3);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:not-allowed">Nothing to Move</button>';
+  }
+  html += '</div>';
+  html += '</div>';
+
+  // Modal wrapper
+  var existing = document.getElementById('gm-reroute-modal');
+  if(existing) existing.remove();
+  var wrap = document.createElement('div');
+  wrap.id = 'gm-reroute-modal';
+  wrap.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+  wrap.innerHTML = html;
+  document.body.appendChild(wrap);
+}
+
+function gmCommitReroute(){
+  var u = DB.current;
+  if(!u || (!isOwner(u) && !isInventory(u))){
+    alert('Only the Owner or Inventory Department can re-route inventory.');
+    return;
+  }
+  var report = gmRerouteExistingInventory(true);
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  var modal = document.getElementById('gm-reroute-modal');
+  if(modal) modal.remove();
+  alert('✓ Re-routed '+report.moves.length+' device(s).\n\n'+
+        'Devices matched by CSV Name: '+(report.bySource['csv-name']||0)+'\n'+
+        'Devices fell back to Market MM: '+(report.bySource['market-mm']||0)+'\n'+
+        'Devices left unassigned: '+(report.bySource['unassigned']||0));
+  if(typeof cdFlash === 'function') cdFlash('Reroute complete — '+report.moves.length+' moves');
+  // Force dashboard refresh if user is on it
+  if(typeof goto === 'function' && typeof currentPanel !== 'undefined'){
+    try { goto(currentPanel); } catch(e){}
+  }
 }
 
 function gmConfirmActivationUpload(batchId){
@@ -30879,10 +31415,13 @@ function showYTDReport(){
         +'<td style="padding:8px 14px;font-family:Oswald,Arial Black,sans-serif;font-size:1rem;font-weight:900;color:#fff;text-align:right">'+t+'</td></tr>';
     });
 
-    // Find all agents under this leader (include inactive)
+    // Find all agents under this leader transitively (Calvin 2026-05-03)
+    // Includes TLs' agents for MMs, MMs' TLs' agents for CMs, etc.
+    var _orgIds31417 = (typeof agentIdsInMyOrgEffective === 'function')
+      ? agentIdsInMyOrgEffective(u) : [u.id];
     var teamAgents = DB.agents.filter(function(a){
       if(a.id===u.id) return false;
-      return a.teamLeaderId===u.id || a.marketManagerId===u.id || a.campaignManagerId===u.id;
+      return _orgIds31417.indexOf(a.id) >= 0;
     });
 
     // For MM: also include TLs under them and their agents
@@ -31209,10 +31748,12 @@ function panelLinks(){
 
 function panelMyTeam(){
   var u = DB.current;
+  // Calvin 2026-05-03: TRANSITIVE — same scope as scoreboardInventory.
+  // MMs now see their TLs' agents, CMs see the whole org.
+  var _orgIds31746 = (typeof agentIdsInMyOrgEffective === 'function')
+    ? agentIdsInMyOrgEffective(u) : [u.id];
   var myTeammates = DB.agents.filter(function(a){
-    return a.active && a.id!==u.id && (
-      a.teamLeaderId===u.id || a.marketManagerId===u.id || a.campaignManagerId===u.id
-    );
+    return a.active && a.id !== u.id && _orgIds31746.indexOf(a.id) >= 0;
   });
   var myTeams = LIFELINE_TEAMS.filter(function(t){
     return t.members&&t.members.indexOf(u.id)>=0;
