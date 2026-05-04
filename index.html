@@ -1962,6 +1962,7 @@ function loadFromStorage(){
   //   agents under an IBO upline. Idempotent: skips if already present.
   try { if(typeof syncIboModels === 'function') syncIboModels(); } catch(e){ console.warn('[loadFromStorage] syncIboModels failed:', e); }
   try { if(typeof ensureIboDownlinePackage === 'function') ensureIboDownlinePackage(); } catch(e){ console.warn('[loadFromStorage] ensureIboDownlinePackage failed:', e); }
+  try { if(typeof makenzieBonusLoad === 'function') makenzieBonusLoad(); } catch(e){ console.warn('[loadFromStorage] makenzieBonusLoad failed:', e); }
 }
 
 // ══════════════════════
@@ -5003,16 +5004,23 @@ var GM_RATES = {
     byodBonus:  5
   },
 
-  // ibo-tiered (Stephanie): agents on flat rates, manager keeps diff
+  // ibo-tiered (Stephanie) — Calvin 2026-05-03 LOCKED SPEC:
+  //   Agents NLAD: STANDARD sliding $9/$11 retroactive (NOT flat $8)
+  //   Agents Tribal: flat $20
+  //   Stephanie NLAD: flat $13 — keeps DIFFERENCE per-tier ($4 tier1 / $2 tier2)
+  //   Stephanie Tribal: $29/$34 sliding by MARKET TOTAL count — keeps diff
+  //   Stephanie email +$1, NO BYOD
+  //   Universal bonuses (email/BYOD) flow to personal enroller per spec
   iboTieredAgent: {
-    nladFlat:   8,
-    tribalFlat: 20
+    // NLAD: standard sliding (matches standardAgent.nlad)
+    nlad: { tier1Cap:30, tier1:9, tier2:11 },
+    tribalFlat: 20  // Tribal stays flat for agents under Stephanie
   },
   iboTieredManager: {
     nlad:   { flat: 13 },                          // flat $13 NLAD personal
-    tribal: { tier1Cap:30, tier1:29, tier2:34 },   // slides on MARKET total
+    tribal: { tier1Cap:30, tier1:29, tier2:34 },   // slides on MARKET total Tribal
     emailBonus: 1,
-    byodBonus:  5
+    byodBonus:  0  // Calvin 2026-05-03: Stephanie does NOT get BYOD
   },
 
   // cm-difference (Brandon): agents standard NLAD sliding, Tribal flat $24
@@ -5039,6 +5047,92 @@ var GM_RATES = {
     byodBonus:  5
   }
 };
+
+// ════════════════════════════════════════════════════════════════════
+//  MAKENZIE BONUS — Calvin 2026-05-03 LOCKED
+// ════════════════════════════════════════════════════════════════════
+// Makenzie Gibson gets a per-enrollment override on Stephanie's entire
+// GM org each week (Stephanie personal + all agents under her).
+// Rates: $1/each NLAD, $5/each Tribal. Gen Mobile only.
+//
+// Stored as a global config so Calvin can edit via UI later without
+// code changes. The engine reads MAKENZIE_BONUS at calc time.
+//
+// Schema:
+//   { recipientId, recipientName, targetCmId, campaign, nladRate, tribalRate, active }
+//
+// PRESERVATION: never overwrites Calvin's existing config. Loaded from
+// localStorage at boot; if not present, falls back to spec defaults.
+// Calvin can update via the Comp Plans UI later (admin team enters).
+var MAKENZIE_BONUS = null;  // populated by makenzieBonusLoad()
+
+function makenzieBonusLoad(){
+  try{
+    var raw = localStorage.getItem('wmam_makenzie_bonus');
+    if(raw){
+      var parsed = JSON.parse(raw);
+      if(parsed && typeof parsed === 'object'){
+        MAKENZIE_BONUS = parsed;
+        return;
+      }
+    }
+  }catch(e){ /* fall through to defaults */ }
+  // Default per locked spec — finds Makenzie + Stephanie by name
+  // (resolved at boot when DB.agents is loaded). If they don't exist yet,
+  // the engine guard will skip the bonus.
+  MAKENZIE_BONUS = {
+    recipientId:   null,                   // resolved by name at engine time
+    recipientName: 'Makenzie Gibson',
+    targetCmId:    null,                   // resolved by name at engine time
+    targetCmName:  'Stephanie',            // first name match — covers Tubman/etc
+    campaign:      'Gen Mobile',
+    nladRate:      1,
+    tribalRate:    5,
+    active:        true,
+    notes:         'Locked spec 2026-05-03: $1 NLAD + $5 Tribal on Stephanie\'s entire GM org'
+  };
+}
+
+function makenzieBonusSave(){
+  try{
+    if(MAKENZIE_BONUS) localStorage.setItem('wmam_makenzie_bonus', JSON.stringify(MAKENZIE_BONUS));
+  }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient && MAKENZIE_BONUS){
+    supaClient.from('app_settings').upsert(
+      {key:'makenzie_bonus', value: JSON.stringify(MAKENZIE_BONUS)},
+      {onConflict:'key'}
+    ).then(function(){}).catch(function(){});
+  }
+}
+
+// Resolve recipientId / targetCmId from the names (idempotent, run at engine time).
+// Returns true if both IDs are valid for the bonus to fire.
+function makenzieBonusResolve(){
+  if(!MAKENZIE_BONUS || !MAKENZIE_BONUS.active) return false;
+  if(!Array.isArray(DB.agents) || !DB.agents.length) return false;
+
+  // Resolve Makenzie if not yet ID'd
+  if(!MAKENZIE_BONUS.recipientId && MAKENZIE_BONUS.recipientName){
+    var matchM = DB.agents.find(function(a){
+      return a && a.active !== false && a.name &&
+             a.name.toLowerCase().indexOf(MAKENZIE_BONUS.recipientName.toLowerCase()) >= 0;
+    });
+    if(matchM) MAKENZIE_BONUS.recipientId = matchM.id;
+  }
+
+  // Resolve Stephanie's CM ID if not yet set
+  if(!MAKENZIE_BONUS.targetCmId && MAKENZIE_BONUS.targetCmName){
+    var matchS = DB.agents.find(function(a){
+      return a && a.active !== false && a.name &&
+             a.name.toLowerCase().indexOf(MAKENZIE_BONUS.targetCmName.toLowerCase()) >= 0
+             && (a.role === 'Campaign Manager' || a.role === 'IBO');
+    });
+    if(matchS) MAKENZIE_BONUS.targetCmId = matchS.id;
+  }
+
+  return !!(MAKENZIE_BONUS.recipientId && MAKENZIE_BONUS.targetCmId);
+}
+// ════════════════════════════════════════════════════════════════════
 
 // Look up the cmModel for an agent record. Defaults to 'none'.
 function gmCmModelOf(agent){
@@ -5214,14 +5308,19 @@ function gmCalculateWeek(weekRows){
       return;
     }
 
-    // ────────── PATH: ibo-tiered (Stephanie-Flat) ──────────
+    // ────────── PATH: ibo-tiered (Stephanie) ──────────
     // STEPHANIE IS A CAMPAIGN MANAGER, NOT AN IBO. The cmModel string
     // 'ibo-tiered' is a legacy identifier kept for storage compatibility
-    // (renaming would break existing records). Her agents are paid flat
-    // rates ($8 NLAD / $20 Tribal — lower than standard sliding) and
-    // Stephanie keeps the difference between her tier rate and the
-    // agent flat. NO IBO logic applies here. Email/BYOD bonuses go to
-    // the personal enroller (universal rule).
+    // (renaming would break existing records).
+    //
+    // Calvin 2026-05-03 LOCKED SPEC:
+    //   Agents NLAD: STANDARD sliding $9/$11 retroactive (per agent count)
+    //   Agents Tribal: flat $20
+    //   Stephanie NLAD: $13 flat (per-agent diff = $13 - agent's tier rate)
+    //   Stephanie Tribal: $29/$34 sliding by MARKET TOTAL Tribal count
+    //   Stephanie email +$1, NO BYOD
+    //   Email bonus: agent gets it on their own deals
+    //   BYOD bonus: agent gets standard $5 on their deals; Stephanie gets $0
     if(cmModel === 'ibo-tiered'){
       var mgrId = cm.id;
       // Manager's Tribal tier determined by MARKET total Tribal
@@ -5232,37 +5331,76 @@ function gmCalculateWeek(weekRows){
         var aidI = parseInt(aidStr);
         var a = t.agents[aidStr];
         if(aidI === mgrId){
-          // Manager's PERSONAL enrollments at manager rates
+          // ── Manager's PERSONAL enrollments at manager rates ──
+          // NLAD: $13 flat. Tribal: market-tier rate.
           var nladPay = a.nlad * GM_RATES.iboTieredManager.nlad.flat;
           var tribalPay = a.tribal * mgrTribalRate;
-          // Bonuses: only on personal deals (universal rule)
+          // Stephanie email yes ($1), BYOD no ($0 per spec)
           var emailPay = a.email * GM_RATES.iboTieredManager.emailBonus;
-          var byodPay  = a.byod  * GM_RATES.iboTieredManager.byodBonus;
-          if(a.nlad)   bump(mgrId, nladPay,   'Personal NLAD',                                            a.nlad,   GM_RATES.iboTieredManager.nlad.flat);
-          if(a.tribal) bump(mgrId, tribalPay, 'Personal Tribal (market tier $'+mgrTribalRate+')',         a.tribal, mgrTribalRate);
-          if(a.email)  bump(mgrId, emailPay,  'Personal Email bonus',                                     a.email,  GM_RATES.iboTieredManager.emailBonus);
-          if(a.byod)   bump(mgrId, byodPay,   'Personal BYOD bonus',                                      a.byod,   GM_RATES.iboTieredManager.byodBonus);
-          if(a.cb)     bump(mgrId, a.cb/100,  'Personal Chargebacks',                                     0,        0);
+          var byodPay  = a.byod  * GM_RATES.iboTieredManager.byodBonus;  // 0
+          if(a.nlad)   bump(mgrId, nladPay,   'Personal NLAD ($'+GM_RATES.iboTieredManager.nlad.flat+' flat)', a.nlad, GM_RATES.iboTieredManager.nlad.flat);
+          if(a.tribal) bump(mgrId, tribalPay, 'Personal Tribal (market tier $'+mgrTribalRate+')', a.tribal, mgrTribalRate);
+          if(a.email && emailPay > 0) bump(mgrId, emailPay, 'Personal Email bonus', a.email, GM_RATES.iboTieredManager.emailBonus);
+          // BYOD intentionally skipped per spec
+          if(a.cb)     bump(mgrId, a.cb/100,  'Personal Chargebacks', 0, 0);
         } else {
-          // Agent under tiered manager: flat rates + universal bonuses (per Calvin's confirmation)
-          var nladPay = a.nlad * GM_RATES.iboTieredAgent.nladFlat;
+          // ── Agent under Stephanie ──
+          // NLAD: STANDARD sliding $9/$11 (driven by THIS agent's personal count)
+          // Tribal: flat $20
+          // Email/BYOD: standard universal bonuses to the enroller
+          var agentNladRate = (a.nlad <= GM_RATES.iboTieredAgent.nlad.tier1Cap)
+            ? GM_RATES.iboTieredAgent.nlad.tier1   // $9
+            : GM_RATES.iboTieredAgent.nlad.tier2;  // $11
+          var nladPay   = a.nlad   * agentNladRate;
           var tribalPay = a.tribal * GM_RATES.iboTieredAgent.tribalFlat;
-          var emailPay = a.email * GM_RATES.standardAgent.emailBonus;  // bonus to activator
-          var byodPay  = a.byod  * GM_RATES.standardAgent.byodBonus;
-          if(a.nlad)   bump(aidI, nladPay,   'NLAD enrollments (flat)',   a.nlad,   GM_RATES.iboTieredAgent.nladFlat);
-          if(a.tribal) bump(aidI, tribalPay, 'Tribal enrollments (flat)', a.tribal, GM_RATES.iboTieredAgent.tribalFlat);
-          if(a.email)  bump(aidI, emailPay,  'Email bonus',               a.email,  GM_RATES.standardAgent.emailBonus);
-          if(a.byod)   bump(aidI, byodPay,   'BYOD bonus',                a.byod,   GM_RATES.standardAgent.byodBonus);
-          if(a.cb)     bump(aidI, a.cb/100,  'Chargebacks',               0,        0);
+          var emailPay  = a.email  * GM_RATES.standardAgent.emailBonus;  // $1 to activator
+          var byodPay   = a.byod   * GM_RATES.standardAgent.byodBonus;   // $5 to activator
+          if(a.nlad)   bump(aidI, nladPay,   'NLAD enrollments ($'+agentNladRate+' tier'+(a.nlad <= GM_RATES.iboTieredAgent.nlad.tier1Cap ? '1' : '2')+')', a.nlad, agentNladRate);
+          if(a.tribal) bump(aidI, tribalPay, 'Tribal enrollments ($'+GM_RATES.iboTieredAgent.tribalFlat+' flat)', a.tribal, GM_RATES.iboTieredAgent.tribalFlat);
+          if(a.email)  bump(aidI, emailPay,  'Email bonus', a.email, GM_RATES.standardAgent.emailBonus);
+          if(a.byod)   bump(aidI, byodPay,   'BYOD bonus',  a.byod,  GM_RATES.standardAgent.byodBonus);
+          if(a.cb)     bump(aidI, a.cb/100,  'Chargebacks', 0, 0);
 
-          // Manager keeps the difference between her tier and agent flat — NOT bonuses
+          // ── Stephanie's diff override per agent enrollment ──
+          // NLAD diff: $13 - agentNladRate ($4 tier1, $2 tier2)
+          // Tribal diff: mgrTribalRate - $20 ($9 tier1, $14 tier2)
           var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
-          var nladDiff = a.nlad * (GM_RATES.iboTieredManager.nlad.flat - GM_RATES.iboTieredAgent.nladFlat);   // 13-8 = $5
-          var tribalDiff = a.tribal * (mgrTribalRate - GM_RATES.iboTieredAgent.tribalFlat);                   // 29-20=$9 or 34-20=$14
-          if(a.nlad)   bump(mgrId, nladDiff,   'Override on '+aName+' NLAD ($'+(GM_RATES.iboTieredManager.nlad.flat - GM_RATES.iboTieredAgent.nladFlat)+'/each)', a.nlad,   GM_RATES.iboTieredManager.nlad.flat - GM_RATES.iboTieredAgent.nladFlat);
-          if(a.tribal) bump(mgrId, tribalDiff, 'Override on '+aName+' Tribal ($'+(mgrTribalRate - GM_RATES.iboTieredAgent.tribalFlat)+'/each)', a.tribal, mgrTribalRate - GM_RATES.iboTieredAgent.tribalFlat);
+          var nladDiffRate   = GM_RATES.iboTieredManager.nlad.flat - agentNladRate;
+          var tribalDiffRate = mgrTribalRate - GM_RATES.iboTieredAgent.tribalFlat;
+          var nladDiff   = a.nlad   * nladDiffRate;
+          var tribalDiff = a.tribal * tribalDiffRate;
+          if(a.nlad   && nladDiffRate   > 0) bump(mgrId, nladDiff,   'Override on '+aName+' NLAD ($'+nladDiffRate+'/each, agent at $'+agentNladRate+')', a.nlad, nladDiffRate);
+          if(a.tribal && tribalDiffRate > 0) bump(mgrId, tribalDiff, 'Override on '+aName+' Tribal ($'+tribalDiffRate+'/each)', a.tribal, tribalDiffRate);
         }
       });
+      // ── Calvin 2026-05-03: Makenzie Gibson bonus on Stephanie's org ──
+      // Makenzie gets $1/each NLAD + $5/each Tribal on every sale that
+      // Stephanie's entire org does each week (Stephanie personal + agents).
+      // Bonus is ADDITIVE — doesn't reduce anyone else's pay.
+      // GEN MOBILE ONLY per Calvin's locked spec.
+      if(typeof MAKENZIE_BONUS === 'object' && MAKENZIE_BONUS && MAKENZIE_BONUS.active &&
+         typeof makenzieBonusResolve === 'function' && makenzieBonusResolve()){
+        var mb = MAKENZIE_BONUS;
+        // Only fires if THIS market's CM matches the configured target
+        // (and never on Stephanie's own paycheck — Makenzie is a separate person)
+        if(mb.targetCmId === mgrId && mb.campaign === 'Gen Mobile' &&
+           mb.recipientId !== mgrId){
+          var mkzNladRate   = mb.nladRate   || 0;
+          var mkzTribalRate = mb.tribalRate || 0;
+          var mkzNladPay    = t.nladCount   * mkzNladRate;
+          var mkzTribalPay  = t.tribalCount * mkzTribalRate;
+          if(t.nladCount && mkzNladRate > 0){
+            bump(mb.recipientId, mkzNladPay,
+                 'Makenzie bonus on Stephanie org NLAD ($'+mkzNladRate+'/each)',
+                 t.nladCount, mkzNladRate);
+          }
+          if(t.tribalCount && mkzTribalRate > 0){
+            bump(mb.recipientId, mkzTribalPay,
+                 'Makenzie bonus on Stephanie org Tribal ($'+mkzTribalRate+'/each)',
+                 t.tribalCount, mkzTribalRate);
+          }
+        }
+      }
       return;
     }
 
@@ -5427,18 +5565,24 @@ function gmCalculateWeek(weekRows){
           // Other agent's enrollments — calculate CM's override
           var aName = (DB.agents.find(function(x){return x.id===aidI;})||{name:'agent'}).name;
           if(cmModel === 'cm-difference'){
-            // NLAD: max(0, $13 − agent_paid − tl_paid − mm_paid) per enrollment
+            // Per-CM target lookup — Brandon defaults to $13/$34, but a CM
+            // with their own gmCmRates override gets their custom targets.
+            var _gmTargets = (typeof gmCmTargetsFor === 'function') ? gmCmTargetsFor(cm) : {
+              nladTarget:   GM_RATES.cmDifferenceManager.nladTarget,
+              tribalTarget: GM_RATES.cmDifferenceManager.tribalTarget
+            };
+            // NLAD: max(0, nladTarget − agent_paid − tl_paid − mm_paid) per enrollment
             // Agent-paid rate depends on whether agent is in tier 1 or tier 2 personal count
             var agentNLADRate = (a.nlad <= GM_RATES.cmDifferenceAgent.nlad.tier1Cap)
               ? GM_RATES.cmDifferenceAgent.nlad.tier1
               : GM_RATES.cmDifferenceAgent.nlad.tier2;
-            var nladLeftover = Math.max(0, GM_RATES.cmDifferenceManager.nladTarget - agentNLADRate - tlPaidForThisAgent - mmPaidForThisAgent);
+            var nladLeftover = Math.max(0, _gmTargets.nladTarget - agentNLADRate - tlPaidForThisAgent - mmPaidForThisAgent);
             var nladOverride = a.nlad * nladLeftover;
-            // Tribal: max(0, $34 − $24 agent − tl − mm) per enrollment
-            var tribalLeftover = Math.max(0, GM_RATES.cmDifferenceManager.tribalTarget - GM_RATES.cmDifferenceAgent.tribalFlat - tlPaidForThisAgent - mmPaidForThisAgent);
+            // Tribal: max(0, tribalTarget − $24 agent − tl − mm) per enrollment
+            var tribalLeftover = Math.max(0, _gmTargets.tribalTarget - GM_RATES.cmDifferenceAgent.tribalFlat - tlPaidForThisAgent - mmPaidForThisAgent);
             var tribalOverride = a.tribal * tribalLeftover;
-            if(a.nlad && nladLeftover>0)   bump(cmId, nladOverride,   'CM diff on '+aName+' NLAD ($'+nladLeftover+'/each)',   a.nlad,   nladLeftover);
-            if(a.tribal && tribalLeftover>0) bump(cmId, tribalOverride, 'CM diff on '+aName+' Tribal ($'+tribalLeftover+'/each)', a.tribal, tribalLeftover);
+            if(a.nlad && nladLeftover>0)   bump(cmId, nladOverride,   'CM diff on '+aName+' NLAD ($'+nladLeftover+'/each, target $'+_gmTargets.nladTarget+')',   a.nlad,   nladLeftover);
+            if(a.tribal && tribalLeftover>0) bump(cmId, tribalOverride, 'CM diff on '+aName+' Tribal ($'+tribalLeftover+'/each, target $'+_gmTargets.tribalTarget+')', a.tribal, tribalLeftover);
           } else {
             // cm-oklahoma: NLAD flat +$1/each, Tribal $34 difference
             var nladOverride = a.nlad * GM_RATES.cmOklahomaManager.nladPerEnrollment;
@@ -5533,9 +5677,10 @@ var TC_RATES = {
     tribalPersonal:      28,
     tribalOverridePerEnrollment: 30  // FLAT $30 per Tribal enrollment by anyone below CM
   },
-  // Juan's consolidated rates
+  // Juan's consolidated rates — Calvin 2026-05-03 LOCKED:
+  // $10 NLAD flat, $25 Tribal flat for ALL enrollments (personal or routed)
   cmConsolidated: {
-    nladFlat:   25,
+    nladFlat:   10,
     tribalFlat: 25
   },
   // Universal bonus
@@ -5547,6 +5692,75 @@ function tcCmModelOf(agent){
   if(!agent) return 'none';
   return agent.tcModel || 'none';
 }
+
+// ════════════════════════════════════════════════════════════════════
+//  PER-AGENT CM RATE OVERRIDES — Calvin 2026-05-03
+// ════════════════════════════════════════════════════════════════════
+// Each CM/IBO can have custom rate targets stored directly on their
+// agent record:
+//   agent.tcCmRates = { nladTarget, tribalTarget }
+//   agent.gmCmRates = { nladTarget, tribalTarget }
+//   agent.awCmRates = { perEnrollment }
+//
+// If not set, the engine falls back to the model's legacy default rate.
+//
+// Tanita: tcModel='tc-cm-difference' with no override → $10 NLAD / $28 Tribal
+// Brandon: tcModel='tc-cm-difference' with tcCmRates={nladTarget:10, tribalTarget:25}
+//          → his deals total $10/$25, others stay at Tanita's defaults.
+// Future CMs: add to record without code changes.
+// PRESERVATION: never overwrites an existing override; only reads it.
+function tcCmTargetsFor(cm){
+  if(cm && cm.tcCmRates && typeof cm.tcCmRates === 'object'){
+    var r = cm.tcCmRates;
+    var nlad   = (typeof r.nladTarget   === 'number' && r.nladTarget   >= 0) ? r.nladTarget   : null;
+    var tribal = (typeof r.tribalTarget === 'number' && r.tribalTarget >= 0) ? r.tribalTarget : null;
+    if(nlad !== null || tribal !== null){
+      return {
+        nladTarget:   (nlad   !== null) ? nlad   : TC_RATES.cmDifference.nladPersonal,
+        tribalTarget: (tribal !== null) ? tribal : TC_RATES.cmDifference.tribalPersonal,
+        source: 'agent-override'
+      };
+    }
+  }
+  // Legacy default — Tanita's spec
+  return {
+    nladTarget:   TC_RATES.cmDifference.nladPersonal,    // $10
+    tribalTarget: TC_RATES.cmDifference.tribalPersonal,  // $28
+    source: 'tc-cm-difference-default'
+  };
+}
+
+function gmCmTargetsFor(cm){
+  if(cm && cm.gmCmRates && typeof cm.gmCmRates === 'object'){
+    var r = cm.gmCmRates;
+    var nlad   = (typeof r.nladTarget   === 'number' && r.nladTarget   >= 0) ? r.nladTarget   : null;
+    var tribal = (typeof r.tribalTarget === 'number' && r.tribalTarget >= 0) ? r.tribalTarget : null;
+    if(nlad !== null || tribal !== null){
+      return {
+        nladTarget:   (nlad   !== null) ? nlad   : GM_RATES.cmDifferenceManager.nladTarget,
+        tribalTarget: (tribal !== null) ? tribal : GM_RATES.cmDifferenceManager.tribalTarget,
+        source: 'agent-override'
+      };
+    }
+  }
+  // Legacy default — Brandon's GM spec ($13 NLAD target / $34 Tribal target)
+  return {
+    nladTarget:   GM_RATES.cmDifferenceManager.nladTarget,    // $13
+    tribalTarget: GM_RATES.cmDifferenceManager.tribalTarget,  // $34
+    source: 'cm-difference-default'
+  };
+}
+
+function awCmRateFor(cm){
+  if(cm && cm.awCmRates && typeof cm.awCmRates === 'object'){
+    var r = cm.awCmRates;
+    if(typeof r.perEnrollment === 'number' && r.perEnrollment >= 0){
+      return { perEnrollment: r.perEnrollment, source: 'agent-override' };
+    }
+  }
+  return { perEnrollment: AW_RATES.perEnrollment, source: 'aw-default' };
+}
+// ════════════════════════════════════════════════════════════════════
 
 // Look up the team's Campaign Manager / IBO. Returns agent or null.
 function tcMarketCM(team){
@@ -6495,19 +6709,20 @@ function tcCalculateWeek(weekRows){
     }
 
     // ────────── PATH: tc-cm-consolidated (Juan) ──────────
-    // ALL activations route to the CM at flat $25 NLAD / $25 Tribal.
+    // ALL activations route to the CM at flat $10 NLAD / $25 Tribal.
     // Other agents in the market get $0 from company; CM pays them privately.
+    //
+    // ── Calvin 2026-05-03 LOCKED SPEC ──
+    // Juan gets $10 on TC NLAD for ALL enrollments (personal or routed from
+    // his agents). $25 on TC Tribal for ALL enrollments. Port-in adds $7
+    // on top per port row. Keep it simple — same rate either way.
     if(tcModel === 'tc-cm-consolidated'){
       var cmId = cm.id;
       var marketLabel = team ? (team.city || team.name) : 'market';
 
-      // Aggregate everything across the market
-      var nladPay   = t.nladCount   * TC_RATES.cmConsolidated.nladFlat;
-      var tribalPay = t.tribalCount * TC_RATES.cmConsolidated.tribalFlat;
-      // Port-in/out goes to whoever PERSONALLY enrolled — but in
-      // consolidated, the CM is functionally the doer-of-record on every
-      // routed deal. So ports go to him too.
-      var portPay   = t.portCount   * TC_RATES.portInOut;
+      var nladPay   = t.nladCount   * TC_RATES.cmConsolidated.nladFlat;    // $10 per NLAD
+      var tribalPay = t.tribalCount * TC_RATES.cmConsolidated.tribalFlat;  // $25 per Tribal
+      var portPay   = t.portCount   * TC_RATES.portInOut;                  // $7 per port-in
       // Chargebacks roll up to CM
       var cbCents = 0;
       t.rows.forEach(function(r){ if(r.chargebackCents) cbCents += r.chargebackCents; });
@@ -6554,8 +6769,11 @@ function tcCalculateWeek(weekRows){
       if(a.nlad){
         var nladRate, nladLabel;
         if(isThisAgentCM && tcModel === 'tc-cm-difference'){
-          nladRate  = TC_RATES.cmDifference.nladPersonal;  // $10
-          nladLabel = 'Personal NLAD ($'+nladRate+')';
+          // Per-CM target lookup so each CM can have their own NLAD rate
+          // (Tanita default $10, Brandon override $10, etc.)
+          var _persTargets = (typeof tcCmTargetsFor === 'function') ? tcCmTargetsFor(agentRecord) : null;
+          nladRate  = _persTargets ? _persTargets.nladTarget : TC_RATES.cmDifference.nladPersonal;
+          nladLabel = 'Personal NLAD ($'+nladRate+' CM rate)';
         } else if(isThisAgentMM){
           nladRate  = TC_RATES.nlad.mm;                     // $10
           nladLabel = 'Personal NLAD ($'+nladRate+' MM rate)';
@@ -6573,7 +6791,9 @@ function tcCalculateWeek(weekRows){
       if(a.tribal){
         var tribalPay, tribalLabel, tribalRate;
         if(isThisAgentCM && tcModel === 'tc-cm-difference'){
-          tribalRate = TC_RATES.cmDifference.tribalPersonal;  // $28 flat
+          // Per-CM target lookup so Brandon gets $25 personal, Tanita $28
+          var _persTargetsT = (typeof tcCmTargetsFor === 'function') ? tcCmTargetsFor(agentRecord) : null;
+          tribalRate = _persTargetsT ? _persTargetsT.tribalTarget : TC_RATES.cmDifference.tribalPersonal;
           tribalPay  = a.tribal * tribalRate;
           tribalLabel = 'Personal Tribal ($'+tribalRate+' CM rate)';
         } else if(isThisAgentTL){
@@ -6656,19 +6876,27 @@ function tcCalculateWeek(weekRows){
       });
     }
 
-    // Layer 4: CM-difference (Tanita) — applies only when tcModel === 'tc-cm-difference'
+    // Layer 4: CM-difference (Tanita / Brandon / any tc-cm-difference CM)
+    // — applies only when tcModel === 'tc-cm-difference'
     // LOCKED SPEC (Calvin 2026-04-30):
-    //   Every Tribal deal is worth $28 to the company. Agent gets their tier rate
-    //   ($18 tier 1 / $23 tier 2). TL gets the difference between their tier rate
-    //   and the agent's tier rate ($5 tier 1 / $2 tier 2). Tanita keeps WHATEVER'S
-    //   LEFT to make the deal total exactly $28. So:
-    //     tier 1 deal: $18 agent + $5 TL diff + $5 Tanita = $28
-    //     tier 2 deal: $23 agent + $2 TL diff + $3 Tanita = $28
-    //   No deal ever costs the company more than $28 per Tribal.
+    //   Every Tribal deal is worth nladTarget/tribalTarget to the company.
+    //   Targets come from the CM's own record (tcCmRates) if set, else fall
+    //   back to Tanita's defaults ($10 NLAD / $28 Tribal).
+    //   - Tanita: $10/$28 (default)
+    //   - Brandon: $10/$25 (per-agent override)
+    //   Agent gets their tier rate ($18 tier 1 / $23 tier 2). TL gets the
+    //   difference between their tier rate and the agent's tier rate
+    //   ($5 tier 1 / $2 tier 2). CM keeps WHATEVER'S LEFT to make the deal
+    //   total exactly tribalTarget. Cap is enforced by max(0, ...).
     //
     // MULTI-TL aware: must check each agent's actual teamLeaderId (and that the
     // TL has role='Team Leader') to know if a TL was actually paid in Layer 2.
     if(tcModel === 'tc-cm-difference' && cmId){
+      var cmTargets = (typeof tcCmTargetsFor === 'function') ? tcCmTargetsFor(cm) : {
+        nladTarget:   TC_RATES.cmDifference.nladPersonal,
+        tribalTarget: TC_RATES.cmDifference.tribalPersonal,
+        source: 'fallback'
+      };
       Object.keys(t.agents).forEach(function(aidStr){
         var aidI = parseInt(aidStr);
         if(aidI === cmId) return;  // not on themselves
@@ -6680,7 +6908,7 @@ function tcCalculateWeek(weekRows){
         var isThisAgentTL = (agentRole === 'Team Leader');
         var isThisAgentMM = (agentRole === 'Market Manager');
 
-        // NLAD: max(0, $10 − agent_rate − mm_override). Total per NLAD = $10.
+        // NLAD: max(0, nladTarget − agent_rate − mm_override). Total per NLAD = nladTarget.
         if(a.nlad){
           var agentNLADRate;
           if(isThisAgentMM)      agentNLADRate = TC_RATES.nlad.mm;       // $10 — no Tanita cut
@@ -6689,15 +6917,15 @@ function tcCalculateWeek(weekRows){
           // MM override (already paid in Layer 3): $2/each on agent NLAD only
           var mmOverridePaid = (mmId && !isThisAgentMM && !isThisAgentTL)
             ? TC_RATES.nlad.mmOverridePerAgentEnrollment : 0;
-          var nladLeftover = Math.max(0, TC_RATES.cmDifference.nladPersonal - agentNLADRate - mmOverridePaid);
+          var nladLeftover = Math.max(0, cmTargets.nladTarget - agentNLADRate - mmOverridePaid);
           if(nladLeftover > 0){
             bump(cmId, a.nlad * nladLeftover,
-                 'CM NLAD diff on '+aName+' ($'+nladLeftover+'/each, ceiling $'+TC_RATES.cmDifference.nladPersonal+')',
+                 'CM NLAD diff on '+aName+' ($'+nladLeftover+'/each, ceiling $'+cmTargets.nladTarget+')',
                  a.nlad, nladLeftover);
           }
         }
 
-        // Tribal: max(0, $28 − agent_tier_rate − tl_override_paid). Total per Tribal = $28.
+        // Tribal: max(0, tribalTarget − agent_tier_rate − tl_override_paid). Total per Tribal = tribalTarget.
         if(a.tribal){
           // Agent's actual Tribal rate based on THEIR personal count tier
           var agentTribalRate;
@@ -6721,10 +6949,10 @@ function tcCalculateWeek(weekRows){
               tlOverridePaid = Math.max(0, tlTribalRate - agentTribalRate);
             }
           }
-          var tribalLeftover = Math.max(0, TC_RATES.cmDifference.tribalPersonal - agentTribalRate - tlOverridePaid);
+          var tribalLeftover = Math.max(0, cmTargets.tribalTarget - agentTribalRate - tlOverridePaid);
           if(tribalLeftover > 0){
             bump(cmId, a.tribal * tribalLeftover,
-                 'CM Tribal diff on '+aName+' ($'+tribalLeftover+'/each, ceiling $'+TC_RATES.cmDifference.tribalPersonal+')',
+                 'CM Tribal diff on '+aName+' ($'+tribalLeftover+'/each, ceiling $'+cmTargets.tribalTarget+')',
                  a.tribal, tribalLeftover);
           }
         }
@@ -6877,6 +7105,20 @@ function awCalculateWeek(weekRows){
     var team = t.team;
     var cm = awMarketCM(team);
     var awModel = awCmModelOf(cm);
+
+    // ── Calvin 2026-05-03 BUG FIX: IBO upline override (mirror GM/TC engines) ──
+    // If this market's CM is NOT themselves an IBO but an IBO sits above
+    // them in the chain, redirect all AW pay to the IBO at consolidated
+    // rates. Locked rule: we never pay anyone below an IBO. Without this,
+    // an IBO who's not the direct team CM was getting $0 from AW.
+    if(cm && cm.role !== 'IBO' && typeof agentIsUnderIBO === 'function'){
+      var iboAbove = agentIsUnderIBO(cm.id);
+      if(iboAbove){
+        cm      = iboAbove;
+        awModel = 'aw-cm-consolidated';
+        try { console.log('[AW engine] IBO upline detected for market "'+(team?team.name:teamId)+'" — routing all AW pay to IBO '+iboAbove.name+' (was CM '+(team?team.campaignManager:'?')+')'); } catch(e){}
+      }
+    }
 
     // Determine the single recipient for this team
     var recipientId = null;
@@ -16952,6 +17194,16 @@ function applyIboModelsIfIBO(agent){
     // TC mirror: 'tc-cm-consolidated' is Juan's existing TC model that
     // routes ALL TC deals to him at $25 flat. Same rule, applied by role.
     if(agent.tcModel !== 'tc-cm-consolidated') agent.tcModel = 'tc-cm-consolidated';
+    // ── Calvin 2026-05-03 BUG FIX ──
+    // AW mirror: Assurance must also route to the IBO. Without this, Juan's
+    // AW pay defaulted to whatever MM was configured (often null) and Juan
+    // got $0 for every Assurance enrollment in his markets. This was the
+    // bug Calvin reported on 2026-05-03.
+    // PRESERVATION: only set if currently empty/none — never overwrite a
+    // custom awModel an admin may have explicitly chosen.
+    if(!agent.awModel || agent.awModel === 'none' || agent.awModel === ''){
+      agent.awModel = 'aw-cm-consolidated';
+    }
   }
 }
 
@@ -17853,7 +18105,7 @@ function doLogin(){
   launchBO(found);
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
-  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadPayrollDebtLedger(); loadCompPlans(); loadOnboardData(); loadStore(); gmPricelistLoad(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
+  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadPayrollDebtLedger(); loadCompPlans(); loadOnboardData(); loadStore(); gmPricelistLoad(); makenzieBonusLoad(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
   // Ship B: auto-run points batch on login (idempotent, no-op before 9am CST)
   setTimeout(function(){ try { if(typeof pointsMaybeAutoRun === 'function') pointsMaybeAutoRun(); } catch(e){} }, 1500);
   // Scheduled call reminders — start the periodic check
