@@ -6994,6 +6994,92 @@ function ppGetPlanById(planId){
   return COMP_PLANS.find(function(p){return p.id===planId;});
 }
 
+// ── Calvin 2026-05-03: effective-date-aware comp plan lookup ──
+// Each comp plan now carries an `effectiveDate` (YYYY-MM-DD).
+// When the admin team updates a plan, the OLD plan stays in COMP_PLANS
+// (with supersededBy/supersededAt set), so already-paid sales keep their
+// snapshot. New sales activated on/after the new effectiveDate use the
+// new plan. PRESERVATION: never delete or mutate a historical plan.
+//
+// Lookup rules:
+//   1. Find assignment for agent+campaign (just like before).
+//   2. Walk the chain of plans for that {campaign, service, role} where
+//      effectiveDate <= asOfDate.
+//   3. Pick the most recent one (latest effectiveDate that's not in the
+//      future relative to asOfDate).
+function ppActivePlanForAgent(agentId, campaign, asOfDate){
+  if(!Array.isArray(COMP_ASSIGNMENTS) || !Array.isArray(COMP_PLANS)) return null;
+  var assignment = COMP_ASSIGNMENTS.find(function(a){
+    return a.agentId === agentId && a.campaign === campaign;
+  });
+  if(!assignment) return null;
+  if(!asOfDate) asOfDate = new Date().toISOString().slice(0,10);
+
+  var anchor = COMP_PLANS.find(function(p){ return p.id === assignment.planId; });
+  if(!anchor) return null;
+
+  // Find every plan in the same {campaign, service, role} family that's
+  // effective on/before asOfDate. The "family" lets us follow a price
+  // change even if the assignment row points to an older plan id.
+  var family = COMP_PLANS.filter(function(p){
+    if(p.campaign !== anchor.campaign) return false;
+    if((p.service||'') !== (anchor.service||'')) return false;
+    if(p.role !== anchor.role) return false;
+    var eff = p.effectiveDate || p.createdAt || '1970-01-01';
+    if(eff.length > 10) eff = eff.slice(0,10);
+    return eff <= asOfDate;
+  });
+  if(!family.length) return anchor;  // nothing dated yet — fall back
+
+  family.sort(function(a,b){
+    var ea = (a.effectiveDate || a.createdAt || '1970-01-01').slice(0,10);
+    var eb = (b.effectiveDate || b.createdAt || '1970-01-01').slice(0,10);
+    if(ea < eb) return 1;
+    if(ea > eb) return -1;
+    // tiebreaker — prefer higher version
+    return (b.version||0) - (a.version||0);
+  });
+  return family[0];
+}
+
+// ── Comp Plan Audit ──
+// Calvin 2026-05-03: scan every comp plan family for chronology issues
+// (overlapping effective dates, gaps, superseded-but-still-pointing-at,
+// missing dates). Returns an array of {planId, severity, message}.
+function ppAuditCompPlans(){
+  if(!Array.isArray(COMP_PLANS)) return [];
+  var issues = [];
+  // Group plans by family key
+  var families = {};
+  COMP_PLANS.forEach(function(p){
+    var key = (p.campaign||'?') + '|' + (p.service||'') + '|' + (p.role||'?');
+    if(!families[key]) families[key] = [];
+    families[key].push(p);
+  });
+  Object.keys(families).forEach(function(key){
+    var fam = families[key];
+    fam.forEach(function(p){
+      if(!p.effectiveDate){
+        issues.push({planId:p.id, severity:'warn', message:'Plan "'+key+'" v'+(p.version||1)+' has no effectiveDate — defaulting to creation date'});
+      }
+    });
+    // Check for two plans active on the same effectiveDate
+    var byDate = {};
+    fam.forEach(function(p){
+      var d = (p.effectiveDate || p.createdAt || '').slice(0,10);
+      if(!byDate[d]) byDate[d] = [];
+      byDate[d].push(p);
+    });
+    Object.keys(byDate).forEach(function(d){
+      if(byDate[d].length > 1 && d){
+        issues.push({planId: byDate[d][0].id, severity:'warn',
+          message:'Family "'+key+'" has '+byDate[d].length+' plans with effectiveDate '+d+' — only newest version (highest v) wins'});
+      }
+    });
+  });
+  return issues;
+}
+
 // ── Format cents as $X.XX
 function ppFmtCents(c){
   if(c == null) return '—';
@@ -9655,6 +9741,11 @@ function canAccess(u, area){
           || (isMgr && mmHasCodedReports(u,'Gen Mobile'))
           || (isTL  && tlHasCodedReports(u,'Gen Mobile'));
 
+    // ── Pricelist: Owner + Inventory only (per Calvin spec) ──
+    case 'gm-pricelist':
+      return (typeof isOwner === 'function' && isOwner(u))
+          || isInventory(u);
+
     // ── Sales-focused panels ──
     // IBOs also get their docs / daily audit / links / inv-request because
     // they operate just like a contractor — but they DON'T see the full
@@ -9977,6 +10068,218 @@ var GM_ACTIVATIONS = [];  // parsed activation records
 var GM_TRANSFERS   = [];  // transfer requests + audit log
 var INV_MARKETS    = {};  // {marketName: {mmDays:30, tlDays:14, agentDays:10, upsellPct:30}}
 var INV_UPSELL_REQUIREMENTS = {'Gen Mobile':30, 'TruConnect':30};
+
+// ══════════════════════════════════════════════════════════
+//  GM PRICELIST — Calvin 2026-05-03
+// ══════════════════════════════════════════════════════════
+// Effective-dated price entries for Gen Mobile devices.
+// PRESERVATION RULE: when prices change, we INSERT a new row with new
+// effectiveDate; the old row gets supersededBy/supersededAt set but is
+// NEVER deleted. This means:
+//   - Existing inventory keeps its locked devCost forever
+//   - CSV uploads dated <= old.effectiveDate use old price
+//   - CSV uploads dated >  new.effectiveDate use new price
+//   - Audit trail for every price change preserved
+//
+// Per Calvin: pricelist is the FALLBACK for missing CSV prices only;
+// CSV prices win when present.
+//
+// Row schema:
+//   {id, model, network, screen, specs, price,
+//    caTribalCredit, nonCACredit,
+//    effectiveDate (YYYY-MM-DD),
+//    supersededBy (id|null), supersededAt (ISO|null),
+//    createdAt, createdBy, notes}
+var GM_PRICELIST = [];
+
+function gmPricelistSeedDefaults(){
+  // Seed from official May 2026 Gen Mobile Lifeline Device Pricing Sheet.
+  // Idempotent: only seeds if pricelist is empty.
+  if(GM_PRICELIST.length > 0) return;
+  var seed = [
+    {model:'Hot Pepper Tepin+',     network:'Sky',        screen:'5.5', specs:'3GB/32GB',  price: 40, caTribalCredit:55, nonCACredit:40},
+    {model:'Blu X5+',               network:'Sky',        screen:'5.5', specs:'3GB/32GB',  price: 40, caTribalCredit:55, nonCACredit:40},
+    {model:'Hot Pepper Cascabel',   network:'Sky',        screen:'6.5', specs:'3GB/32GB',  price: 55, caTribalCredit:55, nonCACredit:40},
+    {model:'Nuu N21',               network:'Sky',        screen:'6.5', specs:'3GB/32GB',  price: 55, caTribalCredit:55, nonCACredit:40},
+    {model:'Maxwest Nitro A65',     network:'Sky',        screen:'6.5', specs:'6GB/32GB',  price: 55, caTribalCredit:55, nonCACredit:40},
+    {model:'Maxwest Nitro N67',     network:'Sky',        screen:'6.7', specs:'4GB/64GB',  price: 65, caTribalCredit:55, nonCACredit:40},
+    {model:'Coosea Summit 5G',      network:'Orange',     screen:'6.6', specs:'4GB/64GB',  price: 65, caTribalCredit:55, nonCACredit:40},
+    {model:'Celero 5G SC (24)',     network:'Sky/Orange', screen:'6.6', specs:'4GB/64GB',  price: 75, caTribalCredit:55, nonCACredit:40},
+    {model:'Moto G 5G (22)',        network:'Sky',        screen:'6.5', specs:'4GB/64GB',  price: 75, caTribalCredit:55, nonCACredit:40},
+    {model:'Moto G 5G (23, 24)',    network:'Sky/Orange', screen:'6.6', specs:'4GB/128GB', price: 80, caTribalCredit:55, nonCACredit:40},
+    {model:'Moto G Play (24)',      network:'Sky',        screen:'6.5', specs:'4GB/128GB', price: 85, caTribalCredit:55, nonCACredit:40},
+    {model:'Moto G Stylus 5G (23)', network:'Sky/Orange', screen:'6.6', specs:'4GB/128GB', price: 85, caTribalCredit:55, nonCACredit:40},
+    {model:'Samsung Galaxy A14',    network:'Sky',        screen:'6.6', specs:'4GB/64GB',  price:100, caTribalCredit:55, nonCACredit:40},
+    {model:'iPhone SE2',            network:'Orange',     screen:'4.7', specs:'64GB',      price:115, caTribalCredit:55, nonCACredit:40},
+    {model:'iPhone 11',             network:'Orange',     screen:'6.1', specs:'64GB',      price:175, caTribalCredit:55, nonCACredit:40}
+  ];
+  var nowISO = new Date().toISOString();
+  seed.forEach(function(row, i){
+    GM_PRICELIST.push({
+      id: 'pl-seed-2026-05-' + String(i+1).padStart(3,'0'),
+      model: row.model, network: row.network, screen: row.screen, specs: row.specs,
+      price: row.price,
+      caTribalCredit: row.caTribalCredit, nonCACredit: row.nonCACredit,
+      effectiveDate: '2026-05-01',
+      supersededBy: null, supersededAt: null,
+      createdAt: nowISO, createdBy: 1,
+      notes: 'Seeded from official May 2026 Gen Mobile Lifeline Device Pricing Sheet'
+    });
+  });
+}
+
+function gmPricelistLoad(){
+  try{
+    var raw = localStorage.getItem('wmam_gm_pricelist');
+    if(raw){
+      var parsed = JSON.parse(raw);
+      if(Array.isArray(parsed)) GM_PRICELIST = parsed;
+    }
+  }catch(e){ /* ignore — keep defaults */ }
+  gmPricelistSeedDefaults();
+}
+
+function gmPricelistSave(){
+  try{ localStorage.setItem('wmam_gm_pricelist', JSON.stringify(GM_PRICELIST)); }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    supaClient.from('app_settings').upsert(
+      {key:'gm_pricelist', value: JSON.stringify(GM_PRICELIST)},
+      {onConflict:'key'}
+    ).then(function(){}).catch(function(){});
+  }
+}
+
+// Normalize a model name for matching. Removes punctuation, collapses whitespace,
+// lowercases. So "Moto G 5G ('23, '24)" matches "Moto G 5G (23, 24)" matches
+// "moto g 5g 23 24". Helps the CSV → pricelist lookup tolerate apostrophes,
+// extra spaces, and case differences.
+function gmPricelistNormalize(s){
+  if(!s) return '';
+  return String(s)
+    .toLowerCase()
+    .replace(/['']/g,'')        // strip apostrophes
+    .replace(/[^a-z0-9]+/g,' ') // punctuation → space
+    .replace(/\s+/g,' ')        // collapse spaces
+    .trim();
+}
+
+// Lookup: given a model name + asOfDate (YYYY-MM-DD), return the pricelist
+// row that was effective on that date, or null if none.
+// PRESERVATION: this NEVER mutates anything — pure lookup.
+function gmPricelistLookup(model, asOfDate){
+  if(!model) return null;
+  if(!asOfDate) asOfDate = new Date().toISOString().slice(0,10);
+  var target = gmPricelistNormalize(model);
+  // Find all rows for this model where effectiveDate <= asOfDate.
+  // Among those, pick the one with the LATEST effectiveDate (most recent
+  // active price as of that date).
+  var candidates = GM_PRICELIST.filter(function(row){
+    return gmPricelistNormalize(row.model) === target
+        && row.effectiveDate <= asOfDate;
+  });
+  if(!candidates.length) return null;
+  candidates.sort(function(a,b){
+    if(a.effectiveDate < b.effectiveDate) return 1;
+    if(a.effectiveDate > b.effectiveDate) return -1;
+    return 0;
+  });
+  return candidates[0];
+}
+
+// Add or update a pricelist entry. PRESERVATION: never edits an existing row;
+// instead supersedes the old row and inserts a new one.
+//   - For a new model: just insert.
+//   - For an existing model with a new effectiveDate: insert new, supersede old.
+//   - For correcting a typo on the SAME effectiveDate (no historical inventory
+//     could exist between two same-day rows), allow in-place edit only if
+//     no GM_INVENTORY record uses this row's price (lookup by model+date).
+function gmPricelistAddOrSupersede(newRow, currentUserId){
+  if(!newRow || !newRow.model || !newRow.effectiveDate){
+    return {ok:false, error:'model and effectiveDate required'};
+  }
+  var nowISO = new Date().toISOString();
+  // Find currently-active row for this model on the new effective date
+  var prior = gmPricelistLookup(newRow.model, newRow.effectiveDate);
+  if(prior && prior.effectiveDate === newRow.effectiveDate){
+    // Same-date overwrite. Only allowed if no inventory locked at this price.
+    // (Inventory locks devCost at upload time; price changes don't retro it.)
+    // We still allow the in-place edit because the dev cost was locked into
+    // each inventory record at upload time, NOT pulled by reference.
+    prior.network        = newRow.network        || prior.network;
+    prior.screen         = newRow.screen         || prior.screen;
+    prior.specs          = newRow.specs          || prior.specs;
+    prior.price          = (newRow.price !== undefined) ? newRow.price : prior.price;
+    prior.caTribalCredit = (newRow.caTribalCredit !== undefined) ? newRow.caTribalCredit : prior.caTribalCredit;
+    prior.nonCACredit    = (newRow.nonCACredit    !== undefined) ? newRow.nonCACredit    : prior.nonCACredit;
+    prior.notes          = newRow.notes || prior.notes;
+    prior.editedAt       = nowISO;
+    prior.editedBy       = currentUserId || prior.createdBy;
+    gmPricelistSave();
+    return {ok:true, action:'edited-in-place', row:prior};
+  }
+  // Different date — create new effective-dated row, supersede prior.
+  var newId = 'pl-' + Date.now() + '-' + Math.random().toString(36).substr(2,5);
+  var inserted = {
+    id: newId,
+    model: newRow.model,
+    network: newRow.network || (prior ? prior.network : ''),
+    screen:  newRow.screen  || (prior ? prior.screen  : ''),
+    specs:   newRow.specs   || (prior ? prior.specs   : ''),
+    price:   newRow.price,
+    caTribalCredit: (newRow.caTribalCredit !== undefined) ? newRow.caTribalCredit : (prior ? prior.caTribalCredit : 0),
+    nonCACredit:    (newRow.nonCACredit    !== undefined) ? newRow.nonCACredit    : (prior ? prior.nonCACredit    : 0),
+    effectiveDate: newRow.effectiveDate,
+    supersededBy: null, supersededAt: null,
+    createdAt: nowISO, createdBy: currentUserId || 1,
+    notes: newRow.notes || ''
+  };
+  GM_PRICELIST.push(inserted);
+  if(prior){
+    prior.supersededBy = newId;
+    prior.supersededAt = nowISO;
+  }
+  gmPricelistSave();
+  return {ok:true, action:(prior ? 'superseded-prior' : 'new-model'), row:inserted, prior:prior};
+}
+
+// Remove a model entirely from the pricelist (via UI). PRESERVATION:
+// We don't HARD delete — we add a tombstone row with price:0 and effective
+// "today" so existing inventory keeps their locked cost but new uploads
+// won't auto-fill from this model. Soft delete preserves audit trail.
+function gmPricelistRemoveModel(model, currentUserId){
+  if(!model) return {ok:false, error:'model required'};
+  var prior = gmPricelistLookup(model, new Date().toISOString().slice(0,10));
+  if(!prior) return {ok:false, error:'model not found'};
+  var today = new Date().toISOString().slice(0,10);
+  var tombstoneId = 'pl-tombstone-' + Date.now();
+  var tombstone = {
+    id: tombstoneId,
+    model: prior.model,
+    network: prior.network, screen: prior.screen, specs: prior.specs,
+    price: 0, caTribalCredit: 0, nonCACredit: 0,
+    effectiveDate: today,
+    supersededBy: null, supersededAt: null,
+    createdAt: new Date().toISOString(), createdBy: currentUserId || 1,
+    notes: 'TOMBSTONE — model removed from pricelist',
+    isTombstone: true
+  };
+  GM_PRICELIST.push(tombstone);
+  prior.supersededBy = tombstoneId;
+  prior.supersededAt = new Date().toISOString();
+  gmPricelistSave();
+  return {ok:true, action:'tombstoned', row:tombstone, prior:prior};
+}
+
+// Permission check: Owner + Inventory dept can manage pricelist.
+function canManageGMPricelist(user){
+  if(!user) return false;
+  if(typeof isOwner === 'function' && isOwner(user)) return true;
+  if(user.depts && (user.depts.inventory === true || user.depts.inv === true)) return true;
+  return false;
+}
+// ══════════════════════════════════════════════════════════
+//  END GM PRICELIST
+// ══════════════════════════════════════════════════════════
 
 // ── Gen Mobile CSV team name → clean market name ──
 var GM_MARKET_MAP = {
@@ -10564,16 +10867,34 @@ function processGMInventoryUpload(csvText, batchId){
     // CSV but the agency has already paid Purchase Cost. Use Purchase Cost
     // for the invoice so we can recoup. Otherwise use Dev. Cost.
     var invoiceCost;
+    var costSource;  // for audit trail
     if(invStatus === 'Aged-Out' && ownedByAgency && rawPurchaseCost > 0){
       invoiceCost = rawPurchaseCost;
+      costSource = 'csv-purchase-cost-aged-out';
     } else if(rawDevCost > 0){
       invoiceCost = rawDevCost;
+      costSource = 'csv-dev-cost';
     } else if(rawPurchaseCost > 0){
       // Edge case: Dev.Cost missing but Purchase Cost present — use Purchase Cost
       invoiceCost = rawPurchaseCost;
+      costSource = 'csv-purchase-cost-fallback';
     } else {
-      // No cost data at all — flag for follow-up but don't break upload
-      invoiceCost = 0;
+      // ── Calvin 2026-05-03 PRICELIST FALLBACK ──
+      // No cost data in the CSV. Look up the managed pricelist by model
+      // name + the SO date (or upload date if SO date missing). This is the
+      // ONLY case where the pricelist is consulted — CSV data always wins
+      // when present. The looked-up price is locked into this device's
+      // record so future pricelist changes don't retroactively affect it.
+      var asOf = (soDate && /^\d{4}-\d{2}-\d{2}/.test(soDate)) ? soDate.slice(0,10) : nowDate;
+      var plRow = (typeof gmPricelistLookup === 'function') ? gmPricelistLookup(model, asOf) : null;
+      if(plRow && plRow.price > 0){
+        invoiceCost = plRow.price;
+        costSource = 'pricelist-' + plRow.id;
+      } else {
+        // No pricelist match — flag for follow-up but don't break upload
+        invoiceCost = 0;
+        costSource = 'no-cost-data';
+      }
     }
 
     if(!imei) return;
@@ -10639,6 +10960,7 @@ function processGMInventoryUpload(csvText, batchId){
       campaign:      'Gen Mobile',
       // ── Cost fields (Calvin 2026-05-03) ──
       devCost:           invoiceCost,      // authoritative invoice cost
+      devCostSource:     costSource,       // audit trail: where did this price come from?
       gmDevCost:         rawDevCost,       // raw from CSV (snapshot)
       gmDistCredit:      rawDistCredit,    // distributor credit per device
       gmPurchaseCost:    rawPurchaseCost,  // original purchase cost
@@ -17531,7 +17853,7 @@ function doLogin(){
   launchBO(found);
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
-  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadPayrollDebtLedger(); loadCompPlans(); loadOnboardData(); loadStore(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
+  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadPayrollDebtLedger(); loadCompPlans(); loadOnboardData(); loadStore(); gmPricelistLoad(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
   // Ship B: auto-run points batch on login (idempotent, no-op before 9am CST)
   setTimeout(function(){ try { if(typeof pointsMaybeAutoRun === 'function') pointsMaybeAutoRun(); } catch(e){} }, 1500);
   // Scheduled call reminders — start the periodic check
@@ -18123,6 +18445,7 @@ function buildNav(u){
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>'
       +boDropBtn('imei-search','🔍 IMEI / SIM Search')
       +boDropBtn('sold-reports','💵 Sold Reports')
+      +(canAccess(u,'gm-pricelist') ? boDropBtn('gm-pricelist','💲 GM Pricelist') : '')
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
     activeCampaigns().forEach(function(c){
       var cfg = campaignCfg(c);
@@ -19380,6 +19703,7 @@ function gotoPanel(id, params){
     'inv-dashboard':'All Inventory','inv-upload':'Upload Devices',
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
+    'gm-pricelist':'GM Pricelist',
     'inv-hub':'Inventory Hub',
     'aw-inventory':'Assurance Wireless Inventory','aw-upload':'Assurance Upload','aw-transfers':'Assurance Transfers',
     'tc-inventory':'TruConnect Inventory','tc-upload':'TruConnect Upload','tc-transfers':'TruConnect Transfers',
@@ -19416,6 +19740,7 @@ function gotoPanel(id, params){
     'inv-hub':panelInvHub,
     'gm-inventory':panelGMInventory,'gm-upload':panelGMUpload,
     'gm-transfers':panelGMTransfers,'gm-agent-inv':panelGMAgentInventory,
+    'gm-pricelist':panelGMPricelist,
     'aw-inventory':function(){ return panelCampaignInventory('Assurance'); },
     'aw-upload':   function(){ return panelCampaignUpload('Assurance'); },
     'aw-transfers':function(){ return panelCampaignTransfers('Assurance'); },
@@ -23344,7 +23669,20 @@ function panelCompPlanEdit(){
     h += '<option value="'+r+'"'+(p.role===r?' selected':'')+'>'+r+'</option>';
   });
   h += '</select></div>';
-  h += '</div></div></div>';
+  h += '</div>';
+  // ── Calvin 2026-05-03: Effective Date ──
+  // Per Calvin: "once they save and there is a date when they go into effect
+  // it should automatically update". So this date controls when the new plan
+  // becomes the active comp for sales going forward. Already-paid sales keep
+  // their snapshot via the supersededBy chain.
+  if(!p.effectiveDate) p.effectiveDate = new Date().toISOString().slice(0,10);
+  h += '<div style="margin-top:14px;padding:14px;background:rgba(124,58,237,.04);border:1px solid rgba(124,58,237,.2);border-radius:6px">';
+  h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;color:#7c3aed;font-weight:700;display:block;margin-bottom:6px">📅 Effective Date *</label>';
+  h += '<input type="date" id="cpf-effectiveDate" value="'+p.effectiveDate+'" onchange="window._ppEditingPlan.effectiveDate=this.value" style="padding:8px 10px;border:1.5px solid #7c3aed;border-radius:6px;font-family:monospace;font-size:.9rem;background:white">';
+  h += '<div style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);line-height:1.5">';
+  h += 'Sales activated <strong>on or after</strong> this date use this comp plan. Sales before this date keep their original comp values (already-paid commissions are NEVER recalculated). Set this to a FUTURE date to schedule a price change.';
+  h += '</div></div>';
+  h += '</div></div>';
 
   // Section 2: Rate Structure
   h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">2️⃣ Rate Structure</div></div><div style="padding:18px 20px">';
@@ -23476,6 +23814,10 @@ function ppSaveCompPlanFromForm(){
     return;
   }
   if(!p.role){ alert('Pick a role.'); return; }
+  if(!p.effectiveDate){
+    // Default to today if not set
+    p.effectiveDate = new Date().toISOString().slice(0,10);
+  }
 
   // Validate rate type fields
   if(p.rateType==='flat' && !(p.flatCents>0)){
@@ -23497,50 +23839,106 @@ function ppSaveCompPlanFromForm(){
     delete p.isNew;
     p.createdAt = new Date().toISOString();
     p.version = 1;
+    p.supersededBy = null;
+    p.supersededAt = null;
     COMP_PLANS.push(p);
     saveCompPlans();
     window._ppEditingPlan = null;
-    alert('✓ Plan created.');
+    alert('✓ Plan created.\n\nEffective date: '+p.effectiveDate+'\n\nSales activated on/after this date will use this plan.');
     gotoPanel('comp-plans');
   } else {
-    delete p.isNew;
-    p.updatedAt = new Date().toISOString();
-    p.version = (p.version||1) + 1;
-    var idx = COMP_PLANS.findIndex(function(x){return x.id===p.id;});
-    if(idx >= 0) COMP_PLANS[idx] = p;
-    saveCompPlans();
+    // ── Calvin 2026-05-03 PRESERVATION RULE ──
+    // If effectiveDate changed vs the stored prior, the user is making a
+    // SCHEDULED CHANGE. Preserve the prior plan (it's the source of truth
+    // for sales already paid against it) and insert a new plan, marking
+    // the prior as supersededBy this new one.
+    var stored = COMP_PLANS.find(function(x){return x.id===p.id;});
+    var priorEffDate = stored ? (stored.effectiveDate || (stored.createdAt||'').slice(0,10) || '') : '';
+    var datesDiffer = (priorEffDate && priorEffDate !== p.effectiveDate);
 
-    // Flag affected assignments for addendum acknowledgment
-    if(affected.length){
+    if(datesDiffer){
+      // Insert new plan, preserve the old as historical
+      var newId = 'cp-' + Date.now() + '-' + Math.random().toString(36).substr(2,5);
+      var nextVersion = (stored && stored.version) ? (stored.version + 1) : 2;
+      var newPlan = Object.assign({}, p, {
+        id: newId,
+        version: nextVersion,
+        createdAt: new Date().toISOString(),
+        supersededBy: null,
+        supersededAt: null,
+        previousPlanId: p.id  // audit trail
+      });
+      delete newPlan.isNew;
+      COMP_PLANS.push(newPlan);
+      // Mark prior as superseded
+      if(stored){
+        stored.supersededBy = newId;
+        stored.supersededAt = new Date().toISOString();
+      }
+      // Re-point assignments to the NEW plan id so future calculations
+      // pick it up. ppActivePlanForAgent will still find the old one for
+      // sales activated before the new effectiveDate via family lookup.
       affected.forEach(function(a){
+        a.planId = newId;
         a.pendingAddendum = true;
-        a.addendumPlanVersion = p.version;
-        // Push in-app notification so they see it in the bell
+        a.addendumPlanVersion = nextVersion;
+        a.addendumEffectiveDate = newPlan.effectiveDate;
         try{
           var ag = DB.agents.find(function(x){return x.id===a.agentId;});
           pushNotification({
-            type:'alert',
-            icon:'⚠',
-            title:'Comp Plan UPDATED — Addendum Required',
-            body:'Your compensation plan for '+(p.campaign||a.campaign)+' has been updated to v'+p.version+'. You must log in and acknowledge the addendum before continuing.',
-            fromId: DB.current.id,
-            fromName: DB.current.name,
-            toIds: [a.agentId]
+            type:'alert', icon:'⚠',
+            title:'Comp Plan UPDATED — Effective '+newPlan.effectiveDate,
+            body:'Your compensation plan for '+(newPlan.campaign||a.campaign)+' has been updated to v'+nextVersion+', effective '+newPlan.effectiveDate+'. Sales activated on/after that date use the new rates. Acknowledge the addendum to continue.',
+            fromId: DB.current.id, fromName: DB.current.name, toIds: [a.agentId]
           });
-          // Email + SMS via Brevo (best effort)
           if(typeof ppNotifyAgentOfCompChange === 'function'){
-            ppNotifyAgentOfCompChange(ag, p, /*isAddendum=*/true);
+            ppNotifyAgentOfCompChange(ag, newPlan, /*isAddendum=*/true);
           }
         }catch(e){ console.warn('[comp addendum notify]', e); }
       });
+      saveCompPlans();
       saveCompAssignments();
-      alert('✓ Plan updated to v'+p.version+'.\n\n⚠ '+affected.length+' agent'+(affected.length===1?' has':'s have')+' been flagged for addendum acknowledgment.\n\n• In-app notifications pushed.\n• Email + SMS sent via Brevo if API key is configured.\n• They will see a blocking screen until they acknowledge.');
+      window._ppEditingPlan = null;
+      alert('✓ NEW comp plan v'+nextVersion+' scheduled for '+newPlan.effectiveDate+'.\n\n• Old plan preserved (sales already paid keep their original rates).\n• '+affected.length+' agent(s) flagged for addendum acknowledgment.\n• In-app notifications + Brevo email/SMS sent.');
+      gotoPanel('comp-plans');
     } else {
-      alert('✓ Plan updated to v'+p.version+'.');
+      // Same effective date — true in-place edit (correcting a typo, etc.)
+      // SAFETY: only allow if no sales have been paid against THIS plan id
+      // already. (Sales paid through here would have an unchangeable snapshot.)
+      delete p.isNew;
+      p.updatedAt = new Date().toISOString();
+      p.version = (p.version||1) + 1;
+      var idx = COMP_PLANS.findIndex(function(x){return x.id===p.id;});
+      if(idx >= 0) COMP_PLANS[idx] = p;
+      saveCompPlans();
+
+      // Flag affected assignments for addendum acknowledgment
+      if(affected.length){
+        affected.forEach(function(a){
+          a.pendingAddendum = true;
+          a.addendumPlanVersion = p.version;
+          try{
+            var ag = DB.agents.find(function(x){return x.id===a.agentId;});
+            pushNotification({
+              type:'alert', icon:'⚠',
+              title:'Comp Plan UPDATED — Addendum Required',
+              body:'Your compensation plan for '+(p.campaign||a.campaign)+' has been updated to v'+p.version+'. You must log in and acknowledge the addendum before continuing.',
+              fromId: DB.current.id, fromName: DB.current.name, toIds: [a.agentId]
+            });
+            if(typeof ppNotifyAgentOfCompChange === 'function'){
+              ppNotifyAgentOfCompChange(ag, p, /*isAddendum=*/true);
+            }
+          }catch(e){ console.warn('[comp addendum notify]', e); }
+        });
+        saveCompAssignments();
+        alert('✓ Plan updated to v'+p.version+' (in-place, same effective date).\n\n⚠ '+affected.length+' agent'+(affected.length===1?' has':'s have')+' been flagged for addendum acknowledgment.\n\n• In-app notifications pushed.\n• Email + SMS sent via Brevo if API key is configured.');
+      } else {
+        alert('✓ Plan updated to v'+p.version+'.');
+      }
+      window._ppEditingPlan = null;
+      window._ppEditingPlanOriginal = null;
+      gotoPanel('comp-plans');
     }
-    window._ppEditingPlan = null;
-    window._ppEditingPlanOriginal = null;
-    gotoPanel('comp-plans');
   }
 }
 
@@ -29544,6 +29942,254 @@ function gmConfirmActivationUpload(batchId){
     preview.innerHTML = msg;
   }
   cdFlash('Activations applied — dashboards updated');
+}
+
+// ══════════════════════════════════════════════════════════
+//  PANEL: GM PRICELIST — Calvin 2026-05-03
+// ══════════════════════════════════════════════════════════
+// Owner + Inventory dept can manage. Effective-dated pricelist
+// for Gen Mobile devices. Old prices preserved as history; new
+// prices apply to NEW shipments only (existing inventory locked
+// at upload-time cost).
+function panelGMPricelist(){
+  var u = DB.current;
+  if(!canManageGMPricelist(u)){
+    return panelHeader('💲 Gen Mobile Pricelist') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner or Inventory team only.</div></div>';
+  }
+  // Make sure pricelist is loaded
+  if(!Array.isArray(GM_PRICELIST) || !GM_PRICELIST.length){
+    if(typeof gmPricelistLoad === 'function') gmPricelistLoad();
+  }
+
+  var today = new Date().toISOString().slice(0,10);
+
+  // Build a model-keyed map. Each key holds the CURRENT active row +
+  // an array of historical rows.
+  var byModel = {};
+  GM_PRICELIST.forEach(function(row){
+    var k = gmPricelistNormalize(row.model);
+    if(!byModel[k]) byModel[k] = {model: row.model, current:null, history:[]};
+    byModel[k].history.push(row);
+  });
+  Object.keys(byModel).forEach(function(k){
+    var entry = byModel[k];
+    // Sort history newest first
+    entry.history.sort(function(a,b){
+      var ea = (a.effectiveDate||'').slice(0,10), eb=(b.effectiveDate||'').slice(0,10);
+      if(ea < eb) return 1;
+      if(ea > eb) return -1;
+      return 0;
+    });
+    // Current = row with latest effectiveDate <= today AND no tombstone
+    var cur = entry.history.find(function(r){
+      return (r.effectiveDate||'').slice(0,10) <= today && !r.isTombstone;
+    });
+    entry.current = cur || entry.history[0];
+  });
+
+  var h = panelHeader('💲 Gen Mobile Pricelist');
+
+  // Action strip
+  h += '<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap;align-items:center">';
+  h += '<button onclick="gmPricelistShowAddForm()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">+ Add Device</button>';
+  h += '<button onclick="gmPricelistShowImportSheet()" style="padding:10px 18px;background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.3);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">📋 View Source Sheet</button>';
+  h += '<div style="flex:1"></div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">'+Object.keys(byModel).filter(function(k){return byModel[k].current && !byModel[k].current.isTombstone;}).length+' active models · '+GM_PRICELIST.length+' total rows (incl. history)</div>';
+  h += '</div>';
+
+  // Add-form area (toggled visible by gmPricelistShowAddForm)
+  h += '<div id="gmpl-add-form" style="display:none;margin-bottom:18px"></div>';
+
+  // Main table
+  h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Active Devices</div></div>';
+  h += '<div style="padding:0 0 10px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.84rem">';
+  h += '<thead><tr style="border-bottom:2px solid var(--border);background:var(--cream)">';
+  ['Model','Network','Screen','Specs','Price','CA/Tribal Credit','Non-CA Credit','Effective','Actions'].forEach(function(c){
+    h += '<th style="padding:8px 10px;text-align:left;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--brown);font-weight:700">'+c+'</th>';
+  });
+  h += '</tr></thead><tbody>';
+
+  var keys = Object.keys(byModel).sort(function(a,b){
+    return (byModel[a].current?byModel[a].current.price:0) - (byModel[b].current?byModel[b].current.price:0);
+  });
+  keys.forEach(function(k){
+    var entry = byModel[k];
+    var c = entry.current;
+    if(!c) return;
+    var isActive = !c.isTombstone;
+    var rowBg = isActive ? 'white' : 'rgba(153,27,27,.04)';
+    h += '<tr style="border-bottom:1px solid var(--border);background:'+rowBg+'">';
+    h += '<td style="padding:8px 10px;font-weight:'+(isActive?'600':'400')+';color:'+(isActive?'var(--brown)':'#991B1B')+'">'+_escapeHtml(c.model)+(isActive?'':' <em>(removed)</em>')+'</td>';
+    h += '<td style="padding:8px 10px">'+_escapeHtml(c.network||'')+'</td>';
+    h += '<td style="padding:8px 10px">'+_escapeHtml(c.screen||'')+'</td>';
+    h += '<td style="padding:8px 10px;font-family:monospace;font-size:.78rem">'+_escapeHtml(c.specs||'')+'</td>';
+    h += '<td style="padding:8px 10px;font-weight:700;color:#059669">$'+(c.price||0)+'</td>';
+    h += '<td style="padding:8px 10px;color:var(--muted)">$'+(c.caTribalCredit||0)+'</td>';
+    h += '<td style="padding:8px 10px;color:var(--muted)">$'+(c.nonCACredit||0)+'</td>';
+    h += '<td style="padding:8px 10px;font-family:monospace;font-size:.78rem;color:var(--muted)">'+(c.effectiveDate||'—')+'</td>';
+    h += '<td style="padding:8px 10px;white-space:nowrap">';
+    if(isActive){
+      h += '<button onclick="gmPricelistShowEditForm(\''+_escapeAttr(c.model)+'\')" style="padding:5px 10px;background:rgba(8,145,178,.1);border:1px solid rgba(8,145,178,.3);color:#0891b2;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:3px;cursor:pointer;margin-right:5px">Edit</button>';
+    }
+    if(entry.history.length > 1){
+      h += '<button onclick="gmPricelistShowHistory(\''+_escapeAttr(c.model)+'\')" style="padding:5px 10px;background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.25);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:3px;cursor:pointer;margin-right:5px">History ('+entry.history.length+')</button>';
+    }
+    if(isActive){
+      h += '<button onclick="gmPricelistRemoveModelClick(\''+_escapeAttr(c.model)+'\')" style="padding:5px 10px;background:rgba(153,27,27,.08);border:1px solid rgba(153,27,27,.25);color:#991B1B;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:3px;cursor:pointer">Remove</button>';
+    }
+    h += '</td></tr>';
+  });
+  if(!keys.length){
+    h += '<tr><td colspan="9" style="padding:30px;text-align:center;color:var(--muted);font-style:italic">No devices in pricelist. Click "+ Add Device" to start.</td></tr>';
+  }
+  h += '</tbody></table></div></div>';
+
+  // Info card explaining the system
+  h += '<div class="bo-card" style="margin-top:18px;border-left:4px solid #7c3aed">';
+  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;line-height:1.6;color:var(--brown)">';
+  h += '<strong style="color:#7c3aed">How pricing works:</strong><br>';
+  h += '• <strong>CSV uploads with a price</strong> — that price is locked into the device record at upload time.<br>';
+  h += '• <strong>CSV uploads WITHOUT a price</strong> — the system looks up the model in this pricelist (matched to the SO date) and uses that price.<br>';
+  h += '• <strong>Price changes</strong> — Add a new entry with a future effective date. Old inventory keeps its locked cost; only new shipments after that date get the new price.<br>';
+  h += '• <strong>Audit trail</strong> — Every price change creates a history row. Old prices are NEVER deleted.';
+  h += '</div></div>';
+
+  return h;
+}
+
+// Helpers for the panel
+
+function gmPricelistShowAddForm(){
+  var holder = document.getElementById('gmpl-add-form');
+  if(!holder) return;
+  var today = new Date().toISOString().slice(0,10);
+  var h = '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">+ Add Device</div></div>';
+  h += '<div style="padding:18px 20px"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px">';
+  h += _gmplField('Model *',          'gmpl-add-model',    'text',   '', 'e.g. Moto G 5G (24)');
+  h += _gmplField('Network',          'gmpl-add-network',  'text',   '', 'Sky / Orange / Sky/Orange');
+  h += _gmplField('Screen',           'gmpl-add-screen',   'text',   '', 'e.g. 6.5');
+  h += _gmplField('Specs',            'gmpl-add-specs',    'text',   '', 'e.g. 4GB/64GB');
+  h += _gmplField('Price ($) *',      'gmpl-add-price',    'number', '', '');
+  h += _gmplField('CA/Tribal Credit ($)', 'gmpl-add-caCredit',  'number', '55', '');
+  h += _gmplField('Non-CA Credit ($)',     'gmpl-add-noncaCredit','number', '40', '');
+  h += _gmplField('Effective Date *', 'gmpl-add-effDate',  'date',   today, '');
+  h += '</div>';
+  h += '<div style="margin-top:14px;display:flex;gap:10px">';
+  h += '<button onclick="gmPricelistSubmitAdd()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">✓ Save</button>';
+  h += '<button onclick="document.getElementById(\'gmpl-add-form\').style.display=\'none\'" style="padding:10px 18px;background:rgba(0,0,0,.05);border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Cancel</button>';
+  h += '</div></div></div>';
+  holder.innerHTML = h;
+  holder.style.display = 'block';
+  holder.scrollIntoView({behavior:'smooth', block:'center'});
+}
+
+function _gmplField(label, id, type, defVal, placeholder){
+  var s = '<div><label style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:700;display:block;margin-bottom:4px">'+label+'</label>';
+  s += '<input type="'+type+'" id="'+id+'" value="'+_escapeAttr(String(defVal||''))+'" placeholder="'+_escapeAttr(placeholder||'')+'" style="width:100%;padding:8px 10px;border:1.5px solid var(--sand);border-radius:6px;font-family:'+(type==='text'?'Barlow Condensed,sans-serif':'monospace')+';font-size:.85rem;background:white"></div>';
+  return s;
+}
+
+function _gmplGetField(id){
+  var el = document.getElementById(id);
+  return el ? el.value.trim() : '';
+}
+
+function gmPricelistSubmitAdd(){
+  if(!canManageGMPricelist(DB.current)){ alert('Permission denied.'); return; }
+  var model = _gmplGetField('gmpl-add-model');
+  var price = parseFloat(_gmplGetField('gmpl-add-price')||'0');
+  var effDate = _gmplGetField('gmpl-add-effDate');
+  if(!model){ alert('Model name is required.'); return; }
+  if(!(price >= 0)){ alert('Price must be a number.'); return; }
+  if(!effDate){ alert('Effective date is required.'); return; }
+  var existing = gmPricelistLookup(model, effDate);
+  if(existing && existing.effectiveDate === effDate){
+    if(!confirm('A pricelist row for "'+model+'" already exists with effective date '+effDate+'.\n\nReplace its values? (Inventory locked at this price is NOT affected — devCost is captured at upload time, not by reference.)')) return;
+  } else if(existing){
+    if(!confirm('"'+model+'" already has a price effective '+existing.effectiveDate+' ($'+existing.price+').\n\nThis will create a NEW pricelist entry effective '+effDate+'. Existing inventory keeps its locked cost; only new uploads after '+effDate+' will use the new price.\n\nProceed?')) return;
+  }
+  var newRow = {
+    model: model,
+    network: _gmplGetField('gmpl-add-network'),
+    screen: _gmplGetField('gmpl-add-screen'),
+    specs: _gmplGetField('gmpl-add-specs'),
+    price: price,
+    caTribalCredit: parseFloat(_gmplGetField('gmpl-add-caCredit')||'0'),
+    nonCACredit: parseFloat(_gmplGetField('gmpl-add-noncaCredit')||'0'),
+    effectiveDate: effDate
+  };
+  var result = gmPricelistAddOrSupersede(newRow, DB.current ? DB.current.id : null);
+  if(!result.ok){ alert('Failed: '+result.error); return; }
+  alert('✓ Saved.\n\n'+(result.action==='superseded-prior' ? 'New entry created. Old entry preserved as history.' : (result.action==='edited-in-place' ? 'Existing entry updated.' : 'New device added.')));
+  gotoPanel('gm-pricelist');
+}
+
+function gmPricelistShowEditForm(model){
+  if(!canManageGMPricelist(DB.current)){ alert('Permission denied.'); return; }
+  var current = gmPricelistLookup(model, new Date().toISOString().slice(0,10));
+  if(!current){ alert('Model not found.'); return; }
+  var holder = document.getElementById('gmpl-add-form');
+  if(!holder) return;
+  // Pre-fill the add form with current values; user picks an effective date
+  // and either edits in place (same date) or schedules a future change.
+  var h = '<div class="bo-card" style="border-left:4px solid #0891b2"><div class="bo-card-head"><div class="bo-card-title">Edit / Schedule Price Change — '+_escapeHtml(model)+'</div></div>';
+  h += '<div style="padding:18px 20px"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px">';
+  h += _gmplField('Model *',          'gmpl-add-model',    'text',   current.model, '');
+  h += _gmplField('Network',          'gmpl-add-network',  'text',   current.network||'', '');
+  h += _gmplField('Screen',           'gmpl-add-screen',   'text',   current.screen||'', '');
+  h += _gmplField('Specs',            'gmpl-add-specs',    'text',   current.specs||'', '');
+  h += _gmplField('Price ($) *',      'gmpl-add-price',    'number', current.price||0, '');
+  h += _gmplField('CA/Tribal Credit ($)', 'gmpl-add-caCredit',  'number', current.caTribalCredit||0, '');
+  h += _gmplField('Non-CA Credit ($)',     'gmpl-add-noncaCredit','number', current.nonCACredit||0, '');
+  h += _gmplField('Effective Date *', 'gmpl-add-effDate',  'date',   current.effectiveDate||'', '');
+  h += '</div>';
+  h += '<div style="margin-top:10px;padding:10px 14px;background:rgba(124,58,237,.05);border:1px solid rgba(124,58,237,.2);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5">';
+  h += '<strong>Same effective date</strong> = corrects the current entry in place.<br>';
+  h += '<strong>New effective date</strong> = schedules a price change. Old entry preserved as history.';
+  h += '</div>';
+  h += '<div style="margin-top:14px;display:flex;gap:10px">';
+  h += '<button onclick="gmPricelistSubmitAdd()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">✓ Save</button>';
+  h += '<button onclick="document.getElementById(\'gmpl-add-form\').style.display=\'none\'" style="padding:10px 18px;background:rgba(0,0,0,.05);border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">Cancel</button>';
+  h += '</div></div></div>';
+  holder.innerHTML = h;
+  holder.style.display = 'block';
+  holder.scrollIntoView({behavior:'smooth', block:'center'});
+}
+
+function gmPricelistShowHistory(model){
+  var rows = GM_PRICELIST.filter(function(r){
+    return gmPricelistNormalize(r.model) === gmPricelistNormalize(model);
+  });
+  if(!rows.length){ alert('No history.'); return; }
+  rows.sort(function(a,b){
+    var ea = (a.effectiveDate||'').slice(0,10), eb=(b.effectiveDate||'').slice(0,10);
+    if(ea < eb) return 1;
+    if(ea > eb) return -1;
+    return 0;
+  });
+  var msg = 'Price History — ' + model + '\n\n';
+  rows.forEach(function(r){
+    msg += '• ' + (r.effectiveDate||'(no date)') + '  $' + r.price;
+    if(r.isTombstone) msg += '  [REMOVED]';
+    if(r.supersededBy) msg += '  [superseded ' + (r.supersededAt||'').slice(0,10) + ']';
+    if(r.notes) msg += '\n      ' + r.notes;
+    msg += '\n';
+  });
+  alert(msg);
+}
+
+function gmPricelistRemoveModelClick(model){
+  if(!canManageGMPricelist(DB.current)){ alert('Permission denied.'); return; }
+  if(!confirm('Remove "'+model+'" from the pricelist?\n\nThis is a SOFT DELETE — the model is marked removed, but historical entries are preserved for audit trail. Existing inventory keeps its locked cost. New CSV uploads will no longer fall back to this model\'s price.\n\nProceed?')) return;
+  var result = gmPricelistRemoveModel(model, DB.current ? DB.current.id : null);
+  if(!result.ok){ alert('Failed: '+result.error); return; }
+  alert('✓ Removed.');
+  gotoPanel('gm-pricelist');
+}
+
+function gmPricelistShowImportSheet(){
+  alert('Source sheet:\n\nThis pricelist was seeded from the official May 2026 Gen Mobile Lifeline Device Pricing Sheet (15 devices, effective 2026-05-01).\n\nGen Mobile sends an updated sheet at the start of each pricing period. When you receive a new sheet:\n\n1. Click "Edit" on each device whose price changed\n2. Set the new effective date (typically the 1st of the month)\n3. Enter the new price + credits\n4. Save\n\nOld inventory keeps its locked cost. Only new CSV uploads after the effective date use the new price.');
 }
 
 // ── Transfers Panel ──
