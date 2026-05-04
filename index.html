@@ -23364,40 +23364,71 @@ function ppRenderCarrierPreview(carrier, parsed){
         h += '</tr></thead><tbody>';
         // Pull the audit trail for each deduction so we can show who actually paid
         (cascadeResult.audit||[]).filter(function(a){return a.kind==='deduction';}).forEach(function(a){
-          // ── Calvin 2026-05-04 fix ──
+          // ── Calvin 2026-05-04 v2 fix ──
           // The "Amount" column was showing the CARRIER rate (e.g. $28 cap for
-          // Tribal cancels). What Calvin actually wants here is what the NAMED
-          // AGENT on the row got paid for this deal — i.e. the amount being
-          // clawed back from THAT person specifically. The named agent is the
-          // first non-CARRYOVER-DEBT entry in the cascade trail. Total chain
-          // reversal still appears on the right in the Cascade Trail column.
-          var agentPaidCents = a.amountCents;  // fallback to carrier rate
-          if(a.trail && a.trail.length){
-            for(var ti=0; ti<a.trail.length; ti++){
-              if(a.trail[ti].role !== 'CARRYOVER DEBT'){
-                agentPaidCents = a.trail[ti].paidCents;
+          // Tribal cancels). What Calvin wants: show what the NAMED AGENT on
+          // the row got paid for THAT specific deal — i.e. what's being
+          // clawed back from THAT person.
+          //
+          // Lookup chain (most accurate first):
+          //   1) Look up the orderNum in past weeks' dealPaySplits and use
+          //      splits[enrollerAid] — that's exactly what the named agent
+          //      got paid for this deal originally.
+          //   2) If no historical split (e.g. the original deal wasn't in
+          //      our payroll history), use the trail's first non-debt
+          //      paidCents as the next best signal.
+          //   3) Fallback to carrier rate.
+          //
+          // The Cascade Trail column on the right still shows the full
+          // chain breakdown (TL/MM/CM absorptions and carryover debt).
+          var agentPaidCents = null;
+          var dealPay = (typeof payrollLookupDealPay === 'function')
+                        ? payrollLookupDealPay(a.orderNum, 'TruConnect')
+                        : null;
+          if(dealPay && dealPay.splits){
+            // Find the named agent's slice of THIS deal.
+            // a.agentName is the deduction's named agent. Resolve to aid.
+            var namedAid = null;
+            // Prefer the trail head's aid (already resolved by cascade)
+            if(a.trail && a.trail.length){
+              for(var ti=0; ti<a.trail.length; ti++){
+                if(a.trail[ti].role !== 'CARRYOVER DEBT'){
+                  namedAid = a.trail[ti].aid;
+                  break;
+                }
+              }
+            }
+            // Fall back to enrollerAid on the original deal
+            if(!namedAid && dealPay.enrollerAid) namedAid = dealPay.enrollerAid;
+            if(namedAid != null && dealPay.splits[namedAid] != null){
+              agentPaidCents = dealPay.splits[namedAid];
+            }
+          }
+          // Fallback 2: cascade trail
+          if(agentPaidCents == null && a.trail && a.trail.length){
+            for(var tj=0; tj<a.trail.length; tj++){
+              if(a.trail[tj].role !== 'CARRYOVER DEBT'){
+                agentPaidCents = a.trail[tj].paidCents;
                 break;
               }
             }
-            // If every trail entry is debt (agent had $0 to absorb), fall back
-            // to the trail head's pay attempt (which is 0 in that case).
             if(a.trail.every(function(t){return t.role==='CARRYOVER DEBT';})){
               agentPaidCents = 0;
             }
           }
+          // Fallback 3: carrier rate (legacy behavior)
+          if(agentPaidCents == null) agentPaidCents = a.amountCents;
+
           h += '<tr style="border-bottom:1px solid rgba(0,0,0,.05)">';
           h += '<td style="padding:7px 8px;font-size:.74rem"><strong style="color:#991B1B">'+a.type+'</strong>'+(a.isTribal?'<span style="font-size:.6rem;color:var(--muted);margin-left:6px">Tribal</span>':a.isTribal===false?'<span style="font-size:.6rem;color:var(--muted);margin-left:6px">NLAD</span>':'')+'</td>';
           h += '<td style="padding:7px 8px;font-size:.74rem">'+a.agentName+'</td>';
           h += '<td style="padding:7px 8px;font-family:monospace;font-size:.7rem;color:var(--muted)">'+(a.orderNum||'—')+'</td>';
-          // Amount column: agent's actual paid-back amount (what they got for this deal).
-          // If the agent paid back less than the full carrier rate, hint at the
-          // remaining cascade in a small tooltip-style note.
+          // Amount column: agent's actual pay for THIS deal.
+          // If the carrier rate is higher (cap-fill agent earned), show it as a hint.
           var carrierTotalCents = a.amountCents;
           h += '<td style="padding:7px 8px;text-align:right;font-weight:700;color:#991B1B">−$'+(agentPaidCents/100).toFixed(2);
-          if(carrierTotalCents > agentPaidCents && agentPaidCents > 0){
-            h += '<div style="font-size:.6rem;color:var(--muted);font-weight:400;margin-top:2px">of $'+(carrierTotalCents/100).toFixed(2)+' total</div>';
-          } else if(carrierTotalCents > 0 && agentPaidCents === 0){
-            h += '<div style="font-size:.6rem;color:var(--muted);font-weight:400;margin-top:2px">($'+(carrierTotalCents/100).toFixed(2)+' debt)</div>';
+          if(carrierTotalCents !== agentPaidCents && carrierTotalCents > 0){
+            h += '<div style="font-size:.6rem;color:var(--muted);font-weight:400;margin-top:2px">carrier $'+(carrierTotalCents/100).toFixed(2)+'</div>';
           }
           h += '</td>';
           h += '<td style="padding:7px 8px;font-size:.7rem">';
@@ -26819,6 +26850,79 @@ function panelInvDashboard(){
     h += '<div style="margin-bottom:14px;padding:8px 14px;background:rgba(0,53,148,.05);border:1px solid rgba(0,53,148,.2);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--blue);display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
     h += '<span><strong>Showing:</strong> '+(statusLabels[activeStatusFilter]||activeStatusFilter)+'</span>';
     h += '<button onclick="invDashSetStatusFilter(\'\')" style="margin-left:auto;background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer">✕ Clear status filter</button>';
+    h += '</div>';
+
+    // ── Calvin 2026-05-04 v2: INLINE IMEI panel ──
+    // The full inventory table is far below the screen (after Gen Mobile
+    // live card, quick actions, etc.). When Calvin clicks "Available"
+    // he expects to see the 8 IMEIs RIGHT THERE, not scroll to find them.
+    // This panel renders the matching devices immediately below the click,
+    // visible without scrolling.
+    var _quickStatusFilter = activeStatusFilter;
+    var _quickList = devices.filter(function(d){
+      if(_quickStatusFilter === 'available'){
+        var s = d.status;
+        return s==='available' || s==='unassigned' || !s;
+      }
+      if(_quickStatusFilter === 'assigned')  return d.status === 'assigned';
+      if(_quickStatusFilter === 'awaiting')  return d.status === 'uploaded';
+      if(_quickStatusFilter === 'expired')   return d.assignedDate && invDaysRemaining(d.expiryDate, d.assignedDate) < 0;
+      return true;
+    });
+    // Sort by urgency (most urgent first)
+    _quickList.sort(function(a,b){
+      var da = invDaysRemaining(a.expiryDate, a.assignedDate);
+      var db = invDaysRemaining(b.expiryDate, b.assignedDate);
+      if(da===null && db===null) return 0;
+      if(da===null) return 1;
+      if(db===null) return -1;
+      return da - db;
+    });
+    var _qLabel = (_quickStatusFilter === 'available') ? 'Available Devices'
+                : (_quickStatusFilter === 'assigned')  ? 'Devices Assigned to Agents'
+                : (_quickStatusFilter === 'awaiting')  ? 'Devices Awaiting Assignment'
+                : (_quickStatusFilter === 'expired')   ? 'Expired (Still Active) Devices'
+                : 'Devices';
+    var _qColor = (_quickStatusFilter === 'available') ? '#059669'
+                : (_quickStatusFilter === 'awaiting')  ? '#D97706'
+                : (_quickStatusFilter === 'expired')   ? '#CC0000'
+                : 'var(--blue)';
+    h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid '+_qColor+'">';
+    h += '<div class="bo-card-head"><div class="bo-card-title" style="color:'+_qColor+'">📋 '+_qLabel+' ('+_quickList.length+')</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">Showing '+Math.min(_quickList.length, 50)+' of '+_quickList.length+' &middot; sorted most urgent first</div></div>';
+    if(_quickList.length === 0){
+      h += '<div style="padding:30px 20px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.85rem;font-style:italic">No devices match this filter.</div>';
+    } else {
+      h += '<div style="overflow-x:auto"><table style="width:100%"><thead><tr>';
+      h += '<th style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)">IMEI</th>';
+      h += '<th style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)">Type</th>';
+      h += '<th style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)">Campaign</th>';
+      h += '<th style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)">Market</th>';
+      h += '<th style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)">Holder</th>';
+      h += '<th style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)">Expiry</th>';
+      h += '<th style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)">Time Left</th>';
+      h += '</tr></thead><tbody>';
+      _quickList.slice(0, 50).forEach(function(d){
+        var days = invDaysRemaining(d.expiryDate, d.assignedDate);
+        var rowBg = (days !== null && days < 0) ? 'rgba(204,0,0,.04)' : (days !== null && days <= 3) ? 'rgba(204,0,0,.02)' : '';
+        var holderLabel = d.holderName ? _escapeHtml(d.holderName)
+                        : (d.status === 'uploaded' ? '<em style="color:#D97706">Awaiting MM assignment</em>'
+                        : '<em style="color:var(--muted2)">Unassigned</em>');
+        h += '<tr style="background:'+rowBg+'">';
+        h += '<td style="font-family:monospace;font-size:.78rem;padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.05)">'+_escapeHtml(d.imei || '\u2014')+'</td>';
+        h += '<td style="font-size:.78rem;padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.05);text-transform:capitalize">'+_escapeHtml(d.type || '\u2014')+'</td>';
+        h += '<td style="font-size:.78rem;padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.05)">'+_escapeHtml(d.campaign || '\u2014')+'</td>';
+        h += '<td style="font-size:.78rem;padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.05)">'+_escapeHtml(d.market || '\u2014')+'</td>';
+        h += '<td style="font-size:.78rem;padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.05)">'+holderLabel+'</td>';
+        h += '<td style="font-size:.75rem;padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.05)">'+_escapeHtml(d.expiryDate || '\u2014')+'</td>';
+        h += '<td style="padding:7px 10px;border-bottom:1px solid rgba(0,0,0,.05)">'+invExpiryBadge(d)+'</td>';
+        h += '</tr>';
+      });
+      if(_quickList.length > 50){
+        h += '<tr><td colspan="7" style="text-align:center;padding:10px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);font-style:italic">Showing 50 of '+_quickList.length+' &middot; scroll down for the full searchable table</td></tr>';
+      }
+      h += '</tbody></table></div>';
+    }
     h += '</div>';
   }
 
