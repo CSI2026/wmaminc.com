@@ -42942,6 +42942,8 @@ function _p3Aggregate(weeks){
     revenue: 0,           // dollars
     payoutCents: 0,
     chargebackCents: 0,
+    deductionsCents: 0,   // separate track for deductions (was being conflated)
+    creditsCents: 0,
     activations: 0,
     byCarrier: {},        // {name:{revenue, payoutCents, chargebackCents, activations, weeks}}
     agentTotals: {}       // {aid:{name, acts, grossCents, carriers:Set}}
@@ -42949,29 +42951,67 @@ function _p3Aggregate(weeks){
   weeks.forEach(function(w){
     var c = w.carrier || 'Unknown';
     if(!out.byCarrier[c]){
-      out.byCarrier[c] = { revenue:0, payoutCents:0, chargebackCents:0, activations:0, weeks:0 };
+      out.byCarrier[c] = { revenue:0, payoutCents:0, chargebackCents:0, deductionsCents:0, creditsCents:0, activations:0, weeks:0 };
     }
     var bc = out.byCarrier[c];
     bc.weeks++;
-    if(w.invoice && typeof w.invoice.tcTotal === 'number'){
-      bc.revenue += w.invoice.tcTotal;
-      out.revenue += w.invoice.tcTotal;
+    // ── Calvin 2026-05-04 BUG FIX: Robust TC revenue fallback ──
+    // The Invoice tab's "TC Total" label isn't always present (some carrier
+    // emails ship with different totals row). Fall back to summing the
+    // component fields when tcTotal is missing or zero.
+    if(w.invoice){
+      var rev = 0;
+      if(typeof w.invoice.tcTotal === 'number' && w.invoice.tcTotal > 0){
+        rev = w.invoice.tcTotal;
+      } else {
+        // Component sum: agent revenue (NLAD + Tribal + TC Plus + Port In Spif)
+        // Note: cancels/upgrades/aging are deductions to the carrier invoice,
+        // not revenue, so we don't add them here. The P&L deduction view
+        // tracks those separately.
+        rev = (Number(w.invoice.nladLifeline)||0)
+            + (Number(w.invoice.tribalLifeline)||0)
+            + (Number(w.invoice.tcPlus)||0)
+            + (Number(w.invoice.portInSpif)||0);
+        if(rev === 0 && (typeof w.invoice.gmTotal === 'number')){
+          rev = w.invoice.gmTotal;  // Gen Mobile invoice format compat
+        }
+      }
+      bc.revenue += rev;
+      out.revenue += rev;
     }
     (w.rows||[]).forEach(function(r){
       var acts = (r.activations && r.activations.Total) || 0;
       bc.activations += acts;
       out.activations += acts;
-      bc.payoutCents += (r.grossCents || 0);
-      out.payoutCents += (r.grossCents || 0);
+      // ── Calvin 2026-05-04 BUG FIX: Use GROSS commission for P&L payout ──
+      // After payrollApplyDeductions cascade, row.grossCents is overwritten
+      // with NET pay (after deductions/credits). Owner P&L should show what
+      // the COMPANY paid in commission (gross), with chargebacks/deductions
+      // tracked separately. Without this fix, deductions get double-counted:
+      // once in chargebackCents and again as a reduction to payoutCents.
+      var payoutCents = (typeof r.grossCommissionCents === 'number')
+                        ? r.grossCommissionCents
+                        : (r.grossCents || 0);
+      bc.payoutCents += payoutCents;
+      out.payoutCents += payoutCents;
       bc.chargebackCents += (r.chargebackTotal || 0);
       out.chargebackCents += (r.chargebackTotal || 0);
+      // Track deductions/credits separately for cleaner P&L analytics
+      if(typeof r.deductionsApplied === 'number'){
+        bc.deductionsCents += r.deductionsApplied;
+        out.deductionsCents += r.deductionsApplied;
+      }
+      if(typeof r.creditsApplied === 'number'){
+        bc.creditsCents += r.creditsApplied;
+        out.creditsCents += r.creditsApplied;
+      }
       if(r.agentId){
         if(!out.agentTotals[r.agentId]){
           out.agentTotals[r.agentId] = { name:r.agentName||'?', acts:0, grossCents:0, carriers:{} };
         }
         var at = out.agentTotals[r.agentId];
         at.acts += acts;
-        at.grossCents += (r.grossCents || 0);
+        at.grossCents += payoutCents;
         at.carriers[c] = true;
       }
     });
