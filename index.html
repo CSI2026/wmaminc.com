@@ -11526,6 +11526,48 @@ function agentIdsInMyOrgEffective(user){
     if(matches) addIfNew(a.id);
   });
 
+  // ── Calvin 2026-05-03: MARKETS-based org walk ──
+  // Production data often has agents missing campaignManagerId / marketManagerId
+  // fields. Walk MARKETS as a second source of truth: if I'm CM of a market,
+  // every MM/TL/FA in that market's program sections is in my org. If I'm
+  // MM of a market, every TL/FA in that section is in my org. If I'm TL of
+  // a market, every FA in that section is in my org. This catches Jerry-as-MM
+  // even when his campaignManagerId isn't pointing at Tanita explicitly.
+  if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+    var role2 = user.role;
+    MARKETS.forEach(function(m){
+      if(!m || m.active === false) return;
+      var sections = (m.programs && typeof m.programs === 'object')
+        ? Object.keys(m.programs).map(function(k){return m.programs[k];})
+        : [];
+      sections.forEach(function(sec){
+        if(!sec) return;
+        var iAmTopOfThisSection = false;
+        if(role2 === 'Campaign Manager' || role2 === 'IBO'){
+          // I'm top of section if cmId or iboId is me
+          if(sec.cmId === user.id || sec.iboId === user.id) iAmTopOfThisSection = true;
+        } else if(role2 === 'Market Manager'){
+          if(sec.mmId === user.id) iAmTopOfThisSection = true;
+        } else if(role2 === 'Team Leader'){
+          if(Array.isArray(sec.tlIds) && sec.tlIds.indexOf(user.id) >= 0) iAmTopOfThisSection = true;
+        }
+        if(!iAmTopOfThisSection) return;
+
+        // Add everyone below me in this section
+        if(role2 === 'Campaign Manager' || role2 === 'IBO'){
+          if(sec.mmId) addIfNew(sec.mmId);
+          (sec.tlIds || []).forEach(addIfNew);
+          (sec.faIds || []).forEach(addIfNew);
+        } else if(role2 === 'Market Manager'){
+          (sec.tlIds || []).forEach(addIfNew);
+          (sec.faIds || []).forEach(addIfNew);
+        } else if(role2 === 'Team Leader'){
+          (sec.faIds || []).forEach(addIfNew);
+        }
+      });
+    });
+  }
+
   return ids;
 }
 
@@ -38999,6 +39041,25 @@ function commitPlaceInMarket(agentId){
     var errEl = document.getElementById('pimError');
     var role = agent.role;
 
+    // ── Calvin 2026-05-03 REWRITE ──
+    // Writes go into m.programs.lifeline.X (the section), NOT top-level
+    // fields. The dashboard MARKETS-walk (agentIdsInMyOrgEffective) reads
+    // section data — top-level was being mirrored from section, not the
+    // other way around, so old code's writes were silently overwritten.
+    // Also: FAs now correctly push into faIds, TLs inherit campaignManagerId
+    // from the section's cmId, FAs inherit both from section's mmId and cmId.
+
+    function _section(m){
+      if(!m.programs) m.programs = {};
+      if(!m.programs.lifeline) {
+        m.programs.lifeline = {cmId:null, mmId:null, iboId:null, tlIds:[], faIds:[], active:true, topRole:null};
+      }
+      var s = m.programs.lifeline;
+      if(!Array.isArray(s.tlIds)) s.tlIds = [];
+      if(!Array.isArray(s.faIds)) s.faIds = [];
+      return s;
+    }
+
     if(role === 'Campaign Manager' || role === 'IBO'){
       // Multi-select
       var marketIds = [];
@@ -39010,16 +39071,24 @@ function commitPlaceInMarket(agentId){
         if(errEl){ errEl.textContent = '⚠ Pick at least one market.'; errEl.style.display = 'block'; }
         return;
       }
-      // Update each market AND the agent's iboMarkets
+      // Update each market's lifeline SECTION + the agent's iboMarkets
       var iboKeys = [];
       marketIds.forEach(function(mid){
         var m = (MARKETS||[]).find(function(x){ return x.id === mid; });
         if(!m) return;
+        var sec = _section(m);
         if(role === 'Campaign Manager'){
+          sec.cmId = agent.id;
+          sec.topRole = 'cm';
+          sec.iboId = null;
+          // Mirror to top-level for legacy callers
           m.cmId = agent.id;
           m.topRole = 'cm';
           m.iboId = null;
         } else {
+          sec.iboId = agent.id;
+          sec.topRole = 'ibo';
+          sec.cmId = null;
           m.iboId = agent.id;
           m.topRole = 'ibo';
           m.cmId = null;
@@ -39036,9 +39105,13 @@ function commitPlaceInMarket(agentId){
       }
       var m1 = (MARKETS||[]).find(function(x){ return x.id === mid1; });
       if(!m1){ alert('Market not found.'); return; }
-      m1.mmId = agent.id;
+      var sec1 = _section(m1);
+      sec1.mmId = agent.id;
+      m1.mmId = agent.id;  // mirror
       m1.updatedAt = new Date().toISOString();
       agent.team = 'market-'+m1.id;
+      // MM inherits chain from section's CM/IBO if present
+      agent.campaignManagerId = sec1.cmId || null;
     } else if(role === 'Team Leader'){
       var mid2 = parseInt((document.getElementById('pimMarketSelect')||{}).value, 10) || 0;
       if(!mid2){
@@ -39047,11 +39120,15 @@ function commitPlaceInMarket(agentId){
       }
       var m2 = (MARKETS||[]).find(function(x){ return x.id === mid2; });
       if(!m2){ alert('Market not found.'); return; }
+      var sec2 = _section(m2);
+      if(sec2.tlIds.indexOf(agent.id) < 0) sec2.tlIds.push(agent.id);
+      // Mirror to top-level
       if(!Array.isArray(m2.tlIds)) m2.tlIds = [];
       if(m2.tlIds.indexOf(agent.id) < 0) m2.tlIds.push(agent.id);
       m2.updatedAt = new Date().toISOString();
       agent.team = 'market-'+m2.id;
-      agent.marketManagerId = m2.mmId || null;
+      agent.marketManagerId   = sec2.mmId || null;
+      agent.campaignManagerId = sec2.cmId || sec2.iboId || null;
     } else if(role === 'Field Agent'){
       var mid3 = parseInt((document.getElementById('pimMarketSelect')||{}).value, 10) || 0;
       var tid = parseInt((document.getElementById('pimTlSelect')||{}).value, 10) || 0;
@@ -39065,15 +39142,20 @@ function commitPlaceInMarket(agentId){
       }
       var m3 = (MARKETS||[]).find(function(x){ return x.id === mid3; });
       if(!m3){ alert('Market not found.'); return; }
+      var sec3 = _section(m3);
+      // ── CRITICAL: push FA into the section's faIds so dashboard org walk picks them up
+      if(sec3.faIds.indexOf(agent.id) < 0) sec3.faIds.push(agent.id);
+      m3.updatedAt = new Date().toISOString();
       agent.team = 'market-'+m3.id;
-      agent.teamLeaderId = tid;
-      agent.marketManagerId = m3.mmId || null;
-      agent.campaignManagerId = m3.cmId || null;
+      agent.teamLeaderId      = tid;
+      agent.marketManagerId   = sec3.mmId || null;
+      agent.campaignManagerId = sec3.cmId || sec3.iboId || null;
     }
 
     if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent);
     if(typeof saveToStorage === 'function') saveToStorage();
     if(typeof saveInventory === 'function') saveInventory();
+    if(typeof saveTeams === 'function') saveTeams();  // persist MARKETS too
     // Calvin 2026-05-02: re-sync legacy LIFELINE_TEAMS mirror
     if(typeof syncLegacyTeamMembers === 'function') syncLegacyTeamMembers();
 
