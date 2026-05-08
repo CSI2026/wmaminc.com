@@ -13596,6 +13596,152 @@ function initEmailJS(){ /* replaced by Brevo */ }
 
 
 
+// ════════════════════════════════════════════════════════════════════════
+//  AUDIT GPS + REVERSE GEOCODING  (Calvin 2026-05-07)
+//  Calvin's spec: capture the agent's PHYSICAL ADDRESS at audit submission
+//  via GPS + reverse geocoding (OpenStreetMap Nominatim — free, no key).
+//  If the agent denies location permission, the submission is BLOCKED
+//  for compliance.
+//
+//  Flow:
+//    1. Panel loads → audGpsRequest() fires immediately (sets status badge)
+//    2. Browser prompts agent for location permission
+//    3. On success: lat/lng captured → reverse-geocode → cache address
+//    4. window._audGps = { state, lat, lng, address, error }
+//    5. submitDailyAudit() reads window._audGps; blocks if state !== 'ok'
+// ════════════════════════════════════════════════════════════════════════
+
+// State machine: 'idle' → 'requesting' → 'geocoding' → 'ok' | 'denied' | 'error'
+function audGpsReset(){
+  window._audGps = { state: 'idle', lat: null, lng: null, address: '', error: '' };
+  audGpsRenderStatus();
+}
+
+function audGpsRenderStatus(){
+  var el = document.getElementById('aud-gps-status');
+  if(!el) return;
+  var g = window._audGps || { state: 'idle' };
+  var dot = '#D97706'; // amber
+  var msg = '';
+  if(g.state === 'idle'){
+    dot = '#D97706';
+    msg = 'Requesting location permission…';
+  } else if(g.state === 'requesting'){
+    dot = '#2a7de1';
+    msg = 'Acquiring GPS… please allow location when prompted';
+  } else if(g.state === 'geocoding'){
+    dot = '#2a7de1';
+    msg = 'Resolving address from GPS…';
+  } else if(g.state === 'ok'){
+    dot = '#059669';
+    msg = '✓ Location captured: ' + (g.address || (g.lat.toFixed(5) + ', ' + g.lng.toFixed(5)));
+  } else if(g.state === 'denied'){
+    dot = '#CC0000';
+    msg = '⚠ Location DENIED. You must allow location to submit. Tap Retry after enabling.';
+  } else if(g.state === 'error'){
+    dot = '#CC0000';
+    msg = '⚠ Location error: ' + (g.error || 'unknown') + '. Tap Retry.';
+  }
+  el.innerHTML = '<div style="width:10px;height:10px;border-radius:50%;background:'+dot+';flex-shrink:0"></div>'
+              + '<span style="flex:1">'+msg+'</span>'
+              + (g.state==='denied' || g.state==='error'
+                  ? ' <button onclick="audGpsRequest()" style="background:white;border:1px solid var(--border);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:4px 10px;border-radius:4px;cursor:pointer">↻ Retry</button>'
+                  : '');
+  // Also keep submit button enabled/disabled in sync
+  var btn = document.querySelector('button[onclick="submitDailyAudit()"]');
+  if(btn){
+    if(g.state === 'ok'){
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.style.cursor = 'pointer';
+    } else {
+      btn.disabled = true;
+      btn.style.opacity = '0.5';
+      btn.style.cursor = 'not-allowed';
+    }
+  }
+}
+
+function audGpsRequest(){
+  if(!navigator || !navigator.geolocation){
+    window._audGps = { state:'error', lat:null, lng:null, address:'',
+                       error:'Geolocation not supported on this device' };
+    audGpsRenderStatus();
+    return;
+  }
+  window._audGps = { state:'requesting', lat:null, lng:null, address:'', error:'' };
+  audGpsRenderStatus();
+  navigator.geolocation.getCurrentPosition(
+    function(pos){
+      var lat = pos.coords.latitude;
+      var lng = pos.coords.longitude;
+      window._audGps = { state:'geocoding', lat:lat, lng:lng, address:'', error:'' };
+      audGpsRenderStatus();
+      audGpsReverseGeocode(lat, lng);
+    },
+    function(err){
+      var state = (err && err.code === 1) ? 'denied' : 'error';
+      var msg = err && err.message ? err.message : 'unknown';
+      window._audGps = { state:state, lat:null, lng:null, address:'', error:msg };
+      audGpsRenderStatus();
+    },
+    { enableHighAccuracy:true, timeout:20000, maximumAge:0 }
+  );
+}
+
+// Reverse-geocode lat/lng → physical street address using OpenStreetMap
+// Nominatim (free, no API key required). Per their usage policy: max ~1
+// request/second, must include a User-Agent or Referer (we're a browser
+// so the Referer is sent automatically).
+function audGpsReverseGeocode(lat, lng){
+  var url = 'https://nominatim.openstreetmap.org/reverse?format=json&lat='
+          + encodeURIComponent(lat) + '&lon=' + encodeURIComponent(lng)
+          + '&addressdetails=1&zoom=18';
+  fetch(url, {
+    method: 'GET',
+    headers: { 'Accept': 'application/json' }
+  }).then(function(r){
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(function(json){
+    var address = '';
+    if(json && json.display_name){
+      address = json.display_name;
+    } else if(json && json.address){
+      // Fallback: assemble from address parts
+      var a = json.address;
+      address = [a.house_number, a.road, a.city||a.town||a.village, a.state, a.postcode]
+                .filter(Boolean).join(', ');
+    }
+    if(!address){
+      // Final fallback: lat/lng with a Google Maps link
+      address = lat.toFixed(5) + ', ' + lng.toFixed(5);
+    }
+    window._audGps = {
+      state: 'ok',
+      lat: lat,
+      lng: lng,
+      address: address,
+      error: ''
+    };
+    audGpsRenderStatus();
+  }).catch(function(err){
+    // Geocoding failed — keep lat/lng but mark address as missing
+    // We still let the agent submit because we have lat/lng (compliance
+    // can decode later). Address shows as "GPS captured (address unavailable)".
+    window._audGps = {
+      state: 'ok',
+      lat: lat,
+      lng: lng,
+      address: 'GPS ' + lat.toFixed(5) + ', ' + lng.toFixed(5)
+               + ' (street address lookup failed)',
+      error: ''
+    };
+    audGpsRenderStatus();
+  });
+}
+
+
 // ══ DAILY PHOTO AUDIT PANEL ══
 function panelDailyAudit(){
   var u = DB.current;
@@ -13718,13 +13864,18 @@ function panelDailyAudit(){
     +'Our company standard for each agent is <strong>6 or more qualified enrollments</strong> each work day. By submitting this Daily Photo Audit, you are committing to finish this work day with a minimum of <strong>6 or more enrollments today</strong>.'
     +'</div>';
 
-  // GPS status
-  h += '<div id="aud-gps-status" style="display:flex;align-items:center;gap:8px;font-family:\'Barlow Condensed\',sans-serif;font-size:.75rem;color:var(--muted);margin-bottom:16px">'
-    +'<div style="width:8px;height:8px;border-radius:50%;background:#D97706;flex-shrink:0"></div>'
-    +'Timestamp recorded automatically on submit'
+  // GPS status — Calvin 2026-05-07: now actually captures GPS + reverse-geocodes
+  // address. Submission is BLOCKED until state==='ok'.
+  h += '<div id="aud-gps-status" style="display:flex;align-items:center;gap:10px;font-family:\'Barlow Condensed\',sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:14px;padding:10px 14px;background:rgba(217,119,6,.06);border:1px solid rgba(217,119,6,.2);border-radius:8px">'
+    +'<div style="width:10px;height:10px;border-radius:50%;background:#D97706;flex-shrink:0"></div>'
+    +'<span style="flex:1">Requesting location permission…</span>'
     +'</div>';
+  // Schedule the GPS request after the panel has been inserted into DOM
+  setTimeout(function(){
+    if(typeof audGpsRequest === 'function') audGpsRequest();
+  }, 50);
 
-  h += '<button onclick="submitDailyAudit()" class="btn-fire" style="width:100%;justify-content:center;padding:14px;font-size:.82rem;letter-spacing:3px">Submit Daily Audit →</button>';
+  h += '<button onclick="submitDailyAudit()" disabled class="btn-fire" style="width:100%;justify-content:center;padding:14px;font-size:.82rem;letter-spacing:3px;opacity:.5;cursor:not-allowed">Submit Daily Audit →</button>';
   h += '<div id="aud-error" style="display:none;margin-top:12px;color:var(--red);font-family:\'Barlow Condensed\',sans-serif;font-size:.8rem;letter-spacing:1px"></div>';
 
   h += '</div></div>';
@@ -13822,12 +13973,26 @@ function submitDailyAudit(){
   var selfieMeta  = (typeof liveCamGetMeta === 'function') ? liveCamGetMeta('aud-selfie-cam')  : null;
   var stationMeta = (typeof liveCamGetMeta === 'function') ? liveCamGetMeta('aud-station-cam') : null;
 
+  // ── Calvin 2026-05-07: GPS+address capture is REQUIRED ──
+  // window._audGps is populated by audGpsRequest() when the panel loads.
+  // Submission is blocked until state==='ok' (we have lat/lng + address).
+  var gps = window._audGps || { state: 'idle' };
+
   var errors = [];
   if(!campaign) errors.push('Select a campaign');
   if(!setupEl)  errors.push('Select Event or Door to Door');
   if(!goal)     errors.push("Set today's goal");
   if(!selfieData)  errors.push('Take your selfie');
   if(!stationData) errors.push('Take your location photo');
+  if(gps.state !== 'ok'){
+    if(gps.state === 'denied'){
+      errors.push('Location permission DENIED — enable location for this site and tap Retry');
+    } else if(gps.state === 'error'){
+      errors.push('Location error: '+(gps.error||'unknown')+' — tap Retry');
+    } else {
+      errors.push('Location still acquiring — wait for green ✓ then submit');
+    }
+  }
 
   if(errors.length){
     var errEl = document.getElementById('aud-error');
@@ -13852,8 +14017,9 @@ function submitDailyAudit(){
     date:          now.toISOString().slice(0,10),
     submittedAt:   now.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
     submittedFull: now.toLocaleString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}),
-    location:      'Submitted ' + now.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
-    lat: null, lng: null,
+    location:      gps.address,        // ← real street address from Nominatim
+    lat:           gps.lat,
+    lng:           gps.lng,
     selfie:        selfieData,
     station:       stationData,
     // Provenance — proves photos were captured live (not uploaded from disk)
@@ -13910,6 +14076,8 @@ function finalizeAudit(data){
     submittedFull:data.submittedFull,
     submittedTs:  Date.now(),       // ms epoch — used for 7-day photo expiry
     location:     data.location,
+    lat:          data.lat || null,    // Calvin 2026-05-07 — GPS coords for map link
+    lng:          data.lng || null,
     selfie:       data.selfie || '',   // base64 data URL — viewable for 7 days
     station:      data.station || ''   // base64 data URL — viewable for 7 days
   };
@@ -13987,7 +14155,11 @@ function finalizeAudit(data){
       +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Campaign</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;color:#111">'+data.campaign+'</td></tr>'
       +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Work Type</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;color:#111">'+data.setup+'</td></tr>'
       +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Today\'s Goal</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:15px;font-weight:700;color:#059669">'+data.goal+' enrollments</td></tr>'
-      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">📍 Location</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#555">'+(data.location||'Not captured')+'</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">📍 Location</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#555">'+(data.location||'Not captured')
+      + ((data.lat != null && data.lng != null)
+          ? '<br><a href="https://www.google.com/maps?q='+data.lat+','+data.lng+'" style="font-size:12px;color:#003594;text-decoration:none">🗺️ View on Google Maps ('+data.lat.toFixed(5)+', '+data.lng.toFixed(5)+')</a>'
+          : '')
+      +'</td></tr>'
       +'<tr><td style="padding:12px 16px;font-size:13px;color:#888">⏰ Submitted</td><td style="padding:12px 16px;font-size:13px;color:#555">'+data.submittedFull+'</td></tr>'
       +'</table>'
       +(data.selfie||data.station ? '<div style="margin-top:20px;display:flex;gap:16px;flex-wrap:wrap">'
@@ -14153,11 +14325,19 @@ function panelAuditDetail(){
   h += _kv('Submitted At', rec.submittedAt || '—');
   h += _kv('Date', rec.date || '—');
   h += '</div>';
-  // Location row (full width)
-  if(rec.location){
+  // Location row (full width) — Calvin 2026-05-07: clickable Google Maps
+  // link when lat/lng available
+  if(rec.location || (rec.lat != null && rec.lng != null)){
+    var hasGps = (rec.lat != null && rec.lng != null);
+    var mapsUrl = hasGps
+      ? 'https://www.google.com/maps?q=' + encodeURIComponent(rec.lat + ',' + rec.lng)
+      : '';
     h += '<div style="padding:14px 28px;background:var(--offwhite);border-top:1px solid var(--border)">'
       +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">📍 Location</div>'
-      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--black)">'+_escapeHtml(rec.location)+'</div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--black);margin-bottom:'+(hasGps?'6px':'0')+'">'+_escapeHtml(rec.location || '(address unavailable)')+'</div>'
+      + (hasGps
+          ? '<a href="'+mapsUrl+'" target="_blank" rel="noopener" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--blue);text-decoration:none;font-weight:700">🗺️ Open in Google Maps · '+rec.lat.toFixed(5)+', '+rec.lng.toFixed(5)+' →</a>'
+          : '')
       +'</div>';
   }
   h += '</div>';
@@ -14280,7 +14460,11 @@ function sendAuditEmail(agentId, dateStr, submittedTs){
     +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Program</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;font-weight:700;color:#7c3aed">'+_escapeHtml(program)+'</td></tr>'
     +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Campaign</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;color:#111">'+_escapeHtml(rec.campaign || '—')+'</td></tr>'
     +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Work Setup</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;color:#111">'+_escapeHtml(rec.setup || '—')+'</td></tr>'
-    +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">📍 Location</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#555">'+_escapeHtml(rec.location || 'Not captured')+'</td></tr>'
+    +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">📍 Location</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#555">'+_escapeHtml(rec.location || 'Not captured')
+    + ((rec.lat != null && rec.lng != null)
+        ? '<br><a href="https://www.google.com/maps?q='+rec.lat+','+rec.lng+'" style="font-size:12px;color:#003594;text-decoration:none">🗺️ View on Google Maps ('+rec.lat.toFixed(5)+', '+rec.lng.toFixed(5)+')</a>'
+        : '')
+    +'</td></tr>'
     +'<tr><td style="padding:12px 16px;font-size:13px;color:#888">⏰ Submitted</td><td style="padding:12px 16px;font-size:13px;color:#555">'+_escapeHtml(rec.submittedFull || rec.submittedAt || '—')+'</td></tr>'
     +'</table>'
     +(rec.selfie||rec.station ? '<div style="margin-top:20px;display:flex;gap:16px;flex-wrap:wrap">'
