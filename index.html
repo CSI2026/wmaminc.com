@@ -6485,46 +6485,111 @@ function payrollApplyDeductions(opts){
       return;
     }
 
-    var owed  = d.amountCents;
     var trail = [];
-    // Walk the cascade
-    for(var i=0; i<chain.length && owed>0; i++){
-      var link = chain[i];
-      var b = ensureBalance(link.aid);
-      var pay = Math.min(b.remainingCents, owed);
-      if(pay > 0){
-        b.remainingCents  -= pay;
-        b.deductionsCents += pay;
-        b.cascade.push({
-          type:        d.type,
-          orderNum:    d.orderNum,
-          amountCents: pay,
-          fromName:    sourceLabel,          // named agent OR "(unassigned · market)"
-          paidByRole:  link.role,            // who actually absorbed it
-          paidByAid:   link.aid
-        });
-        trail.push({aid: link.aid, name: link.name, role: link.role, paidCents: pay});
-        owed -= pay;
-      }
-    }
-    // Anything left becomes carryover debt
-    if(owed > 0){
-      // For named agents, debt goes to that agent.
-      // For unassigned deductions, debt goes to the LAST link of the market chain
-      // (the highest-up CM/MM/IBO who couldn't cover this week).
-      var debtAid = agent ? agent.id : (chain[chain.length-1] && chain[chain.length-1].aid);
-      var debtName = agent ? agent.name : (chain[chain.length-1] && chain[chain.length-1].name);
-      if(debtAid){
-        var nb = ensureBalance(debtAid);
-        nb.carryoverCents += owed;
-        if(!dryRun){
-          payrollAddDebt(debtAid, owed,
-            d.type+(d.orderNum?' #'+d.orderNum:'')+(agent?' (uncovered after cascade)':' (unassigned · '+(d.market||'')+')'),
-            weekId);
+
+    // ── Calvin 2026-05-07: SPLIT-AWARE CHARGEBACK (locked spec) ──
+    // OLD behavior: cascade the entire $28 carrier rate through one agent's
+    // chain (agent → TL → MM → CM). This wrongly forced Brittany to absorb
+    // the full $28 even though she was only paid $23 — the other $5 went
+    // to Tanita as cap-fill.
+    //
+    // NEW behavior: if we have the original deal's pay splits saved
+    // (built at commit time by payrollBuildDealPayMap), charge each
+    // recipient their OWN slice of the original pay. Brittany owes $23
+    // because she was paid $23. Tanita owes $5 because she was paid $5.
+    // Each person's debt overflow is THEIRS — Brittany not having $23
+    // doesn't push the missing piece to Tanita, and vice versa.
+    //
+    // Fallback: if no split data exists (legacy weeks before splits were
+    // saved, or non-TC carriers), use the original cascade behavior so
+    // existing functionality is preserved.
+    var splitData = (typeof payrollLookupDealPay === 'function' && d.orderNum)
+                    ? payrollLookupDealPay(d.orderNum, carrier) : null;
+    var useSplitMath = !!(splitData && splitData.splits && splitData.splits.length);
+
+    if(useSplitMath){
+      // Charge each split-recipient their own share independently
+      splitData.splits.forEach(function(sp){
+        if(!sp || !sp.aid || !sp.cents) return;
+        var b = ensureBalance(sp.aid);
+        var personOwed = sp.cents;
+        var personPaid = Math.min(b.remainingCents, personOwed);
+        if(personPaid > 0){
+          b.remainingCents  -= personPaid;
+          b.deductionsCents += personPaid;
+          b.cascade.push({
+            type:        d.type,
+            orderNum:    d.orderNum,
+            amountCents: personPaid,
+            fromName:    sourceLabel,
+            paidByRole:  sp.role || 'split',
+            paidByAid:   sp.aid
+          });
+          var spName = (DB.agents.find(function(a){return a.id===sp.aid;})||{}).name || ('Agent '+sp.aid);
+          trail.push({aid: sp.aid, name: spName, role: sp.role || 'split', paidCents: personPaid});
         }
-        trail.push({aid: debtAid, name: debtName, role: 'CARRYOVER DEBT', paidCents: owed});
+        // Personal debt — only this person's missing piece, NOT cascade
+        var personDebt = personOwed - personPaid;
+        if(personDebt > 0){
+          var pb = ensureBalance(sp.aid);
+          pb.carryoverCents += personDebt;
+          if(!dryRun){
+            payrollAddDebt(sp.aid, personDebt,
+              d.type+(d.orderNum?' #'+d.orderNum:'')+' (own share, uncovered this week)',
+              weekId);
+          }
+          var pName = (DB.agents.find(function(a){return a.id===sp.aid;})||{}).name || ('Agent '+sp.aid);
+          trail.push({aid: sp.aid, name: pName, role: 'CARRYOVER DEBT', paidCents: personDebt});
+        }
+      });
+    } else {
+      // ── Legacy cascade fallback (preserves prior behavior) ──
+      // Used when:
+      //   (a) deal has no split data saved (older committed weeks)
+      //   (b) order number missing
+      //   (c) non-TC carriers (no per-deal split tracking yet)
+      //   (d) market-chain unassigned deductions
+      var owed = d.amountCents;
+      // Walk the cascade
+      for(var i=0; i<chain.length && owed>0; i++){
+        var link = chain[i];
+        var b = ensureBalance(link.aid);
+        var pay = Math.min(b.remainingCents, owed);
+        if(pay > 0){
+          b.remainingCents  -= pay;
+          b.deductionsCents += pay;
+          b.cascade.push({
+            type:        d.type,
+            orderNum:    d.orderNum,
+            amountCents: pay,
+            fromName:    sourceLabel,          // named agent OR "(unassigned · market)"
+            paidByRole:  link.role,            // who actually absorbed it
+            paidByAid:   link.aid
+          });
+          trail.push({aid: link.aid, name: link.name, role: link.role, paidCents: pay});
+          owed -= pay;
+        }
+      }
+      // Anything left becomes carryover debt
+      if(owed > 0){
+        // For named agents, debt goes to that agent.
+        // For unassigned deductions, debt goes to the LAST link of the market chain
+        // (the highest-up CM/MM/IBO who couldn't cover this week).
+        var debtAid = agent ? agent.id : (chain[chain.length-1] && chain[chain.length-1].aid);
+        var debtName = agent ? agent.name : (chain[chain.length-1] && chain[chain.length-1].name);
+        if(debtAid){
+          var nb = ensureBalance(debtAid);
+          nb.carryoverCents += owed;
+          if(!dryRun){
+            payrollAddDebt(debtAid, owed,
+              d.type+(d.orderNum?' #'+d.orderNum:'')+(agent?' (uncovered after cascade)':' (unassigned · '+(d.market||'')+')'),
+              weekId);
+          }
+          trail.push({aid: debtAid, name: debtName, role: 'CARRYOVER DEBT', paidCents: owed});
+        }
       }
     }
+
     audit.push({
       kind:        'deduction',
       type:        d.type,
@@ -6535,6 +6600,7 @@ function payrollApplyDeductions(opts){
       market:      d.market || '',
       amountCents: d.amountCents,
       isTribal:    d.isTribal,
+      splitMath:   useSplitMath,           // tells display layer the source of trail
       trail:       trail
     });
   });
@@ -23400,62 +23466,86 @@ function ppRenderCarrierPreview(carrier, parsed){
           //
           // The Cascade Trail column on the right still shows the full
           // chain breakdown (TL/MM/CM absorptions and carryover debt).
-          var agentPaidCents = null;
-          var dealPay = (typeof payrollLookupDealPay === 'function')
+          // ── Calvin 2026-05-07: SPLIT-AWARE display ──
+          // For deductions where the engine used split-math (a.splitMath===true),
+          // the trail already contains one entry per split-recipient with their
+          // actual paid-back amount + their personal debt overflow. We just
+          // render those entries.
+          //
+          // For legacy deductions (no split data found), the trail is the
+          // old cascade chain — agent → TL → MM → CM → debt. We render that
+          // and use the lookup chain to compute the named agent's slice.
+          var carrierTotalCents = a.amountCents;
+          var namedAgentSliceCents = null;
+          var dealPay = (typeof payrollLookupDealPay === 'function' && a.orderNum)
                         ? payrollLookupDealPay(a.orderNum, 'TruConnect')
                         : null;
-          if(dealPay && dealPay.splits){
-            // Find the named agent's slice of THIS deal.
-            // a.agentName is the deduction's named agent. Resolve to aid.
-            var namedAid = null;
-            // Prefer the trail head's aid (already resolved by cascade)
-            if(a.trail && a.trail.length){
-              for(var ti=0; ti<a.trail.length; ti++){
-                if(a.trail[ti].role !== 'CARRYOVER DEBT'){
-                  namedAid = a.trail[ti].aid;
-                  break;
-                }
+          if(dealPay && dealPay.splits && a.agentId != null){
+            // Sum up all split entries for the named agent (could be both
+            // a deduction and personal debt rows targeting same aid)
+            for(var sIdx=0; sIdx<dealPay.splits.length; sIdx++){
+              var spl = dealPay.splits[sIdx];
+              if(spl && spl.aid === a.agentId){
+                namedAgentSliceCents = (namedAgentSliceCents||0) + (spl.cents||0);
               }
             }
-            // Fall back to enrollerAid on the original deal
-            if(!namedAid && dealPay.enrollerAid) namedAid = dealPay.enrollerAid;
-            if(namedAid != null && dealPay.splits[namedAid] != null){
-              agentPaidCents = dealPay.splits[namedAid];
-            }
           }
-          // Fallback 2: cascade trail
-          if(agentPaidCents == null && a.trail && a.trail.length){
+          // Final fallback: trail head non-debt amount
+          if(namedAgentSliceCents == null && a.trail && a.trail.length){
             for(var tj=0; tj<a.trail.length; tj++){
-              if(a.trail[tj].role !== 'CARRYOVER DEBT'){
-                agentPaidCents = a.trail[tj].paidCents;
+              if(a.trail[tj].role !== 'CARRYOVER DEBT' && a.trail[tj].aid === a.agentId){
+                namedAgentSliceCents = a.trail[tj].paidCents;
                 break;
               }
             }
-            if(a.trail.every(function(t){return t.role==='CARRYOVER DEBT';})){
-              agentPaidCents = 0;
-            }
           }
-          // Fallback 3: carrier rate (legacy behavior)
-          if(agentPaidCents == null) agentPaidCents = a.amountCents;
+          if(namedAgentSliceCents == null) namedAgentSliceCents = carrierTotalCents;
 
           h += '<tr style="border-bottom:1px solid rgba(0,0,0,.05)">';
           h += '<td style="padding:7px 8px;font-size:.74rem"><strong style="color:#991B1B">'+a.type+'</strong>'+(a.isTribal?'<span style="font-size:.6rem;color:var(--muted);margin-left:6px">Tribal</span>':a.isTribal===false?'<span style="font-size:.6rem;color:var(--muted);margin-left:6px">NLAD</span>':'')+'</td>';
           h += '<td style="padding:7px 8px;font-size:.74rem">'+a.agentName+'</td>';
           h += '<td style="padding:7px 8px;font-family:monospace;font-size:.7rem;color:var(--muted)">'+(a.orderNum||'—')+'</td>';
-          // Amount column: agent's actual pay for THIS deal.
-          // If the carrier rate is higher (cap-fill agent earned), show it as a hint.
-          var carrierTotalCents = a.amountCents;
-          h += '<td style="padding:7px 8px;text-align:right;font-weight:700;color:#991B1B">−$'+(agentPaidCents/100).toFixed(2);
-          if(carrierTotalCents !== agentPaidCents && carrierTotalCents > 0){
+          // Amount column: named agent's own share (what they were paid for this deal)
+          h += '<td style="padding:7px 8px;text-align:right;font-weight:700;color:#991B1B">−$'+(namedAgentSliceCents/100).toFixed(2);
+          if(carrierTotalCents !== namedAgentSliceCents && carrierTotalCents > 0){
             h += '<div style="font-size:.6rem;color:var(--muted);font-weight:400;margin-top:2px">carrier $'+(carrierTotalCents/100).toFixed(2)+'</div>';
           }
           h += '</td>';
+          // Trail column: full breakdown of every party charged + their amounts
           h += '<td style="padding:7px 8px;font-size:.7rem">';
-          (a.trail||[]).forEach(function(t,idx){
-            if(idx>0) h += ' → ';
-            var color = t.role==='CARRYOVER DEBT' ? '#991B1B' : (idx===0 ? 'var(--brown)' : '#7c3aed');
-            h += '<span style="color:'+color+'"><strong>'+t.name+'</strong> $'+(t.paidCents/100).toFixed(2)+(t.role==='CARRYOVER DEBT'?' <em>(debt)</em>':'')+'</span>';
-          });
+          if(a.splitMath){
+            // Group trail entries by aid so we can show "Name $X" once per person,
+            // appending "(debt)" if there's a CARRYOVER DEBT row for them.
+            var byAid = {};
+            (a.trail||[]).forEach(function(t){
+              if(!byAid[t.aid]) byAid[t.aid] = { name: t.name, paid: 0, debt: 0 };
+              if(t.role === 'CARRYOVER DEBT'){
+                byAid[t.aid].debt += t.paidCents;
+              } else {
+                byAid[t.aid].paid += t.paidCents;
+              }
+            });
+            var keys = Object.keys(byAid);
+            keys.forEach(function(aid, idx){
+              if(idx > 0) h += ' &middot; ';
+              var entry = byAid[aid];
+              var color = (entry.debt > 0 && entry.paid === 0) ? '#991B1B' : 'var(--brown)';
+              h += '<span style="color:'+color+'"><strong>'+entry.name+'</strong> ';
+              if(entry.paid > 0) h += '$'+(entry.paid/100).toFixed(2);
+              if(entry.debt > 0){
+                if(entry.paid > 0) h += ' + ';
+                h += '<em style="color:#991B1B">$'+(entry.debt/100).toFixed(2)+' debt</em>';
+              }
+              h += '</span>';
+            });
+          } else {
+            // Legacy cascade trail
+            (a.trail||[]).forEach(function(t,idx){
+              if(idx>0) h += ' → ';
+              var color = t.role==='CARRYOVER DEBT' ? '#991B1B' : (idx===0 ? 'var(--brown)' : '#7c3aed');
+              h += '<span style="color:'+color+'"><strong>'+t.name+'</strong> $'+(t.paidCents/100).toFixed(2)+(t.role==='CARRYOVER DEBT'?' <em>(debt)</em>':'')+'</span>';
+            });
+          }
           h += '</td></tr>';
         });
         h += '</tbody></table></div></div>';
