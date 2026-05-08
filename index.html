@@ -1986,6 +1986,12 @@ const LINKS = [
     badge:'REQUIRED DAILY',
     url:'#daily-audit', onclick:'gotoPanel(\'daily-audit\')' },
 
+  { id:'ll-encroach', cat:'Lifeline — Daily Required', prog:'Lifeline', color:'purple',
+    ic:'🚧', nm:'Encroachment Report',
+    ds:'File when another agent is attempting to set up beside you. Sent to compliance with photos/video.',
+    badge:'AS NEEDED',
+    url:'#encroachment', onclick:'gotoPanel(\'encroachment\')' },
+
   { id:'ll-zoom',     cat:'Lifeline — Daily Required', prog:'Lifeline', color:'blue',
     ic:'📞', nm:'National Team Call',
     ds:'Monday mornings 9:00AM CST',
@@ -2035,6 +2041,12 @@ const LINKS = [
     ds:'Submit your daily setup photo. Required Mon–Fri before 9AM.',
     badge:'REQUIRED DAILY',
     url:'#daily-audit', onclick:'gotoPanel(\'daily-audit\')' },
+
+  { id:'ql-encroach', cat:'Lifeline — Daily Required', prog:'Lifeline', color:'purple',
+    ic:'🚧', nm:'Encroachment Report',
+    ds:'Report another agent setting up beside you. Sent to compliance.',
+    badge:'AS NEEDED',
+    url:'#encroachment', onclick:'gotoPanel(\'encroachment\')' },
 
 
   // ── General (all agents) ──
@@ -13933,6 +13945,14 @@ function panelDailyAudit(){
       +'<div style="font-family:\'Bebas Neue\',sans-serif;font-size:1.6rem;letter-spacing:2px;color:#059669;margin-bottom:6px">Audit Submitted!</div>'
       +'<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:.85rem;color:var(--muted)">Submitted at '+todayAudit.submittedAt+' &nbsp;|&nbsp; '+todayAudit.location+'</div>'
       +'</div>';
+    // ── Calvin 2026-05-08: Encroachment shortcut for Lifeline agents ──
+    if(typeof _agentHasLifeline === 'function' && _agentHasLifeline(u)){
+      h += '<div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.3);border-radius:10px;padding:18px 22px;text-align:center;margin-bottom:16px">'
+        +'<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:#7c3aed;margin-bottom:4px">Another agent setting up beside you?</div>'
+        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:12px">File an Encroachment Report — sent directly to compliance with photos/video.</div>'
+        +'<button onclick="gotoPanel(\'encroachment\')" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 20px;border-radius:5px;cursor:pointer;font-weight:700">🚧 File Encroachment Report</button>'
+        +'</div>';
+    }
     h += '</div>';
     return h;
   }
@@ -14814,7 +14834,756 @@ function downloadAuditArchiveCsv(){
 
 
 
-// ══ FORM BUILDER PANEL (Admin only) ══
+// ════════════════════════════════════════════════════════════════════════
+//  ENCROACHMENT REPORT  (Calvin 2026-05-08)
+//  Lifeline-only audit. Filed when a competing/other agent tries to set
+//  up beside our agent at an event/door. Captures: DPA gate, campaign,
+//  competitor info, what they said, photos/short videos. Sends Brevo
+//  email to the configured carrier compliance address (cc info@wmaminc).
+//  Notifies Owner + admin + office + TL/MM/CM upline.
+//
+//  Storage: localStorage 'wmam_encroach' — same shape pattern as audits
+//  (7-day photo/video retention, metadata permanent).
+//
+//  Per-campaign compliance email map: localStorage 'wmam_compliance_emails'
+//  Owner-only settings panel at #compliance-settings.
+// ════════════════════════════════════════════════════════════════════════
+
+// Helper: agent has Lifeline program?
+function _agentHasLifeline(a){
+  if(!a) return false;
+  if(Array.isArray(a.programs) && a.programs.length){
+    return a.programs.indexOf('Lifeline') >= 0;
+  }
+  return a.program === 'Lifeline';
+}
+
+// Compliance email lookup — per-campaign address. Defaults to info@wmaminc.com.
+function _complianceEmailFor(campaign){
+  try{
+    var raw = localStorage.getItem('wmam_compliance_emails');
+    if(raw){
+      var map = JSON.parse(raw) || {};
+      if(map[campaign]) return map[campaign];
+    }
+  }catch(e){}
+  return 'info@wmaminc.com';
+}
+
+function _saveComplianceEmails(map){
+  try{
+    localStorage.setItem('wmam_compliance_emails', JSON.stringify(map||{}));
+  }catch(e){}
+}
+function _loadComplianceEmails(){
+  try{
+    var raw = localStorage.getItem('wmam_compliance_emails');
+    return raw ? (JSON.parse(raw)||{}) : {};
+  }catch(e){ return {}; }
+}
+
+// ── Encroachment panel (the form) ──
+function panelEncroachment(){
+  var u = DB.current;
+  var h = '';
+  h += panelHeader('🚧 Encroachment Report');
+
+  // Lifeline-only access
+  if(!_agentHasLifeline(u) && !isOwner(u) && u.role !== 'admin'){
+    h += '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">'
+      +'<div style="font-size:1.6rem;margin-bottom:10px">🔒</div>'
+      +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;margin-bottom:6px">Lifeline Program Only</div>'
+      +'<div style="font-size:.85rem">Encroachment reports are part of the Lifeline compliance flow.</div>'
+      +'</div>';
+    return h;
+  }
+
+  var now = new Date();
+  var today = now.toISOString().slice(0,10);
+
+  // Has the agent done their DPA today?
+  var audits = [];
+  try{ audits = JSON.parse(localStorage.getItem('wmam_audits')||'[]'); }catch(e){}
+  var dpaToday = audits.find(function(a){ return a.agentId === u.id && a.date === today; });
+
+  h += '<div style="max-width:680px;margin:0 auto">';
+
+  // Header banner
+  h += '<div style="background:linear-gradient(135deg,#7c3aed,#5b21b6);border-radius:10px;padding:22px 26px;margin-bottom:18px;color:white">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.6rem;letter-spacing:3px;margin-bottom:4px">Encroachment Report</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.85;letter-spacing:1px">File when another agent is attempting to set up beside you</div>'
+    +'</div>';
+
+  // ── DPA GATE ──
+  // Per Calvin: first question is "Did you do your DPA today?" — if no,
+  // hard-block and redirect them to the Daily Audit panel.
+  h += '<div class="bo-card" style="padding:22px 24px;margin-bottom:18px">';
+  h += '<label class="f-label" style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;margin-bottom:10px;display:block">1. Did you complete your Daily Photo Audit today?</label>';
+  if(dpaToday){
+    // Pre-confirmed because it's already on file
+    h += '<div style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:8px;padding:10px 14px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:#059669"><strong>✓ Yes</strong> — DPA already on file for today ('+_escapeHtml(dpaToday.submittedAt)+')</div>';
+    h += '<input type="hidden" id="enc-dpa-yes" value="1">';
+  } else {
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">'
+      +'<label style="display:flex;align-items:center;gap:8px;padding:11px 18px;border:2px solid var(--border);border-radius:8px;cursor:pointer;font-family:\'Barlow Condensed\',sans-serif;font-size:.9rem"><input type="radio" name="enc-dpa" value="yes" style="accent-color:#7c3aed;width:16px;height:16px" onchange="encDpaGate(this.value)"> ✓ Yes</label>'
+      +'<label style="display:flex;align-items:center;gap:8px;padding:11px 18px;border:2px solid var(--border);border-radius:8px;cursor:pointer;font-family:\'Barlow Condensed\',sans-serif;font-size:.9rem"><input type="radio" name="enc-dpa" value="no" style="accent-color:#CC0000;width:16px;height:16px" onchange="encDpaGate(this.value)"> ✗ No</label>'
+      +'</div>';
+    h += '<div id="enc-dpa-block" style="display:none;margin-top:12px;background:rgba(204,0,0,.08);border:2px solid rgba(204,0,0,.4);border-radius:8px;padding:14px 16px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:#991B1B">'
+      +'<strong>⛔ STOP.</strong> You must complete your Daily Photo Audit before filing an Encroachment Report. '
+      +'<button onclick="gotoPanel(\'daily-audit\')" style="margin-top:8px;background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700;display:block">→ Go to Daily Audit</button>'
+      +'</div>';
+  }
+  h += '</div>';
+
+  // ── REST OF FORM (hidden until DPA confirmed; visible when dpaToday exists) ──
+  var formDisplay = dpaToday ? 'block' : 'none';
+  h += '<div id="enc-form-rest" style="display:'+formDisplay+'">';
+
+  // LOCATION REQUIRED warning (same as daily audit)
+  h += '<div style="background:linear-gradient(135deg,#CC0000,#8b0000);border-radius:10px;padding:14px 18px;margin-bottom:16px;color:white;display:flex;gap:12px;align-items:flex-start">'
+    +'<div style="font-size:1.5rem;flex-shrink:0;line-height:1">📍</div>'
+    +'<div style="flex:1">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:2px;margin-bottom:4px">LOCATION ACCESS REQUIRED</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.76rem;line-height:1.45">Tap <strong>ALLOW</strong> when your browser asks. The encroachment location is captured for compliance.</div>'
+    +'</div>'
+    +'</div>';
+
+  // GPS status
+  h += '<div id="enc-gps-status" style="display:flex;align-items:center;gap:10px;font-family:\'Barlow Condensed\',sans-serif;font-size:.82rem;color:var(--black);margin-bottom:14px;padding:12px 14px;background:rgba(217,119,6,.1);border:2px solid rgba(217,119,6,.4);border-radius:8px;font-weight:600">'
+    +'<div style="width:11px;height:11px;border-radius:50%;background:#D97706;flex-shrink:0;animation:audGpsPulse 1.2s ease-in-out infinite"></div>'
+    +'<span style="flex:1">📡 Requesting your location… please tap <strong>Allow</strong> when your browser asks.</span>'
+    +'</div>';
+  // Schedule the GPS request — reuse the audit GPS pipeline but to a separate
+  // status element (we point the renderer at this panel by mounting it on
+  // window._encGps which mirrors window._audGps semantics)
+  setTimeout(function(){ if(typeof encGpsRequest === 'function') encGpsRequest(); }, 60);
+
+  h += '<div class="bo-card" style="padding:22px 24px;margin-bottom:18px">';
+
+  // Q2: Campaign
+  h += '<label class="f-label">2. Which campaign were you working? *</label>'
+    +'<select class="f-select" id="enc-campaign" style="margin-bottom:14px">'
+    +'<option value="">-- Select Campaign --</option>'
+    +'<option value="TruConnect">TruConnect</option>'
+    +'<option value="Excess Telecom">Excess Telecom</option>'
+    +'<option value="Gen Mobile">Gen Mobile</option>'
+    +'<option value="Assurance Wireless">Assurance Wireless</option>'
+    +'</select>';
+
+  // Q3: Did you ask them to leave?
+  h += '<label class="f-label">3. Did you ask the other agent to leave? *</label>'
+    +'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'
+    +'<label style="display:flex;align-items:center;gap:8px;padding:10px 16px;border:2px solid var(--border);border-radius:8px;cursor:pointer;font-family:\'Barlow Condensed\',sans-serif;font-size:.85rem"><input type="radio" name="enc-asked" value="yes" style="accent-color:#7c3aed;width:16px;height:16px"> ✓ Yes</label>'
+    +'<label style="display:flex;align-items:center;gap:8px;padding:10px 16px;border:2px solid var(--border);border-radius:8px;cursor:pointer;font-family:\'Barlow Condensed\',sans-serif;font-size:.85rem"><input type="radio" name="enc-asked" value="no" style="accent-color:var(--muted);width:16px;height:16px"> ✗ No / Did not ask</label>'
+    +'</div>';
+
+  // Q4: What did they say? (multi-select checkboxes + Other)
+  h += '<label class="f-label">4. What did the other agent say or do? <span style="font-size:.7rem;color:var(--muted);font-weight:400">(check all that apply)</span></label>'
+    +'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px;margin-bottom:10px">';
+  var responses = [
+    'Refused to leave',
+    'Said they had permission from the venue',
+    'Said they were here first',
+    'Said they are with the same carrier',
+    'Said they are with a different carrier',
+    'Got verbally aggressive',
+    'Threatened or intimidated me',
+    'Agreed and left peacefully',
+    'Ignored me / did not respond',
+    'Tried to take customers I was helping'
+  ];
+  responses.forEach(function(r, i){
+    h += '<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.78rem;background:white">'
+      +'<input type="checkbox" name="enc-response" value="'+_escapeHtml(r)+'" style="accent-color:#7c3aed;width:14px;height:14px">'
+      +'<span>'+r+'</span>'
+      +'</label>';
+  });
+  h += '</div>';
+  h += '<label class="f-label" style="font-size:.7rem;color:var(--muted);margin-top:6px">Other / additional details (optional)</label>'
+    +'<textarea id="enc-response-other" rows="2" style="width:100%;padding:10px 12px;border:1.5px solid var(--sand);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;margin-bottom:14px;resize:vertical" placeholder="Anything else they said or did…"></textarea>';
+
+  // Q5: Other agent info
+  h += '<label class="f-label">5. Information about the other agent <span style="font-size:.7rem;color:var(--muted);font-weight:400">(if known)</span></label>'
+    +'<input type="text" id="enc-other-name" placeholder="Other agent\'s name" style="width:100%;padding:10px 12px;border:1.5px solid var(--sand);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;margin-bottom:8px">'
+    +'<input type="text" id="enc-other-company" placeholder="Their company / master agent / carrier" style="width:100%;padding:10px 12px;border:1.5px solid var(--sand);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;margin-bottom:8px">'
+    +'<input type="text" id="enc-other-badge" placeholder="Their badge ID (if visible)" style="width:100%;padding:10px 12px;border:1.5px solid var(--sand);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;margin-bottom:14px">';
+
+  h += '</div>'; // end card
+
+  // Attachments — up to 4 photos OR short videos
+  h += '<div class="bo-card" style="padding:22px 24px;margin-bottom:18px">';
+  h += '<label class="f-label">6. Attach photos or short videos <span style="font-size:.7rem;color:var(--muted);font-weight:400">(up to 4 files, max 5MB each)</span></label>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:10px">📎 Photos or short clips. Files larger than 5MB will be flagged because they may not fit in the compliance email.</div>';
+  h += '<input type="file" id="enc-attachments" accept="image/*,video/*" multiple style="display:block;margin-bottom:8px;font-family:Barlow Condensed,sans-serif" onchange="encOnAttachmentsChange(this)">';
+  h += '<div id="enc-attach-list" style="display:flex;flex-direction:column;gap:6px;margin-top:8px"></div>';
+  h += '</div>';
+
+  // Submit button (initially disabled — re-enabled when GPS state ok)
+  h += '<button id="enc-submit-btn" onclick="submitEncroachment()" disabled class="btn-fire" style="width:100%;justify-content:center;padding:14px;font-size:.82rem;letter-spacing:3px;opacity:.5;cursor:not-allowed;background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white">📍 Waiting for Location…</button>';
+  h += '<div id="enc-error" style="display:none;margin-top:12px;color:var(--red);font-family:\'Barlow Condensed\',sans-serif;font-size:.85rem"></div>';
+
+  h += '</div>'; // end enc-form-rest
+  h += '</div>'; // end max-width wrapper
+
+  // Defensive: clear stale GPS state when panel mounts
+  setTimeout(function(){ window._encGps = { state:'idle', lat:null, lng:null, address:'', error:'' }; }, 0);
+
+  return h;
+}
+
+// DPA gate handler — toggle the rest of the form on/off
+function encDpaGate(value){
+  var rest = document.getElementById('enc-form-rest');
+  var block = document.getElementById('enc-dpa-block');
+  if(value === 'yes'){
+    if(rest) rest.style.display = 'block';
+    if(block) block.style.display = 'none';
+    // Fire GPS request now since the form just became visible
+    setTimeout(function(){ if(typeof encGpsRequest === 'function') encGpsRequest(); }, 60);
+  } else {
+    if(rest) rest.style.display = 'none';
+    if(block) block.style.display = 'block';
+  }
+}
+
+// ── GPS pipeline for encroachment form (parallel to audit's audGps*) ──
+// Reuses the same Nominatim/BigDataCloud helpers but stores state on
+// window._encGps and renders to #enc-gps-status. Submission of the
+// encroachment requires _encGps.state === 'ok' (real address captured).
+function encGpsRenderStatus(){
+  var el = document.getElementById('enc-gps-status');
+  if(!el) return;
+  var g = window._encGps || { state: 'idle' };
+  var dot = '#D97706';
+  var msg = '';
+  var bgColor = 'rgba(217,119,6,.1)';
+  var borderColor = 'rgba(217,119,6,.4)';
+  var pulse = false;
+  if(g.state === 'idle' || g.state === 'requesting'){
+    dot = '#D97706'; pulse = true;
+    msg = '📡 Acquiring GPS… please tap <strong>Allow</strong> when your browser asks.';
+  } else if(g.state === 'geocoding'){
+    dot = '#2a7de1'; pulse = true;
+    bgColor = 'rgba(42,125,225,.08)';
+    borderColor = 'rgba(42,125,225,.35)';
+    msg = '📍 Got your GPS — looking up your street address…';
+  } else if(g.state === 'ok'){
+    dot = '#059669';
+    bgColor = 'rgba(5,150,105,.08)';
+    borderColor = 'rgba(5,150,105,.4)';
+    msg = '✓ Location captured: <strong>' + g.address + '</strong>';
+  } else if(g.state === 'denied'){
+    dot = '#CC0000';
+    bgColor = 'rgba(204,0,0,.08)';
+    borderColor = 'rgba(204,0,0,.5)';
+    msg = '⛔ <strong>LOCATION DENIED.</strong> You must allow location to submit. On iPhone: Settings → Safari → Location → Allow. Then tap Retry.';
+  } else if(g.state === 'no-address'){
+    dot = '#CC0000';
+    bgColor = 'rgba(204,0,0,.08)';
+    borderColor = 'rgba(204,0,0,.5)';
+    msg = '⚠ <strong>Could not look up your street address.</strong> Check your data/wifi connection and tap Retry.';
+  } else if(g.state === 'error'){
+    dot = '#CC0000';
+    bgColor = 'rgba(204,0,0,.08)';
+    borderColor = 'rgba(204,0,0,.5)';
+    msg = '⚠ <strong>Location error:</strong> ' + (g.error || 'unknown') + '. Tap Retry.';
+  }
+  el.style.background = bgColor;
+  el.style.borderColor = borderColor;
+  el.innerHTML = '<div style="width:11px;height:11px;border-radius:50%;background:'+dot+';flex-shrink:0'+(pulse?';animation:audGpsPulse 1.2s ease-in-out infinite':'')+'"></div>'
+              + '<span style="flex:1">'+msg+'</span>'
+              + (g.state==='denied' || g.state==='error' || g.state==='no-address'
+                  ? ' <button onclick="encGpsRequest()" style="background:white;border:1px solid var(--border);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 14px;border-radius:5px;cursor:pointer;font-weight:700">↻ Retry</button>'
+                  : '');
+  var btn = document.getElementById('enc-submit-btn');
+  if(btn){
+    if(g.state === 'ok'){
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.style.cursor = 'pointer';
+      btn.textContent = 'Submit Encroachment Report →';
+    } else if(g.state === 'denied'){
+      btn.disabled = true; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed';
+      btn.textContent = '⛔ Location Denied — Cannot Submit';
+    } else if(g.state === 'no-address'){
+      btn.disabled = true; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed';
+      btn.textContent = '⚠ Address Lookup Failed — Cannot Submit';
+    } else if(g.state === 'error'){
+      btn.disabled = true; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed';
+      btn.textContent = '⚠ Location Error — Cannot Submit';
+    } else if(g.state === 'geocoding'){
+      btn.disabled = true; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed';
+      btn.textContent = '📍 Looking up address…';
+    } else {
+      btn.disabled = true; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed';
+      btn.textContent = '📍 Waiting for Location…';
+    }
+  }
+}
+
+function encGpsRequest(){
+  if(!navigator || !navigator.geolocation){
+    window._encGps = { state:'error', lat:null, lng:null, address:'', error:'Geolocation not supported on this device' };
+    encGpsRenderStatus();
+    return;
+  }
+  window._encGps = { state:'requesting', lat:null, lng:null, address:'', error:'' };
+  encGpsRenderStatus();
+  navigator.geolocation.getCurrentPosition(
+    function(pos){
+      var lat = pos.coords.latitude;
+      var lng = pos.coords.longitude;
+      window._encGps = { state:'geocoding', lat:lat, lng:lng, address:'', error:'' };
+      encGpsRenderStatus();
+      _encGpsReverseGeocode(lat, lng, 0);
+    },
+    function(err){
+      var state = (err && err.code === 1) ? 'denied' : 'error';
+      var msg = err && err.message ? err.message : 'unknown';
+      window._encGps = { state:state, lat:null, lng:null, address:'', error:msg };
+      encGpsRenderStatus();
+    },
+    { enableHighAccuracy:true, timeout:20000, maximumAge:0 }
+  );
+}
+
+function _encGpsReverseGeocode(lat, lng, attempt){
+  attempt = attempt || 0;
+  // Reuse the same primary/secondary helpers built for the daily audit
+  _audGpsTryNominatim(lat, lng).then(function(addr){
+    if(addr){ _encGpsSetOk(lat, lng, addr); return; }
+    return _audGpsTryBigDataCloud(lat, lng).then(function(addr2){
+      if(addr2){ _encGpsSetOk(lat, lng, addr2); return; }
+      _encGpsHandleAllFailed(lat, lng, attempt);
+    });
+  }).catch(function(){
+    _audGpsTryBigDataCloud(lat, lng).then(function(addr2){
+      if(addr2){ _encGpsSetOk(lat, lng, addr2); }
+      else { _encGpsHandleAllFailed(lat, lng, attempt); }
+    }).catch(function(){
+      _encGpsHandleAllFailed(lat, lng, attempt);
+    });
+  });
+}
+
+function _encGpsSetOk(lat, lng, address){
+  if(!address || !String(address).trim()){
+    _encGpsHandleAllFailed(lat, lng, 1);
+    return;
+  }
+  window._encGps = { state:'ok', lat:lat, lng:lng, address:address, error:'' };
+  encGpsRenderStatus();
+}
+
+function _encGpsHandleAllFailed(lat, lng, attempt){
+  if(attempt < 1){
+    window._encGps = { state:'geocoding', lat:lat, lng:lng, address:'', error:'Address lookup retrying (network issue)…' };
+    encGpsRenderStatus();
+    setTimeout(function(){ _encGpsReverseGeocode(lat, lng, attempt+1); }, 3000);
+    return;
+  }
+  window._encGps = { state:'no-address', lat:lat, lng:lng, address:'', error:'Could not look up your street address — check your connection and tap Retry' };
+  encGpsRenderStatus();
+}
+
+// Attachments handling — read files into base64 + warn if >5MB
+function encOnAttachmentsChange(input){
+  var files = input.files ? Array.from(input.files).slice(0, 4) : [];
+  var listEl = document.getElementById('enc-attach-list');
+  if(!listEl) return;
+  if(files.length > 4){
+    listEl.innerHTML = '<div style="color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.8rem">⚠ Only the first 4 files will be attached.</div>';
+  } else {
+    listEl.innerHTML = '';
+  }
+  window._encAttachments = [];
+  files.forEach(function(file, idx){
+    var sizeMB = (file.size / (1024*1024));
+    var oversized = sizeMB > 5;
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid '+(oversized?'rgba(204,0,0,.4)':'var(--border)')+';border-radius:6px;background:'+(oversized?'rgba(204,0,0,.05)':'rgba(124,58,237,.04)')+';font-family:Barlow Condensed,sans-serif;font-size:.78rem';
+    row.innerHTML = (oversized?'⚠':'📎') + ' <strong>'+_escapeHtml(file.name)+'</strong> '
+      + '<span style="color:var(--muted);font-size:.72rem">('+sizeMB.toFixed(1)+' MB · '+_escapeHtml(file.type||'unknown')+')</span>'
+      + (oversized?'<span style="color:#CC0000;margin-left:auto;font-weight:700">may not fit in email</span>':'<span style="margin-left:auto;color:#059669">✓ ready</span>');
+    listEl.appendChild(row);
+
+    var reader = new FileReader();
+    reader.onload = function(e){
+      window._encAttachments.push({
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        sizeMB: sizeMB,
+        oversized: oversized,
+        dataUrl: e.target.result
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function submitEncroachment(){
+  var u = DB.current;
+  var gps = window._encGps || { state:'idle' };
+
+  // Gather inputs
+  var dpaConfirmed = !!document.getElementById('enc-dpa-yes')
+                  || (document.querySelector('input[name="enc-dpa"]:checked')||{}).value === 'yes';
+  var campaign = (document.getElementById('enc-campaign')||{}).value || '';
+  var asked = (document.querySelector('input[name="enc-asked"]:checked')||{}).value || '';
+  var responses = Array.from(document.querySelectorAll('input[name="enc-response"]:checked')).map(function(c){return c.value;});
+  var responseOther = (document.getElementById('enc-response-other')||{}).value.trim() || '';
+  var otherName = (document.getElementById('enc-other-name')||{}).value.trim() || '';
+  var otherCompany = (document.getElementById('enc-other-company')||{}).value.trim() || '';
+  var otherBadge = (document.getElementById('enc-other-badge')||{}).value.trim() || '';
+  var attachments = window._encAttachments || [];
+
+  var errors = [];
+  if(!dpaConfirmed) errors.push('Confirm Daily Photo Audit was completed today');
+  if(!campaign)     errors.push('Select a campaign');
+  if(!asked)        errors.push('Did you ask the agent to leave?');
+  if(responses.length === 0 && !responseOther) errors.push('Indicate what they said or did');
+  if(gps.state !== 'ok'){
+    if(gps.state === 'denied')          errors.push('Location DENIED — tap Retry');
+    else if(gps.state === 'no-address') errors.push('Address lookup failed — tap Retry');
+    else if(gps.state === 'error')      errors.push('Location error — tap Retry');
+    else                                 errors.push('Location still acquiring — wait for green ✓');
+  }
+
+  if(errors.length){
+    var errEl = document.getElementById('enc-error');
+    if(errEl){
+      errEl.innerHTML = '⚠ <strong>Cannot submit:</strong> ' + errors.join(' &middot; ');
+      errEl.style.display = 'block';
+      errEl.style.background = 'rgba(204,0,0,.08)';
+      errEl.style.border = '2px solid rgba(204,0,0,.4)';
+      errEl.style.borderRadius = '8px';
+      errEl.style.padding = '12px 16px';
+      errEl.style.fontWeight = '700';
+    }
+    if(gps.state !== 'ok'){
+      var b = document.getElementById('enc-gps-status');
+      if(b){
+        try{ b.scrollIntoView({behavior:'smooth', block:'center'}); }catch(e){}
+        var ob = b.style.background, obr = b.style.borderColor;
+        b.style.background = 'rgba(204,0,0,.2)';
+        b.style.borderColor = '#CC0000';
+        setTimeout(function(){ b.style.background = ob; b.style.borderColor = obr; }, 600);
+      }
+    }
+    return;
+  }
+
+  var btn = document.getElementById('enc-submit-btn');
+  if(btn){ btn.disabled = true; btn.textContent = 'Submitting…'; }
+
+  var now = new Date();
+  var report = {
+    id: Date.now() * 1000 + Math.floor(Math.random()*1000),
+    agentId: u.id,
+    agentName: u.name,
+    program: 'Lifeline',
+    campaign: campaign,
+    askedToLeave: asked,
+    responses: responses,
+    responseOther: responseOther,
+    otherName: otherName,
+    otherCompany: otherCompany,
+    otherBadge: otherBadge,
+    location: gps.address,
+    lat: gps.lat,
+    lng: gps.lng,
+    date: now.toISOString().slice(0,10),
+    submittedAt: now.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
+    submittedFull: now.toLocaleString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}),
+    submittedTs: Date.now(),
+    attachments: attachments  // full base64 (kept 7 days, then stripped)
+  };
+
+  // Save to localStorage with same 7-day retention as audits
+  try{
+    var arr = JSON.parse(localStorage.getItem('wmam_encroach')||'[]');
+    arr.unshift(report);
+    var cutoff = Date.now() - 7*24*60*60*1000;
+    arr = arr.map(function(r){
+      if(r.submittedTs && r.submittedTs < cutoff && r.attachments && r.attachments.length){
+        return Object.assign({}, r, { attachments: [], attachmentsExpired: true });
+      }
+      return r;
+    });
+    if(arr.length > 5000) arr = arr.slice(0, 5000);
+    localStorage.setItem('wmam_encroach', JSON.stringify(arr));
+  }catch(e){ console.warn('Encroachment save failed:', e); }
+
+  // ── Notify Owner + admin + office + TL/MM/CM upline ──
+  var recips = (typeof getNotifRecipients === 'function') ? getNotifRecipients(u.id) : [];
+  pushNotification({
+    type:     'audit',
+    icon:     '🚧',
+    title:    'Encroachment Report — ' + u.name,
+    body:     u.name + ' filed an encroachment report at ' + report.submittedAt
+              + '. Campaign: ' + campaign
+              + '. Other agent: ' + (otherName || 'unknown') + (otherCompany ? ' ('+otherCompany+')' : '')
+              + '. Location: ' + report.location,
+    fromId:   u.id,
+    fromName: u.name,
+    formType: 'encroachment',
+    data:     { kind:'encroachment', agentId:u.id, reportId:report.id, submittedTs:report.submittedTs },
+    toIds:    recips
+  });
+
+  // ── Send Brevo email to compliance + cc info@wmaminc.com ──
+  var complianceEmail = _complianceEmailFor(campaign);
+  if(BREVO_API_KEY){
+    var attachmentsHtml = '';
+    if(attachments.length){
+      attachmentsHtml = '<div style="margin-top:18px"><p style="font-size:13px;color:#444;font-weight:700;margin:0 0 8px">📎 Attachments:</p>'
+        + attachments.map(function(a){
+            // Embed images inline; for videos, link by data URL (Brevo accepts attachment array but
+            // embedded data URLs work for inline images at least)
+            if(a.type && a.type.indexOf('image/') === 0){
+              return '<div style="margin-bottom:10px"><p style="font-size:11px;color:#888;margin:0 0 4px">'+_escapeHtml(a.name)+' ('+a.sizeMB.toFixed(1)+' MB)</p>'
+                +'<img src="'+a.dataUrl+'" style="max-width:100%;border:1px solid #ddd;border-radius:6px;max-height:380px"></div>';
+            } else {
+              // Video — link to data URL won't work in most email clients, so flag
+              return '<div style="margin-bottom:10px;padding:10px;background:#f8f9fa;border:1px solid #ddd;border-radius:6px"><p style="font-size:12px;color:#444;margin:0">🎥 <strong>'+_escapeHtml(a.name)+'</strong> — '+a.sizeMB.toFixed(1)+' MB '+(a.oversized?'<span style="color:#CC0000">(too large for email — provided to internal team)</span>':'')+'</p></div>';
+            }
+          }).join('')
+        +'</div>';
+    }
+
+    var responseLines = responses.length ? responses.map(function(r){return '• '+_escapeHtml(r);}).join('<br>') : '<em>(none specified)</em>';
+    if(responseOther) responseLines += '<br><br><strong>Additional:</strong> '+_escapeHtml(responseOther);
+
+    var emailBody = '<div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto">'
+      +'<div style="background:#7c3aed;padding:20px;text-align:center">'
+      +'<h2 style="color:white;margin:0;letter-spacing:2px">🚧 Encroachment Report</h2>'
+      +'<p style="color:rgba(255,255,255,.85);margin:4px 0 0;font-size:13px">'+_escapeHtml(report.submittedFull)+'</p>'
+      +'</div>'
+      +'<div style="padding:24px;background:#f8f9fa">'
+      +'<table style="width:100%;border-collapse:collapse;background:white;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08)">'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888;width:38%">Filed by</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;font-weight:700;color:#003594">'+_escapeHtml(u.name)+'</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Program</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;font-weight:700;color:#7c3aed">Lifeline</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Campaign</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;color:#111">'+_escapeHtml(campaign)+'</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">Asked them to leave?</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:14px;color:#111">'+_escapeHtml(asked === 'yes' ? 'Yes' : 'No / Did not ask')+'</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888;vertical-align:top">What they said / did</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#111">'+responseLines+'</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888;vertical-align:top">Other agent</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#111">'
+        + (otherName    ? '<strong>Name:</strong> '+_escapeHtml(otherName)+'<br>' : '')
+        + (otherCompany ? '<strong>Company:</strong> '+_escapeHtml(otherCompany)+'<br>' : '')
+        + (otherBadge   ? '<strong>Badge:</strong> '+_escapeHtml(otherBadge) : '')
+        + (!otherName && !otherCompany && !otherBadge ? '<em>(not provided)</em>' : '')
+      +'</td></tr>'
+      +'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#888">📍 Location</td><td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:13px;color:#555">'+_escapeHtml(report.location)
+        + ((report.lat != null && report.lng != null) ? '<br><a href="https://www.google.com/maps?q='+report.lat+','+report.lng+'" style="font-size:12px;color:#003594;text-decoration:none">🗺️ View on Google Maps</a>' : '')
+      +'</td></tr>'
+      +'<tr><td style="padding:12px 16px;font-size:13px;color:#888">⏰ Submitted</td><td style="padding:12px 16px;font-size:13px;color:#555">'+_escapeHtml(report.submittedFull)+'</td></tr>'
+      +'</table>'
+      + attachmentsHtml
+      +'<div style="margin-top:18px;padding:14px;background:rgba(124,58,237,.06);border-left:4px solid #7c3aed;font-size:13px;color:#444">'
+      +'<strong style="color:#7c3aed">Compliance Note:</strong> This report was filed by the WMAMinc agent named above at the location and time shown. The agent confirmed their Daily Photo Audit was completed before submitting this report. Photos and any short video clips attached were captured at the time of the encroachment.'
+      +'</div>'
+      +'</div>'
+      +'<div style="background:#5b21b6;padding:14px;text-align:center;color:rgba(255,255,255,.7);font-size:12px">WMAMinc. Compliance &nbsp;|&nbsp; ONE TEAM. ONE DREAM.</div>'
+      +'</div>';
+
+    // Recipient + cc info@wmaminc.com always
+    var toList = [{ email: complianceEmail, name: campaign + ' Compliance' }];
+    if(complianceEmail.toLowerCase() !== 'info@wmaminc.com'){
+      toList.push({ email:'info@wmaminc.com', name:'WMAMinc Owner' });
+    }
+
+    fetch('https://api.brevo.com/v3/smtp/email',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','api-key':BREVO_API_KEY},
+      body:JSON.stringify({
+        sender:{name:'WMAMinc. Compliance',email:'info@wmaminc.com'},
+        to: toList,
+        subject:'Encroachment Report — '+u.name+' — '+campaign+' — '+(report.submittedAt||report.date),
+        htmlContent:emailBody
+      })
+    }).then(function(r){
+      if(!r.ok){ console.warn('[encroachment] Brevo HTTP '+r.status); }
+    }).catch(function(e){ console.warn('[encroachment] Brevo failed:', e); });
+  }
+
+  alert('✅ Encroachment Report submitted.\n\nCompliance has been notified. Your upline and the back office have been alerted.');
+  gotoPanel('home');
+}
+
+
+// ── Encroachment detail panel ──
+function _findEncroachReport(reportId){
+  try{
+    var arr = JSON.parse(localStorage.getItem('wmam_encroach')||'[]');
+    return arr.find(function(r){ return r.id === reportId; }) || null;
+  }catch(e){ return null; }
+}
+
+function viewEncroachmentDetail(reportId){
+  window._encViewKey = reportId;
+  gotoPanel('encroach-detail');
+}
+
+function panelEncroachDetail(){
+  var u = DB.current;
+  var rec = _findEncroachReport(window._encViewKey);
+  var h = '';
+  h += panelHeader('🚧 Encroachment Report Detail');
+
+  if(!rec){
+    h += '<div class="bo-card" style="padding:40px;text-align:center">'
+      +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;letter-spacing:2px;color:var(--muted)">Report not found</div>'
+      +'<button onclick="gotoPanel(\'notifications\')" style="margin-top:20px;background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 18px;border-radius:5px;cursor:pointer">← Back</button>'
+      +'</div>';
+    return h;
+  }
+
+  // Permission gate — same as audit detail
+  var canView = isOwner(u) || u.role === 'admin'
+                || (typeof isOfficeRole === 'function' && isOfficeRole(u))
+                || u.id === rec.agentId
+                || (function(){
+                  var recips = getNotifRecipients(rec.agentId);
+                  return recips.indexOf(u.id) >= 0;
+                })();
+  if(!canView){
+    h += '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 You don\'t have permission to view this report.</div>';
+    return h;
+  }
+
+  var attachmentsExpired = !!rec.attachmentsExpired;
+  var hasAttachments = !!(rec.attachments && rec.attachments.length);
+
+  h += '<div class="bo-card" style="padding:0;overflow:hidden;margin-bottom:18px">';
+  h += '<div style="background:linear-gradient(135deg,#7c3aed,#5b21b6);padding:24px 28px;color:white">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:3px;margin-bottom:4px">'+_escapeHtml(rec.agentName)+'</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.85;letter-spacing:1px">'+_escapeHtml(rec.submittedFull || '')+'</div>'
+    +'</div>';
+  h += '<div style="padding:20px 28px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px">';
+  function _kv(label, val, color){
+    return '<div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">'+label+'</div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.9rem;font-weight:700;color:'+(color||'var(--black)')+'">'+val+'</div>'
+      +'</div>';
+  }
+  h += _kv('Program',  'Lifeline', '#7c3aed');
+  h += _kv('Campaign', _escapeHtml(rec.campaign || '—'));
+  h += _kv('Asked to leave?', rec.askedToLeave === 'yes' ? '✓ Yes' : '✗ No', rec.askedToLeave === 'yes' ? '#059669' : '#CC0000');
+  h += _kv('Submitted', _escapeHtml(rec.submittedAt || '—'));
+  h += '</div>';
+
+  // Location row
+  if(rec.location){
+    var hasGps = (rec.lat != null && rec.lng != null);
+    var mapsUrl = hasGps ? 'https://www.google.com/maps?q='+encodeURIComponent(rec.lat+','+rec.lng) : '';
+    h += '<div style="padding:14px 28px;background:var(--offwhite);border-top:1px solid var(--border)">'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">📍 Location</div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--black);margin-bottom:'+(hasGps?'6px':'0')+'">'+_escapeHtml(rec.location)+'</div>'
+      + (hasGps ? '<a href="'+mapsUrl+'" target="_blank" rel="noopener" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:#7c3aed;text-decoration:none;font-weight:700">🗺️ Open in Google Maps →</a>' : '')
+      +'</div>';
+  }
+  h += '</div>';
+
+  // Other agent info
+  if(rec.otherName || rec.otherCompany || rec.otherBadge){
+    h += '<div class="bo-card" style="padding:18px 24px;margin-bottom:18px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:10px">Other Agent</div>';
+    if(rec.otherName)    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;margin-bottom:4px"><strong>Name:</strong> '+_escapeHtml(rec.otherName)+'</div>';
+    if(rec.otherCompany) h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;margin-bottom:4px"><strong>Company:</strong> '+_escapeHtml(rec.otherCompany)+'</div>';
+    if(rec.otherBadge)   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem"><strong>Badge:</strong> '+_escapeHtml(rec.otherBadge)+'</div>';
+    h += '</div>';
+  }
+
+  // Responses
+  h += '<div class="bo-card" style="padding:18px 24px;margin-bottom:18px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:10px">What the other agent said / did</div>';
+  if(rec.responses && rec.responses.length){
+    h += '<ul style="margin:0 0 8px 18px;padding:0;font-family:Barlow Condensed,sans-serif;font-size:.85rem;line-height:1.6">';
+    rec.responses.forEach(function(r){ h += '<li>'+_escapeHtml(r)+'</li>'; });
+    h += '</ul>';
+  }
+  if(rec.responseOther){
+    h += '<div style="margin-top:6px;padding:10px 14px;background:var(--offwhite);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;line-height:1.5"><strong>Additional:</strong> '+_escapeHtml(rec.responseOther)+'</div>';
+  }
+  h += '</div>';
+
+  // Attachments
+  if(attachmentsExpired){
+    h += '<div class="bo-card" style="padding:30px;text-align:center;background:rgba(204,0,0,.04);border:1px dashed rgba(204,0,0,.3);margin-bottom:18px">'
+      +'<div style="font-size:2rem;margin-bottom:8px">🗄️</div>'
+      +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px;color:#991B1B">Attachments archived (older than 7 days)</div>'
+      +'</div>';
+  } else if(hasAttachments){
+    h += '<div class="bo-card" style="padding:20px;margin-bottom:18px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:12px">📎 Attachments ('+rec.attachments.length+')</div>';
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px">';
+    rec.attachments.forEach(function(a){
+      if(a.type && a.type.indexOf('image/') === 0){
+        h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">'+_escapeHtml(a.name)+' &middot; '+a.sizeMB.toFixed(1)+' MB</div>'
+          +'<img src="'+a.dataUrl+'" style="width:100%;border-radius:8px;border:1px solid var(--border);max-height:480px;object-fit:contain;background:#000"></div>';
+      } else if(a.type && a.type.indexOf('video/') === 0){
+        h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">🎥 '+_escapeHtml(a.name)+' &middot; '+a.sizeMB.toFixed(1)+' MB</div>'
+          +'<video controls style="width:100%;border-radius:8px;border:1px solid var(--border);max-height:480px;background:#000"><source src="'+a.dataUrl+'" type="'+_escapeHtml(a.type)+'"></video></div>';
+      } else {
+        h += '<div style="padding:14px;background:var(--offwhite);border-radius:8px;font-family:Barlow Condensed,sans-serif;font-size:.78rem">📎 '+_escapeHtml(a.name)+' &middot; '+a.sizeMB.toFixed(1)+' MB</div>';
+      }
+    });
+    h += '</div></div>';
+  }
+
+  h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:18px">';
+  h += '<button onclick="gotoPanel(\'notifications\')" style="background:white;color:var(--muted);border:1px solid var(--border);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:5px;cursor:pointer">← Back to Notifications</button>';
+  h += '</div>';
+
+  return h;
+}
+
+
+// ──────────────────────────────────────────────────────────────────────
+//  COMPLIANCE EMAIL SETTINGS PANEL  (Owner+admin only)
+// ──────────────────────────────────────────────────────────────────────
+function panelComplianceSettings(){
+  var u = DB.current;
+  var h = '';
+  h += panelHeader('⚙️ Compliance Email Settings');
+  if(!isOwner(u) && u.role !== 'admin'){
+    h += '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner / admin only.</div>';
+    return h;
+  }
+  var current = _loadComplianceEmails();
+  var campaigns = ['TruConnect','Excess Telecom','Gen Mobile','Assurance Wireless'];
+
+  h += '<div class="bo-card" style="padding:24px 28px;max-width:680px;margin:0 auto">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--muted);margin-bottom:18px">Set the compliance officer email for each Lifeline campaign. Encroachment Reports will be sent here. WMAMinc Owner is always cc\'d.</div>';
+  campaigns.forEach(function(c){
+    h += '<div style="margin-bottom:14px">'
+      +'<label class="f-label" style="display:block;margin-bottom:6px">'+_escapeHtml(c)+'</label>'
+      +'<input type="email" id="comp-email-'+_escapeHtml(c.replace(/\s+/g,'_'))+'" value="'+_escapeHtml(current[c]||'')+'" placeholder="compliance@'+c.toLowerCase().replace(/\s+/g,'')+'.com" style="width:100%;padding:10px 12px;border:1.5px solid var(--sand);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.9rem">'
+      +'</div>';
+  });
+  h += '<button onclick="saveComplianceSettings()" class="btn-fire" style="margin-top:10px;padding:11px 22px;background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">💾 Save Settings</button>';
+  h += '<div id="comp-save-status" style="margin-top:12px;font-family:Barlow Condensed,sans-serif;font-size:.78rem"></div>';
+  h += '</div>';
+  return h;
+}
+
+function saveComplianceSettings(){
+  var u = DB.current;
+  if(!isOwner(u) && u.role !== 'admin'){ alert('Owner / admin only.'); return; }
+  var campaigns = ['TruConnect','Excess Telecom','Gen Mobile','Assurance Wireless'];
+  var map = {};
+  campaigns.forEach(function(c){
+    var v = (document.getElementById('comp-email-'+c.replace(/\s+/g,'_'))||{}).value || '';
+    v = v.trim();
+    if(v) map[c] = v;
+  });
+  _saveComplianceEmails(map);
+  var s = document.getElementById('comp-save-status');
+  if(s){ s.textContent = '✓ Saved'; s.style.color = '#059669'; }
+}
+
+
+
 // Stores config in localStorage under 'wmam_form_config'
 // The application form reads from this config to render programs/campaigns
 
@@ -16315,6 +17084,14 @@ function panelNotifications(){
         + (_canEmailAuditToCompliance(u)
             ? '<button onclick="openAuditEmailModal('+aId+',\''+aDate+'\','+aTs+')" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">📧 Email DPA</button>'
             : '')
+        +'</div>';
+    }
+
+    // ── Calvin 2026-05-08: View Encroachment Report button ──
+    if(n.formType === 'encroachment' && n.data && n.data.kind === 'encroachment'){
+      var rId = (n.data.reportId|0);
+      h += '<div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">'
+        +'<button onclick="viewEncroachmentDetail('+rId+')" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">🚧 View Encroachment Report</button>'
         +'</div>';
     }
 
@@ -21014,7 +21791,7 @@ function gotoPanel(id, params){
     'supply-mgmt':panelSupplyMgmt,'pending-transfers':panelPendingTransfers,
     'agent-codes':panelAgentCodes,'goal-settings':panelGoalSettings,
     'form-builder':panelFormBuilder,announce:panelAnnounce,
-    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,
+    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
     agents:panelAgents,'ll-teams':panelMarketsAdmin,
