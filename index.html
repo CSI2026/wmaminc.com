@@ -4061,6 +4061,12 @@ function pushNotification(opts){
     formType: opts.formType||null,
     toIds: opts.toIds ? opts.toIds.slice() : [],
     toRoles: opts.toRoles ? opts.toRoles.slice() : [],
+    // ── Calvin 2026-05-07 CRITICAL FIX ──
+    // opts.data was being silently dropped, which broke the View Audit /
+    // Email DPA buttons in the notifications panel (they check
+    // n.data && n.data.kind === 'audit'). Preserve the field through to
+    // the saved notification + Supabase row + localStorage.
+    data: opts.data || null,
     ts: new Date().toISOString(),
     read: []
   };
@@ -14049,14 +14055,32 @@ function finalizeAudit(data){
 // ════════════════════════════════════════════════════════════════════════
 
 // Resolve a stored audit by its identity. Notifications carry
-// {agentId, date, submittedTs} so we can find the exact record.
+// {agentId, date, submittedTs} so we can find the exact record. For older
+// notifications (created before the data field was preserved), fall back
+// to the most-recent audit for that agent.
 function _findAuditRecord(agentId, dateStr, submittedTs){
   try{
     var arr = JSON.parse(localStorage.getItem('wmam_audits')||'[]');
-    // Prefer exact submittedTs match (unique); fall back to agentId+date
-    var hit = arr.find(function(a){ return a.submittedTs && a.submittedTs === submittedTs; });
-    if(hit) return hit;
-    return arr.find(function(a){ return a.agentId === agentId && a.date === dateStr; });
+    // Prefer exact submittedTs match (unique per submission)
+    if(submittedTs){
+      var hit = arr.find(function(a){ return a.submittedTs === submittedTs; });
+      if(hit) return hit;
+    }
+    // Try agentId + date
+    if(agentId && dateStr){
+      var hit2 = arr.find(function(a){ return a.agentId === agentId && a.date === dateStr; });
+      if(hit2) return hit2;
+    }
+    // Last resort: most recent audit for this agent (legacy notification path)
+    if(agentId){
+      var matches = arr.filter(function(a){ return a.agentId === agentId; });
+      if(matches.length){
+        // Sort by submittedTs descending (newest first)
+        matches.sort(function(a,b){ return (b.submittedTs||0) - (a.submittedTs||0); });
+        return matches[0];
+      }
+    }
+    return null;
   }catch(e){ return null; }
 }
 
@@ -15880,10 +15904,16 @@ function panelNotifications(){
 
     // ── Calvin 2026-05-07: View Audit button on audit-type notifications ──
     // Opens the detail panel with photos, location, program, work type, etc.
-    if(n.formType === 'daily-audit' && n.data && n.data.kind === 'audit'){
-      var aId = n.data.agentId|0;
-      var aDate = (n.data.date||'').replace(/'/g,'');
-      var aTs = (n.data.submittedTs|0);
+    // FALLBACK: notifications created before the data-field fix won't have
+    // n.data populated. In that case, we can still link to the most recent
+    // audit by the same submitter (n.fromId) — the panel handles missing
+    // records gracefully with a friendly message.
+    if(n.formType === 'daily-audit'){
+      var aId = (n.data && n.data.agentId) ? (n.data.agentId|0) : (n.fromId|0);
+      var aDate = (n.data && n.data.date) ? String(n.data.date).replace(/'/g,'') : '';
+      var aTs = (n.data && n.data.submittedTs) ? (n.data.submittedTs|0) : 0;
+      // For legacy notifications (no aTs/aDate), the resolver in viewAuditDetail
+      // falls back to the agent's most-recent stored audit.
       h += '<div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">'
         +'<button onclick="viewAuditDetail('+aId+',\''+aDate+'\','+aTs+')" style="background:#003594;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">📸 View Audit</button>'
         + (_canEmailAuditToCompliance(u)
@@ -15900,6 +15930,10 @@ function panelNotifications(){
       +'</div></div>';
   });
   h += '</div>';
+  // ── Calvin 2026-05-07: defensive bell refresh ──
+  // If the bell DOM was clobbered by an earlier panel render or got out of
+  // sync with reality, fix it now. Schedule for after this panel is in DOM.
+  setTimeout(function(){ if(typeof renderNotifBell==='function') renderNotifBell(); }, 0);
   return h;
 }
 
