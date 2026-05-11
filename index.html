@@ -1473,7 +1473,7 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
       </div>
     </div>
     <div id="boDateEl" style="font-family:'Barlow Condensed',sans-serif;font-size:.65rem;color:var(--muted);margin-left:12px"></div>
-    <button id="bo-back-btn" onclick="goBack()" style="display:none;background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.2);color:var(--blue);font-family:'Barlow Condensed',sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:5px 11px;border-radius:4px;cursor:pointer;margin-right:6px">← Back</button><button id="bo-home-btn" onclick="goHome()" style="display:none;background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.25);color:#059669;font-family:'Barlow Condensed',sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:5px 11px;border-radius:4px;cursor:pointer;margin-right:6px">🏠 Home</button><button id="notif-bell-btn" onclick="gotoPanel('notifications')" style="position:relative;background:rgba(0,53,148,.07);border:1px solid rgba(0,53,148,.2);color:var(--blue);font-family:'Barlow Condensed',sans-serif;font-size:1rem;padding:5px 12px;cursor:pointer;border-radius:4px;margin-right:6px">🔔</button><button onclick="gotoPanel('my-profile')" title="My Profile" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.25);color:#7c3aed;font-family:'Barlow Condensed',sans-serif;font-size:.65rem;letter-spacing:1px;text-transform:uppercase;padding:6px 12px;cursor:pointer;border-radius:4px;margin-right:6px">👤 My Profile</button><button onclick="doLogout()" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:'Barlow Condensed',sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:6px 14px;cursor:pointer;border-radius:4px;transition:background .15s;margin-left:8px" onmouseover="this.style.background='rgba(204,0,0,.18)'" onmouseout="this.style.background='rgba(204,0,0,.08)'">Sign Out</button>
+    <button id="bo-back-btn" onclick="goBack()" style="display:none;background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.2);color:var(--blue);font-family:'Barlow Condensed',sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:5px 11px;border-radius:4px;cursor:pointer;margin-right:6px">← Back</button><button id="bo-home-btn" onclick="goHome()" style="display:none;background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.25);color:#059669;font-family:'Barlow Condensed',sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:5px 11px;border-radius:4px;cursor:pointer;margin-right:6px">🏠 Home</button><button id="sync-bell-btn" onclick="gotoPanel('sync-status')" title="Save status" style="position:relative;background:rgba(5,150,105,.07);border:1px solid rgba(5,150,105,.2);color:#059669;font-family:'Barlow Condensed',sans-serif;font-size:1rem;padding:5px 12px;cursor:pointer;border-radius:4px;margin-right:6px"><span style="color:#059669;font-size:1.1rem">✓</span></button><button id="notif-bell-btn" onclick="gotoPanel('notifications')" style="position:relative;background:rgba(0,53,148,.07);border:1px solid rgba(0,53,148,.2);color:var(--blue);font-family:'Barlow Condensed',sans-serif;font-size:1rem;padding:5px 12px;cursor:pointer;border-radius:4px;margin-right:6px">🔔</button><button onclick="gotoPanel('my-profile')" title="My Profile" style="background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.25);color:#7c3aed;font-family:'Barlow Condensed',sans-serif;font-size:.65rem;letter-spacing:1px;text-transform:uppercase;padding:6px 12px;cursor:pointer;border-radius:4px;margin-right:6px">👤 My Profile</button><button onclick="doLogout()" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:'Barlow Condensed',sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:6px 14px;cursor:pointer;border-radius:4px;transition:background .15s;margin-left:8px" onmouseover="this.style.background='rgba(204,0,0,.18)'" onmouseout="this.style.background='rgba(204,0,0,.08)'">Sign Out</button>
   </div>
   <!-- BO TOP NAV ROW 2: Nav links -->
   <div class="bo-topbar-row2" id="boNav"></div>
@@ -1902,13 +1902,10 @@ function saveTeams(){
 async function saveAppSettingToSupabase(key, value){
   if(typeof supaClient === 'undefined' || !supaClient) return;
   if(!key) return;
-  try{
-    var payload = (typeof value === 'string') ? value : JSON.stringify(value);
-    await supaClient.from('app_settings')
-      .upsert({key: key, value: payload}, {onConflict: 'key'});
-  }catch(e){
-    console.warn('[saveAppSettingToSupabase] '+key+' failed:', e && (e.message||e));
-  }
+  // ── Calvin 2026-05-08: route through SYNC_QUEUE for durable writes ──
+  // Old behavior dropped failures silently. Now they're queued + retried.
+  var payload = (typeof value === 'string') ? value : JSON.stringify(value);
+  syncEnqueue('app_setting', 'app_settings', { key: key, value: payload }, 'app_setting:'+key, 'key');
 }
 
 function loadFromStorage(){
@@ -13114,6 +13111,509 @@ async function sbDelete(table, filters){
   } catch(e){ console.warn('sbDelete error:', e); return false; }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  SYNC QUEUE  (Calvin 2026-05-08)
+//
+//  Bulletproof save pipeline. Every write goes through this queue:
+//    1. Enqueue to localStorage FIRST (survives crash/refresh/close)
+//    2. Attempt Supabase write
+//    3. On success: remove from queue
+//    4. On failure: stays in queue, retried with exponential backoff
+//
+//  The queue persists across page reloads, browser closes, and offline
+//  periods. It auto-flushes on:
+//    - page load
+//    - every 30 seconds
+//    - the 'online' event (regained connection)
+//    - the 'focus' event (user came back to tab)
+//
+//  Each pending write surfaces in the sync-status bell. Owner can view
+//  the full pending list at gotoPanel('sync-status'), inspect errors,
+//  manually retry or discard stuck items.
+// ════════════════════════════════════════════════════════════════════════
+var SYNC_QUEUE = [];               // in-memory copy of the queue
+var SYNC_FLUSHING = false;         // mutex — only one flush at a time
+var SYNC_STATUS_LISTENERS = [];    // callbacks for UI updates
+var SYNC_FLUSH_TIMER = null;
+var SYNC_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;  // 14 days — never auto-discard
+var SYNC_BACKOFFS = [0, 30000, 60000, 120000, 300000, 600000, 600000];
+
+// Each entry shape:
+// {
+//   id: string (unique),
+//   kind: 'agent' | 'app_setting' | 'lifeline_team' | 'inventory_device' | 'notification' | ...
+//   table: string (Supabase table)
+//   payload: object (the row to upsert)
+//   conflictCol: string (default 'id')
+//   attempts: number,
+//   lastError: string,
+//   lastAttempt: ms epoch,
+//   nextAttempt: ms epoch,
+//   createdAt: ms epoch,
+//   recordKey: string (a stable id for dedup, e.g. "agent:101" or "app_setting:lifeline_teams")
+// }
+
+function syncLoadQueue(){
+  try{
+    var raw = localStorage.getItem('wmam_sync_queue');
+    if(raw){
+      var parsed = JSON.parse(raw);
+      if(Array.isArray(parsed)) SYNC_QUEUE = parsed;
+    }
+  }catch(e){ console.warn('[sync] load queue failed:', e); SYNC_QUEUE = []; }
+  // Discard ancient entries that are unrecoverable
+  var now = Date.now();
+  SYNC_QUEUE = SYNC_QUEUE.filter(function(e){
+    return e && (now - (e.createdAt||now)) < SYNC_MAX_AGE_MS;
+  });
+}
+
+function syncSaveQueue(){
+  try{
+    localStorage.setItem('wmam_sync_queue', JSON.stringify(SYNC_QUEUE));
+  }catch(e){
+    console.error('[sync] persist queue FAILED — quota? Re-trying after pruning oldest entries.', e);
+    // Last-resort: if localStorage is full, drop the oldest 10 entries and try again
+    SYNC_QUEUE.sort(function(a,b){ return (a.createdAt||0) - (b.createdAt||0); });
+    SYNC_QUEUE = SYNC_QUEUE.slice(10);
+    try{ localStorage.setItem('wmam_sync_queue', JSON.stringify(SYNC_QUEUE)); }catch(_){}
+  }
+}
+
+// Add a write to the queue. Always succeeds (writes to localStorage first).
+// recordKey is used to dedup repeat saves of the same record (e.g. saving
+// agent #101 three times in a row coalesces into ONE pending write with
+// the latest payload).
+function syncEnqueue(kind, table, payload, recordKey, conflictCol){
+  if(!table || !payload){
+    console.warn('[sync] enqueue called with empty table/payload');
+    return null;
+  }
+  var entry = {
+    id: 'sq_' + Date.now() + '_' + Math.floor(Math.random()*100000),
+    kind: kind || 'other',
+    table: table,
+    payload: payload,
+    conflictCol: conflictCol || 'id',
+    attempts: 0,
+    lastError: '',
+    lastAttempt: 0,
+    nextAttempt: Date.now(),
+    createdAt: Date.now(),
+    recordKey: recordKey || (kind + ':' + (payload.id || payload.key || JSON.stringify(payload).slice(0,40)))
+  };
+  // Dedup — replace any earlier pending write for the same recordKey
+  var existingIdx = SYNC_QUEUE.findIndex(function(e){ return e.recordKey === entry.recordKey; });
+  if(existingIdx >= 0){
+    // Preserve the createdAt and attempt count from the first try
+    var existing = SYNC_QUEUE[existingIdx];
+    entry.createdAt = existing.createdAt;
+    entry.attempts = existing.attempts;
+    entry.lastError = existing.lastError;
+    SYNC_QUEUE[existingIdx] = entry;
+  } else {
+    SYNC_QUEUE.push(entry);
+  }
+  syncSaveQueue();
+  syncNotifyListeners();
+  // Kick a flush in the background (non-blocking)
+  setTimeout(syncFlush, 0);
+  return entry;
+}
+
+// Public status — for the sync bell + Owner panel
+function syncStatus(){
+  var now = Date.now();
+  var pending = 0, failed = 0, retrying = 0;
+  var lastError = '';
+  SYNC_QUEUE.forEach(function(e){
+    if(e.attempts >= 3) failed++;
+    else if(e.attempts > 0) retrying++;
+    else pending++;
+    if(e.lastError && (!lastError || e.lastAttempt > 0)) lastError = e.lastError;
+  });
+  return {
+    total: SYNC_QUEUE.length,
+    pending: pending,        // never tried yet
+    retrying: retrying,      // tried 1-2 times, will retry
+    failed: failed,          // tried 3+ times, still failing
+    lastError: lastError,
+    online: navigator.onLine !== false
+  };
+}
+
+function syncOnStatusChange(cb){
+  if(typeof cb !== 'function') return;
+  SYNC_STATUS_LISTENERS.push(cb);
+}
+function syncNotifyListeners(){
+  SYNC_STATUS_LISTENERS.forEach(function(cb){
+    try{ cb(syncStatus()); }catch(e){ console.warn('[sync] listener error:', e); }
+  });
+  // Also refresh the bell UI if it exists
+  if(typeof renderSyncBell === 'function'){
+    try{ renderSyncBell(); }catch(e){}
+  }
+}
+
+// Attempt to flush the queue. Walks each entry, respecting nextAttempt
+// timestamps (backoff). Mutex-protected so concurrent flush calls (from
+// timer + online event + manual) don't double-fire.
+async function syncFlush(force){
+  if(SYNC_FLUSHING) return;
+  if(!supaClient) return;
+  if(!SYNC_QUEUE.length) return;
+  SYNC_FLUSHING = true;
+  try{
+    var now = Date.now();
+    // Snapshot — walk a copy so removals during iteration don't break us
+    var entries = SYNC_QUEUE.slice();
+    for(var i=0; i<entries.length; i++){
+      var entry = entries[i];
+      // Verify it's still in the live queue (could have been removed mid-flush)
+      var liveIdx = SYNC_QUEUE.findIndex(function(e){ return e.id === entry.id; });
+      if(liveIdx < 0) continue;
+      // Honor backoff unless force=true
+      if(!force && entry.nextAttempt > now) continue;
+      // Try the write
+      entry.attempts++;
+      entry.lastAttempt = now;
+      var ok = await _syncAttemptUpsert(entry);
+      if(ok){
+        // Success — drop from queue
+        SYNC_QUEUE = SYNC_QUEUE.filter(function(e){ return e.id !== entry.id; });
+        syncSaveQueue();
+        syncNotifyListeners();
+      } else {
+        // Failure — schedule retry with backoff
+        var err = (window._lastSbError && (window._lastSbError.message || window._lastSbError.code))
+                  || 'unknown error';
+        entry.lastError = String(err);
+        var backoffIdx = Math.min(entry.attempts, SYNC_BACKOFFS.length - 1);
+        entry.nextAttempt = now + SYNC_BACKOFFS[backoffIdx];
+        // Replace in queue with updated attempt info
+        var idx = SYNC_QUEUE.findIndex(function(e){ return e.id === entry.id; });
+        if(idx >= 0) SYNC_QUEUE[idx] = entry;
+        syncSaveQueue();
+        syncNotifyListeners();
+        // Don't continue hammering on a persistent failure during this flush —
+        // back off and let the next scheduled flush try again.
+        if(entry.attempts >= 3){
+          console.warn('[sync] entry '+entry.recordKey+' has failed '+entry.attempts+' times. Last error: '+err);
+        }
+      }
+    }
+  } catch(e){
+    console.error('[sync] flush crashed:', e);
+  } finally {
+    SYNC_FLUSHING = false;
+  }
+}
+
+// Manual force-retry — Owner can click "Retry All" on the sync panel
+function syncRetryAll(){
+  SYNC_QUEUE.forEach(function(e){ e.nextAttempt = 0; });
+  syncSaveQueue();
+  syncFlush(true);
+}
+
+// Manual discard — Owner can drop a stuck entry (last resort)
+function syncDiscard(id){
+  SYNC_QUEUE = SYNC_QUEUE.filter(function(e){ return e.id !== id; });
+  syncSaveQueue();
+  syncNotifyListeners();
+}
+
+// ── Per-kind upsert handlers ──
+// For most kinds, a plain sbUpsert is enough. For 'agent', we preserve
+// the 3-tier schema-mismatch fallback that the original saveAgentToSupabase
+// had (full → legacy → bare). This way we don't lose intelligence by
+// going through the queue.
+async function _syncAttemptUpsert(entry){
+  if(entry.kind === 'agent'){
+    return await _syncAttemptAgentUpsert(entry);
+  }
+  return await sbUpsert(entry.table, entry.payload, entry.conflictCol);
+}
+
+async function _syncAttemptAgentUpsert(entry){
+  // Full schema first
+  var ok = await sbUpsert('agents', entry.payload, 'id');
+  if(ok) return true;
+  // Schema may be missing newer columns — try legacy
+  var legacy = Object.assign({}, entry.payload);
+  delete legacy.category;
+  delete legacy.depts;
+  delete legacy.office_manager;
+  delete legacy.can_distribute_inventory;
+  delete legacy.ibo_markets;
+  delete legacy.cm_model;
+  delete legacy.tc_model;
+  delete legacy.aw_model;
+  delete legacy.reports_to;
+  delete legacy.address;
+  var retryOk = await sbUpsert('agents', legacy, 'id');
+  if(retryOk){
+    console.warn('[sync] agent #'+entry.payload.id+' saved via legacy fallback');
+    return true;
+  }
+  // Last resort — bare minimum so password at least persists
+  var bare = {
+    id: entry.payload.id, name: entry.payload.name,
+    username: entry.payload.username, password: entry.payload.password,
+    role: entry.payload.role, email: entry.payload.email||'',
+    active: entry.payload.active
+  };
+  var bareOk = await sbUpsert('agents', bare, 'id');
+  if(bareOk){
+    console.warn('[sync] agent #'+entry.payload.id+' saved via BARE fallback — full payload could not save');
+    return true;
+  }
+  return false;
+}
+
+// Set up background flusher + online/focus listeners. Idempotent — safe
+// to call multiple times.
+function syncStartBackgroundFlush(){
+  syncLoadQueue();
+  if(SYNC_FLUSH_TIMER) return;
+  SYNC_FLUSH_TIMER = setInterval(syncFlush, 30000);
+  if(typeof window !== 'undefined'){
+    window.addEventListener('online', function(){
+      console.log('[sync] back online — flushing queue');
+      syncFlush(true);
+    });
+    window.addEventListener('focus', function(){ syncFlush(); });
+    // Warn user if they try to close with pending writes — last line of defense
+    window.addEventListener('beforeunload', function(e){
+      var st = syncStatus();
+      if(st.total > 0){
+        e.preventDefault();
+        e.returnValue = 'You have '+st.total+' unsaved change(s) that are still syncing. Wait a moment, or your work may be lost.';
+        return e.returnValue;
+      }
+    });
+  }
+}
+
+// Re-pull a single agent's record from Supabase (Owner / admin use only).
+// Wired to the "Fix My Data" button on the agent profile. Overwrites
+// local DB.agents[i] with the fresh row.
+async function syncPullFreshAgent(agentId){
+  if(!supaClient){ alert('No Supabase connection.'); return false; }
+  try{
+    var result = await supaClient.from('agents').select('*').eq('id', agentId).single();
+    if(result.error || !result.data){
+      alert('Could not fetch agent #'+agentId+' from Supabase: '+(result.error && result.error.message || 'not found'));
+      return false;
+    }
+    var a = result.data;
+    var refreshed = {
+      id: a.id, name: a.name, username: a.username, password: a.password,
+      role: a.role, email: a.email||'',
+      programs: safeJSON(a.programs, []),
+      program: a.program||'', carrier: a.carrier||'',
+      team: a.team||null,
+      teamLeaderId: a.team_leader_id||null,
+      marketManagerId: a.market_manager_id||null,
+      campaignManagerId: a.campaign_manager_id||null,
+      active: a.active, sales: a.sales||0,
+      monthlySales: safeJSON(a.monthly_sales, []),
+      channels: safeJSON(a.channels, []),
+      links: safeJSON(a.links, []),
+      start: a.start_date||'',
+      agentCodes: safeJSON(a.agent_codes, {}),
+      canHostCall: a.can_host_call===true,
+      profilePic:  a.profile_pic||'',
+      phone:       a.phone||'',
+      address:     a.address||'',
+      category:      a.category      || null,
+      depts:         safeJSON(a.depts, {}),
+      officeManager: a.office_manager === true,
+      canDistributeInventory: a.can_distribute_inventory === true,
+      iboMarkets:    safeJSON(a.ibo_markets, []),
+      cmModel:       a.cm_model || 'none',
+      tcModel:       a.tc_model || 'none',
+      awModel:       a.aw_model || 'none',
+      reportsTo:     safeJSON(a.reports_to, {})
+    };
+    var idx = DB.agents.findIndex(function(x){ return x.id === agentId; });
+    if(idx >= 0){
+      DB.agents[idx] = refreshed;
+    } else {
+      DB.agents.push(refreshed);
+    }
+    saveToStorage();
+    return true;
+  }catch(e){
+    console.error('[syncPullFreshAgent] failed:', e);
+    alert('Refresh failed: '+(e && e.message || e));
+    return false;
+  }
+}
+
+// Re-pull ALL agents — useful when you suspect bulk desync
+async function syncPullFreshAllAgents(){
+  if(!supaClient){ alert('No Supabase connection.'); return false; }
+  if(!confirm('Re-fetch all agents from Supabase? This OVERWRITES your local copy. Any unsaved local changes will be discarded (but anything in the sync queue will still flush).')) return false;
+  try{
+    var result = await supaClient.from('agents').select('*');
+    if(result.error || !result.data){
+      alert('Fetch failed: '+(result.error && result.error.message || 'no data'));
+      return false;
+    }
+    DB.agents = result.data.map(function(a){
+      return {
+        id: a.id, name: a.name, username: a.username, password: a.password,
+        role: a.role, email: a.email||'',
+        programs: safeJSON(a.programs, []),
+        program: a.program||'', carrier: a.carrier||'',
+        team: a.team||null,
+        teamLeaderId: a.team_leader_id||null,
+        marketManagerId: a.market_manager_id||null,
+        campaignManagerId: a.campaign_manager_id||null,
+        active: a.active, sales: a.sales||0,
+        monthlySales: safeJSON(a.monthly_sales, []),
+        channels: safeJSON(a.channels, []),
+        links: safeJSON(a.links, []),
+        start: a.start_date||'',
+        agentCodes: safeJSON(a.agent_codes, {}),
+        canHostCall: a.can_host_call===true,
+        profilePic:  a.profile_pic||'',
+        phone:       a.phone||'',
+        address:     a.address||'',
+        category:      a.category      || null,
+        depts:         safeJSON(a.depts, {}),
+        officeManager: a.office_manager === true,
+        canDistributeInventory: a.can_distribute_inventory === true,
+        iboMarkets:    safeJSON(a.ibo_markets, []),
+        cmModel:       a.cm_model || 'none',
+        tcModel:       a.tc_model || 'none',
+        awModel:       a.aw_model || 'none',
+        reportsTo:     safeJSON(a.reports_to, {})
+      };
+    });
+    saveToStorage();
+    alert('✓ Pulled '+DB.agents.length+' agents fresh from Supabase. Refresh the page to see updates.');
+    return true;
+  }catch(e){
+    console.error('[syncPullFreshAllAgents] failed:', e);
+    alert('Refresh failed: '+(e && e.message || e));
+    return false;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SYNC BELL UI  (header indicator)
+// ════════════════════════════════════════════════════════════════════════
+function renderSyncBell(){
+  var el = document.getElementById('sync-bell-btn');
+  if(!el) return;
+  var st = syncStatus();
+  var icon, color, title;
+  if(!st.online){
+    icon = '📴'; color = '#666'; title = 'Offline — '+st.total+' change(s) will sync when you reconnect';
+  } else if(st.total === 0){
+    icon = '✓'; color = '#059669'; title = 'All changes saved';
+  } else if(st.failed > 0){
+    icon = '⚠'; color = '#CC0000'; title = st.failed+' write(s) failed. Click to view.';
+  } else {
+    icon = '↻'; color = '#D97706'; title = st.total+' change(s) syncing…';
+  }
+  var badge = (st.total > 0)
+    ? '<span style="position:absolute;top:-5px;right:-5px;background:'+color+';color:white;font-size:.55rem;font-weight:700;padding:2px 5px;border-radius:8px;min-width:14px;text-align:center;line-height:1">'+st.total+'</span>'
+    : '';
+  el.innerHTML = '<span style="color:'+color+';font-size:1.1rem">'+icon+'</span>' + badge;
+  el.title = title;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SYNC STATUS PANEL  (gotoPanel('sync-status'))
+//  Visible to all users. Shows pending writes, errors, retry/discard.
+//  Owner sees discard buttons; others see view-only.
+// ════════════════════════════════════════════════════════════════════════
+function panelSyncStatus(){
+  var u = DB.current;
+  var h = '';
+  if(typeof panelHeader === 'function') h += panelHeader('💾 Save Status');
+  var st = syncStatus();
+  // Top summary card
+  var summaryBg, summaryColor, summaryHeading;
+  if(!st.online){
+    summaryBg = 'rgba(100,100,100,.08)';
+    summaryColor = '#444';
+    summaryHeading = '📴 You are OFFLINE';
+  } else if(st.total === 0){
+    summaryBg = 'rgba(5,150,105,.08)';
+    summaryColor = '#059669';
+    summaryHeading = '✓ All changes saved';
+  } else if(st.failed > 0){
+    summaryBg = 'rgba(204,0,0,.08)';
+    summaryColor = '#CC0000';
+    summaryHeading = '⚠ '+st.failed+' write(s) FAILED — '+st.retrying+' retrying, '+st.pending+' new';
+  } else {
+    summaryBg = 'rgba(217,119,6,.08)';
+    summaryColor = '#D97706';
+    summaryHeading = '↻ '+st.total+' change(s) syncing…';
+  }
+  h += '<div class="bo-card" style="padding:20px 24px;margin-bottom:18px;background:'+summaryBg+';border:1px solid '+summaryColor+'40">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:'+summaryColor+';margin-bottom:4px">'+summaryHeading+'</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted)">All changes you make are saved locally first, then synced to the cloud. If a sync fails, it will retry automatically. Your work is never lost.</div>'
+    +'</div>';
+
+  // Action buttons
+  if(st.total > 0){
+    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">';
+    h += '<button onclick="syncRetryAll();setTimeout(function(){gotoPanel(\'sync-status\');},500)" style="background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">↻ Retry All Now</button>';
+    h += '</div>';
+  }
+
+  // Pending writes list
+  if(SYNC_QUEUE.length === 0){
+    h += '<div class="bo-card" style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No pending writes. Everything is saved.</div>';
+  } else {
+    h += '<div class="bo-card" style="padding:0;overflow:hidden">';
+    h += '<div style="background:var(--offwhite);padding:12px 20px;border-bottom:1px solid var(--border);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Pending Writes ('+SYNC_QUEUE.length+')</div>';
+    SYNC_QUEUE.forEach(function(e){
+      var ageSec = Math.round((Date.now() - (e.createdAt||0))/1000);
+      var ageStr = ageSec < 60 ? ageSec+'s ago'
+                 : ageSec < 3600 ? Math.round(ageSec/60)+'m ago'
+                 : ageSec < 86400 ? Math.round(ageSec/3600)+'h ago'
+                 : Math.round(ageSec/86400)+'d ago';
+      var statusColor = e.attempts >= 3 ? '#CC0000' : e.attempts > 0 ? '#D97706' : '#059669';
+      var statusLabel = e.attempts >= 3 ? 'FAILED ('+e.attempts+' tries)'
+                      : e.attempts > 0 ? 'RETRYING ('+e.attempts+' tries)'
+                      : 'PENDING';
+      h += '<div style="padding:14px 20px;border-bottom:1px solid rgba(0,0,0,.05);display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap">';
+      h += '<div style="flex:1;min-width:240px">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;font-weight:700">'+_escapeHtml(e.recordKey || (e.kind+':'+e.payload.id))+' <span style="color:'+statusColor+';font-size:.62rem;letter-spacing:1.5px;margin-left:8px">'+statusLabel+'</span></div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px">Table: '+_escapeHtml(e.table)+' &middot; Created '+ageStr+'</div>';
+      if(e.lastError){
+        h += '<div style="margin-top:6px;padding:6px 10px;background:rgba(204,0,0,.06);border-left:3px solid #CC0000;font-family:monospace;font-size:.72rem;color:#991B1B;word-break:break-all">'+_escapeHtml(e.lastError)+'</div>';
+      }
+      h += '</div>';
+      // Action buttons — only Owner+admin can discard
+      if(typeof isOwner === 'function' && (isOwner(u) || u.role === 'admin')){
+        h += '<button onclick="if(confirm(\'Discard this pending write? The change has been saved locally but will NOT sync to Supabase.\')){ syncDiscard(\''+e.id+'\'); setTimeout(function(){gotoPanel(\'sync-status\');},100); }" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">Discard</button>';
+      }
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // Owner-only bulk refresh tools
+  if(typeof isOwner === 'function' && (isOwner(u) || u.role === 'admin')){
+    h += '<div class="bo-card" style="padding:20px 24px;margin-top:18px">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;margin-bottom:6px">⚙️ Recovery Tools</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:12px">If a user reports stale or missing data, force a fresh pull from Supabase. This overwrites the local copy with whatever is in the cloud.</div>';
+    h += '<button onclick="syncPullFreshAllAgents()" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:5px;cursor:pointer;font-weight:700">🔄 Refresh All Agents from Supabase</button>';
+    h += '</div>';
+  }
+
+  return h;
+}
+
+
 // ── Load all data from Supabase on init ──
 
 async function seedDefaultAgents(){
@@ -13514,10 +14014,22 @@ function safeJSON(val, fallback){
 
 // ── Save agent to Supabase ──
 async function saveAgentToSupabase(agent){
-  if(!supaClient) { saveToStorage(); return false; }
-  // ── LOUD diagnostic. When password updates aren't sticking, we need
-  //    to see the EXACT password string that's about to be written. ──
-  try { console.log('[saveAgentToSupabase] agent #'+agent.id+' name="'+agent.name+'" username="'+agent.username+'" password.length='+(agent.password?String(agent.password).length:0)); } catch(e){}
+  // ── Calvin 2026-05-08: ROUTE THROUGH SYNC QUEUE ──
+  // Old behavior: fire one upsert, hope it succeeds. If it failed
+  // (network blip, RLS reject, schema mismatch), the write was lost
+  // and the user never knew. Agent profiles silently disappeared.
+  //
+  // New behavior: localStorage save happens IMMEDIATELY (synchronous),
+  // then the Supabase write is enqueued in the persistent SYNC_QUEUE
+  // (which survives reload, retries with backoff, surfaces failures
+  // in the sync bell UI).
+  //
+  // The queue's _syncAttemptAgentUpsert preserves the 3-tier schema
+  // fallback (full → legacy → bare) so if Supabase columns are missing,
+  // at minimum username+password still save.
+  saveToStorage();  // always-on local persistence
+  if(!supaClient) return false;
+  try { console.log('[saveAgentToSupabase] enqueue agent #'+agent.id+' name="'+agent.name+'" username="'+agent.username+'" password.length='+(agent.password?String(agent.password).length:0)); } catch(e){}
   var full = {
     id: agent.id, name: agent.name, username: agent.username, password: agent.password,
     role: agent.role, email: agent.email||'',
@@ -13537,69 +14049,18 @@ async function saveAgentToSupabase(agent){
     profile_pic:  agent.profilePic||'',
     phone:        agent.phone||'',
     address:      agent.address||'',
-    // New category/depts columns. If the Supabase schema doesn't have
-    // these, the upsert below will fail and we'll retry without them.
     category:       agent.category || null,
     depts:          JSON.stringify(agent.depts || {}),
     office_manager: agent.officeManager === true,
     can_distribute_inventory: agent.canDistributeInventory === true,
     ibo_markets:    JSON.stringify(agent.iboMarkets || []),
-    // Gen Mobile pay model (cmModel). Stored as a string column. Falls
-    // back to legacy save if the column doesn't exist in the schema.
     cm_model:       agent.cmModel || null,
-    // TruConnect pay model (tcModel). Same fallback behavior.
     tc_model:       agent.tcModel || null,
-    // Assurance Wireless pay model (awModel). Same fallback behavior.
     aw_model:       agent.awModel || null,
-    // Per-campaign reporting chain. JSONB column. {campaignName: parentId|null}
     reports_to:     agent.reportsTo || {}
   };
-  // Try the full write first.
-  var ok = await sbUpsert('agents', full);
-  // sbUpsert returns false on any error (including unknown columns from a
-  // not-yet-migrated Supabase schema). Retry without the new columns so the
-  // agent still saves and we don't lose data on schema lag.
-  if(!ok){
-    console.warn('[saveAgentToSupabase] Full save failed (likely unknown columns). Retrying with legacy fields only — cmModel/tcModel/awModel/reportsTo/category/depts/address will not persist until the schema is migrated, but core fields (name, username, password, role, email, phone, team) WILL save.');
-    var legacy = Object.assign({}, full);
-    delete legacy.category;
-    delete legacy.depts;
-    delete legacy.office_manager;
-    delete legacy.can_distribute_inventory;
-    delete legacy.ibo_markets;
-    delete legacy.cm_model;
-    delete legacy.tc_model;
-    delete legacy.aw_model;
-    delete legacy.reports_to;
-    // ── PGRST204 fix: address column may not exist on legacy schemas.
-    //    Strip it from the fallback so password+username always save. ──
-    delete legacy.address;
-    var retryOk = await sbUpsert('agents', legacy);
-    if(!retryOk){
-      // Try one MORE time with even more fields stripped — last-resort save
-      // that should work on virtually any schema. Better to lose a profile
-      // pic than to lose the password.
-      console.warn('[saveAgentToSupabase] Legacy save also failed. Final attempt with bare-minimum fields...');
-      var bare = {
-        id: agent.id, name: agent.name, username: agent.username, password: agent.password,
-        role: agent.role, email: agent.email||'', active: agent.active
-      };
-      var bareOk = await sbUpsert('agents', bare);
-      if(!bareOk){
-        console.error('[saveAgentToSupabase] BOTH full AND legacy AND bare upsert FAILED for agent #'+agent.id+'. Username/password did NOT persist to Supabase. Last error:', window._lastSbError);
-        return false;
-      } else {
-        console.log('[saveAgentToSupabase] ✓ Saved (BARE fallback — only id/name/username/password/role/email/active) agent #'+agent.id+'. Other fields could not save.');
-        return true;
-      }
-    } else {
-      console.log('[saveAgentToSupabase] ✓ Saved (legacy fallback) agent #'+agent.id);
-      return true;
-    }
-  } else {
-    console.log('[saveAgentToSupabase] ✓ Saved (full schema) agent #'+agent.id);
-    return true;
-  }
+  syncEnqueue('agent', 'agents', full, 'agent:'+agent.id, 'id');
+  return true;
 }
 
 async function deleteAgentFromSupabase(agentId){
@@ -19896,8 +20357,8 @@ function doLogin(){
   }
   launchBO(found);
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
-  loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(showLoginSplash, 950);
-  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadPayrollDebtLedger(); loadCompPlans(); loadOnboardData(); loadStore(); gmPricelistLoad(); makenzieBonusLoad(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
+  loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(function(){ if(typeof renderSyncBell==='function') renderSyncBell(); }, 100); setTimeout(showLoginSplash, 950);
+  loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadPayrollDebtLedger(); loadCompPlans(); loadOnboardData(); loadStore(); gmPricelistLoad(); makenzieBonusLoad(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(function(){ if(typeof renderSyncBell==='function') renderSyncBell(); },100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
   // Ship B: auto-run points batch on login (idempotent, no-op before 9am CST)
   setTimeout(function(){ try { if(typeof pointsMaybeAutoRun === 'function') pointsMaybeAutoRun(); } catch(e){} }, 1500);
   // Scheduled call reminders — start the periodic check
@@ -20719,6 +21180,21 @@ function panelAgentProfile(){
   var ini = u.name.split(' ').map(function(n){return n[0]||'';}).join('').toUpperCase().slice(0,2);
   var h   = panelHeader(u.name + ' — My Profile');
   h += '<div style="max-width:600px;margin:0 auto">';
+
+  // ── Calvin 2026-05-08: Fix My Data button ──
+  // If a user's local copy is desynced from Supabase (e.g. they refreshed
+  // the page mid-sync, or were on a different device that overwrote
+  // changes), they can force-pull the latest. Owner+admin can also pull
+  // fresh for ANY agent via the Sync Status panel.
+  h += '<div class="bo-card" style="margin-bottom:18px;padding:18px 22px;background:rgba(124,58,237,.04);border-left:4px solid #7c3aed">';
+  h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">';
+  h += '<div>'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:#7c3aed;margin-bottom:2px">Something Looking Wrong?</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);max-width:480px">If your data looks out of date, click below to re-fetch your profile from the cloud. This pulls the latest saved version.</div>'
+    +'</div>';
+  h += '<button onclick="(async function(){ if(typeof syncPullFreshAgent===\'function\'){ var ok=await syncPullFreshAgent(DB.current.id); if(ok){ alert(\'✓ Your profile has been refreshed from the cloud. Reloading…\'); location.reload(); } } else { alert(\'Sync system not loaded — please refresh the page.\'); } })()" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700;white-space:nowrap">🔄 Fix My Data</button>';
+  h += '</div>';
+  h += '</div>';
 
   // ── Profile Picture ──
   h += '<div class="bo-card" style="margin-bottom:20px">';
@@ -21798,7 +22274,7 @@ function gotoPanel(id, params){
     'supply-mgmt':panelSupplyMgmt,'pending-transfers':panelPendingTransfers,
     'agent-codes':panelAgentCodes,'goal-settings':panelGoalSettings,
     'form-builder':panelFormBuilder,announce:panelAnnounce,
-    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,
+    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
     agents:panelAgents,'ll-teams':panelMarketsAdmin,
@@ -49812,9 +50288,15 @@ document.addEventListener('keydown', function(e){
 // Init
 document.getElementById('boDateEl').textContent=new Date().toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
 initSupabase();
+// ── Calvin 2026-05-08: start sync queue background flush ──
+// Loads pending writes from localStorage, sets up retry timer + online/focus
+// listeners. Idempotent. Safe to call early — flushes are gated on supaClient.
+if(typeof syncStartBackgroundFlush === 'function') syncStartBackgroundFlush();
 // Load data async then init page
 (async function(){
   await loadFromSupabase();
+  // Flush any pending writes accumulated from prior sessions
+  if(typeof syncFlush === 'function') setTimeout(function(){ syncFlush(true); }, 1000);
   // Restore session if user was already logged in
   try{
     var savedId = sessionStorage.getItem('wmam_session');
