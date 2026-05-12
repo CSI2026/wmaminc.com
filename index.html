@@ -13394,7 +13394,76 @@ function syncStartBackgroundFlush(){
       }
     });
   }
+  // ── Calvin 2026-05-08: SAFETY NET SENTINEL ──
+  // Every 60 seconds, check DB.agents for changes since the last snapshot.
+  // If we detect a change that's NOT already in the sync queue (meaning
+  // some code path mutated DB without calling saveAgentToSupabase), force-
+  // enqueue that agent. This is the catch-all that guarantees no work is
+  // ever silently lost even if a future bug introduces a new path that
+  // forgets to save.
+  syncStartSentinel();
 }
+
+// ── Safety net sentinel ──
+// Periodically diffs DB.agents against its last-known-saved snapshot. Any
+// agent whose JSON has changed AND isn't already in the queue gets force-
+// enqueued. Defense in depth against forgotten save calls.
+var SENTINEL_SNAPSHOT = {};  // {agentId: jsonString}
+var SENTINEL_TIMER = null;
+function syncStartSentinel(){
+  if(SENTINEL_TIMER) return;
+  // Build initial snapshot
+  syncRebaselineSentinel();
+  SENTINEL_TIMER = setInterval(syncSentinelCheck, 60000);
+}
+
+function syncRebaselineSentinel(){
+  if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return;
+  SENTINEL_SNAPSHOT = {};
+  DB.agents.forEach(function(a){
+    if(a && a.id != null){
+      try{ SENTINEL_SNAPSHOT[a.id] = JSON.stringify(a); }catch(e){}
+    }
+  });
+}
+
+function syncSentinelCheck(){
+  if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return;
+  if(!supaClient) return;
+  var changed = 0;
+  var enqueued = 0;
+  DB.agents.forEach(function(a){
+    if(!a || a.id == null) return;
+    var current;
+    try{ current = JSON.stringify(a); }catch(e){ return; }
+    var prior = SENTINEL_SNAPSHOT[a.id];
+    if(prior !== current){
+      changed++;
+      // Check whether this agent already has a pending write in the queue
+      var alreadyQueued = SYNC_QUEUE.some(function(e){ return e.recordKey === 'agent:'+a.id; });
+      if(!alreadyQueued){
+        // FORCE-enqueue — some code path mutated this agent without saving
+        if(typeof saveAgentToSupabase === 'function'){
+          console.warn('[sentinel] agent #'+a.id+' ('+a.name+') changed but NOT in sync queue — forcing save. Some code path mutated the agent without calling save.');
+          try{ saveAgentToSupabase(a); enqueued++; }catch(e){ console.error('[sentinel] force-enqueue failed', e); }
+        }
+      }
+      SENTINEL_SNAPSHOT[a.id] = current;
+    }
+  });
+  // Detect deletions too — agent vanished from DB
+  Object.keys(SENTINEL_SNAPSHOT).forEach(function(idStr){
+    var id = parseInt(idStr, 10);
+    if(!DB.agents.some(function(a){ return a.id === id; })){
+      console.warn('[sentinel] agent #'+id+' disappeared from DB.agents. Snapshot cleared (no auto-delete from Supabase — Owner must explicitly delete).');
+      delete SENTINEL_SNAPSHOT[idStr];
+    }
+  });
+  if(changed > 0){
+    console.log('[sentinel] checked DB.agents: '+changed+' changed, '+enqueued+' force-enqueued (the rest were already in queue)');
+  }
+}
+
 
 // Re-pull a single agent's record from Supabase (Owner / admin use only).
 // Wired to the "Fix My Data" button on the agent profile. Overwrites
@@ -20192,8 +20261,17 @@ function genAgent() {
 function saveAgent() {
   if (!pendingAgent) return;
   DB.agents.push(pendingAgent);
+  // ── Calvin 2026-05-08: defensive save ──
+  // This function appears to be dead code (nothing calls it in current source)
+  // but I'm not deleting it per the preservation rule. Adding actual saves so
+  // if some legacy onclick handler still calls it, work isn't lost.
+  if(typeof saveToStorage === 'function') saveToStorage();
+  if(typeof saveAgentToSupabase === 'function'){
+    try{ saveAgentToSupabase(pendingAgent); }catch(e){ console.warn('[saveAgent] supabase save failed:', e); }
+  }
   pendingAgent=null;
-  document.getElementById('nAgentName').value='';
+  var nAgentNameEl = document.getElementById('nAgentName');
+  if(nAgentNameEl) nAgentNameEl.value='';
   closeModal('addAgentModal');
   gotoPanel('agents');
 }
@@ -42957,8 +43035,12 @@ function apDangerDelete(){
   if(typeof hardDeleteAgent === 'function'){
     hardDeleteAgent(id);
   } else {
+    // ── Calvin 2026-05-08: defensive — also delete from Supabase ──
     DB.agents = DB.agents.filter(function(a){ return a.id !== id; });
     if(typeof saveToStorage === 'function') saveToStorage();
+    if(typeof deleteAgentFromSupabase === 'function'){
+      try{ deleteAgentFromSupabase(id); }catch(e){ console.warn('[apDangerDelete] supabase delete failed:', e); }
+    }
   }
   closeModal('addPersonModal');
   if(typeof gotoPanel === 'function') gotoPanel(window._currentPanelId || 'manage-agents');
