@@ -1885,6 +1885,149 @@ function saveToStorage(){
     localStorage.setItem('wmam_teamMsgs',  JSON.stringify(TEAM_MSGS));  } catch(e){ console.warn('Storage save failed:', e); }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  ROLLING LOCAL BACKUP   (Calvin 2026-05-08 — 911 fix)
+// ════════════════════════════════════════════════════════════════════════
+//  Independent from the main localStorage agents key. Keeps last 5
+//  versions of DB.agents, timestamped. If something catastrophically
+//  wipes the live data, the user can restore from any of the snapshots
+//  via wmamRestoreBackup(index) from the browser console.
+//
+//  Owner can also see the 5 backups in panelSyncStatus and one-click
+//  restore.
+//
+//  Stored under 'wmam_agents_backup' as JSON: { backups: [{ts, agents:[...], count}] }
+// ════════════════════════════════════════════════════════════════════════
+function _wmamBackupAgents(){
+  try{
+    if(!Array.isArray(DB.agents) || !DB.agents.length) return; // never overwrite with empty
+    var raw = localStorage.getItem('wmam_agents_backup');
+    var store = { backups: [] };
+    if(raw){
+      try{ store = JSON.parse(raw) || { backups: [] }; }catch(e){}
+      if(!Array.isArray(store.backups)) store.backups = [];
+    }
+    // Build snapshot
+    var snap = {
+      ts: new Date().toISOString(),
+      count: DB.agents.length,
+      agents: DB.agents
+    };
+    // De-dupe: if the most recent snapshot has the same count and an identical
+    // hash to this one, skip — no point storing duplicates.
+    if(store.backups.length){
+      var last = store.backups[0];
+      try{
+        if(last && last.count === snap.count && JSON.stringify(last.agents) === JSON.stringify(snap.agents)){
+          return;
+        }
+      }catch(e){}
+    }
+    store.backups.unshift(snap);
+    if(store.backups.length > 5) store.backups = store.backups.slice(0, 5);
+    localStorage.setItem('wmam_agents_backup', JSON.stringify(store));
+  }catch(e){ console.warn('[_wmamBackupAgents] failed:', e); }
+}
+
+// Read backups (for the recovery UI in panelSyncStatus and console use)
+function wmamListBackups(){
+  try{
+    var raw = localStorage.getItem('wmam_agents_backup');
+    if(!raw) return [];
+    var store = JSON.parse(raw) || {};
+    return Array.isArray(store.backups) ? store.backups : [];
+  }catch(e){ return []; }
+}
+
+// Console-callable: wmamRestoreBackup(0) restores the most recent snapshot
+function wmamRestoreBackup(index){
+  try{
+    var bk = wmamListBackups();
+    if(!bk.length){ console.error('No backups available.'); return false; }
+    var idx = index|0;
+    if(idx < 0 || idx >= bk.length){ console.error('Invalid index. Available: 0-'+(bk.length-1)); return false; }
+    var snap = bk[idx];
+    if(!snap || !Array.isArray(snap.agents)){ console.error('Backup #'+idx+' is corrupt.'); return false; }
+    if(!confirm('Restore '+snap.count+' agent(s) from backup taken at '+new Date(snap.ts).toLocaleString()+'?\n\nThis will REPLACE your current DB.agents. Each restored agent will be re-queued for Supabase push.')) return false;
+    DB.agents = JSON.parse(JSON.stringify(snap.agents));
+    DB.nextId = Math.max.apply(null, DB.agents.map(function(a){return a.id;})) + 1;
+    // Re-queue every agent so Supabase gets the restored version
+    DB.agents.forEach(function(a){
+      a._localUpdatedAt = new Date().toISOString();
+      if(typeof saveAgentToSupabase === 'function'){
+        try{ saveAgentToSupabase(a); }catch(e){}
+      }
+    });
+    saveToStorage();
+    if(typeof renderCurrentPanel === 'function') renderCurrentPanel();
+    console.log('[wmamRestoreBackup] restored '+snap.count+' agent(s) from snapshot #'+idx);
+    alert('✓ Restored '+snap.count+' agent(s) from '+new Date(snap.ts).toLocaleString()+'. All records re-queued for Supabase sync.');
+    return true;
+  }catch(e){ console.warn('[wmamRestoreBackup] failed:', e); alert('Restore failed: '+e.message); return false; }
+}
+
+if(typeof window !== 'undefined'){
+  window.wmamListBackups   = wmamListBackups;
+  window.wmamRestoreBackup = wmamRestoreBackup;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  STUCK-QUEUE WARNING BANNER  (Calvin 2026-05-08 — 911 fix)
+// ════════════════════════════════════════════════════════════════════════
+//  If the sync queue has anything pending and >30 seconds have passed
+//  since it was last empty, show a LOUD, NON-DISMISSIBLE red banner at
+//  the top of every page. This is what Calvin needs to see when a write
+//  is silently failing — no more guessing.
+// ════════════════════════════════════════════════════════════════════════
+var _wmamLastEmptyAt = Date.now();
+function _wmamStuckQueueCheck(){
+  try{
+    if(typeof SYNC_QUEUE === 'undefined' || !Array.isArray(SYNC_QUEUE)) return;
+    if(!SYNC_QUEUE.length){
+      _wmamLastEmptyAt = Date.now();
+      var existing = document.getElementById('wmam-stuck-banner');
+      if(existing) existing.remove();
+      return;
+    }
+    var stuckMs = Date.now() - _wmamLastEmptyAt;
+    if(stuckMs < 30000) return;  // grace period — normal sync
+    // Build / refresh the banner
+    var banner = document.getElementById('wmam-stuck-banner');
+    var oldestAgeMin = Math.floor(stuckMs / 60000);
+    var oldestAgeSec = Math.floor((stuckMs % 60000) / 1000);
+    var ageStr = oldestAgeMin > 0 ? oldestAgeMin+'m '+oldestAgeSec+'s' : oldestAgeSec+'s';
+    var firstErr = '';
+    for(var i=0;i<SYNC_QUEUE.length;i++){
+      if(SYNC_QUEUE[i] && SYNC_QUEUE[i].lastError){
+        firstErr = SYNC_QUEUE[i].lastError;
+        break;
+      }
+    }
+    var html = '<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+      +'<div style="font-size:1.4rem">🚨</div>'
+      +'<div style="flex:1;min-width:260px">'
+      +  '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px">SYNC STUCK — '+SYNC_QUEUE.length+' WRITE'+(SYNC_QUEUE.length===1?'':'S')+' NOT REACHING SUPABASE ('+ageStr+')</div>'
+      +  '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.92;margin-top:2px">Your edits are saved LOCALLY but Supabase is rejecting them. DO NOT close this tab. ' + (firstErr ? 'Error: <code style="background:rgba(0,0,0,.2);padding:1px 5px;border-radius:3px">'+_escapeHtml(firstErr).slice(0,80)+'</code>' : 'Click the bell icon to see details.') + '</div>'
+      +'</div>'
+      +'<button onclick="if(typeof syncFlush===\'function\') syncFlush(true)" style="background:white;color:#CC0000;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0">↻ Retry Now</button>'
+      +'<button onclick="gotoPanel(\'sync-status\')" style="background:rgba(255,255,255,.2);border:1px solid white;color:white;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0">View Details</button>'
+      +'</div>';
+    if(!banner){
+      banner = document.createElement('div');
+      banner.id = 'wmam-stuck-banner';
+      banner.style.cssText = 'position:sticky;top:0;left:0;right:0;z-index:99998;background:linear-gradient(135deg,#CC0000,#8b0000);color:white;padding:14px 18px;box-shadow:0 4px 12px rgba(0,0,0,.3);border-bottom:2px solid #ffd700';
+      banner.innerHTML = html;
+      // Insert at top of body
+      if(document.body){
+        document.body.insertBefore(banner, document.body.firstChild);
+      }
+    } else {
+      banner.innerHTML = html;
+    }
+  }catch(e){ console.warn('[_wmamStuckQueueCheck] failed:', e); }
+}
+
+
 // Convenience wrapper used by Markets editor — same end result as
 // saveToStorage but explicit about intent. Also pushes teams to Supabase.
 function saveTeams(){
@@ -13858,10 +14001,47 @@ async function seedDefaultAgents(){
 async function loadFromSupabase(){
   if(!supaClient){ loadFromStorage(); return; }
   try{
+    // ════════════════════════════════════════════════════════════════════
+    // CALVIN 2026-05-08 — DATA LOSS 911 FIX
+    // ════════════════════════════════════════════════════════════════════
+    // OLD BEHAVIOR (the bug): this function did DB.agents = agents.map(...)
+    // which WHOLESALE REPLACED local DB.agents with whatever Supabase had.
+    // If a save to Supabase failed silently and the user refreshed, the
+    // load wiped their unsaved local edits. That's why Calvin's "edits not
+    // saving" issue kept reappearing — the edits WERE there locally, but
+    // the refresh blew them away.
+    //
+    // NEW BEHAVIOR (this fix): MERGE Supabase data with local data.
+    //   1. Any agent with a pending write in the sync queue → LOCAL WINS.
+    //      That edit hasn't reached Supabase yet, so the Supabase copy is
+    //      stale by definition.
+    //   2. Any agent whose local _localUpdatedAt is newer than Supabase
+    //      → LOCAL WINS. Edit was made offline or during a Supabase outage.
+    //   3. Otherwise → Supabase wins (normal sync from cloud).
+    // ════════════════════════════════════════════════════════════════════
+
+    // Step 1: snapshot existing local agents BEFORE the load so we can merge
+    var localAgents = Array.isArray(DB.agents) ? DB.agents.slice() : [];
+    var localById = {};
+    localAgents.forEach(function(a){ if(a && a.id != null) localById[a.id] = a; });
+
+    // Step 2: build set of agent IDs with pending queue entries (LOCAL WINS for these)
+    var pendingAgentIds = {};
+    try{
+      if(Array.isArray(SYNC_QUEUE)){
+        SYNC_QUEUE.forEach(function(e){
+          if(e && e.recordKey && e.recordKey.indexOf('agent:') === 0){
+            var id = parseInt(e.recordKey.split(':')[1], 10);
+            if(!isNaN(id)) pendingAgentIds[id] = true;
+          }
+        });
+      }
+    }catch(qE){ console.warn('[loadFromSupabase] queue scan failed:', qE); }
+
     // Load agents
     var agents = await sbSelect('agents');
     if(agents && agents.length > 0){
-      DB.agents = agents.map(function(a){
+      var supaList = agents.map(function(a){
         return {
           id: a.id, name: a.name, username: a.username, password: a.password,
           role: a.role, email: a.email||'',
@@ -13898,9 +14078,56 @@ async function loadFromSupabase(){
           // Per-campaign reporting chain. Map of {campaignName: parentAgentId | null}.
           // null means "top of org for this campaign". Defaults to {} so legacy
           // fields (teamLeaderId/marketManagerId/campaignManagerId) are used.
-          reportsTo:     safeJSON(a.reports_to, {})
+          reportsTo:     safeJSON(a.reports_to, {}),
+          _supaUpdatedAt: a.updated_at || null
         };
       });
+
+      // ── MERGE: walk through Supabase list and substitute LOCAL when local should win ──
+      var merged = [];
+      var seenIds = {};
+      var protectedCount = 0;
+      supaList.forEach(function(sa){
+        seenIds[sa.id] = true;
+        var local = localById[sa.id];
+        if(!local){
+          // Brand-new agent from Supabase that we didn't have locally
+          merged.push(sa);
+          return;
+        }
+        // Decision tree:
+        // (a) Is there a pending write in the queue for this agent? → LOCAL WINS
+        if(pendingAgentIds[sa.id]){
+          merged.push(local);
+          protectedCount++;
+          console.warn('[loadFromSupabase] LOCAL WINS for agent #'+sa.id+' ('+local.name+') — has pending sync queue entry');
+          return;
+        }
+        // (b) Local _localUpdatedAt > Supabase updated_at? → LOCAL WINS
+        var localTs = local._localUpdatedAt ? new Date(local._localUpdatedAt).getTime() : 0;
+        var supaTs  = sa._supaUpdatedAt    ? new Date(sa._supaUpdatedAt).getTime()    : 0;
+        if(localTs && localTs > supaTs + 1000){  // 1 sec grace for clock skew
+          merged.push(local);
+          protectedCount++;
+          console.warn('[loadFromSupabase] LOCAL WINS for agent #'+sa.id+' ('+local.name+') — local newer ('+new Date(localTs).toISOString()+' > '+new Date(supaTs).toISOString()+')');
+          return;
+        }
+        // (c) Default: Supabase wins
+        merged.push(sa);
+      });
+      // Also include any LOCAL-ONLY agents that aren't in Supabase yet (i.e. just created)
+      Object.keys(localById).forEach(function(idStr){
+        var id = parseInt(idStr, 10);
+        if(seenIds[id]) return;
+        // This local agent isn't in Supabase. Protect it ALWAYS — never silently drop a local agent.
+        merged.push(localById[id]);
+        protectedCount++;
+        console.warn('[loadFromSupabase] LOCAL-ONLY agent #'+id+' ('+(localById[id].name||'unknown')+') — keeping; not in Supabase yet');
+      });
+      DB.agents = merged;
+      if(protectedCount > 0){
+        console.log('[loadFromSupabase] MERGE done — '+protectedCount+' local agent(s) protected from being clobbered');
+      }
       // Auto-derive .category/.depts for every legacy record we just loaded.
       if(typeof migrateAllAgentCategories==='function') migrateAllAgentCategories();
       DB.nextId = Math.max.apply(null, DB.agents.map(function(a){return a.id;})) + 1;
@@ -14033,7 +14260,24 @@ async function loadFromSupabase(){
     // Load settings (EmailJS keys)
     var settings = await sbSelect('app_settings');
     if(settings){
+      // ── Calvin 2026-05-08 911 FIX: skip any app_setting that has a
+      // pending sync queue entry. The local version is newer and the
+      // queue will push it up shortly.
+      var pendingSettingKeys = {};
+      try{
+        if(Array.isArray(SYNC_QUEUE)){
+          SYNC_QUEUE.forEach(function(e){
+            if(e && e.recordKey && e.recordKey.indexOf('app_setting:') === 0){
+              pendingSettingKeys[e.recordKey.substring('app_setting:'.length)] = true;
+            }
+          });
+        }
+      }catch(qE){}
       settings.forEach(function(s){
+        if(s && s.key && pendingSettingKeys[s.key]){
+          console.warn('[loadFromSupabase] SKIPPING app_setting:'+s.key+' from Supabase — has pending local write in queue');
+          return;
+        }
         if(s.key==='brevo_key' && s.value) BREVO_API_KEY=s.value;
         if(s.key==='prog_thresholds' && s.value){ try{PROG_THRESHOLDS=JSON.parse(s.value);}catch(e){} }
         if(s.key==='departments_cfg' && s.value){ try{var dc=JSON.parse(s.value);if(dc&&Array.isArray(dc))WMAM_DEPARTMENTS=dc;}catch(e){} }
@@ -14239,6 +14483,21 @@ async function saveAgentToSupabase(agent){
   // The queue's _syncAttemptAgentUpsert preserves the 3-tier schema
   // fallback (full → legacy → bare) so if Supabase columns are missing,
   // at minimum username+password still save.
+
+  // ── Calvin 2026-05-08 911 FIX: stamp _localUpdatedAt ──
+  // The MERGE logic in loadFromSupabase uses this timestamp to decide
+  // whether the local copy is newer than what's in Supabase. Without
+  // this stamp, every refresh would reset the agent back to Supabase.
+  agent._localUpdatedAt = new Date().toISOString();
+
+  // ── Calvin 2026-05-08 911 FIX: ROLLING LOCAL BACKUP ──
+  // Write a separate localStorage snapshot of the agents array on EVERY
+  // save. Keeps last 5 versions. If everything else fails (Supabase
+  // wipes, localStorage clears, etc.), there's a recoverable history.
+  try{
+    _wmamBackupAgents();
+  }catch(bkE){ console.warn('[saveAgentToSupabase] backup failed:', bkE); }
+
   saveToStorage();  // always-on local persistence
   if(!supaClient) return false;
   try { console.log('[saveAgentToSupabase] enqueue agent #'+agent.id+' name="'+agent.name+'" username="'+agent.username+'" password.length='+(agent.password?String(agent.password).length:0)); } catch(e){}
@@ -17772,6 +18031,21 @@ function panelNotifications(){
       var rId = (n.data.reportId|0);
       h += '<div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">'
         +'<button onclick="viewEncroachmentDetail('+rId+')" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">🚧 View Encroachment Report</button>'
+        +'</div>';
+    }
+
+    // ── Calvin 2026-05-08: Sign Acknowledgment button for training-ack notifications ──
+    if(n.formType === 'training-ack-needed' && n.data && n.data.completionId){
+      var ackCid = (n.data.completionId|0);
+      h += '<div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">'
+        +'<button onclick="gotoPanel(\'training-acknowledge\',{completionId:'+ackCid+'})" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">✍️ Sign Acknowledgment</button>'
+        +'</div>';
+    }
+
+    // ── Calvin 2026-05-08: View Pending Transfers button for inv notifications ──
+    if((n.formType === 'inv-transfer' || n.formType === 'inv-holder-approval' || n.formType === 'inv-escalation') && n.data){
+      h += '<div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">'
+        +'<button onclick="gotoPanel(\'pending-transfers\')" style="background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">🔄 View Pending Transfers</button>'
         +'</div>';
     }
 
@@ -22456,7 +22730,7 @@ function gotoPanel(id, params){
   var titles = {
     bo:'Back Office', owner:'Owner Dashboard', notifications:'Notifications', meetings:'Meetings', 'meeting-hosts':'Manage Hosts',
     'hr-dashboard':'HR Dashboard','training-scheduled':'Schedule Training',
-    'training-complete':'Training Complete','onboarding-queue':'Onboarding Queue',
+    'training-complete':'Training Complete','training-acknowledge':'Acknowledge Training','onboarding-queue':'Onboarding Queue',
     'inv-dashboard':'All Inventory','inv-upload':'Upload Devices',
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
@@ -22489,6 +22763,7 @@ function gotoPanel(id, params){
   var map = {
     bo:panelBO, owner:panelOwner,
     'hr-dashboard':panelHRDashboard,'training-scheduled':panelTrainingSchedule,
+    'training-acknowledge':panelTrainingAcknowledge,
     'onboarding-queue':panelOnboardingQueue,
     'inv-dashboard':panelInvDashboard,'inv-upload':panelInvUpload,
     'inv-transfer':panelInvTransfer,'inv-requests':panelInvRequests,
@@ -22540,6 +22815,7 @@ function gotoPanel(id, params){
     'direct-deposits-admin':panelDirectDepositAdmin,
     'training-schedule':panelTrainingSchedule,
     'training-complete':panelTrainingComplete,
+    'training-acknowledge':panelTrainingAcknowledge,
     'pending-code-approvals':panelPendingCodeApprovals,
     'onboard-upload':panelOnboardUpload,
     'bg-auth':panelBgAuth,
@@ -39124,13 +39400,49 @@ function panelTrainingSchedule(){
     });
     h += '</select></div>';
 
-    h += '<div style="display:flex;gap:12px;margin-bottom:14px">';
-    h += '<div class="f-field" style="flex:1"><label class="f-label">Date</label><input id="tsDate" type="date" class="f-input" min="'+new Date().toISOString().slice(0,10)+'"></div>';
-    h += '<div class="f-field" style="flex:1"><label class="f-label">Time</label><input id="tsTime" type="time" class="f-input"></div>';
+    h += '<div style="display:flex;gap:12px;margin-bottom:14px;flex-wrap:wrap">';
+    h += '<div class="f-field" style="flex:1;min-width:140px"><label class="f-label">Start Date</label><input id="tsDate" type="date" class="f-input" min="'+new Date().toISOString().slice(0,10)+'" onchange="tsRefreshEndDate()"></div>';
+    h += '<div class="f-field" style="flex:1;min-width:140px"><label class="f-label">Start Time</label><input id="tsTime" type="time" class="f-input"></div>';
+    h += '<div class="f-field" style="flex:1;min-width:120px"><label class="f-label">End Time</label><input id="tsEndTime" type="time" class="f-input"></div>';
     h += '</div>';
 
+    // ── Calvin 2026-05-08: NUMBER OF DAYS (1-5, default 3) ──
+    h += '<div style="display:flex;gap:12px;margin-bottom:14px;flex-wrap:wrap;align-items:flex-end">';
+    h += '<div class="f-field" style="flex:0 0 140px"><label class="f-label">Days</label>'
+       + '<select id="tsNumDays" class="f-input" onchange="tsRefreshEndDate()">'
+       +   '<option value="1">1 day</option>'
+       +   '<option value="2">2 days</option>'
+       +   '<option value="3" selected>3 days</option>'
+       +   '<option value="4">4 days</option>'
+       +   '<option value="5">5 days</option>'
+       + '</select></div>';
+    h += '<div style="flex:1;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);padding-bottom:10px">'
+       + '<span id="tsEndDatePreview" style="display:inline-block;padding:6px 14px;background:var(--cream);border:1px solid var(--sand);border-radius:5px;color:var(--muted);font-style:italic">Pick start date to see end date</span>'
+       + '</div>';
+    h += '</div>';
+
+    // ── Calvin 2026-05-08: SAVED LOCATIONS LIBRARY (per-manager) ──
+    var savedLocs = Array.isArray(u.trainingLocations) ? u.trainingLocations.slice() : [];
+    // Sort by lastUsed desc
+    savedLocs.sort(function(a,b){ return (b.lastUsed||0) - (a.lastUsed||0); });
     h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Location</label>';
-    h += '<input id="tsLocation" type="text" class="f-input" placeholder="e.g., 1234 Main St Dallas TX, OR &quot;Remote/Phone&quot;"></div>';
+    if(savedLocs.length){
+      h += '<select id="tsLocationPick" class="f-input" onchange="tsLocationPickChange(this)" style="margin-bottom:6px">'
+         +   '<option value="">— Pick a saved location or enter new —</option>';
+      savedLocs.forEach(function(L, i){
+        h += '<option value="'+i+'">'+_escapeHtml(L.label || L.address)+(L.label && L.address && L.label !== L.address ? ' ('+_escapeHtml(L.address)+')' : '')+'</option>';
+      });
+      h += '  <option value="__new__">＋ Enter new location</option>';
+      h += '</select>';
+    }
+    h += '<input id="tsLocation" type="text" class="f-input" placeholder="e.g., 1234 Main St Dallas TX, OR &quot;Remote/Phone&quot;">';
+    h += '<label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);cursor:pointer">'
+       + '<input type="checkbox" id="tsSaveLocation"' + (savedLocs.length ? '' : ' checked') + '> Save this location for next time'
+       + '</label>';
+    h += '</div>';
+
+    // Stash the saved locations on a window var so tsLocationPickChange can read them
+    if(typeof window !== 'undefined') window._tsSavedLocations = savedLocs;
 
     h += '<div class="f-field" style="margin-bottom:14px"><label class="f-label">Estimated Duration (minutes)</label>';
     h += '<input id="tsDuration" type="number" min="15" step="15" class="f-input" value="60"></div>';
@@ -39191,6 +39503,66 @@ function panelTrainingSchedule(){
   }
 }
 
+// ── Calvin 2026-05-08: helpers for new schedule fields ──
+
+// User picked a saved location (or chose "Enter new") — populate the
+// free-text field accordingly. Sets the "save next time" checkbox state
+// (off for saved-pick, on for new entry).
+function tsLocationPickChange(sel){
+  try{
+    var idx = sel.value;
+    var input = document.getElementById('tsLocation');
+    var saveCb = document.getElementById('tsSaveLocation');
+    if(!input) return;
+    if(idx === '__new__' || idx === ''){
+      input.value = '';
+      input.disabled = false;
+      input.focus();
+      if(saveCb) saveCb.checked = true;
+    } else {
+      var n = parseInt(idx, 10);
+      var locs = window._tsSavedLocations || [];
+      if(locs[n]){
+        input.value = locs[n].address || locs[n].label || '';
+        if(saveCb) saveCb.checked = false;  // already saved
+      }
+    }
+  } catch(e){ console.warn('[tsLocationPickChange] failed:', e); }
+}
+
+// Re-compute the end-date preview based on tsDate + tsNumDays. Calls when
+// either field changes. Shows the inclusive end date so the manager sees
+// "3-day training: Mon Oct 7 → Wed Oct 9".
+function tsRefreshEndDate(){
+  try{
+    var dateEl = document.getElementById('tsDate');
+    var daysEl = document.getElementById('tsNumDays');
+    var prev = document.getElementById('tsEndDatePreview');
+    if(!dateEl || !daysEl || !prev) return;
+    var date = dateEl.value;
+    var n = parseInt(daysEl.value, 10) || 1;
+    if(!date){
+      prev.innerHTML = '<em>Pick start date to see end date</em>';
+      prev.style.color = 'var(--muted)';
+      return;
+    }
+    var d = new Date(date + 'T12:00:00');
+    if(isNaN(d.getTime())){
+      prev.innerHTML = '<em>Invalid date</em>';
+      return;
+    }
+    var end = new Date(d.getTime() + (n - 1) * 24 * 60 * 60 * 1000);
+    var fmt = function(x){ return x.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'}); };
+    if(n === 1){
+      prev.innerHTML = '<strong>Single day:</strong> ' + fmt(d);
+    } else {
+      prev.innerHTML = '<strong>'+n+'-day training:</strong> ' + fmt(d) + ' → ' + fmt(end);
+    }
+    prev.style.color = 'var(--brown)';
+    prev.style.fontStyle = 'normal';
+  } catch(e){ console.warn('[tsRefreshEndDate] failed:', e); }
+}
+
 function tsSchedule(){
   try {
     var u = DB.current;
@@ -39198,7 +39570,12 @@ function tsSchedule(){
     var agentId = parseInt((document.getElementById('tsAgent')||{}).value, 10);
     var date = (document.getElementById('tsDate')||{}).value || '';
     var time = (document.getElementById('tsTime')||{}).value || '';
+    var endTime = (document.getElementById('tsEndTime')||{}).value || '';
+    var numDays = parseInt((document.getElementById('tsNumDays')||{}).value, 10) || 3;
+    if(numDays < 1) numDays = 1;
+    if(numDays > 5) numDays = 5;
     var loc  = (document.getElementById('tsLocation')||{}).value || '';
+    var saveLoc = !!(document.getElementById('tsSaveLocation')||{}).checked;
     var dur  = parseInt((document.getElementById('tsDuration')||{}).value, 10) || 60;
     var notes = (document.getElementById('tsNotes')||{}).value || '';
     var topics = [];
@@ -39213,7 +39590,7 @@ function tsSchedule(){
 
     var errors = [];
     if(!agentId) errors.push('Select an agent');
-    if(!date) errors.push('Pick a date');
+    if(!date) errors.push('Pick a start date');
     if(!loc.trim()) errors.push('Enter a location');
     if(!topics.length) errors.push('Select at least one topic');
     // Hard validations on RADID format if anything was entered
@@ -39249,14 +39626,29 @@ function tsSchedule(){
     var agent = (DB.agents||[]).find(function(a){ return a.id === agentId; });
     if(!agent){ alert('Agent not found.'); return; }
 
+    // ── Calvin 2026-05-08: compute end date from start + numDays ──
+    var startDt = new Date(date + 'T12:00:00');
+    var endDt = new Date(startDt.getTime() + (numDays - 1) * 24 * 60 * 60 * 1000);
+    var endDate = endDt.toISOString().slice(0, 10);
+    var dayList = [];
+    for(var i = 0; i < numDays; i++){
+      var dayDt = new Date(startDt.getTime() + i * 24 * 60 * 60 * 1000);
+      dayList.push(dayDt.toISOString().slice(0, 10));
+    }
+
     var session = {
       id: TRAINING_NEXT_ID++,
       agentId: agent.id,
       agentName: agent.name,
       scheduledById: u.id,
       scheduledByName: u.name,
-      date: date,
+      // Calvin 2026-05-08: multi-day fields
+      date: date,           // start date (kept for backward compat with completion picker)
+      endDate: endDate,
+      numDays: numDays,
+      days: dayList,        // explicit list of dates
       time: time,
+      endTime: endTime,
       location: loc.trim(),
       duration: dur,
       topics: topics,
@@ -39271,23 +39663,86 @@ function tsSchedule(){
     };
     TRAINING_SESSIONS.unshift(session);
     saveInventory();
-    console.log('[tsSchedule] session #'+session.id+' scheduled: '+agent.name+' / '+date);
 
-    // Notify the agent
+    // ── Calvin 2026-05-08: persist location to manager's library ──
+    if(saveLoc && loc.trim() && !/^remote/i.test(loc.trim())){
+      if(!Array.isArray(u.trainingLocations)) u.trainingLocations = [];
+      var nowMs = Date.now();
+      var existing = u.trainingLocations.find(function(L){
+        return (L.address||'').trim().toLowerCase() === loc.trim().toLowerCase();
+      });
+      if(existing){
+        existing.lastUsed = nowMs;
+      } else {
+        u.trainingLocations.push({
+          label:    loc.trim(),       // user can rename later; default to address
+          address:  loc.trim(),
+          createdAt: nowMs,
+          lastUsed:  nowMs
+        });
+        // Keep library bounded — max 30 locations per manager
+        if(u.trainingLocations.length > 30){
+          u.trainingLocations.sort(function(a,b){ return (b.lastUsed||0) - (a.lastUsed||0); });
+          u.trainingLocations = u.trainingLocations.slice(0, 30);
+        }
+      }
+      // Persist via the sync queue (covers Supabase + local)
+      if(typeof saveAgentToSupabase === 'function'){
+        try{ saveAgentToSupabase(u); }catch(e){ console.warn('[tsSchedule] save location library failed:', e); }
+      }
+    }
+    console.log('[tsSchedule] session #'+session.id+' scheduled: '+agent.name+' / '+date+' for '+numDays+' day(s)');
+
+    // ── Notify the trainee ──
+    var bodyDateText = (numDays === 1)
+      ? date + (time ? ' at ' + time : '')
+      : numDays + '-day training starting ' + date + (time ? ' at ' + time : '') + ' through ' + endDate;
     if(typeof postNotification === 'function'){
       try {
         postNotification({
           icon: '🎓',
           title: 'Training Scheduled',
-          body: u.name+' scheduled training with you on '+date+(time?' at '+time:'')+'. Location: '+loc.trim()+'. Topics: '+topics.join(', ')+'.',
+          body: u.name+' scheduled '+bodyDateText+' with you. Location: '+loc.trim()+'. Topics: '+topics.join(', ')+'.',
           fromId: u.id, fromName: u.name,
           formType: 'training-scheduled',
+          data: { kind:'training-scheduled', sessionId: session.id },
           toIds: [agent.id]
         });
       } catch(e){ /* ignore */ }
     }
 
-    alert('✓ Training scheduled with '+agent.name+'.\n\nAfter the session, come back and click "Mark Complete" to log outcomes.');
+    // ── Calvin 2026-05-08: also notify the MANAGER'S UPLINE ──
+    // TL → MM, MM → CM, CM → Owner, IBO → Owner.
+    // Uses reportingChainFor (campaign-aware) PLUS the legacy single-parent
+    // fields so we catch every shape of org placement.
+    try{
+      var uplineIds = {};
+      var chain = (typeof reportingChainFor === 'function') ? reportingChainFor(u) : {};
+      if(chain.marketManagerId)   uplineIds[chain.marketManagerId]   = true;
+      if(chain.campaignManagerId) uplineIds[chain.campaignManagerId] = true;
+      // Owner always notified
+      (DB.agents||[]).forEach(function(a){
+        if(a && a.active && typeof isOwner === 'function' && isOwner(a)) uplineIds[a.id] = true;
+      });
+      // Don't notify self
+      delete uplineIds[u.id];
+      var uplineList = Object.keys(uplineIds).map(function(k){ return parseInt(k,10); }).filter(function(x){ return !isNaN(x); });
+      if(uplineList.length && typeof postNotification === 'function'){
+        postNotification({
+          icon: '🎓',
+          title: 'Training Scheduled by '+u.name,
+          body: u.name+' scheduled '+bodyDateText+' with '+agent.name+' at '+loc.trim()+'.',
+          fromId: u.id, fromName: u.name,
+          formType: 'training-scheduled-upline',
+          data: { kind:'training-scheduled-upline', sessionId: session.id, agentId: agent.id },
+          toIds: uplineList
+        });
+      }
+    } catch(uplineErr){ console.warn('[tsSchedule] upline notification failed:', uplineErr); }
+
+    alert('✓ Training scheduled with '+agent.name+'.\n\n'
+      + numDays + '-day session starting '+date+(numDays>1?' through '+endDate:'')+'.\n\n'
+      + 'After the session, come back and click "Mark Complete" to log outcomes.');
     gotoPanel('training-schedule');
   } catch(e){
     console.warn('[tsSchedule] failed:', e);
@@ -39544,7 +39999,22 @@ function tcSubmit(){
       proposedCodes: proposedCodes,
       signature: sig.trim(),
       completedAt: new Date().toISOString(),
-      approvalStatus: Object.keys(proposedCodes).length ? 'pending' : 'approved',  // no codes proposed → no approval needed
+      // ── Calvin 2026-05-08: NEW TWO-PARTY FLOW ──
+      // Old flow: completion went straight to 'pending' for Owner/Onboarding
+      // code approval. Manager's word = enough.
+      // New flow: completion goes through these states:
+      //   1. 'pending-agent-acknowledgment' — trainee must sign that they
+      //      were in fact trained on these topics. Defense against rogue
+      //      managers ghost-coding agents who never actually showed up.
+      //   2. 'pending-bg-check' — trainee signed. Codes wait until the
+      //      agent's background check + agreements are all 'passed'.
+      //   3. 'pending-code-approval' — BG check passed. Owner/Onboarding
+      //      can now approve codes.
+      //   4. 'approved' / 'rejected'.
+      approvalStatus: 'pending-agent-acknowledgment',
+      agentAcknowledgedAt: null,
+      agentAcknowledgedSig: null,    // base64 PNG of trainee signature
+      bgCheckStatusAtApproval: null,  // snapshot when codes finally approve
       approvedById: null,
       approvedAt: null,
       rejectReason: ''
@@ -39552,27 +40022,50 @@ function tcSubmit(){
     TRAINING_COMPLETIONS.unshift(completion);
     session.status = 'completed';
     saveInventory();
-    console.log('[tcSubmit] completion #'+completion.id+' for session #'+session.id+', outcome='+outcome+', approval='+completion.approvalStatus);
+    console.log('[tcSubmit] completion #'+completion.id+' for session #'+session.id+', outcome='+outcome+', approvalStatus='+completion.approvalStatus);
 
-    // Notify Owner + Onboarding if approval needed
-    if(completion.approvalStatus === 'pending' && typeof postNotification === 'function'){
+    // ── Calvin 2026-05-08: Notify the TRAINEE that they need to sign ──
+    if(typeof postNotification === 'function'){
       try {
-        var recips = (DB.agents || []).filter(function(a){
-          return a.active && (a.id === 1 || (a.depts && a.depts.onboarding === true) || a.role === 'Onboarding');
-        }).map(function(a){ return a.id; });
         postNotification({
-          icon: '🎓',
-          title: 'Code Approval Needed — '+session.agentName,
-          body: u.name+' completed training with '+session.agentName+' (outcome: '+outcome+') and proposed coding for '+Object.keys(proposedCodes).length+' campaign(s). Review in the Pending Code Approvals queue.',
+          icon: '✍️',
+          title: 'Training Complete — Your Acknowledgment Needed',
+          body: u.name + ' marked your training complete (outcome: ' + outcome + '). Please sign to acknowledge you were trained on the topics. Until you sign, codes will not be issued.',
           fromId: u.id, fromName: u.name,
-          formType: 'code-approval',
-          toIds: recips
+          formType: 'training-ack-needed',
+          data: { kind:'training-ack-needed', completionId: completion.id },
+          toIds: [session.agentId]
         });
       } catch(e){ /* ignore */ }
     }
+    // Notify the manager's upline (informational — training done, awaiting agent ack)
+    try{
+      var uplineIds2 = {};
+      var chain2 = (typeof reportingChainFor === 'function') ? reportingChainFor(u) : {};
+      if(chain2.marketManagerId)   uplineIds2[chain2.marketManagerId]   = true;
+      if(chain2.campaignManagerId) uplineIds2[chain2.campaignManagerId] = true;
+      (DB.agents||[]).forEach(function(a){
+        if(a && a.active && typeof isOwner === 'function' && isOwner(a)) uplineIds2[a.id] = true;
+        if(a && a.active && typeof isOnboarding === 'function' && isOnboarding(a)) uplineIds2[a.id] = true;
+      });
+      delete uplineIds2[u.id];
+      var uplineList2 = Object.keys(uplineIds2).map(function(k){ return parseInt(k,10); }).filter(function(x){ return !isNaN(x); });
+      if(uplineList2.length && typeof postNotification === 'function'){
+        postNotification({
+          icon: '✅',
+          title: 'Training Marked Complete — '+session.agentName,
+          body: u.name+' marked training complete with '+session.agentName+' (outcome: '+outcome+'). Awaiting agent acknowledgment, then BG check, then code approval.',
+          fromId: u.id, fromName: u.name,
+          formType: 'training-complete-upline',
+          data: { kind:'training-complete-upline', completionId: completion.id, agentId: session.agentId },
+          toIds: uplineList2
+        });
+      }
+    } catch(uplineErr){ console.warn('[tcSubmit] upline notification failed:', uplineErr); }
 
-    alert('✓ Completion submitted!'
-      + (completion.approvalStatus === 'pending' ? '\n\nProposed codes are pending Owner/Onboarding approval before they apply.' : '\n\nNo codes were proposed; no approval needed.'));
+    alert('✓ Completion submitted!\n\n'
+      + session.agentName + ' must now acknowledge they were trained.\n'
+      + 'After acknowledgment, codes will wait for the agent\'s background check and signed agreements before Owner/Onboarding can approve them.');
     gotoPanel('training-schedule');
   } catch(e){
     console.warn('[tcSubmit] failed:', e);
@@ -39581,6 +40074,350 @@ function tcSubmit(){
 }
 
 // ── PANEL 3: PENDING CODE APPROVALS (Owner + Onboarding) ──
+// ════════════════════════════════════════════════════════════════════════
+//  TRAINING ACK + BG-CHECK GATE  (Calvin 2026-05-08)
+//
+//  After the manager submits Training Complete, the completion record
+//  enters state 'pending-agent-acknowledgment'. The trainee gets a
+//  notification with a Sign-to-Acknowledge button → opens the panel
+//  below → draws signature → state advances to 'pending-bg-check'.
+//
+//  From 'pending-bg-check', the system auto-checks agent.backgroundCheck.
+//  status. When status === 'passed' AND all required agreements signed,
+//  state advances to 'pending-code-approval' and Owner/Onboarding can
+//  finally approve the proposed codes.
+// ════════════════════════════════════════════════════════════════════════
+
+// Resolves whether an agent's background check has passed. Reads from
+// AGENT_ONBOARDING_STATUS (existing onboarding store) and the agent's
+// .backgroundCheck field. Returns { passed, status, reason }.
+function trainingBgCheckPassed(agentId){
+  try{
+    var agent = (DB.agents||[]).find(function(a){ return a.id === agentId; });
+    if(!agent) return { passed:false, status:'unknown', reason:'agent-not-found' };
+    // Source 1: agent.backgroundCheck.status (canonical)
+    if(agent.backgroundCheck && typeof agent.backgroundCheck === 'object'){
+      var s = (agent.backgroundCheck.status || '').toLowerCase();
+      if(s === 'passed' || s === 'cleared' || s === 'approved') return { passed:true, status:s };
+      if(s === 'failed' || s === 'denied') return { passed:false, status:s, reason:'bg-failed' };
+      if(s === 'pending' || s === 'in-progress' || s === 'submitted') return { passed:false, status:s, reason:'bg-pending' };
+    }
+    // Source 2: AGENT_ONBOARDING_STATUS[id].bgCheckStatus
+    if(typeof AGENT_ONBOARDING_STATUS === 'object' && AGENT_ONBOARDING_STATUS[agentId]){
+      var ob = AGENT_ONBOARDING_STATUS[agentId];
+      if(ob.bgCheckStatus === 'passed') return { passed:true, status:'passed' };
+      if(ob.bgCheckStatus === 'failed') return { passed:false, status:'failed', reason:'bg-failed' };
+      if(ob.bgCheckStatus) return { passed:false, status:ob.bgCheckStatus, reason:'bg-pending' };
+    }
+    return { passed:false, status:'not-started', reason:'bg-not-started' };
+  } catch(e){ console.warn('[trainingBgCheckPassed] failed:', e); return { passed:false, status:'error', reason:'check-failed' }; }
+}
+
+// Resolves whether the required agreements (onboarding docs) are all
+// signed. Reads AGENT_SIGNED_DOCS. Returns { allSigned, missing }.
+function trainingAgreementsSigned(agentId){
+  try{
+    var REQUIRED_DOCS = ['ic-agreement','dpa-agreement','bg-authorization'];
+    if(typeof AGENT_SIGNED_DOCS !== 'object') return { allSigned:false, missing:REQUIRED_DOCS };
+    var signed = AGENT_SIGNED_DOCS[agentId] || [];
+    var signedSet = {};
+    signed.forEach(function(d){
+      if(typeof d === 'string') signedSet[d] = true;
+      else if(d && d.id) signedSet[d.id] = true;
+      else if(d && d.docId) signedSet[d.docId] = true;
+    });
+    var missing = REQUIRED_DOCS.filter(function(req){ return !signedSet[req]; });
+    return { allSigned: missing.length === 0, missing: missing };
+  } catch(e){ console.warn('[trainingAgreementsSigned] failed:', e); return { allSigned:false, missing:['(error reading)'] }; }
+}
+
+// Composite gate: can this completion move from pending-bg-check to
+// pending-code-approval? Both BG and agreements must be cleared.
+// Returns { ready, blockers: [] }.
+function trainingCanAdvanceToCodeApproval(completion){
+  if(!completion) return { ready:false, blockers:['(no completion)'] };
+  var blockers = [];
+  var bg = trainingBgCheckPassed(completion.agentId);
+  if(!bg.passed) blockers.push('Background check: '+(bg.status||'unknown'));
+  var ag = trainingAgreementsSigned(completion.agentId);
+  if(!ag.allSigned) blockers.push('Missing agreements: '+ag.missing.join(', '));
+  return { ready: blockers.length === 0, blockers: blockers };
+}
+
+// Periodic auto-advance: scans pending-bg-check completions; if BG check
+// + agreements are now resolved, advances to pending-code-approval and
+// notifies Owner+Onboarding to review. Runs on each panel render and on
+// a 30-second timer.
+function trainingAutoAdvancePending(){
+  try{
+    if(typeof TRAINING_COMPLETIONS !== 'object' || !Array.isArray(TRAINING_COMPLETIONS)) return 0;
+    var advanced = 0;
+    TRAINING_COMPLETIONS.forEach(function(c){
+      if(!c || c.approvalStatus !== 'pending-bg-check') return;
+      var gate = trainingCanAdvanceToCodeApproval(c);
+      if(gate.ready){
+        c.approvalStatus = 'pending-code-approval';
+        c.bgCheckPassedAt = new Date().toISOString();
+        c.bgCheckStatusAtApproval = 'passed';
+        advanced++;
+        if(typeof postNotification === 'function'){
+          try{
+            var recips = (DB.agents || []).filter(function(a){
+              return a && a.active && (
+                (typeof isOwner==='function' && isOwner(a))
+                || (typeof isOnboarding === 'function' && isOnboarding(a))
+                || (a.depts && a.depts.onboarding === true)
+              );
+            }).map(function(a){ return a.id; });
+            postNotification({
+              icon: '🎓',
+              title: 'Code Approval Ready — '+c.agentName,
+              body: c.agentName+' has signed training acknowledgment, BG check is passed, and agreements are signed. Review proposed codes.',
+              formType:'code-approval',
+              data:{ kind:'code-approval', completionId:c.id },
+              toIds: recips
+            });
+          } catch(e){}
+        }
+      }
+    });
+    if(advanced > 0){
+      saveInventory();
+      console.log('[trainingAutoAdvance] '+advanced+' completion(s) advanced to pending-code-approval');
+    }
+    return advanced;
+  } catch(e){ console.warn('[trainingAutoAdvancePending] failed:', e); return 0; }
+}
+
+// ── Agent-acknowledgment panel: trainee opens this from the notification ──
+// Shows the completion record (manager, date, outcome, topics, proposed
+// codes) and a signature pad. Trainee draws their signature → completion
+// advances to pending-bg-check.
+function panelTrainingAcknowledge(){
+  try{
+    var u = DB.current;
+    var completionId = (gotoPanel._params && gotoPanel._params.completionId) || null;
+    var h = panelHeader('✍️ Acknowledge Training');
+
+    // Show all completions waiting for this trainee to sign
+    var mine = (TRAINING_COMPLETIONS || []).filter(function(c){
+      return c && c.agentId === u.id && c.approvalStatus === 'pending-agent-acknowledgment';
+    });
+    if(!mine.length){
+      h += '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">'
+        + '<div style="font-size:2rem;margin-bottom:14px">✓</div>'
+        + 'You have no training acknowledgments waiting.'
+        + '</div>';
+      return h;
+    }
+    // If we have a specific completionId, render only that one. Otherwise show all.
+    var list = completionId
+      ? mine.filter(function(c){ return c.id === completionId; })
+      : mine;
+    if(!list.length) list = mine;
+
+    h += '<div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">'
+      + '<strong>Your acknowledgment is required.</strong> Your manager marked your training complete. Before codes can be issued to you, you must sign below to acknowledge you were trained on the topics listed. If anything is wrong (you weren\'t there, topics not covered, etc.) reject instead — your upline and Onboarding will be notified.'
+      + '</div>';
+
+    list.forEach(function(c){
+      var session = (TRAINING_SESSIONS||[]).find(function(s){ return s.id === c.sessionId; });
+      h += '<div class="bo-card" style="margin-bottom:18px;padding:0;overflow:hidden">';
+      h += '<div style="background:linear-gradient(135deg,#7c3aed,#5b21b6);padding:18px 24px;color:white">';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px">Training Acknowledgment Required</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.85;margin-top:2px">Completion #'+c.id+'</div>';
+      h += '</div>';
+      h += '<div style="padding:20px 24px">';
+      h += '<table style="width:100%;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);margin-bottom:14px">';
+      h += '<tr><td style="padding:4px 0;color:var(--muted);width:140px">Marked complete by:</td><td><strong>'+_escapeHtml(c.completedByName)+'</strong></td></tr>';
+      if(session){
+        h += '<tr><td style="padding:4px 0;color:var(--muted)">Training dates:</td><td>'+_escapeHtml(session.date)+(session.endDate && session.endDate !== session.date ? ' → '+_escapeHtml(session.endDate) : '')+' ('+(session.numDays||1)+' day'+((session.numDays||1)===1?'':'s')+')</td></tr>';
+        if(session.location) h += '<tr><td style="padding:4px 0;color:var(--muted)">Location:</td><td>'+_escapeHtml(session.location)+'</td></tr>';
+      }
+      var outColor = c.outcome === 'passed' ? '#16a34a' : c.outcome === 'failed' ? '#dc2626' : '#D97706';
+      var outLabel = c.outcome === 'passed' ? '✓ Passed' : c.outcome === 'failed' ? '✗ Failed' : '↻ Needs More Training';
+      h += '<tr><td style="padding:4px 0;color:var(--muted)">Outcome:</td><td><strong style="color:'+outColor+'">'+outLabel+'</strong></td></tr>';
+      if(c.topicsCovered && c.topicsCovered.length){
+        h += '<tr><td style="padding:4px 0;color:var(--muted);vertical-align:top">Topics covered:</td><td>'+_escapeHtml(c.topicsCovered.join(', '))+'</td></tr>';
+      }
+      if(c.proposedCodes && Object.keys(c.proposedCodes).length){
+        var camps = Object.keys(c.proposedCodes);
+        h += '<tr><td style="padding:4px 0;color:var(--muted);vertical-align:top">Proposed campaigns:</td><td>'+_escapeHtml(camps.join(', '))+'</td></tr>';
+      }
+      if(c.assessment){
+        h += '<tr><td style="padding:4px 0;color:var(--muted);vertical-align:top">Notes:</td><td>'+_escapeHtml(c.assessment)+'</td></tr>';
+      }
+      h += '</table>';
+
+      // Signature pad — reuse the existing inv-accept pattern but with our own canvas id
+      h += '<div style="border-top:1px dashed var(--sand);padding-top:16px;margin-top:14px">';
+      h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:6px">Draw Your Signature to Acknowledge</label>';
+      h += '<div style="border:2px solid var(--sand);border-radius:6px;background:white;position:relative">';
+      h += '<canvas id="trainAckSigCanvas_'+c.id+'" width="600" height="120" style="display:block;width:100%;height:120px;cursor:crosshair;touch-action:none;border-radius:6px"></canvas>';
+      h += '<button onclick="trainAckClearSig('+c.id+')" type="button" style="position:absolute;top:6px;right:6px;background:white;border:1px solid var(--sand);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:4px 10px;border-radius:4px;cursor:pointer">Clear</button>';
+      h += '</div>';
+      h += '<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;margin-top:14px;padding:10px 14px;background:rgba(5,150,105,.06);border:1px solid rgba(5,150,105,.25);border-radius:6px"><input id="trainAckConfirm_'+c.id+'" type="checkbox" style="margin-top:3px"><span style="font-family:Barlow Condensed,sans-serif;font-size:.76rem;color:var(--brown);line-height:1.5"><strong>I confirm I was trained.</strong> I attended the training session(s) listed above and was instructed on the topics shown. I acknowledge that codes will be issued to me only after my background check passes and required agreements are signed.</span></label>';
+      h += '<div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">';
+      h += '<button onclick="trainAckSubmit('+c.id+')" class="btn-fire" style="flex:1;justify-content:center;padding:12px;font-size:.78rem">✓ ACKNOWLEDGE & ADVANCE TO BG CHECK</button>';
+      h += '<button onclick="trainAckReject('+c.id+')" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:12px 18px;border-radius:5px;cursor:pointer">✗ Reject (I wasn\'t trained)</button>';
+      h += '</div>';
+      h += '</div>';
+      h += '</div></div>';
+    });
+
+    // Init signature pads after render
+    setTimeout(function(){
+      list.forEach(function(c){
+        try{ trainAckInitSig(c.id); }catch(e){}
+      });
+    }, 30);
+
+    return h;
+  } catch(e){
+    console.warn('[panelTrainingAcknowledge] failed:', e);
+    return panelHeader('✍️ Acknowledge Training') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load.</div></div>';
+  }
+}
+
+// Signature pad init for the acknowledgment canvas. Stashes state on
+// window._trainAckCanvases keyed by completion id.
+window._trainAckCanvases = window._trainAckCanvases || {};
+function trainAckInitSig(completionId){
+  try {
+    var canvas = document.getElementById('trainAckSigCanvas_'+completionId);
+    if(!canvas) return;
+    var rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width;
+    canvas.height = rect.height;
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.strokeStyle = '#7c3aed';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    var state = { canvas: canvas, ctx: ctx, isDrawing: false, hasInk: false, lastX: 0, lastY: 0 };
+    window._trainAckCanvases[completionId] = state;
+    function pos(ev){
+      var r = canvas.getBoundingClientRect();
+      var x, y;
+      if(ev.touches && ev.touches.length){ x = ev.touches[0].clientX - r.left; y = ev.touches[0].clientY - r.top; }
+      else { x = ev.clientX - r.left; y = ev.clientY - r.top; }
+      return {x:x, y:y};
+    }
+    function start(ev){ ev.preventDefault(); var p = pos(ev); state.isDrawing = true; state.lastX = p.x; state.lastY = p.y; }
+    function draw(ev){
+      if(!state.isDrawing) return;
+      ev.preventDefault();
+      var p = pos(ev);
+      ctx.beginPath(); ctx.moveTo(state.lastX, state.lastY); ctx.lineTo(p.x, p.y); ctx.stroke();
+      state.lastX = p.x; state.lastY = p.y; state.hasInk = true;
+    }
+    function end(){ state.isDrawing = false; }
+    canvas.addEventListener('mousedown', start);
+    canvas.addEventListener('mousemove', draw);
+    canvas.addEventListener('mouseup', end);
+    canvas.addEventListener('mouseleave', end);
+    canvas.addEventListener('touchstart', start, {passive:false});
+    canvas.addEventListener('touchmove', draw, {passive:false});
+    canvas.addEventListener('touchend', end);
+  } catch(e){ console.warn('[trainAckInitSig] failed:', e); }
+}
+
+function trainAckClearSig(completionId){
+  var state = window._trainAckCanvases && window._trainAckCanvases[completionId];
+  if(!state || !state.ctx) return;
+  state.ctx.fillStyle = '#fff';
+  state.ctx.fillRect(0,0,state.canvas.width,state.canvas.height);
+  state.hasInk = false;
+}
+
+function trainAckSubmit(completionId){
+  try{
+    var u = DB.current;
+    var c = (TRAINING_COMPLETIONS||[]).find(function(x){ return x.id === completionId; });
+    if(!c){ alert('Completion record not found.'); return; }
+    if(c.agentId !== u.id){ alert('You can only sign your own training acknowledgment.'); return; }
+    if(c.approvalStatus !== 'pending-agent-acknowledgment'){
+      alert('This completion is not awaiting your acknowledgment (status: '+c.approvalStatus+').');
+      return;
+    }
+    var state = window._trainAckCanvases && window._trainAckCanvases[completionId];
+    var confirmBox = document.getElementById('trainAckConfirm_'+completionId);
+    if(!confirmBox || !confirmBox.checked){ alert('Check the confirmation box first.'); return; }
+    if(!state || !state.hasInk){ alert('Draw your signature before submitting.'); return; }
+    var sigData = '';
+    try{ sigData = state.canvas.toDataURL('image/png'); }catch(e){}
+    c.agentAcknowledgedAt = new Date().toISOString();
+    c.agentAcknowledgedSig = sigData;
+    c.approvalStatus = 'pending-bg-check';
+    saveInventory();
+    console.log('[trainAckSubmit] completion #'+completionId+' → pending-bg-check');
+    // Try to auto-advance if BG check + agreements are already done
+    var advanced = trainingAutoAdvancePending();
+    var msg = '✓ Acknowledgment recorded.\n\n';
+    if(advanced && c.approvalStatus === 'pending-code-approval'){
+      msg += 'Background check and agreements are already complete — your codes have been forwarded to Owner / Onboarding for final approval.';
+    } else {
+      var gate = trainingCanAdvanceToCodeApproval(c);
+      msg += 'Codes are now waiting on:\n  • ' + gate.blockers.join('\n  • ') + '\n\nOnce those are resolved, Owner / Onboarding will approve your codes.';
+    }
+    alert(msg);
+    gotoPanel('dashboard');
+  } catch(e){ console.warn('[trainAckSubmit] failed:', e); alert('Acknowledgment failed: '+e.message); }
+}
+
+function trainAckReject(completionId){
+  try{
+    var u = DB.current;
+    var c = (TRAINING_COMPLETIONS||[]).find(function(x){ return x.id === completionId; });
+    if(!c){ alert('Completion record not found.'); return; }
+    if(c.agentId !== u.id){ alert('You can only reject your own training acknowledgment.'); return; }
+    var reason = prompt('Why are you rejecting this training completion?\n\nExamples:\n- I never attended the training\n- We did not cover the listed topics\n- The dates are wrong', '');
+    if(reason === null) return;
+    reason = (reason || '').trim();
+    if(!reason){ alert('Please provide a reason.'); return; }
+    c.approvalStatus = 'rejected-by-agent';
+    c.rejectReason = reason;
+    c.rejectedAt = new Date().toISOString();
+    saveInventory();
+    // Notify the manager + upline + Onboarding
+    if(typeof postNotification === 'function'){
+      try{
+        var notifyIds = {};
+        notifyIds[c.completedById] = true;
+        // Manager's upline
+        var mgr = (DB.agents||[]).find(function(a){ return a.id === c.completedById; });
+        if(mgr){
+          var chain = (typeof reportingChainFor === 'function') ? reportingChainFor(mgr) : {};
+          if(chain.marketManagerId)   notifyIds[chain.marketManagerId] = true;
+          if(chain.campaignManagerId) notifyIds[chain.campaignManagerId] = true;
+        }
+        // Owner + Onboarding
+        (DB.agents||[]).forEach(function(a){
+          if(a && a.active && ((typeof isOwner==='function' && isOwner(a))
+                            || (typeof isOnboarding==='function' && isOnboarding(a))
+                            || (a.depts && a.depts.onboarding === true))){
+            notifyIds[a.id] = true;
+          }
+        });
+        delete notifyIds[u.id];
+        postNotification({
+          icon: '⛔',
+          title: 'Training REJECTED by '+u.name,
+          body: u.name+' rejected the training completion submitted by '+c.completedByName+'. Reason: '+reason,
+          formType:'training-rejected',
+          data:{ kind:'training-rejected', completionId:c.id },
+          toIds: Object.keys(notifyIds).map(function(k){ return parseInt(k,10); }).filter(function(x){ return !isNaN(x); })
+        });
+      } catch(e){}
+    }
+    alert('Training completion rejected. Your manager and upline have been notified.');
+    gotoPanel('dashboard');
+  } catch(e){ console.warn('[trainAckReject] failed:', e); alert('Reject failed: '+e.message); }
+}
+
+
 function panelPendingCodeApprovals(){
   try {
     var u = DB.current;
@@ -39588,22 +40425,47 @@ function panelPendingCodeApprovals(){
       return panelHeader('🎓 Pending Code Approvals') +
         '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Restricted to Owner and Onboarding.</div></div>';
     }
-    var pending = TRAINING_COMPLETIONS.filter(function(c){ return c.approvalStatus === 'pending'; });
-    var resolved = TRAINING_COMPLETIONS.filter(function(c){ return c.approvalStatus !== 'pending'; });
+    // Calvin 2026-05-08: NEW STATUSES
+    //   - 'pending-agent-acknowledgment' — trainee hasn't signed yet (not shown here; trainee sees in their own panel)
+    //   - 'pending-bg-check'              — trainee signed; waiting on BG + agreements
+    //   - 'pending-code-approval'         — all gates passed; Owner/Onboarding can approve codes
+    //   - 'approved' / 'rejected' / 'rejected-by-agent'
+    // Run auto-advance scan on each render so BG-passed completions float up.
+    if(typeof trainingAutoAdvancePending === 'function'){
+      try{ trainingAutoAdvancePending(); }catch(e){}
+    }
+    var pending  = TRAINING_COMPLETIONS.filter(function(c){ return c.approvalStatus === 'pending-code-approval' || c.approvalStatus === 'pending'; });
+    var blockedBg = TRAINING_COMPLETIONS.filter(function(c){ return c.approvalStatus === 'pending-bg-check'; });
+    var awaitingAck = TRAINING_COMPLETIONS.filter(function(c){ return c.approvalStatus === 'pending-agent-acknowledgment'; });
+    var resolved = TRAINING_COMPLETIONS.filter(function(c){
+      return c.approvalStatus === 'approved'
+          || c.approvalStatus === 'rejected'
+          || c.approvalStatus === 'rejected-by-agent';
+    });
 
     var h = panelHeader('🎓 Pending Code Approvals');
     h += '<div style="background:rgba(217,119,6,.06);border:1px solid rgba(217,119,6,.2);border-radius:8px;padding:14px 18px;margin-bottom:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
     h += '<strong>⚠ Pay-affecting decisions.</strong> Approving a campaign code lets the agent earn commissions on that program. Rejecting sends the manager a note to revise. Always verify the proposed codes against the agent\'s actual carrier IDs before approving.';
     h += '</div>';
 
-    if(!pending.length && !resolved.length){
+    if(!pending.length && !resolved.length && !blockedBg.length && !awaitingAck.length){
       h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">🎓</div><div style="font-size:1rem">No completions yet.</div></div></div>';
       return h;
     }
 
     if(pending.length){
-      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:#D97706;margin:18px 0 12px">⏳ Pending Approval ('+pending.length+')</h3>';
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:#D97706;margin:18px 0 12px">⏳ Ready for Approval ('+pending.length+')</h3>';
       pending.forEach(function(c){ h += _tcApprovalCard(c, true); });
+    }
+    if(blockedBg.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:#7c3aed;margin:24px 0 12px">🔒 Blocked on Background Check / Agreements ('+blockedBg.length+')</h3>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:12px">Trainee signed, but onboarding requirements aren\'t cleared yet. These auto-advance to "Ready for Approval" the moment BG check + agreements are all marked passed.</div>';
+      blockedBg.forEach(function(c){ h += _tcApprovalCard(c, false); });
+    }
+    if(awaitingAck.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:var(--muted);margin:24px 0 12px">✍️ Waiting on Trainee Signature ('+awaitingAck.length+')</h3>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:12px">Manager submitted completion. Trainee has not yet acknowledged.</div>';
+      awaitingAck.forEach(function(c){ h += _tcApprovalCard(c, false); });
     }
     if(resolved.length){
       h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:var(--muted);margin:24px 0 12px">📁 Recently Resolved</h3>';
@@ -39617,8 +40479,13 @@ function panelPendingCodeApprovals(){
 }
 
 function _tcApprovalCard(c, allowAct){
-  var statusColor = (c.approvalStatus === 'pending') ? '#D97706'
-                  : (c.approvalStatus === 'approved') ? '#15803d' : '#dc2626';
+  // Calvin 2026-05-08: new status palette
+  var statusColor;
+  if(c.approvalStatus === 'pending-code-approval' || c.approvalStatus === 'pending') statusColor = '#D97706';
+  else if(c.approvalStatus === 'pending-bg-check')                                   statusColor = '#7c3aed';
+  else if(c.approvalStatus === 'pending-agent-acknowledgment')                       statusColor = 'var(--muted)';
+  else if(c.approvalStatus === 'approved')                                           statusColor = '#15803d';
+  else                                                                                statusColor = '#dc2626';
   var outcomeColor = (c.outcome === 'passed') ? '#15803d' : (c.outcome === 'failed') ? '#dc2626' : '#D97706';
   var dateStr = new Date(c.completedAt).toLocaleString();
   var h = '<div class="bo-card" style="margin-bottom:14px;padding:18px;border-left:3px solid '+statusColor+'">';
@@ -39673,7 +40540,7 @@ function tcApprove(completionId){
     if(!canApproveCodes(u)){ alert('Permission denied.'); return; }
     var c = TRAINING_COMPLETIONS.find(function(x){ return x.id === completionId; });
     if(!c){ alert('Completion not found.'); return; }
-    if(c.approvalStatus !== 'pending'){ alert('Already resolved.'); return; }
+    if(c.approvalStatus !== 'pending-code-approval' && c.approvalStatus !== 'pending'){ alert('Not ready for approval (status: '+c.approvalStatus+').'); return; }
     var agent = (DB.agents || []).find(function(a){ return a.id === c.agentId; });
     if(!agent){ alert('Agent not found.'); return; }
     var codes = c.proposedCodes || {};
@@ -39724,7 +40591,7 @@ function tcReject(completionId){
     if(!canApproveCodes(u)){ alert('Permission denied.'); return; }
     var c = TRAINING_COMPLETIONS.find(function(x){ return x.id === completionId; });
     if(!c){ alert('Completion not found.'); return; }
-    if(c.approvalStatus !== 'pending'){ alert('Already resolved.'); return; }
+    if(c.approvalStatus !== 'pending-code-approval' && c.approvalStatus !== 'pending-bg-check' && c.approvalStatus !== 'pending'){ alert('Already resolved.'); return; }
     var reason = prompt('Reason for rejection (manager will see this):');
     if(reason === null) return;
     c.approvalStatus = 'rejected';
@@ -51143,11 +52010,39 @@ if(typeof invHandleMagicLink === 'function'){
   setTimeout(function(){ try{ invHandleMagicLink(); }catch(e){ console.warn('[invHandleMagicLink]', e); } }, 1500);
   window.addEventListener('hashchange', function(){ try{ invHandleMagicLink(); }catch(e){} });
 }
+// ── Calvin 2026-05-08: training-flow auto-advance ──
+// Every 30 seconds, scan pending-bg-check completions and float them up
+// to pending-code-approval if BG check + agreements are now done.
+if(typeof trainingAutoAdvancePending === 'function'){
+  setTimeout(function(){ try{ trainingAutoAdvancePending(); }catch(e){} }, 10000);
+  setInterval(function(){ try{ trainingAutoAdvancePending(); }catch(e){} }, 30 * 1000);
+}
 // Load data async then init page
 (async function(){
+  // ── Calvin 2026-05-08 911 FIX: PUSH BEFORE PULL ──
+  // Old order: load from Supabase (which clobbered local edits), THEN
+  // flush queue. New order: flush queue FIRST so pending local writes
+  // reach Supabase, THEN load (with merge logic so anything still pending
+  // stays local).
+  //
+  // We have to load the queue from localStorage before we can flush it,
+  // which syncStartBackgroundFlush already does. That ran above. So at
+  // this point SYNC_QUEUE is populated with any prior-session pending writes.
+  if(typeof syncFlush === 'function' && typeof SYNC_QUEUE !== 'undefined' && Array.isArray(SYNC_QUEUE) && SYNC_QUEUE.length){
+    try{
+      console.log('[init] FLUSH BEFORE LOAD — '+SYNC_QUEUE.length+' pending write(s) from prior session');
+      await syncFlush(true);
+      console.log('[init] flush complete, queue length now '+SYNC_QUEUE.length);
+    }catch(e){ console.warn('[init] pre-load flush failed (will retry post-load):', e); }
+  }
   await loadFromSupabase();
-  // Flush any pending writes accumulated from prior sessions
+  // Flush any remaining pending writes (e.g. ones that failed pre-load)
   if(typeof syncFlush === 'function') setTimeout(function(){ syncFlush(true); }, 1000);
+  // Calvin 2026-05-08: wire stuck-queue banner
+  if(typeof _wmamStuckQueueCheck === 'function'){
+    setTimeout(_wmamStuckQueueCheck, 5000);
+    setInterval(_wmamStuckQueueCheck, 5000);
+  }
   // Restore session if user was already logged in
   try{
     var savedId = sessionStorage.getItem('wmam_session');
