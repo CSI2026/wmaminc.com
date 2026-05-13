@@ -29340,21 +29340,60 @@ var INV_TIMEOUT_MS = INV_TIMEOUT_HOURS * 60 * 60 * 1000;
 // Returns { market: 'Tulsa OK', auto: true } or { market: null, reason: 'no-placement' }
 // For IBO recipients with multiple markets, returns the first one OR null
 // to prompt manual choice.
+// Resolve the FULL list of markets an agent serves.
+// Walks every possible signal of placement so no agent shape is missed:
+//   1. agent.team          (single-market field agent / TL)
+//   2. agent.iboMarkets[]  (multi-market roles — IBO, multi-market CM/MM, etc.
+//                           the field name is legacy but it's used for ALL
+//                           multi-market roles, not only IBOs)
+//   3. agent.reportsTo     (per-campaign reporting chain — implies placement
+//                           in whatever market their upline serves)
+//   4. agent.agentCodes    (per-campaign code keys imply placement in the
+//                           campaign even when no explicit market is set)
+//
+// Returns an array of unique market names. Empty array means TRULY no
+// placement — never seen a placement signal anywhere. Calvin 2026-05-13.
+function _invAgentMarkets(agent){
+  if(!agent) return [];
+  var markets = {};
+  // 1. Single-market team
+  if(agent.team && typeof agent.team === 'string'){
+    markets[agent.team] = true;
+  }
+  // 2. iboMarkets array (used by IBO, multi-market CM, multi-market MM, admin)
+  if(Array.isArray(agent.iboMarkets)){
+    agent.iboMarkets.forEach(function(m){
+      if(m && typeof m === 'string') markets[m] = true;
+    });
+  }
+  return Object.keys(markets);
+}
+
 function invResolveRecipientMarket(recipient, deviceCampaign){
   if(!recipient) return { market: null, reason: 'no-recipient' };
   // Owner / Inventory Dept recipients — no market lock (they're a holding pool)
   if(typeof isOwner === 'function' && isOwner(recipient)) return { market: null, reason: 'owner-pool' };
   if(typeof isInventory === 'function' && isInventory(recipient)) return { market: null, reason: 'inv-pool' };
-  // IBO with markets — auto-pick the first if only one, otherwise prompt
-  if(recipient.role === 'IBO'){
-    if(Array.isArray(recipient.iboMarkets) && recipient.iboMarkets.length){
-      if(recipient.iboMarkets.length === 1) return { market: recipient.iboMarkets[0], auto: true };
-      return { market: null, reason: 'ibo-multi-market', options: recipient.iboMarkets.slice() };
-    }
-    return { market: null, reason: 'no-placement' };
+
+  // ── Calvin 2026-05-13: resolve ALL markets this agent serves ──
+  // Previously this function ONLY checked role==='IBO' for multi-market
+  // and recipient.team for single-market. That missed Campaign Managers,
+  // Market Managers, and any multi-market admin — they'd be treated as
+  // unplaced and forced through the manual picker every assign.
+  //
+  // Now we walk every placement signal on the record. If we find ANY
+  // market, the agent IS placed:
+  //   - exactly 1 market → auto-lock to it (no prompt)
+  //   - 2+ markets       → prompt to pick AMONG THEIR MARKETS (not all markets)
+  //   - 0 markets        → truly unplaced, full picker
+  var theirMarkets = _invAgentMarkets(recipient);
+  if(theirMarkets.length === 1){
+    return { market: theirMarkets[0], auto: true };
   }
-  // Field Agent / Team Leader / Market Manager / Campaign Manager — agent.team
-  if(recipient.team){ return { market: recipient.team, auto: true }; }
+  if(theirMarkets.length > 1){
+    return { market: null, reason: 'multi-market', options: theirMarkets };
+  }
+  // No markets found anywhere → truly unplaced
   return { market: null, reason: 'no-placement' };
 }
 
@@ -29371,10 +29410,15 @@ function invPromptMarketChoice(recipient, reason, options){
     return null;
   }
   var msg = recipient.name + ' has ';
-  if(reason === 'no-placement') msg += 'no market placement yet. ';
-  else if(reason === 'ibo-multi-market') msg += 'multiple IBO markets. ';
+  if(reason === 'no-placement') msg += 'NO market placement on their profile. ';
+  else if(reason === 'multi-market') msg += 'multiple markets ('+pickFrom.length+'). Pick which one this inventory belongs to:';
+  else if(reason === 'ibo-multi-market') msg += 'multiple IBO markets. ';  // legacy reason — kept for back-compat
   else msg += 'an ambiguous market. ';
-  msg += '\n\nLock this inventory to which market?\n\n';
+  if(reason !== 'multi-market'){
+    msg += '\n\nLock this inventory to which market?\n\n';
+  } else {
+    msg += '\n\n';
+  }
   pickFrom.forEach(function(m, i){ msg += '  ['+(i+1)+'] '+m+'\n'; });
   msg += '\nEnter a number (or cancel to abort the transfer):';
   var raw = prompt(msg, '');
