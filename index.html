@@ -13619,18 +13619,63 @@ function syncStartSentinel(){
 function syncRebaselineSentinel(){
   if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return;
   SENTINEL_SNAPSHOT = {};
+  // Calvin 2026-05-13 911.4: also initialize high-water richness marks
+  // from this snapshot. Anything thinner than this in the future is a
+  // regression and the sentinel will reject it instead of propagating.
+  SENTINEL_HIGH_WATER = {};
   DB.agents.forEach(function(a){
     if(a && a.id != null){
       try{ SENTINEL_SNAPSHOT[a.id] = JSON.stringify(a); }catch(e){}
+      try{ SENTINEL_HIGH_WATER[a.id] = _sentinelAgentRichness(a); }catch(e){}
     }
   });
 }
+
+// Count "richness" of an agent record — number of non-empty meaningful fields.
+// Used by the sentinel to detect regressions (in-memory record got thinner
+// than the snapshot, which means something stripped data and we should NOT
+// force-save the thinner version to Supabase). Calvin 2026-05-13 911.4.
+function _sentinelAgentRichness(a){
+  if(!a) return 0;
+  var score = 0;
+  // Identity fields (count low — most agents have these)
+  if(a.name)     score += 1;
+  if(a.username) score += 1;
+  if(a.password) score += 1;
+  if(a.role)     score += 1;
+  if(a.email)    score += 1;
+  if(a.active)   score += 1;
+  // RICH fields — these are the ones that get silently stripped
+  if(Array.isArray(a.programs)   && a.programs.length)              score += 3;
+  if(a.agentCodes && Object.keys(a.agentCodes).length)              score += 3;
+  if(a.team)                                                        score += 2;
+  if(Array.isArray(a.iboMarkets) && a.iboMarkets.length)            score += 3;
+  if(a.teamLeaderId)                                                score += 2;
+  if(a.marketManagerId)                                             score += 2;
+  if(a.campaignManagerId)                                           score += 2;
+  if(a.reportsTo && Object.keys(a.reportsTo).length)                score += 2;
+  if(Array.isArray(a.channels)   && a.channels.length)              score += 1;
+  if(Array.isArray(a.links)      && a.links.length)                 score += 1;
+  if(a.start)                                                       score += 1;
+  if(a.phone)                                                       score += 1;
+  if(a.address)                                                     score += 1;
+  if(a.profilePic)                                                  score += 1;
+  if(a.category)                                                    score += 1;
+  if(a.depts && Object.keys(a.depts).length)                        score += 1;
+  return score;
+}
+
+// Track the highest richness we've ever observed per agent. The sentinel
+// uses this to reject regressions — never push a thinner version than the
+// fullest one we've seen. Reset on load (because Supabase brings the truth).
+var SENTINEL_HIGH_WATER = {};
 
 function syncSentinelCheck(){
   if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return;
   if(!supaClient) return;
   var changed = 0;
   var enqueued = 0;
+  var blocked = 0;
   DB.agents.forEach(function(a){
     if(!a || a.id == null) return;
     var current;
@@ -13638,6 +13683,29 @@ function syncSentinelCheck(){
     var prior = SENTINEL_SNAPSHOT[a.id];
     if(prior !== current){
       changed++;
+      // ── Calvin 2026-05-13 911.4 FIX ──
+      // BEFORE force-saving, check if the in-memory version is THINNER
+      // than the high-water mark we've observed for this agent. If yes,
+      // something stripped fields out of the in-memory record — do NOT
+      // propagate that to Supabase. Instead, restore the local copy from
+      // the snapshot (which has the richer data).
+      var currentRichness = _sentinelAgentRichness(a);
+      var highWater       = SENTINEL_HIGH_WATER[a.id] || 0;
+      if(highWater > 0 && currentRichness < highWater - 2){
+        // Regression detected. The in-memory record is significantly thinner
+        // than what we've seen before. DO NOT push to Supabase.
+        console.error('[sentinel] ⛔ BLOCKED save of agent #'+a.id+' ('+a.name+') — current richness '+currentRichness+' < high-water '+highWater+'. Something stripped data. Re-pulling from Supabase to restore.');
+        blocked++;
+        // Attempt to restore from Supabase
+        if(typeof syncPullFreshAgent === 'function'){
+          try{ syncPullFreshAgent(a.id); }catch(e){ console.warn('[sentinel restore]', e); }
+        }
+        // Don't update SENTINEL_SNAPSHOT — we want next tick to retry the comparison
+        return;
+      }
+      // Otherwise, update high-water mark
+      if(currentRichness > highWater) SENTINEL_HIGH_WATER[a.id] = currentRichness;
+
       // Check whether this agent already has a pending write in the queue
       var alreadyQueued = SYNC_QUEUE.some(function(e){ return e.recordKey === 'agent:'+a.id; });
       if(!alreadyQueued){
@@ -13656,10 +13724,14 @@ function syncSentinelCheck(){
     if(!DB.agents.some(function(a){ return a.id === id; })){
       console.warn('[sentinel] agent #'+id+' disappeared from DB.agents. Snapshot cleared (no auto-delete from Supabase — Owner must explicitly delete).');
       delete SENTINEL_SNAPSHOT[idStr];
+      delete SENTINEL_HIGH_WATER[idStr];
     }
   });
   if(changed > 0){
-    console.log('[sentinel] checked DB.agents: '+changed+' changed, '+enqueued+' force-enqueued (the rest were already in queue)');
+    var msg = '[sentinel] checked DB.agents: '+changed+' changed, '+enqueued+' force-enqueued';
+    if(blocked > 0) msg += ', '+blocked+' BLOCKED (regression detected)';
+    msg += ' (the rest were already in queue)';
+    console.log(msg);
   }
 }
 
@@ -14339,6 +14411,143 @@ if(typeof window !== 'undefined') window._repairBareSavedSuggest = _repairBareSa
 if(typeof window !== 'undefined') window._repairBareSavedApply = _repairBareSavedApply;
 
 
+// ════════════════════════════════════════════════════════════════════════
+//  MULTI-TEAM CLEANUP  (Calvin 2026-05-13)
+//
+//  Owner / Inventory dept tool. Finds every agent who's listed in MORE
+//  than one team within LIFELINE_TEAMS — same campaign. Lets the user
+//  pick which team is the "correct" one, then removes the agent from
+//  the others.
+//
+//  Why this matters:
+//    - gmAgentTeam() picks the FIRST matching team for payroll routing.
+//      If Juan is in 2 teams, only sales in his first team count.
+//    - Calvin's rule: an IBO/Field Agent works in ONE market per campaign.
+//      Multi-market situations are handled via agent.iboMarkets, not by
+//      listing the agent in multiple LIFELINE_TEAMS.
+//
+//  Detects membership through every signal:
+//    - team.members[]                  (regular field agents)
+//    - team.leader                     (Team Leader assignment)
+//    - team.marketManager              (MM assignment)
+//    - team.campaignManager            (CM assignment)
+// ════════════════════════════════════════════════════════════════════════
+
+function _multiTeamScan(){
+  if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return [];
+  var byAgent = {}; // agentId → { teams: [{team, roleInTeam}], agentName, agentRole }
+  LIFELINE_TEAMS.forEach(function(t){
+    if(!t || !t.active) return;
+    function add(agentId, roleInTeam){
+      if(!agentId) return;
+      var ag = (DB.agents||[]).find(function(a){ return a.id === agentId; });
+      if(!ag || !ag.active) return;
+      if(!byAgent[agentId]) byAgent[agentId] = { agentId: agentId, agentName: ag.name, agentRole: ag.role, teams: [] };
+      // De-dupe — if this agent is already counted in this team under another role, just merge
+      var existing = byAgent[agentId].teams.find(function(x){ return x.team.id === t.id; });
+      if(existing){
+        if(existing.roleInTeam.indexOf(roleInTeam) < 0) existing.roleInTeam.push(roleInTeam);
+      } else {
+        byAgent[agentId].teams.push({ team: t, roleInTeam: [roleInTeam] });
+      }
+    }
+    if(Array.isArray(t.members)) t.members.forEach(function(id){ add(id, 'member'); });
+    if(t.leader)          add(t.leader,         'Team Leader');
+    if(t.marketManager)   add(t.marketManager,  'Market Manager');
+    if(t.campaignManager) add(t.campaignManager,'Campaign Manager');
+  });
+  // Filter to only agents in 2+ teams
+  return Object.keys(byAgent)
+    .map(function(k){ return byAgent[k]; })
+    .filter(function(x){ return x.teams.length >= 2; })
+    .sort(function(a,b){ return a.agentName.localeCompare(b.agentName); });
+}
+
+// Apply: keep this agent in `keepTeamId`, remove them from all OTHER teams.
+// Idempotent — re-running with the same keepTeamId is a no-op.
+function _multiTeamApply(agentId, keepTeamId){
+  if(typeof LIFELINE_TEAMS === 'undefined' || !Array.isArray(LIFELINE_TEAMS)) return false;
+  var removedFrom = [];
+  LIFELINE_TEAMS.forEach(function(t){
+    if(!t || t.id === keepTeamId) return;
+    var removedHere = false;
+    if(Array.isArray(t.members)){
+      var idx = t.members.indexOf(agentId);
+      if(idx >= 0){ t.members.splice(idx, 1); removedHere = true; }
+    }
+    if(t.leader === agentId){          t.leader = null;          removedHere = true; }
+    if(t.marketManager === agentId){   t.marketManager = null;   removedHere = true; }
+    if(t.campaignManager === agentId){ t.campaignManager = null; removedHere = true; }
+    if(removedHere) removedFrom.push(t.name || t.id);
+  });
+  // Persist
+  try{ if(typeof saveTeams === 'function') saveTeams(); }catch(e){}
+  try{ if(typeof saveToStorage === 'function') saveToStorage(); }catch(e){}
+  // Save the agent record too so any reportsTo/teamLeaderId fields get a chance to be re-resolved on next render
+  try{
+    var ag = (DB.agents||[]).find(function(a){ return a.id === agentId; });
+    if(ag && typeof saveAgentToSupabase === 'function') saveAgentToSupabase(ag);
+  }catch(e){}
+  return { removedFrom: removedFrom };
+}
+
+function panelMultiTeamCleanup(){
+  var u = DB.current;
+  var canAccess = (typeof isOwner === 'function' && isOwner(u)) || (typeof isInventory === 'function' && isInventory(u));
+  if(!canAccess){
+    return panelHeader('🔧 Multi-Team Cleanup')
+      + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Owner / Inventory dept only.</div></div>';
+  }
+  var h = panelHeader('🔧 Multi-Team Cleanup');
+  h += '<div style="background:rgba(220,38,38,.06);border:1px solid rgba(220,38,38,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">'
+    + '<strong>What this is.</strong> Agents below are listed in <strong>more than one team</strong>. Payroll routing picks the FIRST team it finds — meaning sales attributed to their other teams may not count. For each agent, pick the correct team and click <strong>Keep This One</strong>. They will be removed from the others.'
+    + '</div>';
+  var rows = _multiTeamScan();
+  if(!rows.length){
+    h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">✓</div><div style="font-size:1.05rem">No multi-team agents detected.</div><div style="font-size:.78rem;margin-top:8px">Every active agent appears in at most one team.</div></div></div>';
+    return h;
+  }
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.9rem;color:var(--brown);margin-bottom:14px">'+rows.length+' agent'+(rows.length===1?'':'s')+' in 2+ teams:</div>';
+  rows.forEach(function(row){
+    h += '<div class="bo-card" style="margin-bottom:14px;padding:0;overflow:hidden">';
+    h += '<div style="padding:14px 18px;background:var(--cream);border-bottom:1px solid var(--sand)">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+    h += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:1.5px;color:var(--brown)">'+_escapeHtml(row.agentName)+' — '+_escapeHtml(row.agentRole||'(no role)')+'</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">Agent #'+row.agentId+' · '+row.teams.length+' teams</div></div>';
+    h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+row.agentId+'})" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">Open Profile</button>';
+    h += '</div></div>';
+    h += '<div style="padding:14px 18px">';
+    row.teams.forEach(function(entry, idx){
+      var t = entry.team;
+      var roleStr = entry.roleInTeam.join(', ');
+      var teamIdAttr = _escapeAttr(t.id);
+      var teamNameAttr = _escapeAttr(t.name||t.id);
+      var agentNameAttr = _escapeAttr(row.agentName);
+      h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:'+(idx===0?'rgba(124,58,237,.04)':'transparent')+';border:1px solid var(--sand);border-radius:6px;margin-bottom:8px;flex-wrap:wrap;gap:10px">';
+      h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;color:var(--brown);font-weight:600">'+_escapeHtml(t.name||t.id)+'</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">as '+_escapeHtml(roleStr)+(idx===0?' · currently routed to':'')+'</div></div>';
+      h += '<button onclick="_multiTeamKeepClick('+row.agentId+',&quot;'+teamIdAttr+'&quot;,&quot;'+teamNameAttr+'&quot;,&quot;'+agentNameAttr+'&quot;)" class="btn-fire" style="padding:8px 14px;font-size:.7rem">Keep This One</button>';
+      h += '</div>';
+    });
+    h += '</div></div>';
+  });
+  return h;
+}
+
+if(typeof window !== 'undefined') window._multiTeamScan = _multiTeamScan;
+if(typeof window !== 'undefined') window._multiTeamApply = _multiTeamApply;
+
+// Click handler used by the inline button in panelMultiTeamCleanup. Pulled
+// out as a separate function to avoid quote-escaping hell in the onclick attr.
+function _multiTeamKeepClick(agentId, keepTeamId, teamName, agentName){
+  if(!confirm('Keep '+agentName+' in '+teamName+' and remove from all other teams?')) return;
+  var r = _multiTeamApply(agentId, keepTeamId);
+  alert('✓ Removed from: ' + (r && r.removedFrom && r.removedFrom.length ? r.removedFrom.join(', ') : '(no other teams)'));
+  gotoPanel('multi-team-cleanup');
+}
+if(typeof window !== 'undefined') window._multiTeamKeepClick = _multiTeamKeepClick;
+
+
 function panelSyncStatus(){
   var u = DB.current;
   var h = '';
@@ -14589,6 +14798,22 @@ async function loadFromSupabase(){
       // Auto-derive .category/.depts for every legacy record we just loaded.
       if(typeof migrateAllAgentCategories==='function') migrateAllAgentCategories();
       DB.nextId = Math.max.apply(null, DB.agents.map(function(a){return a.id;})) + 1;
+
+      // ── Calvin 2026-05-13: rebaseline sentinel snapshot AFTER load+migrations ──
+      // Without this, the sentinel sees post-load normalizations (syncIboModels,
+      // migrateAllAgentCategories, role corrections) as "unsynced changes" on
+      // its first check and force-enqueues every agent. Polluts the console
+      // and creates Supabase write churn. Rebaselining here makes the sentinel
+      // start with a clean snapshot of the post-migration state.
+      try{
+        if(typeof syncRebaselineSentinel === 'function'){
+          // Delay rebaseline until any synchronous post-load mutations settle.
+          setTimeout(function(){
+            try{ syncRebaselineSentinel(); console.log('[sentinel] rebaselined after loadFromSupabase completed'); }
+            catch(e){ console.warn('[sentinel rebaseline]', e); }
+          }, 2000);
+        }
+      } catch(e){}
 
       // ── ONE-TIME ROLE MIGRATION: TANITA FLOWERS (id 2) ──
       // Tanita's correct role is Campaign Manager (cm-oklahoma pay model).
@@ -23212,6 +23437,7 @@ function gotoPanel(id, params){
     'training-complete':'Training Complete','training-acknowledge':'Acknowledge Training','onboarding-queue':'Onboarding Queue',
     'my-markets':'My Markets','market-breakdown':'Market Breakdown',
     'repair-bare-saved':'Repair Bare-Saved Agents',
+    'multi-team-cleanup':'Multi-Team Cleanup',
     'inv-dashboard':'All Inventory','inv-upload':'Upload Devices',
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
@@ -23253,6 +23479,7 @@ function gotoPanel(id, params){
     'inv-hub':panelInvHub,
     'my-markets':panelMyMarkets,'market-breakdown':panelMarketBreakdown,
     'repair-bare-saved':panelRepairBareSaved,
+    'multi-team-cleanup':panelMultiTeamCleanup,
     'gm-inventory':panelGMInventory,'gm-upload':panelGMUpload,
     'gm-transfers':panelGMTransfers,'gm-agent-inv':panelGMAgentInventory,
     'gm-pricelist':panelGMPricelist,
@@ -23303,6 +23530,7 @@ function gotoPanel(id, params){
     'my-markets':panelMyMarkets,
     'market-breakdown':panelMarketBreakdown,
     'repair-bare-saved':panelRepairBareSaved,
+    'multi-team-cleanup':panelMultiTeamCleanup,
     'onboard-upload':panelOnboardUpload,
     'bg-auth':panelBgAuth,
     'gm-ticket':panelGmTicket,
@@ -23413,8 +23641,22 @@ function panelBO(){
                +'</div>';
         }
       }
+      // ── Calvin 2026-05-13: MULTI-TEAM ALERT ──
+      if(typeof _multiTeamScan === 'function'){
+        var mtList = _multiTeamScan();
+        if(mtList && mtList.length > 0){
+          html += '<div style="background:linear-gradient(135deg,#dc2626,#991b1b);color:white;padding:14px 20px;border-radius:10px;margin-bottom:18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+               +'<div style="font-size:1.8rem">⚠️</div>'
+               +'<div style="flex:1">'
+               +  '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px">MULTI-TEAM CLEANUP — '+mtList.length+' AGENT'+(mtList.length===1?'':'S')+' IN 2+ TEAMS</div>'
+               +  '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.9;margin-top:2px">Payroll routing only picks the FIRST team \u2014 sales attributed to their other teams may not count correctly. Click to clean up.</div>'
+               +'</div>'
+               +'<button onclick="gotoPanel(\'multi-team-cleanup\')" style="background:white;color:#dc2626;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0">Open Cleanup Tool →</button>'
+               +'</div>';
+        }
+      }
     }
-  } catch(e){ console.warn('[panelBO bare-saved banner] failed:', e); }
+  } catch(e){ console.warn('[panelBO bare-saved/multi-team banner] failed:', e); }
 
   // ── DIAGNOSTIC (only shows when URL has ?debug=1) ──
   // Helps troubleshoot routing issues like K-Anna's HR dashboard bug.
