@@ -13480,11 +13480,39 @@ async function _syncAttemptUpsert(entry){
 }
 
 async function _syncAttemptAgentUpsert(entry){
+  // ── Calvin 2026-05-08 911.2 fix ──
+  // The BARE fallback at the end of this function (id+name+username+password+
+  // role+email+active only) was the silent culprit for "edits not saving."
+  // When the full upsert failed (schema mismatch, RLS, etc) we'd retry as
+  // legacy, then as bare. Bare success made the queue say "success" and drop
+  // the entry — but programs, campaigns, agentCodes, team, marketManagerId
+  // etc were NEVER written. From the user's perspective: agent exists, but
+  // everything they edited is gone.
+  //
+  // New behavior:
+  //   - Full schema first.
+  //   - Legacy fallback (strips newest columns) — if this works, fine.
+  //   - If both fail: LOUD WARNING, KEEP IN QUEUE for retry, DO NOT proceed
+  //     to bare. The user sees the stuck-queue banner and can act on it.
+  //   - Bare fallback ONLY runs for genuinely new agents (no existing row)
+  //     where we'd rather have the username+password than nothing at all.
+  //     For updates of existing agents, bare is forbidden.
+
+  // Strip local-only fields that have no Supabase column
+  var payload = Object.assign({}, entry.payload);
+  delete payload._localUpdatedAt;
+  delete payload._supaUpdatedAt;
+  delete payload._pendingInventoryHolds; // saved separately
+
   // Full schema first
-  var ok = await sbUpsert('agents', entry.payload, 'id');
+  var ok = await sbUpsert('agents', payload, 'id');
   if(ok) return true;
-  // Schema may be missing newer columns — try legacy
-  var legacy = Object.assign({}, entry.payload);
+
+  // Capture the first error so it's visible
+  var firstError = window._lastSbError;
+
+  // Legacy fallback — strip newest columns
+  var legacy = Object.assign({}, payload);
   delete legacy.category;
   delete legacy.depts;
   delete legacy.office_manager;
@@ -13497,21 +13525,49 @@ async function _syncAttemptAgentUpsert(entry){
   delete legacy.address;
   var retryOk = await sbUpsert('agents', legacy, 'id');
   if(retryOk){
-    console.warn('[sync] agent #'+entry.payload.id+' saved via legacy fallback');
+    console.warn('[sync] agent #'+payload.id+' saved via LEGACY fallback (some newer columns missing in Supabase schema)');
     return true;
   }
-  // Last resort — bare minimum so password at least persists
-  var bare = {
-    id: entry.payload.id, name: entry.payload.name,
-    username: entry.payload.username, password: entry.payload.password,
-    role: entry.payload.role, email: entry.payload.email||'',
-    active: entry.payload.active
-  };
-  var bareOk = await sbUpsert('agents', bare, 'id');
-  if(bareOk){
-    console.warn('[sync] agent #'+entry.payload.id+' saved via BARE fallback — full payload could not save');
-    return true;
+
+  // Both failed. KEEP IN QUEUE. Do NOT silently fall back to bare for updates.
+  // The bare fallback ONLY runs if this agent doesn't exist in Supabase at all,
+  // so we have a record (username+password) for them. For existing-agent updates,
+  // we refuse to silently drop fields.
+  console.error('[sync] agent #'+payload.id+' ('+payload.name+') FAILED to save (full + legacy both rejected). KEEPING IN QUEUE. First error:', firstError);
+
+  // Check whether the agent exists in Supabase at all — only fall back to bare for genuinely new agents
+  var existsCheck = null;
+  try{
+    if(supaClient && supaClient.from){
+      existsCheck = await supaClient.from('agents').select('id').eq('id', payload.id).limit(1);
+    }
+  }catch(e){}
+  var alreadyExists = existsCheck && Array.isArray(existsCheck.data) && existsCheck.data.length > 0;
+
+  if(!alreadyExists){
+    // Brand-new agent — bare is better than nothing
+    var bare = {
+      id: payload.id, name: payload.name,
+      username: payload.username, password: payload.password,
+      role: payload.role, email: payload.email||'',
+      active: payload.active
+    };
+    var bareOk = await sbUpsert('agents', bare, 'id');
+    if(bareOk){
+      console.warn('[sync] BRAND-NEW agent #'+payload.id+' saved via BARE fallback (will need re-save with full data once schema is fixed)');
+      // Still mark as failed so user knows there's a schema problem
+      // Actually no — if bare succeeded, the agent at least exists.
+      // Re-enqueue the full payload so next flush retries the rich fields.
+      try{
+        if(typeof syncEnqueue === 'function'){
+          syncEnqueue('agent', 'agents', entry.payload, 'agent:'+payload.id, 'id');
+        }
+      }catch(e){}
+      return true;
+    }
   }
+
+  // Total failure — keep in queue, surface the error in the stuck-queue banner
   return false;
 }
 
@@ -13880,6 +13936,113 @@ async function wmamDebugDump(agentId){
 }
 // Expose globally for easy console access
 if(typeof window !== 'undefined') window.wmamDebugDump = wmamDebugDump;
+
+// ════════════════════════════════════════════════════════════════════════
+//  SCHEMA PROBE  (Calvin 2026-05-08 911.2)
+//
+//  Diagnostic — run wmamSchemaProbe() in the F12 console. Probes the
+//  Supabase agents table and reports which columns are missing. If you
+//  see "ibo_markets MISSING" or "reports_to MISSING" or similar, that's
+//  why writes have been silently destroying field data — the upsert was
+//  rejecting because of unknown columns, then falling back to a
+//  stripped-down BARE payload that didn't preserve the fields you edited.
+//
+//  After running this, send me the output and I'll generate the exact
+//  SQL ALTER TABLE statements you need to run in Supabase to add the
+//  missing columns.
+// ════════════════════════════════════════════════════════════════════════
+async function wmamSchemaProbe(){
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('   WMAMinc SCHEMA PROBE  ('+new Date().toLocaleTimeString()+')');
+  console.log('═══════════════════════════════════════════════════════════');
+  if(!supaClient){ console.error('Supabase client not initialized.'); return; }
+  // List of columns we WRITE in saveAgentToSupabase. If any are missing
+  // in the live table, upserts have been silently failing.
+  var expectedColumns = [
+    'id','name','username','password','role','email',
+    'programs','program','carrier','team',
+    'team_leader_id','market_manager_id','campaign_manager_id',
+    'active','sales','monthly_sales','channels','links','start_date',
+    'agent_codes','can_host_call','profile_pic','phone','address',
+    'category','depts','office_manager','can_distribute_inventory',
+    'ibo_markets','cm_model','tc_model','aw_model','reports_to'
+  ];
+  console.log('Probing '+expectedColumns.length+' expected columns on agents table...');
+  // Fetch ONE row to inspect its keys
+  var result = null;
+  try{
+    result = await supaClient.from('agents').select('*').limit(1);
+  }catch(e){
+    console.error('Schema probe failed — could not query agents table:', e);
+    return;
+  }
+  if(result && result.error){
+    console.error('Schema probe failed — Supabase error:', result.error);
+    return;
+  }
+  if(!result || !Array.isArray(result.data) || !result.data.length){
+    console.warn('Agents table is EMPTY. Cannot probe schema from row data. Run wmamProbeWriteFailure() to test a write instead.');
+    return;
+  }
+  var sample = result.data[0];
+  var present = Object.keys(sample);
+  var missing = expectedColumns.filter(function(c){ return present.indexOf(c) < 0; });
+  console.log('Present columns: '+present.length);
+  if(missing.length){
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('   ⚠ SCHEMA MISMATCH — '+missing.length+' COLUMNS MISSING');
+    console.error('═══════════════════════════════════════════════════════════');
+    missing.forEach(function(c){ console.error('  ✗ '+c+' MISSING'); });
+    console.error('');
+    console.error('Writes that touch these columns have been silently failing.');
+    console.error('Send this list to Claude and they will generate the exact');
+    console.error('ALTER TABLE SQL you need to run in Supabase.');
+    return { ok:false, missing: missing, present: present };
+  }
+  console.log('✓ All expected columns present.');
+  return { ok:true, present: present, missing: [] };
+}
+
+// Probe by attempting a real write of a known sample agent to surface
+// any RLS/schema errors. Uses a non-destructive read-then-write of an
+// existing agent. Reports the exact error.
+async function wmamProbeWriteFailure(){
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('   WMAMinc WRITE PROBE  ('+new Date().toLocaleTimeString()+')');
+  console.log('═══════════════════════════════════════════════════════════');
+  if(!supaClient){ console.error('Supabase client not initialized.'); return; }
+  // Take the current logged-in user as the test subject
+  if(!DB.current){ console.error('No current user — log in first.'); return; }
+  var a = DB.current;
+  // Re-save themselves and capture any error
+  if(typeof saveAgentToSupabase !== 'function'){ console.error('saveAgentToSupabase not available.'); return; }
+  window._lastSbError = null;
+  console.log('Forcing a save of your own agent record to probe Supabase response...');
+  await saveAgentToSupabase(a);
+  // Give the flush a tick
+  await new Promise(function(r){ setTimeout(r, 1500); });
+  if(typeof syncFlush === 'function') await syncFlush(true);
+  await new Promise(function(r){ setTimeout(r, 1500); });
+  if(window._lastSbError){
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('  ⚠ WRITE PROBE FAILED — Supabase rejected the upsert');
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('  message:', window._lastSbError.message || '(none)');
+    console.error('  code:   ', window._lastSbError.code    || '(none)');
+    console.error('  details:', window._lastSbError.details || '(none)');
+    console.error('  hint:   ', window._lastSbError.hint    || '(none)');
+    console.error('');
+    console.error('Send this output to Claude. The error reveals exactly why writes are failing.');
+    return window._lastSbError;
+  }
+  console.log('✓ Write probe succeeded. Supabase accepted the upsert.');
+  return null;
+}
+
+if(typeof window !== 'undefined'){
+  window.wmamSchemaProbe       = wmamSchemaProbe;
+  window.wmamProbeWriteFailure = wmamProbeWriteFailure;
+}
 
 
 // ════════════════════════════════════════════════════════════════════════
