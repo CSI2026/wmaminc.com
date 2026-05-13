@@ -21539,6 +21539,22 @@ function panelAgentMasterProfile(agentId){
 
   var h = panelHeader('👤 '+a.name+' — Master Profile');
 
+  // ── Calvin 2026-05-08: PAYROLL HOLD WARNING BANNER ──
+  // If this agent has any pending inventory transfers that escalated past
+  // the 48-hour signature window, surface that prominently at the top of
+  // their profile. Payroll dept reads this to decide whether to hold
+  // commissions for the pay period.
+  if(Array.isArray(a._pendingInventoryHolds) && a._pendingInventoryHolds.length){
+    h += '<div style="background:linear-gradient(135deg,#CC0000,#8b0000);color:white;padding:14px 20px;border-radius:10px;margin-bottom:18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+       +'<div style="font-size:1.8rem">⚠️</div>'
+       +'<div style="flex:1">'
+       +  '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px">COMMISSION HOLD FLAG — '+a._pendingInventoryHolds.length+' OVERDUE INVENTORY SIGNATURE'+(a._pendingInventoryHolds.length===1?'':'S')+'</div>'
+       +  '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.9;margin-top:2px">This agent did not sign for inventory within 48 hours. Payroll dept must decide whether to hold commissions until resolved.</div>'
+       +'</div>'
+       +'<button onclick="gotoPanel(\'pending-transfers\')" style="background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.4);color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0">View Pending Transfers</button>'
+       +'</div>';
+  }
+
   var pic = a.profilePic||'';
   var ini = a.name.split(' ').map(function(n){return n[0]||'';}).join('').toUpperCase().slice(0,2);
   var progs = Array.isArray(a.programs)&&a.programs.length ? a.programs : (a.program?[a.program]:[]);
@@ -28857,6 +28873,353 @@ function invAssignClose(){
 
 // Commit the assignment. Creates a PENDING TRANSFER that requires
 // recipient e-signature before devices change hands. Direction-aware
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY CUSTODY MODULE  (Calvin 2026-05-08)
+//
+//  Builds on the existing transfer infrastructure (pending-approval,
+//  pending-agent-signature) to add the requirements Calvin specified:
+//   1. Market auto-lock — every transfer captures the recipient's
+//      market at create time; transfers to unplaced agents prompt
+//      Inventory dept for manual pick.
+//   2. Holder approval — when Inventory dept moves a device currently
+//      held by an agent, that agent must approve before the transfer
+//      flows to the recipient signature step. Status: 'pending-holder-approval'.
+//   3. Receiver signature — recipient must draw a signature (reuses
+//      the existing invAcceptSigCanvas).
+//   4. 48-hour timeout — pending transfers older than 48 hours fire
+//      escalation notifications to MM, CM, Payroll, and Inventory dept.
+//      Agent's profile gets a payroll-warning banner.
+//   5. Magic-link approval — releasing agent can approve from email
+//      via a one-time URL token.
+// ════════════════════════════════════════════════════════════════════════
+
+// 48-hour escalation window
+var INV_TIMEOUT_HOURS = 48;
+var INV_TIMEOUT_MS = INV_TIMEOUT_HOURS * 60 * 60 * 1000;
+
+// Resolve the market a recipient should be locked to.
+// Returns { market: 'Tulsa OK', auto: true } or { market: null, reason: 'no-placement' }
+// For IBO recipients with multiple markets, returns the first one OR null
+// to prompt manual choice.
+function invResolveRecipientMarket(recipient, deviceCampaign){
+  if(!recipient) return { market: null, reason: 'no-recipient' };
+  // Owner / Inventory Dept recipients — no market lock (they're a holding pool)
+  if(typeof isOwner === 'function' && isOwner(recipient)) return { market: null, reason: 'owner-pool' };
+  if(typeof isInventory === 'function' && isInventory(recipient)) return { market: null, reason: 'inv-pool' };
+  // IBO with markets — auto-pick the first if only one, otherwise prompt
+  if(recipient.role === 'IBO'){
+    if(Array.isArray(recipient.iboMarkets) && recipient.iboMarkets.length){
+      if(recipient.iboMarkets.length === 1) return { market: recipient.iboMarkets[0], auto: true };
+      return { market: null, reason: 'ibo-multi-market', options: recipient.iboMarkets.slice() };
+    }
+    return { market: null, reason: 'no-placement' };
+  }
+  // Field Agent / Team Leader / Market Manager / Campaign Manager — agent.team
+  if(recipient.team){ return { market: recipient.team, auto: true }; }
+  return { market: null, reason: 'no-placement' };
+}
+
+// Pop a market-picker prompt (used when invResolveRecipientMarket returns
+// no market). Returns a market string OR null (user cancelled).
+// Caller is responsible for handling the null cancel case.
+function invPromptMarketChoice(recipient, reason, options){
+  var ALL_MARKETS = (typeof LIFELINE_TEAMS !== 'undefined' && Array.isArray(LIFELINE_TEAMS))
+    ? LIFELINE_TEAMS.filter(function(t){ return t.active !== false; }).map(function(t){ return t.name; })
+    : [];
+  var pickFrom = (Array.isArray(options) && options.length) ? options : ALL_MARKETS;
+  if(!pickFrom.length){
+    alert('No active markets exist to lock this inventory to. Add a market first.');
+    return null;
+  }
+  var msg = recipient.name + ' has ';
+  if(reason === 'no-placement') msg += 'no market placement yet. ';
+  else if(reason === 'ibo-multi-market') msg += 'multiple IBO markets. ';
+  else msg += 'an ambiguous market. ';
+  msg += '\n\nLock this inventory to which market?\n\n';
+  pickFrom.forEach(function(m, i){ msg += '  ['+(i+1)+'] '+m+'\n'; });
+  msg += '\nEnter a number (or cancel to abort the transfer):';
+  var raw = prompt(msg, '');
+  if(raw === null) return null;  // user cancelled
+  var idx = parseInt(raw, 10) - 1;
+  if(isNaN(idx) || idx < 0 || idx >= pickFrom.length){
+    alert('Invalid choice. Transfer cancelled.');
+    return null;
+  }
+  return pickFrom[idx];
+}
+
+// Generate a one-time approval token for a transfer. Stored in
+// localStorage so it persists across reload. Tokens auto-expire after
+// 72 hours (longer than the 48-hour signing window so a late click
+// from the releaser still works to approve).
+function invMintApprovalToken(transferId, agentId){
+  var token = 'apv_' + Date.now() + '_' + Math.floor(Math.random() * 1e9).toString(36);
+  try{
+    var raw = localStorage.getItem('wmam_inv_tokens');
+    var map = raw ? JSON.parse(raw) : {};
+    map[token] = {
+      transferId: transferId,
+      agentId:    agentId,
+      createdAt:  Date.now(),
+      expiresAt:  Date.now() + 72 * 60 * 60 * 1000
+    };
+    // Prune expired tokens while we're here
+    Object.keys(map).forEach(function(k){
+      if(map[k].expiresAt < Date.now()) delete map[k];
+    });
+    localStorage.setItem('wmam_inv_tokens', JSON.stringify(map));
+  }catch(e){ console.warn('[invMintApprovalToken] persist failed:', e); }
+  return token;
+}
+
+// Consume a magic-link token. Returns { ok, transferId, agentId } or
+// { ok: false, reason: 'expired'|'unknown' }.
+function invConsumeApprovalToken(token){
+  if(!token) return { ok: false, reason: 'unknown' };
+  try{
+    var raw = localStorage.getItem('wmam_inv_tokens');
+    var map = raw ? JSON.parse(raw) : {};
+    var entry = map[token];
+    if(!entry) return { ok: false, reason: 'unknown' };
+    if(entry.expiresAt < Date.now()){
+      delete map[token];
+      localStorage.setItem('wmam_inv_tokens', JSON.stringify(map));
+      return { ok: false, reason: 'expired' };
+    }
+    // Single-use: consume on read. Caller is responsible for redirect.
+    delete map[token];
+    localStorage.setItem('wmam_inv_tokens', JSON.stringify(map));
+    return { ok: true, transferId: entry.transferId, agentId: entry.agentId };
+  }catch(e){
+    console.warn('[invConsumeApprovalToken] failed:', e);
+    return { ok: false, reason: 'unknown' };
+  }
+}
+
+// Build the magic-link URL the releaser receives via email. When they
+// click, the URL handler logs them in as that agent and opens the
+// approval modal for the transfer. Token is single-use, 72-hour TTL.
+function invBuildMagicLink(transferId, agentId){
+  var token = invMintApprovalToken(transferId, agentId);
+  var origin = (typeof window !== 'undefined' && window.location) ? window.location.origin + window.location.pathname : '';
+  return origin + '#inv-approve?t=' + encodeURIComponent(token);
+}
+
+// Holder approval — the current holder of a device approves the
+// transfer out. Called from the in-app notification button OR from
+// the magic-link handler. Flips status from 'pending-holder-approval'
+// → 'pending-agent-signature'.
+function invHolderApprove(transferId, campaign){
+  var cfg = (typeof campaignCfg === 'function') ? campaignCfg(campaign) : null;
+  if(!cfg || !cfg.transfers){ alert('Campaign config not found.'); return false; }
+  var req = cfg.transfers().find(function(t){ return t.id === transferId; });
+  if(!req){ alert('Transfer record not found — it may have been resolved already.'); return false; }
+  if(req.status !== 'pending-holder-approval'){
+    alert('This transfer is not awaiting holder approval (status: '+req.status+').');
+    return false;
+  }
+  var u = DB.current;
+  if(!u){ alert('Not signed in.'); return false; }
+  // Only the actual holder OR Owner OR Inventory dept can approve on holder's behalf
+  if(u.id !== req.fromId && !isOwner(u) && !isInventory(u)){
+    alert('Only ' + req.fromName + ' (the current holder) can approve this transfer.');
+    return false;
+  }
+  req.status = 'pending-agent-signature';
+  req.holderApprovedAt = new Date().toISOString();
+  req.holderApprovedBy = u.id;
+  req.holderApprovedByName = u.name;
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  // Notify the recipient that they can now sign
+  if(typeof pushNotification === 'function'){
+    pushNotification({
+      toIds: [req.toId], toRoles: [], icon: '✍️',
+      title: campaign + ' Transfer — SIGNATURE REQUIRED',
+      body: req.fromName + ' approved your ' + req.imeis.length + ' device(s). Sign the invoice to take possession.',
+      panel: 'pending-transfers', priority: 'high',
+      formType: 'inv-transfer', data: { kind: 'inv-transfer', transferId: req.id, campaign: campaign }
+    });
+  }
+  return true;
+}
+
+// Holder reject — current holder declines the transfer. Cancels the
+// transfer record entirely.
+function invHolderReject(transferId, campaign, reason){
+  var cfg = (typeof campaignCfg === 'function') ? campaignCfg(campaign) : null;
+  if(!cfg || !cfg.transfers){ return false; }
+  var req = cfg.transfers().find(function(t){ return t.id === transferId; });
+  if(!req){ alert('Transfer not found.'); return false; }
+  if(req.status !== 'pending-holder-approval'){
+    alert('This transfer is not awaiting holder approval.');
+    return false;
+  }
+  var u = DB.current;
+  if(u.id !== req.fromId && !isOwner(u) && !isInventory(u)){
+    alert('Only ' + req.fromName + ' can reject this transfer.');
+    return false;
+  }
+  req.status = 'rejected-by-holder';
+  req.rejectedAt = new Date().toISOString();
+  req.rejectedBy = u.id;
+  req.rejectionReason = (reason || '').trim();
+  if(typeof saveInventory === 'function') saveInventory();
+  // Notify Inventory dept that the transfer was rejected
+  if(typeof pushNotification === 'function'){
+    DB.agents.forEach(function(a){
+      if(a && a.active && (isInventory(a) || isOwner(a))){
+        pushNotification({
+          toIds: [a.id], toRoles: [], icon: '⛔',
+          title: campaign + ' Transfer REJECTED — ' + req.fromName,
+          body: req.fromName + ' rejected the transfer of ' + req.imeis.length + ' device(s) to ' + req.toName + '. Reason: ' + (req.rejectionReason || '(none given)'),
+          panel: 'pending-transfers', priority: 'high'
+        });
+      }
+    });
+  }
+  return true;
+}
+
+// Periodic timeout check — scans all pending transfers across all
+// campaigns and fires escalation notifications for any that are
+// older than 48 hours. Stamps escalatedAt on the record so we don't
+// re-notify on every check.
+function invCheckTimeouts(){
+  var allCampaigns = ['Gen Mobile', 'TruConnect', 'Assurance Wireless', 'Excess Telecom'];
+  var now = Date.now();
+  var escalated = 0;
+  allCampaigns.forEach(function(camp){
+    var cfg = (typeof campaignCfg === 'function') ? campaignCfg(camp) : null;
+    if(!cfg || !cfg.transfers) return;
+    (cfg.transfers() || []).forEach(function(req){
+      if(!req || req.escalatedAt) return; // already escalated
+      if(req.status !== 'pending-agent-signature' && req.status !== 'pending-holder-approval') return;
+      var createdMs = req.createdAt ? new Date(req.createdAt).getTime() : 0;
+      if(!createdMs) return;
+      if(now - createdMs < INV_TIMEOUT_MS) return;
+      // FIRE escalation
+      req.escalatedAt = new Date().toISOString();
+      escalated++;
+      _invEscalateTransfer(req, camp);
+    });
+  });
+  if(escalated > 0){
+    if(typeof saveInventory === 'function') saveInventory();
+    if(typeof saveToStorage === 'function') saveToStorage();
+    console.log('[invCheckTimeouts] escalated ' + escalated + ' overdue transfer(s)');
+  }
+}
+
+// Fire escalation for one overdue transfer. Notifies:
+//   - The receiving agent's Market Manager
+//   - The receiving agent's Campaign Manager (or IBO upline)
+//   - All Inventory dept members
+//   - All Payroll dept members
+// Also stamps a payroll-warning flag on the agent's record (read by
+// panelAgentMasterProfile + panelPayroll) so they see it on screen.
+function _invEscalateTransfer(req, campaign){
+  var recipient = DB.agents.find(function(a){ return a.id === req.toId; });
+  if(!recipient) return;
+  // Build escalation recipient set
+  var notifyIds = {};
+  var chain = (typeof reportingChainFor === 'function') ? reportingChainFor(recipient) : {};
+  if(chain.marketManagerId)   notifyIds[chain.marketManagerId]   = true;
+  if(chain.campaignManagerId) notifyIds[chain.campaignManagerId] = true;
+  // Inventory dept + Payroll dept + Owner
+  DB.agents.forEach(function(a){
+    if(!a || !a.active) return;
+    if(isOwner(a) || isInventory(a) || (typeof isPayroll === 'function' && isPayroll(a))){
+      notifyIds[a.id] = true;
+    }
+  });
+  // Also notify the recipient themselves — last chance to sign
+  notifyIds[req.toId] = true;
+  var toIds = Object.keys(notifyIds).map(function(k){ return parseInt(k,10); }).filter(function(n){ return !isNaN(n); });
+  // Flag the agent's record for payroll warning banner
+  if(!recipient._pendingInventoryHolds) recipient._pendingInventoryHolds = [];
+  if(recipient._pendingInventoryHolds.indexOf(req.id) < 0){
+    recipient._pendingInventoryHolds.push(req.id);
+  }
+  if(typeof saveAgentToSupabase === 'function'){
+    try{ saveAgentToSupabase(recipient); }catch(e){}
+  }
+  // Push notification
+  if(typeof pushNotification === 'function'){
+    pushNotification({
+      toIds: toIds, toRoles: [], icon: '⚠️',
+      title: '⏰ INVENTORY HOLD — ' + recipient.name + ' (' + INV_TIMEOUT_HOURS + 'h+)',
+      body: recipient.name + ' has not signed for ' + req.imeis.length + ' ' + campaign + ' device(s) from ' + req.fromName + ' (sent ' + new Date(req.createdAt).toLocaleString() + '). Payroll commission hold flag set — Payroll dept must decide whether to hold pay.',
+      panel: 'pending-transfers', priority: 'urgent',
+      formType: 'inv-escalation', data: { kind: 'inv-escalation', transferId: req.id, campaign: campaign, agentId: req.toId }
+    });
+  }
+}
+
+// Magic-link handler — wired to onhashchange. Reads #inv-approve?t=TOKEN
+// from the URL, validates the token, logs in the agent if needed, and
+// opens the approval modal for that transfer.
+function invHandleMagicLink(){
+  if(typeof window === 'undefined' || !window.location) return;
+  var hash = window.location.hash || '';
+  if(hash.indexOf('#inv-approve') !== 0) return;
+  // Parse token from query-string-style fragment
+  var q = hash.indexOf('?');
+  if(q < 0) return;
+  var params = {};
+  hash.slice(q+1).split('&').forEach(function(kv){
+    var p = kv.split('=');
+    if(p.length === 2) params[decodeURIComponent(p[0])] = decodeURIComponent(p[1]);
+  });
+  var token = params.t;
+  if(!token) return;
+  var result = invConsumeApprovalToken(token);
+  if(!result.ok){
+    if(result.reason === 'expired') alert('This approval link has expired (72-hour limit). Please open the app and approve from the notification bell.');
+    else                            alert('This approval link is invalid or has already been used.');
+    // Clear the hash so a refresh doesn't retry
+    try{ history.replaceState(null, '', window.location.pathname); }catch(e){}
+    return;
+  }
+  // Auto-login if needed
+  if(!DB.current || DB.current.id !== result.agentId){
+    var target = DB.agents.find(function(a){ return a.id === result.agentId && a.active; });
+    if(!target){
+      alert('The account this approval link belongs to is no longer active.');
+      return;
+    }
+    DB.current = target;
+    try{ sessionStorage.setItem('wmam_session', String(target.id)); }catch(e){}
+    if(typeof applyPersonalTheme === 'function') applyPersonalTheme();
+  }
+  // Clear the hash so a refresh doesn't re-fire
+  try{ history.replaceState(null, '', window.location.pathname); }catch(e){}
+  // Open the pending transfers panel with this transfer's row highlighted
+  setTimeout(function(){
+    if(typeof gotoPanel === 'function') gotoPanel('pending-transfers');
+    // Try to scroll-to / highlight the specific row
+    setTimeout(function(){
+      var row = document.querySelector('[data-transfer-id="' + result.transferId + '"]');
+      if(row){
+        try{ row.scrollIntoView({behavior:'smooth', block:'center'}); }catch(e){}
+        var orig = row.style.background;
+        row.style.background = 'rgba(124,58,237,.15)';
+        setTimeout(function(){ row.style.background = orig; }, 1500);
+      }
+    }, 400);
+  }, 200);
+}
+
+
+// ════════════════════════════════════════════════════════════════════════
+//  ASSIGN COMMIT  (updated for custody flow — Calvin 2026-05-08)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Recipient receives staged inventory through invAssignCommit. This is
+// the entry point used by:
+//   • Inventory Dashboard "Assign" button (bulk or single)
+//   • Holder transfers from their own pool
+//
 // routing: down-the-chain transfers go straight to recipient signature;
 // up-the-chain transfers (agent handing back) require MM approval first.
 //
@@ -28909,11 +29272,37 @@ function invAssignCommit(deviceIds){
   }
   var reason = (reasonEl && reasonEl.value || '').trim() || 'distribution';
 
+  // ── Calvin 2026-05-08: MARKET AUTO-LOCK ──
+  // Every transfer captures the recipient's market at create time. This
+  // is the fraud-protection gate Calvin specified — inventory cannot
+  // float between markets without an explicit confirmation step.
+  //
+  // Recipients with no placement (new hires, freshly created agents)
+  // trigger a fallback prompt for the Inventory dept to pick a market
+  // manually. Recipients that don't need a market (Owner / Inv Dept
+  // pool) are exempt.
+  var marketLock = invResolveRecipientMarket(recipient);
+  if(!marketLock.market && marketLock.reason !== 'owner-pool' && marketLock.reason !== 'inv-pool'){
+    // Inventory dept and Owner are the only ones allowed to pick a market manually.
+    // Non-inventory senders cannot bypass — they must place the agent first.
+    if(isOwner(u) || isInventory(u)){
+      var picked = invPromptMarketChoice(recipient, marketLock.reason, marketLock.options);
+      if(!picked){ console.log('[invAssignCommit] cancelled — no market picked'); return; }
+      marketLock = { market: picked, manual: true, pickedBy: u.id };
+    } else {
+      alert(recipient.name + ' has no market placement yet. Place them in a market first, or ask Inventory dept to handle this transfer.');
+      return;
+    }
+  }
+
   // ── Resolve devices, group by campaign, block any in pending transfers ──
   var byCampaign = {};
   var blocked = [];
   var notFound = 0;
-  var pendingStatuses = {'pending':1,'pending-approval':1,'pending-mm-approval':1,'pending-agent-signature':1};
+  // pending-holder-approval is added to the block list — devices already
+  // in a holder-approval transfer cannot be moved again until that one
+  // resolves.
+  var pendingStatuses = {'pending':1,'pending-approval':1,'pending-mm-approval':1,'pending-holder-approval':1,'pending-agent-signature':1};
 
   deviceIds.forEach(function(id){
     var hit = invFindDeviceAnyPool(id);
@@ -28980,6 +29369,9 @@ function invAssignCommit(deviceIds){
   //     → recipient's reporting MM (or sender's MM) approves first,
   //       then status flips to 'pending-agent-signature' for the upline
   //       recipient to acknowledge with e-signature
+  //   - Calvin 2026-05-08: when Inventory dept moves a device currently
+  //     held by an agent → 'pending-holder-approval' first. That agent
+  //     must approve before the recipient signature step.
   var initStatus = (direction === 'up' || direction === 'return') ? 'pending-mm-approval' : 'pending-agent-signature';
 
   // Identify the MM that needs to approve an UP transfer. Use the
@@ -29015,6 +29407,48 @@ function invAssignCommit(deviceIds){
       return;
     }
     var imeis = devs.map(function(d){ return d.imei; });
+
+    // ── Calvin 2026-05-08: HOLDER APPROVAL DETECTION ──
+    // If Inventory dept / Owner is moving devices currently HELD BY AN
+    // AGENT (not by the inventory pool), that agent is the "holder" and
+    // must approve before the transfer flows to the recipient signature.
+    // We pick the most common holder among the device group as the
+    // approver. (In practice the bulk-assign UI groups same-holder devices
+    // together; the rare mixed-holder case still gets the dominant holder
+    // pinged and Inventory dept can chase the others manually.)
+    var holderApprovalRequired = false;
+    var holderIdForApproval = null;
+    var holderNameForApproval = '';
+    if((isOwner(u) || isInventory(u)) && initStatus === 'pending-agent-signature'){
+      // Tally current holders
+      var holderCounts = {};
+      devs.forEach(function(d){
+        var h = (typeof deviceHolderId === 'function') ? deviceHolderId(d) : (d.assignedTo || d.holderId || null);
+        // Only count agent-held devices (not pool-held). assignedTo === null
+        // or pointing at Owner/Inventory means "in the pool" — no holder
+        // to approve.
+        if(!h) return;
+        var ha = DB.agents.find(function(a){ return a.id === h; });
+        if(!ha) return;
+        if(isOwner(ha) || isInventory(ha)) return;  // pool-held
+        if(h === recipient.id) return;  // already with recipient — no need to approve to self
+        holderCounts[h] = (holderCounts[h] || 0) + 1;
+      });
+      var topHolder = null, topCount = 0;
+      Object.keys(holderCounts).forEach(function(hid){
+        if(holderCounts[hid] > topCount){ topCount = holderCounts[hid]; topHolder = parseInt(hid,10); }
+      });
+      if(topHolder){
+        var holderAgent = DB.agents.find(function(a){ return a.id === topHolder; });
+        if(holderAgent){
+          holderApprovalRequired = true;
+          holderIdForApproval = topHolder;
+          holderNameForApproval = holderAgent.name;
+          initStatus = 'pending-holder-approval';
+        }
+      }
+    }
+
     var req = {
       id:           camp.toLowerCase().replace(/\s+/g,'')+'t-'+Date.now()+'-'+totalCreated,
       campaign:     camp,
@@ -29034,6 +29468,17 @@ function invAssignCommit(deviceIds){
       approverIds:  approverIds.slice(),
       agentSigned:  false,
       agentSignedAt: null,
+      // ── Calvin 2026-05-08 NEW FIELDS ──
+      marketLocked:           marketLock.market || null,
+      marketLockedManual:     marketLock.manual === true,
+      marketLockedPickedBy:   marketLock.pickedBy || null,
+      holderApprovalRequired: holderApprovalRequired,
+      holderIdForApproval:    holderIdForApproval,
+      holderNameForApproval:  holderNameForApproval,
+      holderApprovedAt:       null,
+      holderApprovedBy:       null,
+      holderApprovedByName:   null,
+      escalatedAt:            null,
       devices: devs.map(function(d){
         var resolved = (typeof invDeviceInvoiceCost === 'function') ? invDeviceInvoiceCost(d) : {cost:0};
         return {
@@ -29058,14 +29503,70 @@ function invAssignCommit(deviceIds){
     totalDevices += imeis.length;
 
     // Notify based on routing
-    if(initStatus === 'pending-agent-signature'){
+    if(initStatus === 'pending-holder-approval'){
+      // ── Calvin 2026-05-08: HOLDER APPROVAL ROUTE ──
+      // Inventory dept is moving devices currently held by an agent. That
+      // agent must approve before the transfer flows to the recipient.
+      // We notify them in-app AND send a magic-link email with click-to-
+      // approve URL.
+      var holderAgent = DB.agents.find(function(a){ return a.id === req.holderIdForApproval; });
+      if(holderAgent){
+        if(typeof pushNotification === 'function'){
+          pushNotification({
+            toIds:[holderAgent.id], toRoles:[], icon:'⚠️',
+            title: cfg.label + ' Transfer — YOUR APPROVAL NEEDED',
+            body: u.name + ' (Inventory) is moving ' + imeis.length + ' of your device(s) to ' + recipient.name + '. Approve or reject — these devices are currently in YOUR inventory.',
+            panel: 'pending-transfers', priority:'urgent',
+            formType: 'inv-holder-approval',
+            data: { kind: 'inv-holder-approval', transferId: req.id, campaign: camp }
+          });
+        }
+        // Magic-link email (only if Brevo configured and holder has email)
+        if(holderAgent.email && typeof BREVO_API_KEY !== 'undefined' && BREVO_API_KEY){
+          var magicLink = invBuildMagicLink(req.id, holderAgent.id);
+          try{
+            var emailBody = '<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto">'
+              +'<div style="background:#7c3aed;padding:20px;text-align:center"><h2 style="color:white;margin:0;letter-spacing:2px">🚚 Inventory Transfer — Approval Needed</h2></div>'
+              +'<div style="padding:24px;background:#f8f9fa">'
+              +'<p style="font-size:14px;color:#222">Hi '+_escapeHtml(holderAgent.name)+',</p>'
+              +'<p style="font-size:14px;color:#444">'+_escapeHtml(u.name)+' (Inventory) is moving <strong>'+imeis.length+' '+cfg.label+' device(s)</strong> currently in YOUR inventory to <strong>'+_escapeHtml(recipient.name)+'</strong> ('+_escapeHtml(req.marketLocked || 'unassigned market')+').</p>'
+              +'<p style="font-size:14px;color:#444">You must approve this transfer before the devices move. Click below to review and approve (or reject) the transfer:</p>'
+              +'<div style="text-align:center;margin:24px 0"><a href="'+magicLink+'" style="display:inline-block;background:#7c3aed;color:white;padding:14px 28px;font-weight:700;text-decoration:none;border-radius:6px;font-size:14px;letter-spacing:1px">✓ REVIEW & APPROVE</a></div>'
+              +'<p style="font-size:12px;color:#888;margin-top:18px">This link is valid for 72 hours and can only be used once. If you didn\'t expect this, contact Inventory dept immediately.</p>'
+              +'<p style="font-size:12px;color:#888">If you don\'t respond within 48 hours, your supervisors and Payroll will be notified and a commission hold warning may be flagged on your account.</p>'
+              +'</div></div>';
+            fetch('https://api.brevo.com/v3/smtp/email',{
+              method:'POST',
+              headers:{'Content-Type':'application/json','api-key':BREVO_API_KEY},
+              body:JSON.stringify({
+                sender:{name:'WMAMinc. Inventory',email:'info@wmaminc.com'},
+                to:[{email:holderAgent.email, name:holderAgent.name}],
+                subject:'Inventory Transfer Approval Needed — '+imeis.length+' '+cfg.label+' device(s)',
+                htmlContent:emailBody
+              })
+            }).catch(function(e){ console.warn('[invAssignCommit] holder email failed:', e); });
+          }catch(e){ console.warn('[invAssignCommit] holder magic-link email build failed:', e); }
+        }
+      }
+      // Also notify recipient that the transfer is awaiting holder approval
+      if(typeof pushNotification === 'function'){
+        pushNotification({
+          toIds:[recipient.id], toRoles:[], icon:'⏳',
+          title: cfg.label + ' Transfer — Awaiting Holder Approval',
+          body: u.name + ' is sending ' + imeis.length + ' device(s) to you. ' + (holderAgent ? holderAgent.name : 'The current holder') + ' must approve before you can sign.',
+          panel: 'pending-transfers', priority:'normal'
+        });
+      }
+    } else if(initStatus === 'pending-agent-signature'){
       // Direct to recipient — they need to sign
       if(typeof pushNotification === 'function'){
         pushNotification({
           toIds:[recipient.id], toRoles:[], icon:'✍️',
           title: cfg.label + ' Transfer — SIGNATURE REQUIRED',
-          body: u.name + ' has sent you ' + imeis.length + ' device(s). You must sign for the invoice (IMEI, cost, expiry) before they appear in your inventory.',
-          panel: 'pending-transfers', priority:'high'
+          body: u.name + ' has sent you ' + imeis.length + ' device(s)' + (req.marketLocked ? ' for ' + req.marketLocked : '') + '. You must sign for the invoice (IMEI, cost, expiry) before they appear in your inventory.',
+          panel: 'pending-transfers', priority:'high',
+          formType: 'inv-transfer',
+          data: { kind: 'inv-transfer', transferId: req.id, campaign: camp }
         });
       }
     } else {
@@ -34518,6 +35019,34 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
   req.agentSigned     = true;
   req.agentSignedAt   = now.toISOString();
   req.status          = 'completed';
+
+  // ── Calvin 2026-05-08: stamp the locked market onto each device ──
+  // Persists the fraud-protection market lock to the device records so
+  // it survives beyond the transfer record. Inventory dept can later
+  // query "show me all devices locked to Tulsa OK".
+  if(req.marketLocked){
+    req.devices.forEach(function(rd){
+      var dev = pool.find(function(d){return d.imei===rd.imei;});
+      if(dev){
+        dev.lockedMarket   = req.marketLocked;
+        dev.lockedAt       = now.toISOString();
+        dev.lockedByTransferId = req.id;
+      }
+    });
+  }
+
+  // ── Calvin 2026-05-08: clear payroll hold flag if this transfer caused one ──
+  if(to && Array.isArray(to._pendingInventoryHolds)){
+    var beforeLen = to._pendingInventoryHolds.length;
+    to._pendingInventoryHolds = to._pendingInventoryHolds.filter(function(rid){ return rid !== req.id; });
+    if(to._pendingInventoryHolds.length < beforeLen){
+      console.log('[invFinalizeTransferAccept] cleared payroll-hold flag for agent #'+to.id+' (transfer '+req.id+' resolved)');
+      if(typeof saveAgentToSupabase === 'function'){
+        try{ saveAgentToSupabase(to); }catch(e){}
+      }
+    }
+  }
+
   saveInventory();
 
   pushNotification({
@@ -48922,9 +49451,13 @@ function panelPendingTransfers(){
   //                           'pending-agent-signature'; I must e-sign
   //   3. waitingOnOthers     — Transfers I sent that haven't completed
   //                           (informational)
-  var needsMyMmApproval = [];
-  var needsMySignature  = [];
-  var waitingOnOthers   = [];
+  //   4. Calvin 2026-05-08: needsMyHolderApproval — Inventory dept is
+  //      moving devices I currently hold; I must approve before they
+  //      can leave my inventory.
+  var needsMyMmApproval     = [];
+  var needsMySignature      = [];
+  var needsMyHolderApproval = [];
+  var waitingOnOthers       = [];
   if(typeof CAMPAIGN_REGISTRY === 'object'){
     Object.keys(CAMPAIGN_REGISTRY).forEach(function(camp){
       var cfg = CAMPAIGN_REGISTRY[camp];
@@ -48938,9 +49471,12 @@ function panelPendingTransfers(){
           if(Array.isArray(t.approverIds) && t.approverIds.indexOf(u.id) >= 0) imApprover = true;
           if(isOwner(u) || isInv || isAdmin) imApprover = true;
           if(imApprover) needsMyMmApproval.push(entry);
+        } else if(t.status === 'pending-holder-approval'){
+          // Calvin 2026-05-08: holder-approval bucket
+          if(t.holderIdForApproval === u.id || isOwner(u) || isInv) needsMyHolderApproval.push(entry);
         } else if(t.status === 'pending-agent-signature' && t.toId === u.id){
           needsMySignature.push(entry);
-        } else if(t.fromId === u.id && (t.status === 'pending-mm-approval' || t.status === 'pending-agent-signature')){
+        } else if(t.fromId === u.id && (t.status === 'pending-mm-approval' || t.status === 'pending-holder-approval' || t.status === 'pending-agent-signature')){
           waitingOnOthers.push(entry);
         }
       });
@@ -48979,6 +49515,44 @@ function panelPendingTransfers(){
       h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
       h += '<button onclick="invAcceptTransfer(\''+entry.campaign+'\',\''+t.id+'\')" class="btn-fire" style="flex:1;justify-content:center;padding:11px;font-size:.78rem">✍ Sign Invoice & Accept →</button>';
       h += '<button onclick="invRejectTransfer(\''+entry.campaign+'\',\''+t.id+'\')" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:11px 18px;border-radius:5px;cursor:pointer">✗ Reject</button>';
+      h += '</div>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // ── Section: HOLDER APPROVAL NEEDED (Inventory dept moving my held devices) ──
+  // Calvin 2026-05-08: Inventory dept tried to move devices currently in
+  // YOUR inventory. They cannot proceed until you approve or reject.
+  if(needsMyHolderApproval.length){
+    h += '<div style="background:rgba(124,58,237,.08);border:2px solid #7c3aed;border-radius:10px;padding:18px;margin-bottom:18px">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:#7c3aed;letter-spacing:2px;margin-bottom:4px">⚠ HOLDER APPROVAL REQUIRED — '+needsMyHolderApproval.length+' INCOMING</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:12px;line-height:1.5">Inventory dept is moving devices currently in YOUR inventory to another agent. They cannot proceed without your explicit approval. If these devices should NOT leave your inventory, reject the transfer.</div>';
+    needsMyHolderApproval.forEach(function(entry){
+      var t = entry.transfer;
+      h += '<div style="background:white;border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:14px;margin-bottom:10px" data-transfer-id="'+_escapeAttr(t.id)+'">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:8px">';
+      h += '<div>';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:var(--brown)">'+entry.label+' &middot; '+t.imeis.length+' device'+(t.imeis.length===1?'':'s')+'</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-top:2px">Initiated by <strong style="color:var(--brown)">'+_escapeHtml(t.fromName)+'</strong> ('+_escapeHtml(t.fromRole)+') &middot; To <strong style="color:var(--brown)">'+_escapeHtml(t.toName)+'</strong>'+(t.marketLocked ? ' in <strong>'+_escapeHtml(t.marketLocked)+'</strong>' : '')+'</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">Reason: '+_escapeHtml(t.reason||'distribution')+'</div>';
+      h += '</div>';
+      // Age indicator — if approaching 48h, show urgent flag
+      var ageMs = Date.now() - new Date(t.createdAt).getTime();
+      var ageH = Math.floor(ageMs / 3600000);
+      var ageColor = ageH > 36 ? '#CC0000' : ageH > 24 ? '#D97706' : 'var(--muted)';
+      h += '<div style="text-align:right">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Sent</div>';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:'+ageColor+';letter-spacing:1px">'+ageH+'h ago</div>';
+      h += '</div>';
+      h += '</div>';
+      // IMEI preview
+      var imeiPrev = t.imeis.slice(0,4).join(', ');
+      if(t.imeis.length > 4) imeiPrev += ', + '+(t.imeis.length-4)+' more';
+      h += '<div style="background:rgba(124,58,237,.04);border:1px solid rgba(124,58,237,.12);border-radius:5px;padding:8px 12px;font-family:monospace;font-size:.74rem;color:var(--brown);margin-bottom:10px;word-break:break-all">'+_escapeHtml(imeiPrev)+'</div>';
+      h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+      h += '<button onclick="if(invHolderApprove(\''+t.id+'\',\''+_escapeAttr(entry.campaign)+'\')) gotoPanel(\'pending-transfers\')" class="btn-fire" style="flex:1;justify-content:center;padding:11px;font-size:.78rem;background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;border:none">✓ APPROVE TRANSFER →</button>';
+      h += '<button onclick="(function(){ var r=prompt(\'Reason for rejection (optional):\',\'\'); if(r!==null && invHolderReject(\''+t.id+'\',\''+_escapeAttr(entry.campaign)+'\',r)) gotoPanel(\'pending-transfers\'); })()" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:11px 18px;border-radius:5px;cursor:pointer">✗ Reject</button>';
       h += '</div>';
       h += '</div>';
     });
@@ -49066,7 +49640,7 @@ function panelPendingTransfers(){
     h+='</div></div>';
   }
   var all=PENDING_TRANSFERS.filter(function(p){return p.status==='Approved'||p.status==='Denied'||p.status==='Rejected by Recipient';});
-  if(!myIncoming.length&&!awaitingApproval.length&&!all.length&&!needsMySignature.length&&!needsMyMmApproval.length&&!waitingOnOthers.length){
+  if(!myIncoming.length&&!awaitingApproval.length&&!all.length&&!needsMySignature.length&&!needsMyMmApproval.length&&!needsMyHolderApproval.length&&!waitingOnOthers.length){
     h+='<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No pending or completed transfers yet.</div>';
   }
   return h;
@@ -50555,6 +51129,20 @@ initSupabase();
 // Loads pending writes from localStorage, sets up retry timer + online/focus
 // listeners. Idempotent. Safe to call early — flushes are gated on supaClient.
 if(typeof syncStartBackgroundFlush === 'function') syncStartBackgroundFlush();
+// ── Calvin 2026-05-08: inventory custody — periodic timeout escalation ──
+// Every 15 minutes, scan pending transfers and fire escalation notifications
+// for any older than 48 hours.
+if(typeof invCheckTimeouts === 'function'){
+  setTimeout(function(){ try{ invCheckTimeouts(); }catch(e){ console.warn('[invCheckTimeouts initial]', e); } }, 8000);
+  setInterval(function(){ try{ invCheckTimeouts(); }catch(e){ console.warn('[invCheckTimeouts interval]', e); } }, 15 * 60 * 1000);
+}
+// ── Calvin 2026-05-08: inventory custody — magic-link URL handler ──
+// If page loaded with #inv-approve?t=TOKEN in the URL, consume token and
+// auto-login the agent to approve the transfer.
+if(typeof invHandleMagicLink === 'function'){
+  setTimeout(function(){ try{ invHandleMagicLink(); }catch(e){ console.warn('[invHandleMagicLink]', e); } }, 1500);
+  window.addEventListener('hashchange', function(){ try{ invHandleMagicLink(); }catch(e){} });
+}
 // Load data async then init page
 (async function(){
   await loadFromSupabase();
