@@ -14050,6 +14050,295 @@ if(typeof window !== 'undefined'){
 //  Visible to all users. Shows pending writes, errors, retry/discard.
 //  Owner sees discard buttons; others see view-only.
 // ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════
+//  REPAIR BARE-SAVED AGENTS  (Calvin 2026-05-13)
+//
+//  Owner / Inventory dept tool. Detects agents whose Supabase record got
+//  saved via the BARE fallback (before the 911.2 fix) — meaning they
+//  have id/name/username/password/role/email/active but their programs,
+//  campaigns, agentCodes, team, iboMarkets, etc. are all EMPTY.
+//
+//  Sources for resurrection:
+//   1. localStorage rolling backups (wmam_agents_backup) — last 5 versions
+//      of DB.agents. If a snapshot has the agent with field data, use it.
+//   2. Sales records — if the agent has any sales attributed to them,
+//      we know which campaign they were coded for.
+//   3. Inventory records — if any device is assigned to the agent, we
+//      know which market they belong to (from device.market).
+//   4. Reporting chain — if other agents reference this agent as their
+//      TL/MM/CM, that's a placement signal.
+//
+//  Output is a PREVIEW. Nothing is saved until the user approves.
+// ════════════════════════════════════════════════════════════════════════
+
+// Detect "bare-saved" agents: have core identity but lack field-level data
+function _repairBareSavedDetect(){
+  var bare = [];
+  if(!Array.isArray(DB.agents)) return bare;
+  DB.agents.forEach(function(a){
+    if(!a || !a.id) return;
+    if(!a.active) return; // skip deactivated
+    // Skip Owner / Inventory / Payroll / HR / Onboarding / admin office staff —
+    // they legitimately have no programs/campaigns/team
+    if(typeof isOwner === 'function' && isOwner(a)) return;
+    if(a.role === 'Inventory' || a.role === 'Payroll' || a.role === 'HR' || a.role === 'Onboarding' || a.role === 'admin') return;
+    if(a.category === 'office') return;
+    // Bare-saved signature: NO programs, NO campaigns/agentCodes, NO team, NO iboMarkets
+    var hasPrograms   = Array.isArray(a.programs) && a.programs.length > 0;
+    var hasCampaigns  = a.agentCodes && Object.keys(a.agentCodes).filter(function(k){ return (a.agentCodes[k]||'').trim() || a.agentCodes[k] === ''; }).length > 0;
+    var hasTeam       = !!a.team;
+    var hasIboMarkets = Array.isArray(a.iboMarkets) && a.iboMarkets.length > 0;
+    var hasChain      = !!(a.teamLeaderId || a.marketManagerId || a.campaignManagerId);
+    // If ALL of these are missing → bare-saved. If at least one is present, the agent has SOME data.
+    if(!hasPrograms && !hasCampaigns && !hasTeam && !hasIboMarkets && !hasChain){
+      bare.push(a);
+    }
+  });
+  return bare;
+}
+
+// Resurrect field data for a bare-saved agent from every source we have.
+// Returns a SUGGESTED enriched record. Caller decides whether to apply.
+function _repairBareSavedSuggest(agent){
+  var suggestion = {
+    programs:           [],
+    agentCodes:         {},
+    team:               null,
+    iboMarkets:         [],
+    teamLeaderId:       null,
+    marketManagerId:    null,
+    campaignManagerId:  null,
+    confidence:         {},
+    sources:            []
+  };
+  if(!agent || !agent.id) return suggestion;
+
+  // ── Source 1: localStorage backups ──
+  try{
+    var raw = localStorage.getItem('wmam_agents_backup');
+    var store = raw ? JSON.parse(raw) : null;
+    if(store && Array.isArray(store.backups)){
+      for(var i = 0; i < store.backups.length; i++){
+        var snap = store.backups[i];
+        if(!snap || !Array.isArray(snap.agents)) continue;
+        var snapAgent = snap.agents.find(function(x){ return x && x.id === agent.id; });
+        if(!snapAgent) continue;
+        var snapHasData = (Array.isArray(snapAgent.programs) && snapAgent.programs.length) ||
+                          (snapAgent.agentCodes && Object.keys(snapAgent.agentCodes).length) ||
+                          snapAgent.team || (Array.isArray(snapAgent.iboMarkets) && snapAgent.iboMarkets.length);
+        if(snapHasData){
+          // Found a snapshot with real data — use it as the primary source
+          if(Array.isArray(snapAgent.programs)) suggestion.programs = snapAgent.programs.slice();
+          if(snapAgent.agentCodes && typeof snapAgent.agentCodes === 'object') suggestion.agentCodes = JSON.parse(JSON.stringify(snapAgent.agentCodes));
+          if(snapAgent.team)               suggestion.team = snapAgent.team;
+          if(Array.isArray(snapAgent.iboMarkets)) suggestion.iboMarkets = snapAgent.iboMarkets.slice();
+          if(snapAgent.teamLeaderId)       suggestion.teamLeaderId = snapAgent.teamLeaderId;
+          if(snapAgent.marketManagerId)    suggestion.marketManagerId = snapAgent.marketManagerId;
+          if(snapAgent.campaignManagerId)  suggestion.campaignManagerId = snapAgent.campaignManagerId;
+          suggestion.confidence.snapshot = 'high';
+          suggestion.sources.push('localStorage backup #'+i+' from '+new Date(snap.ts).toLocaleString());
+          break; // use the newest matching snapshot
+        }
+      }
+    }
+  }catch(e){ console.warn('[_repairBareSavedSuggest] backup read failed:', e); }
+
+  // ── Source 2: Sales records — infer campaigns ──
+  try{
+    var saleCampaigns = {};
+    if(typeof DB !== 'undefined' && DB.sales && Array.isArray(DB.sales)){
+      DB.sales.forEach(function(s){
+        if(s && s.agentId === agent.id && s.campaign){
+          saleCampaigns[s.campaign] = true;
+        }
+      });
+    }
+    // Also check campaign-specific sales arrays if they exist
+    ['GM_SALES','TC_SALES','AW_SALES','EX_SALES'].forEach(function(varName){
+      try{
+        var arr = eval('typeof '+varName+' !== "undefined" ? '+varName+' : null');
+        if(Array.isArray(arr)){
+          var campLabel = varName === 'GM_SALES' ? 'Gen Mobile' :
+                          varName === 'TC_SALES' ? 'TruConnect' :
+                          varName === 'AW_SALES' ? 'Assurance Wireless' :
+                          varName === 'EX_SALES' ? 'Excess Telecom' : null;
+          if(campLabel){
+            arr.forEach(function(s){
+              if(s && (s.agentId === agent.id || s.agent_id === agent.id)){
+                saleCampaigns[campLabel] = true;
+              }
+            });
+          }
+        }
+      }catch(e){}
+    });
+    var saleCampList = Object.keys(saleCampaigns);
+    if(saleCampList.length){
+      // If we don't have agentCodes yet, populate empty placeholders
+      if(!suggestion.agentCodes || Object.keys(suggestion.agentCodes).length === 0){
+        saleCampList.forEach(function(c){ suggestion.agentCodes[c] = ''; });
+      } else {
+        // Merge — add any missing campaigns
+        saleCampList.forEach(function(c){
+          if(!(c in suggestion.agentCodes)) suggestion.agentCodes[c] = '';
+        });
+      }
+      suggestion.confidence.sales = 'medium';
+      suggestion.sources.push('Sales records: '+saleCampList.join(', ')+' ('+Object.keys(saleCampaigns).length+' campaign'+(saleCampList.length===1?'':'s')+')');
+    }
+  }catch(e){ console.warn('[_repairBareSavedSuggest] sales read failed:', e); }
+
+  // ── Source 3: Inventory records — infer market ──
+  try{
+    var devMarkets = {};
+    var pools = (typeof _myMarketsPools === 'function') ? _myMarketsPools() : [];
+    pools.forEach(function(pool){
+      pool.devices.forEach(function(d){
+        if(!d) return;
+        var holder = d.assignedTo || d.holderId || d.heldBy || null;
+        if(holder === agent.id){
+          var name = (typeof _invMarketDisplayName === 'function') ? _invMarketDisplayName(d.market || d.teamName || d.team || '') : (d.market || '');
+          if(name) devMarkets[name] = (devMarkets[name] || 0) + 1;
+        }
+      });
+    });
+    var devMarketList = Object.keys(devMarkets).sort(function(a,b){ return devMarkets[b] - devMarkets[a]; });
+    if(devMarketList.length && !suggestion.team && !suggestion.iboMarkets.length){
+      // Single market → likely their team
+      if(devMarketList.length === 1){
+        suggestion.team = devMarketList[0];
+        suggestion.confidence.inventory = 'high';
+      } else {
+        // Multiple markets → likely a multi-market role
+        suggestion.iboMarkets = devMarketList;
+        suggestion.confidence.inventory = 'medium';
+      }
+      suggestion.sources.push('Inventory device locations: '+devMarketList.join(', '));
+    }
+  }catch(e){ console.warn('[_repairBareSavedSuggest] inventory read failed:', e); }
+
+  // ── Source 4: Reporting chain — other agents reference this one ──
+  try{
+    var downstreamCount = 0;
+    DB.agents.forEach(function(other){
+      if(!other || other.id === agent.id) return;
+      if(other.teamLeaderId === agent.id || other.marketManagerId === agent.id || other.campaignManagerId === agent.id){
+        downstreamCount++;
+      }
+    });
+    if(downstreamCount > 0){
+      suggestion.sources.push(downstreamCount+' agent(s) report to this person — they are a manager/leader');
+    }
+  }catch(e){}
+
+  // ── Source 5: Derive programs from agentCodes ──
+  // If agentCodes has Gen Mobile/TruConnect/etc, programs should include 'Lifeline'
+  if(suggestion.agentCodes && Object.keys(suggestion.agentCodes).length && !suggestion.programs.length){
+    var lifelineCampaigns = ['Gen Mobile','TruConnect','Assurance Wireless','Excess Telecom'];
+    var hasLifeline = Object.keys(suggestion.agentCodes).some(function(c){ return lifelineCampaigns.indexOf(c) >= 0; });
+    if(hasLifeline){
+      suggestion.programs = ['Lifeline'];
+      suggestion.sources.push('Programs inferred from campaigns');
+    }
+  }
+
+  return suggestion;
+}
+
+// Apply a suggestion to an agent — does NOT auto-save until caller requests.
+function _repairBareSavedApply(agentId, suggestion){
+  var a = DB.agents.find(function(x){ return x.id === agentId; });
+  if(!a){ alert('Agent #'+agentId+' not found.'); return false; }
+  if(suggestion.programs && suggestion.programs.length)         a.programs = suggestion.programs.slice();
+  if(suggestion.agentCodes && Object.keys(suggestion.agentCodes).length){
+    a.agentCodes = a.agentCodes || {};
+    Object.keys(suggestion.agentCodes).forEach(function(k){
+      if(!(k in a.agentCodes)) a.agentCodes[k] = suggestion.agentCodes[k];
+    });
+  }
+  if(suggestion.team && !a.team)                                a.team = suggestion.team;
+  if(suggestion.iboMarkets && suggestion.iboMarkets.length){
+    a.iboMarkets = a.iboMarkets || [];
+    suggestion.iboMarkets.forEach(function(m){ if(a.iboMarkets.indexOf(m) < 0) a.iboMarkets.push(m); });
+  }
+  if(suggestion.teamLeaderId && !a.teamLeaderId)                a.teamLeaderId = suggestion.teamLeaderId;
+  if(suggestion.marketManagerId && !a.marketManagerId)          a.marketManagerId = suggestion.marketManagerId;
+  if(suggestion.campaignManagerId && !a.campaignManagerId)      a.campaignManagerId = suggestion.campaignManagerId;
+  // Mark as updated and queue for Supabase save
+  a._localUpdatedAt = new Date().toISOString();
+  saveToStorage();
+  if(typeof saveAgentToSupabase === 'function'){
+    try{ saveAgentToSupabase(a); }catch(e){ console.warn('[repair apply] supa save failed:', e); }
+  }
+  return true;
+}
+
+// Owner-facing panel
+function panelRepairBareSaved(){
+  var u = DB.current;
+  if(!u || (typeof isOwner !== 'function' || !isOwner(u))){
+    if(typeof isInventory !== 'function' || !isInventory(u)){
+      return panelHeader('🔧 Repair Bare-Saved Agents')
+        + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Owner / Inventory dept only.</div></div>';
+    }
+  }
+  var h = panelHeader('🔧 Repair Bare-Saved Agents');
+  h += '<div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">'
+    + '<strong>What this is.</strong> Before the schema fix this morning, some agent saves only wrote core identity (id/name/username/password/role) to Supabase. Their programs, campaigns, market, and reporting chain got silently dropped. This tool finds those agents and rebuilds the missing data from localStorage backups, sales records, inventory device assignments, and reporting-chain references. Nothing is saved until you click <strong>Apply</strong> on each row.'
+    + '</div>';
+
+  var bare = _repairBareSavedDetect();
+  if(!bare.length){
+    h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:14px">✓</div><div style="font-size:1.05rem">No bare-saved agents detected.</div><div style="font-size:.78rem;margin-top:8px">Every active sales-role agent has at least some placement data.</div></div></div>';
+    return h;
+  }
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.9rem;color:var(--brown);margin-bottom:14px">'+bare.length+' agent'+(bare.length===1?'':'s')+' detected with missing field data:</div>';
+
+  bare.forEach(function(a){
+    var sug = _repairBareSavedSuggest(a);
+    var hasSuggestion = sug.sources.length > 0 && (
+      sug.programs.length || Object.keys(sug.agentCodes).length || sug.team || sug.iboMarkets.length
+    );
+    h += '<div class="bo-card" style="margin-bottom:14px;padding:0;overflow:hidden">';
+    h += '<div style="padding:14px 18px;background:var(--cream);border-bottom:1px solid var(--sand)">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+    h += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:1.5px;color:var(--brown)">'+_escapeHtml(a.name)+' — '+_escapeHtml(a.role||'(no role)')+'</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">Agent #'+a.id+' · username: '+_escapeHtml(a.username||'')+'</div></div>';
+    h += '<div style="display:flex;gap:6px">';
+    h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+a.id+'})" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">Open Profile</button>';
+    h += '</div></div></div>';
+    h += '<div style="padding:14px 18px">';
+    if(hasSuggestion){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Suggested fields</div>';
+      h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.82rem;margin-bottom:14px"><tbody>';
+      if(sug.programs.length)                  h += '<tr><td style="padding:4px 8px;color:var(--muted);width:140px;vertical-align:top">Programs:</td><td style="padding:4px 8px;color:var(--brown)">'+_escapeHtml(sug.programs.join(', '))+'</td></tr>';
+      if(Object.keys(sug.agentCodes).length)   h += '<tr><td style="padding:4px 8px;color:var(--muted);vertical-align:top">Campaigns:</td><td style="padding:4px 8px;color:var(--brown)">'+_escapeHtml(Object.keys(sug.agentCodes).join(', '))+'</td></tr>';
+      if(sug.team)                             h += '<tr><td style="padding:4px 8px;color:var(--muted);vertical-align:top">Team:</td><td style="padding:4px 8px;color:var(--brown)">'+_escapeHtml(sug.team)+'</td></tr>';
+      if(sug.iboMarkets.length)                h += '<tr><td style="padding:4px 8px;color:var(--muted);vertical-align:top">IBO Markets:</td><td style="padding:4px 8px;color:var(--brown)">'+_escapeHtml(sug.iboMarkets.join(', '))+'</td></tr>';
+      if(sug.teamLeaderId)                     h += '<tr><td style="padding:4px 8px;color:var(--muted);vertical-align:top">Team Leader:</td><td style="padding:4px 8px;color:var(--brown)">agent #'+sug.teamLeaderId+'</td></tr>';
+      if(sug.marketManagerId)                  h += '<tr><td style="padding:4px 8px;color:var(--muted);vertical-align:top">Market Manager:</td><td style="padding:4px 8px;color:var(--brown)">agent #'+sug.marketManagerId+'</td></tr>';
+      if(sug.campaignManagerId)                h += '<tr><td style="padding:4px 8px;color:var(--muted);vertical-align:top">Campaign Manager:</td><td style="padding:4px 8px;color:var(--brown)">agent #'+sug.campaignManagerId+'</td></tr>';
+      h += '</tbody></table>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:6px">Sources</div>';
+      h += '<ul style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin:0 0 14px 18px;padding:0">';
+      sug.sources.forEach(function(s){ h += '<li>'+_escapeHtml(s)+'</li>'; });
+      h += '</ul>';
+      h += '<button onclick="_repairBareSavedApply('+a.id+', '+JSON.stringify(sug).replace(/'/g,"&#39;")+'); alert(\'Applied to '+_escapeAttr(a.name)+'. Re-render the panel to refresh.\'); gotoPanel(\'repair-bare-saved\');" class="btn-fire" style="padding:10px 18px;font-size:.74rem">✓ Apply Suggested Fields</button>';
+      h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+a.id+'})" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;margin-left:8px">Edit Manually Instead</button>';
+    } else {
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted);margin-bottom:10px">No backup snapshot or signals found for this agent. You will need to set their placement / programs / campaigns manually.</div>';
+      h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+a.id+'})" class="btn-fire" style="padding:10px 18px;font-size:.74rem">Edit Profile →</button>';
+    }
+    h += '</div></div>';
+  });
+  return h;
+}
+
+if(typeof window !== 'undefined') window._repairBareSavedDetect = _repairBareSavedDetect;
+if(typeof window !== 'undefined') window._repairBareSavedSuggest = _repairBareSavedSuggest;
+if(typeof window !== 'undefined') window._repairBareSavedApply = _repairBareSavedApply;
+
+
 function panelSyncStatus(){
   var u = DB.current;
   var h = '';
@@ -14258,24 +14547,30 @@ async function loadFromSupabase(){
           merged.push(sa);
           return;
         }
-        // Decision tree:
+        // ── Calvin 2026-05-13 911.3 FIX ──
+        // Decision tree (simplified):
         // (a) Is there a pending write in the queue for this agent? → LOCAL WINS
+        //     (the user just made an edit that hasn't flushed yet)
+        // (b) Otherwise → SUPABASE WINS (it's the source of truth across devices)
+        //
+        // The previous "local timestamp newer than Supabase timestamp" branch
+        // was REMOVED. It was triggering false positives because the sentinel
+        // and other background mutations kept bumping _localUpdatedAt on YOUR
+        // local copies even when YOU hadn't actually edited anything. That
+        // made stale local copies win over fresh edits from OTHER admins
+        // (e.g. K-Anna's updates not appearing on Calvin's screen).
+        //
+        // The pending-queue check already covers the original concern (don't
+        // clobber unsaved local edits). If there's no pending entry, the
+        // local copy either matches Supabase or is stale — either way,
+        // taking Supabase is correct.
         if(pendingAgentIds[sa.id]){
           merged.push(local);
           protectedCount++;
           console.warn('[loadFromSupabase] LOCAL WINS for agent #'+sa.id+' ('+local.name+') — has pending sync queue entry');
           return;
         }
-        // (b) Local _localUpdatedAt > Supabase updated_at? → LOCAL WINS
-        var localTs = local._localUpdatedAt ? new Date(local._localUpdatedAt).getTime() : 0;
-        var supaTs  = sa._supaUpdatedAt    ? new Date(sa._supaUpdatedAt).getTime()    : 0;
-        if(localTs && localTs > supaTs + 1000){  // 1 sec grace for clock skew
-          merged.push(local);
-          protectedCount++;
-          console.warn('[loadFromSupabase] LOCAL WINS for agent #'+sa.id+' ('+local.name+') — local newer ('+new Date(localTs).toISOString()+' > '+new Date(supaTs).toISOString()+')');
-          return;
-        }
-        // (c) Default: Supabase wins
+        // Default: Supabase wins (source of truth across all devices)
         merged.push(sa);
       });
       // Also include any LOCAL-ONLY agents that aren't in Supabase yet (i.e. just created)
@@ -14647,11 +14942,32 @@ async function saveAgentToSupabase(agent){
   // fallback (full → legacy → bare) so if Supabase columns are missing,
   // at minimum username+password still save.
 
-  // ── Calvin 2026-05-08 911 FIX: stamp _localUpdatedAt ──
-  // The MERGE logic in loadFromSupabase uses this timestamp to decide
-  // whether the local copy is newer than what's in Supabase. Without
-  // this stamp, every refresh would reset the agent back to Supabase.
-  agent._localUpdatedAt = new Date().toISOString();
+  // ── Calvin 2026-05-13 911.3 FIX: stamp _localUpdatedAt ONLY on content changes ──
+  // The MERGE logic was changed to use this timestamp ONLY as a tie-breaker
+  // for diagnostic purposes; the pending-queue check is now the primary
+  // protection against clobbering unsaved edits.
+  //
+  // Why this still matters: if we stamped _localUpdatedAt on every save call
+  // (including sentinel auto-saves and syncIboModels mutations that happen
+  // every 60 seconds), every cross-device comparison would think YOUR local
+  // copy is "freshly modified" and avoid taking Supabase's value. So: only
+  // stamp on real content changes.
+  try{
+    var contentKeys = ['name','username','password','role','email','programs','program','carrier','team',
+      'teamLeaderId','marketManagerId','campaignManagerId','active','agentCodes','channels','links',
+      'category','depts','officeManager','canDistributeInventory','iboMarkets','cmModel','tcModel','awModel',
+      'reportsTo','profilePic','phone','address','start','canHostCall'];
+    var contentSnapshot = {};
+    contentKeys.forEach(function(k){ contentSnapshot[k] = agent[k]; });
+    var newHash = JSON.stringify(contentSnapshot);
+    if(agent.__lastContentHash !== newHash){
+      agent._localUpdatedAt = new Date().toISOString();
+      agent.__lastContentHash = newHash;
+    }
+  } catch(stampErr){
+    // If hashing fails, fall back to always-stamp behavior
+    agent._localUpdatedAt = new Date().toISOString();
+  }
 
   // ── Calvin 2026-05-08 911 FIX: ROLLING LOCAL BACKUP ──
   // Write a separate localStorage snapshot of the agents array on EVERY
@@ -22894,6 +23210,8 @@ function gotoPanel(id, params){
     bo:'Back Office', owner:'Owner Dashboard', notifications:'Notifications', meetings:'Meetings', 'meeting-hosts':'Manage Hosts',
     'hr-dashboard':'HR Dashboard','training-scheduled':'Schedule Training',
     'training-complete':'Training Complete','training-acknowledge':'Acknowledge Training','onboarding-queue':'Onboarding Queue',
+    'my-markets':'My Markets','market-breakdown':'Market Breakdown',
+    'repair-bare-saved':'Repair Bare-Saved Agents',
     'inv-dashboard':'All Inventory','inv-upload':'Upload Devices',
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
@@ -22933,6 +23251,8 @@ function gotoPanel(id, params){
     'inv-export':panelInvExport,'inv-my-inventory':panelMyInventory,
     'inv-distribute':panelDistribute,
     'inv-hub':panelInvHub,
+    'my-markets':panelMyMarkets,'market-breakdown':panelMarketBreakdown,
+    'repair-bare-saved':panelRepairBareSaved,
     'gm-inventory':panelGMInventory,'gm-upload':panelGMUpload,
     'gm-transfers':panelGMTransfers,'gm-agent-inv':panelGMAgentInventory,
     'gm-pricelist':panelGMPricelist,
@@ -22980,6 +23300,9 @@ function gotoPanel(id, params){
     'training-complete':panelTrainingComplete,
     'training-acknowledge':panelTrainingAcknowledge,
     'pending-code-approvals':panelPendingCodeApprovals,
+    'my-markets':panelMyMarkets,
+    'market-breakdown':panelMarketBreakdown,
+    'repair-bare-saved':panelRepairBareSaved,
     'onboard-upload':panelOnboardUpload,
     'bg-auth':panelBgAuth,
     'gm-ticket':panelGmTicket,
@@ -23071,6 +23394,27 @@ function panelBO(){
   var myRankRaw = salesAgents.slice().sort(function(a,b){return (b.sales||0)-(a.sales||0);}).findIndex(function(a){return a.id===u.id;});
   var myRank    = myRankRaw >= 0 ? myRankRaw+1 : null;
   var html = '';
+
+  // ── Calvin 2026-05-13: BARE-SAVED AGENTS ALERT ──
+  // Owner / Inventory dept: detect agents whose Supabase record got bare-saved
+  // (id+name+username+password+role only) and surface a repair link.
+  try{
+    if((typeof isOwner==='function' && isOwner(u)) || (typeof isInventory==='function' && isInventory(u))){
+      if(typeof _repairBareSavedDetect === 'function'){
+        var bareList = _repairBareSavedDetect();
+        if(bareList && bareList.length > 0){
+          html += '<div style="background:linear-gradient(135deg,#D97706,#92400E);color:white;padding:14px 20px;border-radius:10px;margin-bottom:18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+               +'<div style="font-size:1.8rem">🔧</div>'
+               +'<div style="flex:1">'
+               +  '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px">DATA REPAIR — '+bareList.length+' AGENT'+(bareList.length===1?'':'S')+' MISSING FIELD DATA</div>'
+               +  '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.9;margin-top:2px">These agents were saved before the schema fix and lost their programs/campaigns/market. Click to review and apply auto-detected suggestions.</div>'
+               +'</div>'
+               +'<button onclick="gotoPanel(\'repair-bare-saved\')" style="background:white;color:#D97706;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0">Open Repair Tool →</button>'
+               +'</div>';
+        }
+      }
+    }
+  } catch(e){ console.warn('[panelBO bare-saved banner] failed:', e); }
 
   // ── DIAGNOSTIC (only shows when URL has ?debug=1) ──
   // Helps troubleshoot routing issues like K-Anna's HR dashboard bug.
@@ -29340,30 +29684,79 @@ var INV_TIMEOUT_MS = INV_TIMEOUT_HOURS * 60 * 60 * 1000;
 // Returns { market: 'Tulsa OK', auto: true } or { market: null, reason: 'no-placement' }
 // For IBO recipients with multiple markets, returns the first one OR null
 // to prompt manual choice.
+// Resolve any market identifier to its friendly display name.
+// Handles every legacy format we've stored over the years:
+//   - 'market-3'              → MARKETS[id=3].name      (newer market roster)
+//   - 'team-dallas-tx-a'      → LIFELINE_TEAMS[id=…].name (legacy teams)
+//   - 3 (number)              → tries MARKETS[id=3], then LIFELINE_TEAMS
+//   - 'Dallas TX' / 'Team X'  → already a friendly name, pass through
+//   - null/undefined/junk     → null
+// Calvin 2026-05-13.
+function _invMarketDisplayName(raw){
+  if(raw === null || raw === undefined) return null;
+  // Already a number — try MARKETS first, then LIFELINE_TEAMS
+  if(typeof raw === 'number'){
+    if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+      var mNum = MARKETS.find(function(x){ return x.id === raw; });
+      if(mNum && mNum.name) return mNum.name;
+    }
+    if(typeof LIFELINE_TEAMS !== 'undefined' && Array.isArray(LIFELINE_TEAMS)){
+      var tNum = LIFELINE_TEAMS.find(function(x){ return x.id === raw || x.id === String(raw); });
+      if(tNum && tNum.name) return tNum.name;
+    }
+    return String(raw);
+  }
+  if(typeof raw !== 'string') return null;
+  var s = raw.trim();
+  if(!s) return null;
+  // 'market-3' format
+  if(/^market-\d+$/i.test(s)){
+    var id = parseInt(s.slice(7), 10);
+    if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+      var m = MARKETS.find(function(x){ return x.id === id; });
+      if(m && m.name) return m.name;
+    }
+    return s; // fall through — return raw if MARKETS empty/missing
+  }
+  // 'team-xyz' format (legacy LIFELINE_TEAMS ID)
+  if(/^team-/i.test(s)){
+    if(typeof LIFELINE_TEAMS !== 'undefined' && Array.isArray(LIFELINE_TEAMS)){
+      var t = LIFELINE_TEAMS.find(function(x){ return x.id === s; });
+      if(t && t.name) return t.name;
+    }
+    return s;
+  }
+  // Bare numeric string '3'
+  if(/^\d+$/.test(s)){
+    return _invMarketDisplayName(parseInt(s, 10));
+  }
+  // Anything else — assume it's already a friendly name
+  return s;
+}
+
 // Resolve the FULL list of markets an agent serves.
 // Walks every possible signal of placement so no agent shape is missed:
 //   1. agent.team          (single-market field agent / TL)
 //   2. agent.iboMarkets[]  (multi-market roles — IBO, multi-market CM/MM, etc.
 //                           the field name is legacy but it's used for ALL
 //                           multi-market roles, not only IBOs)
-//   3. agent.reportsTo     (per-campaign reporting chain — implies placement
-//                           in whatever market their upline serves)
-//   4. agent.agentCodes    (per-campaign code keys imply placement in the
-//                           campaign even when no explicit market is set)
 //
-// Returns an array of unique market names. Empty array means TRULY no
-// placement — never seen a placement signal anywhere. Calvin 2026-05-13.
+// Returns an array of unique FRIENDLY MARKET NAMES (not raw IDs).
+// Empty array means TRULY no placement — never seen a placement signal
+// anywhere. Calvin 2026-05-13.
 function _invAgentMarkets(agent){
   if(!agent) return [];
   var markets = {};
   // 1. Single-market team
-  if(agent.team && typeof agent.team === 'string'){
-    markets[agent.team] = true;
+  if(agent.team && (typeof agent.team === 'string' || typeof agent.team === 'number')){
+    var name = _invMarketDisplayName(agent.team);
+    if(name) markets[name] = true;
   }
   // 2. iboMarkets array (used by IBO, multi-market CM, multi-market MM, admin)
   if(Array.isArray(agent.iboMarkets)){
     agent.iboMarkets.forEach(function(m){
-      if(m && typeof m === 'string') markets[m] = true;
+      var name = _invMarketDisplayName(m);
+      if(name) markets[name] = true;
     });
   }
   return Object.keys(markets);
@@ -30235,6 +30628,23 @@ function panelInvDashboard(){
 
   var h = '';
   h += panelHeader('📊 All Inventory (All Campaigns)');
+
+  // ── Calvin 2026-05-13: My Markets rollup link ──
+  // For TL/MM/CM/IBO and Inventory/Owner — quick jump to their markets
+  // overview with per-market breakdown.
+  if(typeof canSeeMyMarkets === 'function' && canSeeMyMarkets(u)){
+    var myMarketsCount = (typeof _myMarketsForUser === 'function') ? _myMarketsForUser(u).length : 0;
+    if(myMarketsCount > 0){
+      h += '<div style="background:linear-gradient(135deg,rgba(124,58,237,.08),rgba(124,58,237,.03));border:1px solid rgba(124,58,237,.3);border-radius:10px;padding:14px 18px;margin-bottom:18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;cursor:pointer" onclick="gotoPanel(\'my-markets\')">';
+      h += '<div style="font-size:1.6rem">📍</div>';
+      h += '<div style="flex:1">';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px;color:#7c3aed">My Markets — '+myMarketsCount+' under your oversight</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-top:2px">See inventory rollup by market: totals, holders, campaign mix.</div>';
+      h += '</div>';
+      h += '<button onclick="event.stopPropagation();gotoPanel(\'my-markets\')" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 14px;border-radius:5px;cursor:pointer;font-weight:700">Open →</button>';
+      h += '</div>';
+    }
+  }
 
   // ── Deletion approval tasks (owner only) ──
   if(isOwner(u) && pendingDels > 0){
@@ -32977,6 +33387,343 @@ function checkAgentDocReminders(){
     pushNotification({toIds:[u.id],toRoles:[],icon:'⚠️',title:'Action Required — Onboarding Documents Pending',body:'You have unsigned onboarding documents. Complete them to activate your portal access.',panel:'my-documents',priority:'high'});
   },3000);
 }
+
+// ══════════════════════════════════════════════════════════════════════
+//  MY MARKETS ROLLUP  (Calvin 2026-05-13)
+//
+//  Lets TL/MM/CM/IBO/Owner/Inventory see all inventory in markets they
+//  oversee. Card-based "My Markets" panel; click a market → full
+//  breakdown of metrics + table of agents holding inventory there.
+//
+//  Permission model:
+//    - Owner / Inventory dept       → sees ALL markets
+//    - IBO with iboMarkets[]        → sees those markets
+//    - Campaign Manager / Market Manager / Team Leader → sees the markets
+//      they are placed in (their team + iboMarkets[])
+//    - Field Agent                  → not shown the panel
+// ══════════════════════════════════════════════════════════════════════
+
+// Return every inventory pool array, with the campaign label on each item
+// so we can show campaign mix in the breakdown.
+function _myMarketsPools(){
+  var pools = [];
+  if(typeof GM_INVENTORY        !== 'undefined' && Array.isArray(GM_INVENTORY))        pools.push({ campaign: 'Gen Mobile',         devices: GM_INVENTORY });
+  if(typeof TC_INVENTORY        !== 'undefined' && Array.isArray(TC_INVENTORY))        pools.push({ campaign: 'TruConnect',         devices: TC_INVENTORY });
+  if(typeof AW_INVENTORY        !== 'undefined' && Array.isArray(AW_INVENTORY))        pools.push({ campaign: 'Assurance Wireless', devices: AW_INVENTORY });
+  if(typeof EX_INVENTORY        !== 'undefined' && Array.isArray(EX_INVENTORY))        pools.push({ campaign: 'Excess Telecom',     devices: EX_INVENTORY });
+  if(typeof INVENTORY_DEVICES   !== 'undefined' && Array.isArray(INVENTORY_DEVICES))   pools.push({ campaign: 'General',            devices: INVENTORY_DEVICES });
+  return pools;
+}
+
+// Permission check — can this user see the My Markets panel at all?
+function canSeeMyMarkets(user){
+  if(!user) return false;
+  if(typeof isOwner === 'function' && isOwner(user)) return true;
+  if(typeof isInventory === 'function' && isInventory(user)) return true;
+  if(user.role === 'IBO' || user.role === 'Campaign Manager' || user.role === 'Market Manager' || user.role === 'Team Leader') return true;
+  return false;
+}
+
+// Resolve list of markets visible to the user. Returns array of friendly
+// market names (already display-resolved). Empty array if none.
+function _myMarketsForUser(user){
+  if(!user) return [];
+  // Owner / Inventory dept see ALL markets (union of every market
+  // referenced by any agent + every market in the roster)
+  if((typeof isOwner === 'function' && isOwner(user)) ||
+     (typeof isInventory === 'function' && isInventory(user))){
+    var allMarkets = {};
+    (DB.agents||[]).forEach(function(a){
+      _invAgentMarkets(a).forEach(function(m){ allMarkets[m] = true; });
+    });
+    // Plus every market in the MARKETS roster (even if no agent placed yet)
+    if(typeof MARKETS !== 'undefined' && Array.isArray(MARKETS)){
+      MARKETS.forEach(function(m){
+        if(m && m.name && (m.active !== false)) allMarkets[m.name] = true;
+      });
+    }
+    return Object.keys(allMarkets).sort();
+  }
+  // Everyone else — only their own markets (resolved through _invAgentMarkets)
+  return _invAgentMarkets(user).sort();
+}
+
+// Stats for one market, across all campaign pools.
+// Returns:
+//   {
+//     total, available, assigned, activated, sold, expired,
+//     inField, inPool,
+//     byCampaign: { 'Gen Mobile': {total, sold, ...}, ... }
+//   }
+//
+// Status interpretation (defensive — handles every shape we've seen):
+//   - device.status === 'sold'                         → sold
+//   - device.status === 'activated'                    → activated
+//   - device.status === 'expired' or expiry < today    → expired
+//   - device.assignedTo set (and not Owner/Inv)        → assigned + inField
+//   - no assignedTo                                    → available + inPool
+function _myMarketsDeviceStats(marketName){
+  var stats = {
+    total: 0, available: 0, assigned: 0, activated: 0, sold: 0, expired: 0,
+    inField: 0, inPool: 0,
+    byCampaign: {}
+  };
+  if(!marketName) return stats;
+  var todayMs = Date.now();
+  function bumpCamp(camp, key){
+    if(!stats.byCampaign[camp]) stats.byCampaign[camp] = { total: 0, available: 0, assigned: 0, activated: 0, sold: 0, expired: 0 };
+    stats.byCampaign[camp][key] = (stats.byCampaign[camp][key] || 0) + 1;
+  }
+  _myMarketsPools().forEach(function(pool){
+    pool.devices.forEach(function(d){
+      if(!d) return;
+      // Match by friendly market name OR by ID (legacy)
+      var devMarket = _invMarketDisplayName(d.market || d.teamName || d.team || '');
+      if(devMarket !== marketName) return;
+      stats.total++;
+      bumpCamp(pool.campaign, 'total');
+      var status = (d.status || '').toLowerCase();
+      var expiryMs = 0;
+      try{
+        if(d.expiry)      expiryMs = new Date(d.expiry).getTime();
+        else if(d.expires) expiryMs = new Date(d.expires).getTime();
+      }catch(e){}
+      var isExpired = (status === 'expired') || (expiryMs && expiryMs < todayMs && status !== 'sold' && status !== 'activated');
+      var holder = d.assignedTo || d.holderId || d.heldBy || null;
+      var holderAgent = holder ? (DB.agents||[]).find(function(a){ return a.id === holder; }) : null;
+      var isPoolHeld = !holderAgent || (typeof isOwner === 'function' && isOwner(holderAgent)) || (typeof isInventory === 'function' && isInventory(holderAgent));
+      if(status === 'sold'){ stats.sold++; bumpCamp(pool.campaign, 'sold'); }
+      else if(status === 'activated'){ stats.activated++; bumpCamp(pool.campaign, 'activated'); }
+      else if(isExpired){ stats.expired++; bumpCamp(pool.campaign, 'expired'); }
+      if(isPoolHeld){
+        stats.inPool++;
+        if(status !== 'sold' && status !== 'activated' && !isExpired){
+          stats.available++;
+          bumpCamp(pool.campaign, 'available');
+        }
+      } else {
+        stats.inField++;
+        stats.assigned++;
+        bumpCamp(pool.campaign, 'assigned');
+      }
+    });
+  });
+  return stats;
+}
+
+// Holders breakdown for a market: who currently has devices, with counts.
+// Returns array of { agentId, agentName, role, total, byCampaign }.
+function _myMarketsHolders(marketName){
+  var byHolder = {};  // agentId → record
+  _myMarketsPools().forEach(function(pool){
+    pool.devices.forEach(function(d){
+      if(!d) return;
+      var devMarket = _invMarketDisplayName(d.market || d.teamName || d.team || '');
+      if(devMarket !== marketName) return;
+      var holder = d.assignedTo || d.holderId || d.heldBy || null;
+      if(!holder) return;
+      var holderAgent = (DB.agents||[]).find(function(a){ return a.id === holder; });
+      if(!holderAgent) return;
+      // Skip Owner/Inv pool — that's "in pool" not "held by an agent"
+      if(typeof isOwner === 'function' && isOwner(holderAgent)) return;
+      if(typeof isInventory === 'function' && isInventory(holderAgent)) return;
+      var rec = byHolder[holder];
+      if(!rec){
+        rec = byHolder[holder] = {
+          agentId: holder,
+          agentName: holderAgent.name,
+          role: holderAgent.role || '',
+          total: 0,
+          byCampaign: {}
+        };
+      }
+      rec.total++;
+      rec.byCampaign[pool.campaign] = (rec.byCampaign[pool.campaign] || 0) + 1;
+    });
+  });
+  return Object.keys(byHolder).map(function(k){ return byHolder[k]; })
+                              .sort(function(a,b){ return b.total - a.total; });
+}
+
+// The "My Markets" landing panel — cards layout, one per market the user
+// can see. Each card shows a summary count + click navigates to detail.
+function panelMyMarkets(){
+  try{
+    var u = DB.current;
+    if(!canSeeMyMarkets(u)){
+      return panelHeader('📍 My Markets')
+        + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">You don\'t oversee any markets.</div></div>';
+    }
+    var markets = _myMarketsForUser(u);
+    var h = panelHeader('📍 My Markets');
+    h += '<div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">'
+      + '<strong>Rollup view.</strong> Each market card shows your downline inventory totals across all campaigns. Click a market to see the full breakdown — metrics, who holds what, and per-campaign mix.'
+      + '</div>';
+    if(!markets.length){
+      h += '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No markets assigned to you yet.</div></div>';
+      return h;
+    }
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px">';
+    markets.forEach(function(name){
+      var s = _myMarketsDeviceStats(name);
+      var color = '#0891b2';
+      // Color hint by health: red if all expired, amber if mostly in pool, green if active
+      if(s.total > 0){
+        var activeRate = (s.activated + s.sold) / s.total;
+        var expiredRate = s.expired / s.total;
+        if(expiredRate > 0.3) color = '#dc2626';
+        else if(activeRate > 0.5) color = '#15803d';
+        else if(s.inPool > s.inField) color = '#D97706';
+      }
+      h += '<div onclick="gotoPanel(\'market-breakdown\',{market:'+JSON.stringify(name)+'})" style="background:white;border:2px solid '+color+';border-left:8px solid '+color+';border-radius:10px;padding:18px 20px;cursor:pointer;transition:transform .15s,box-shadow .15s" onmouseover="this.style.transform=\'translateY(-2px)\';this.style.boxShadow=\'0 8px 16px rgba(0,0,0,.08)\'" onmouseout="this.style.transform=\'\';this.style.boxShadow=\'\'">';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:var(--brown);margin-bottom:6px">'+_escapeHtml(name)+'</div>';
+      h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin-bottom:10px">';
+      h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Total</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:'+color+'">'+s.total+'</div></div>';
+      h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Available</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:var(--brown)">'+s.available+'</div></div>';
+      h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">In Field</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--brown)">'+s.inField+'</div></div>';
+      h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Sold</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:#15803d">'+s.sold+'</div></div>';
+      h += '</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin-top:8px">View breakdown →</div>';
+      h += '</div>';
+    });
+    h += '</div>';
+    return h;
+  } catch(e){
+    console.warn('[panelMyMarkets] failed:', e);
+    return panelHeader('📍 My Markets') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load.</div></div>';
+  }
+}
+
+// The market-detail panel — metric tiles + agent holders table.
+// Metric view toggle: 'standard' | 'field' | 'lifecycle'
+function panelMarketBreakdown(){
+  try{
+    var u = DB.current;
+    if(!canSeeMyMarkets(u)){
+      return panelHeader('📍 Market') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">Permission denied.</div></div>';
+    }
+    var marketName = (gotoPanel._params && gotoPanel._params.market) || null;
+    if(!marketName){
+      return panelHeader('📍 Market')
+        + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No market selected. <a href="#" onclick="event.preventDefault();gotoPanel(\'my-markets\')">Go back to My Markets</a></div></div>';
+    }
+    // Permission: non-Owner/Inv users must oversee this market
+    if(!(typeof isOwner === 'function' && isOwner(u)) && !(typeof isInventory === 'function' && isInventory(u))){
+      var mine = _myMarketsForUser(u);
+      if(mine.indexOf(marketName) < 0){
+        return panelHeader('📍 ' + marketName)
+          + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">You don\'t oversee this market.</div></div>';
+      }
+    }
+
+    var view = (gotoPanel._params && gotoPanel._params.view) || 'standard';
+    var s = _myMarketsDeviceStats(marketName);
+    var holders = _myMarketsHolders(marketName);
+    var h = panelHeader('📍 ' + marketName);
+    h += '<div style="display:flex;gap:10px;margin-bottom:16px;align-items:center;flex-wrap:wrap">';
+    h += '<button onclick="gotoPanel(\'my-markets\')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer">← My Markets</button>';
+    h += '<div style="flex:1"></div>';
+    // Metric view toggle
+    var btnStyle = function(active){ return 'background:'+(active?'var(--brown)':'white')+';color:'+(active?'white':'var(--brown)')+';border:1px solid var(--sand);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:'+(active?'700':'400'); };
+    h += '<button style="'+btnStyle(view==='standard')+'" onclick="gotoPanel(\'market-breakdown\',{market:'+JSON.stringify(marketName)+',view:\'standard\'})">Standard</button>';
+    h += '<button style="'+btnStyle(view==='field')+'" onclick="gotoPanel(\'market-breakdown\',{market:'+JSON.stringify(marketName)+',view:\'field\'})">Field vs Pool</button>';
+    h += '<button style="'+btnStyle(view==='lifecycle')+'" onclick="gotoPanel(\'market-breakdown\',{market:'+JSON.stringify(marketName)+',view:\'lifecycle\'})">Lifecycle</button>';
+    h += '</div>';
+
+    // Metric tiles
+    var tiles = [];
+    if(view === 'standard'){
+      tiles = [
+        { label: 'Total',     value: s.total,     color: '#0891b2' },
+        { label: 'Assigned',  value: s.assigned,  color: '#7c3aed' },
+        { label: 'Activated', value: s.activated, color: '#0891b2' },
+        { label: 'Sold',      value: s.sold,      color: '#15803d' },
+        { label: 'Available', value: s.available, color: '#D97706' }
+      ];
+    } else if(view === 'field'){
+      tiles = [
+        { label: 'Total',         value: s.total,    color: '#0891b2' },
+        { label: 'In Field',      value: s.inField,  color: '#7c3aed', sub: '(held by agents)' },
+        { label: 'In Pool',       value: s.inPool,   color: '#D97706', sub: '(not yet assigned)' },
+        { label: 'Sold',          value: s.sold,     color: '#15803d' },
+        { label: 'Expired',       value: s.expired,  color: '#dc2626' }
+      ];
+    } else { // lifecycle
+      tiles = [
+        { label: 'Total',         value: s.total,     color: '#0891b2' },
+        { label: 'Available',     value: s.available, color: '#D97706' },
+        { label: 'Activated',     value: s.activated, color: '#0891b2' },
+        { label: 'Sold',          value: s.sold,      color: '#15803d' },
+        { label: 'Expired',       value: s.expired,   color: '#dc2626' }
+      ];
+    }
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px">';
+    tiles.forEach(function(t){
+      h += '<div style="background:white;border:1px solid var(--sand);border-radius:8px;padding:14px 16px;border-top:4px solid '+t.color+'">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">'+_escapeHtml(t.label)+'</div>';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:2rem;color:'+t.color+';line-height:1.1">'+t.value+'</div>';
+      if(t.sub) h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);margin-top:2px;font-style:italic">'+_escapeHtml(t.sub)+'</div>';
+      h += '</div>';
+    });
+    h += '</div>';
+
+    // Campaign mix
+    var camps = Object.keys(s.byCampaign).filter(function(c){ return s.byCampaign[c].total > 0; });
+    if(camps.length){
+      h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:var(--brown);margin:20px 0 10px">Campaign Mix</h3>';
+      h += '<div class="bo-card" style="padding:0;overflow:hidden;margin-bottom:24px"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+      h += '<thead style="background:var(--cream)"><tr>';
+      ['Campaign','Total','Sold','Activated','Available','Assigned'].forEach(function(col){
+        h += '<th style="text-align:left;padding:10px 14px;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);font-weight:700">'+col+'</th>';
+      });
+      h += '</tr></thead><tbody>';
+      camps.forEach(function(c){
+        var b = s.byCampaign[c];
+        h += '<tr style="border-top:1px solid var(--sand)">';
+        h += '<td style="padding:10px 14px;color:var(--brown);font-weight:600">'+_escapeHtml(c)+'</td>';
+        h += '<td style="padding:10px 14px;color:var(--brown)">'+(b.total||0)+'</td>';
+        h += '<td style="padding:10px 14px;color:#15803d">'+(b.sold||0)+'</td>';
+        h += '<td style="padding:10px 14px;color:#0891b2">'+(b.activated||0)+'</td>';
+        h += '<td style="padding:10px 14px;color:#D97706">'+(b.available||0)+'</td>';
+        h += '<td style="padding:10px 14px;color:#7c3aed">'+(b.assigned||0)+'</td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table></div>';
+    }
+
+    // Holders table
+    h += '<h3 style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:var(--brown);margin:20px 0 10px">Who Holds Inventory ('+holders.length+' agent'+(holders.length===1?'':'s')+')</h3>';
+    if(!holders.length){
+      h += '<div class="bo-card"><div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.85rem">No agents currently hold inventory in this market. All devices are in the pool.</div></div>';
+    } else {
+      h += '<div class="bo-card" style="padding:0;overflow:hidden"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+      h += '<thead style="background:var(--cream)"><tr>';
+      ['Agent','Role','Total','By Campaign','Profile'].forEach(function(col){
+        h += '<th style="text-align:left;padding:10px 14px;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);font-weight:700">'+col+'</th>';
+      });
+      h += '</tr></thead><tbody>';
+      holders.forEach(function(holder){
+        var campBreakdownStr = Object.keys(holder.byCampaign).map(function(c){
+          return _escapeHtml(c)+': '+holder.byCampaign[c];
+        }).join(' · ');
+        h += '<tr style="border-top:1px solid var(--sand)">';
+        h += '<td style="padding:10px 14px;color:var(--brown);font-weight:600">'+_escapeHtml(holder.agentName)+'</td>';
+        h += '<td style="padding:10px 14px;color:var(--muted);font-size:.78rem">'+_escapeHtml(holder.role)+'</td>';
+        h += '<td style="padding:10px 14px"><span style="background:rgba(124,58,237,.1);color:#7c3aed;padding:3px 10px;border-radius:10px;font-weight:700">'+holder.total+'</span></td>';
+        h += '<td style="padding:10px 14px;color:var(--muted);font-size:.78rem">'+campBreakdownStr+'</td>';
+        h += '<td style="padding:10px 14px"><button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+holder.agentId+'})" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">View →</button></td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table></div>';
+    }
+
+    return h;
+  } catch(e){
+    console.warn('[panelMarketBreakdown] failed:', e);
+    return panelHeader('📍 Market') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#dc2626">Panel failed to load.</div></div>';
+  }
+}
+
 
 // ══════════════════════════════════════════════════════════
 //  GEN MOBILE INVENTORY PANELS
