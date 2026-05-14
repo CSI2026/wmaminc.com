@@ -15157,18 +15157,24 @@ async function _autoRefreshTick(){
   if(!supaClient) return;
   if(!DB.current) return; // not logged in yet
   try{
-    var tables = ['notifications','gm_sales','tc_sales','aw_sales','ex_sales','inventory_pending_xfers'];
+    // Calvin 2026-05-14: agents IS polled here even though realtime should
+    // handle it. Realtime has been silently failing to deliver events for
+    // some users — polling is the safety net that guarantees every table
+    // refreshes within 15 seconds regardless.
+    var tables = ['agents','notifications','gm_sales','tc_sales','aw_sales','ex_sales','inventory_pending_xfers','app_settings'];
     for(var i = 0; i < tables.length; i++){
       var table = tables[i];
       try{
         var res = await supaClient.from(table).select('*');
         if(res && res.data){
-          var hash = String(res.data.length) + ':' + (res.data.length ? JSON.stringify(res.data[res.data.length-1]).slice(0,200) : '');
+          // Hash: count + last row's id/updated_at — cheap fingerprint to detect change
+          var sample = res.data.length ? res.data[res.data.length-1] : null;
+          var hash = String(res.data.length) + ':' + (sample ? (sample.id||'') + ':' + (sample.updated_at||'') + ':' + (sample.created_at||'') + ':' + JSON.stringify(sample).slice(0,150) : '');
           if(WMAM_AUTOREFRESH_LAST_HASH[table] !== hash){
             WMAM_AUTOREFRESH_LAST_HASH[table] = hash;
-            // Dispatch to the right in-memory variable based on table name
             _autoRefreshApply(table, res.data);
             _smartReRender(table);
+            console.log('[autoRefresh] '+table+' changed ('+res.data.length+' rows) — re-rendered');
           }
         }
       }catch(tErr){ /* table might not exist or RLS may reject — skip silently */ }
@@ -15179,6 +15185,18 @@ async function _autoRefreshTick(){
 function _autoRefreshApply(table, rows){
   try{
     switch(table){
+      case 'agents':
+        // Use the merge function so column-name translation happens correctly
+        if(Array.isArray(rows) && typeof _mergeServerAgentIntoLocal === 'function'){
+          rows.forEach(function(r){ _mergeServerAgentIntoLocal(r); });
+          // Remove any local agents that no longer exist server-side
+          var serverIds = {};
+          rows.forEach(function(r){ if(r && r.id != null) serverIds[r.id] = true; });
+          if(Array.isArray(DB.agents)){
+            DB.agents = DB.agents.filter(function(a){ return a && a.id != null && serverIds[a.id]; });
+          }
+        }
+        break;
       case 'notifications':
         if(typeof NOTIFICATIONS !== 'undefined') NOTIFICATIONS = rows;
         if(typeof renderBell === 'function'){ try{ renderBell(); }catch(e){} }
@@ -15205,10 +15223,13 @@ function _autoRefreshApply(table, rows){
 
 function startAutoRefresh(){
   if(WMAM_AUTOREFRESH_TIMER) return; // already running
+  console.log('[autoRefresh] started — polling every 15s. Tables: agents, notifications, sales (4), inventory_pending_xfers, app_settings');
   // First tick after 5 sec (let initial load settle)
-  setTimeout(_autoRefreshTick, 5000);
+  setTimeout(function(){
+    console.log('[autoRefresh] first tick — DB.current is '+(DB.current ? '#'+DB.current.id+' '+DB.current.name : 'NULL (waiting for login)'));
+    _autoRefreshTick();
+  }, 5000);
   WMAM_AUTOREFRESH_TIMER = setInterval(_autoRefreshTick, 15000);
-  console.log('[autoRefresh] started — polls every 15s for notifications/sales/transfers');
 }
 
 if(typeof window !== 'undefined'){
