@@ -30948,7 +30948,29 @@ function invAssignCommit(deviceIds){
   //   - Calvin 2026-05-08: when Inventory dept moves a device currently
   //     held by an agent → 'pending-holder-approval' first. That agent
   //     must approve before the recipient signature step.
+  //   - Calvin 2026-05-14: when a manager (CM/MM/IBO/TL) without the
+  //     canTransferWithoutApproval flag sends DOWN to a non-manager agent,
+  //     Inventory Department must approve BEFORE the recipient is asked
+  //     to sign. Owner/Inv Dept/admin and bypass-flagged managers skip.
   var initStatus = (direction === 'up' || direction === 'return') ? 'pending-mm-approval' : 'pending-agent-signature';
+
+  // ── Calvin 2026-05-14: INV DEPT APPROVAL GATE for downward manager transfers ──
+  var MANAGER_ROLES = ['Campaign Manager','Market Manager','IBO','Team Leader'];
+  var senderIsManager = MANAGER_ROLES.indexOf(u.role) >= 0;
+  var recipientIsAgent = MANAGER_ROLES.indexOf(recipient.role) < 0
+                      && recipient.role !== 'owner' && recipient.role !== 'admin'
+                      && recipient.role !== 'HR' && recipient.role !== 'Inventory'
+                      && recipient.role !== 'Payroll' && recipient.role !== 'Onboarding';
+  var senderBypass = (u.canTransferWithoutApproval === true);
+  var senderIsPreApproved = isOwner(u) || u.role === 'admin' || isInventory(u);
+  var needsInvDeptApproval = senderIsManager
+                          && recipientIsAgent
+                          && !senderBypass
+                          && !senderIsPreApproved
+                          && direction === 'down';
+  if(needsInvDeptApproval){
+    initStatus = 'pending-inv-dept-approval';
+  }
 
   // Identify the MM that needs to approve an UP transfer. Use the
   // SENDER's MM (since the sender is the one handing inventory up).
@@ -31079,7 +31101,35 @@ function invAssignCommit(deviceIds){
     totalDevices += imeis.length;
 
     // Notify based on routing
-    if(initStatus === 'pending-holder-approval'){
+    if(initStatus === 'pending-inv-dept-approval'){
+      // ── Calvin 2026-05-14: INV DEPT APPROVAL ROUTE ──
+      // Manager sender without bypass flag transferring DOWN to an agent.
+      // Notify every Inv Dept member; recipient gets NOTHING yet (the
+      // devices haven't moved); sender gets a persistent notification.
+      DB.agents.filter(function(a){ return a && a.active && isInventory(a); }).forEach(function(inv){
+        if(typeof pushNotification === 'function'){
+          pushNotification({
+            toIds:[inv.id], toRoles:[], icon:'🛡️',
+            title: cfg.label + ' Transfer — Inv Dept APPROVAL Needed',
+            body: u.name + ' (' + u.role + ') → ' + recipient.name + ' (' + recipient.role + '): ' + imeis.length + ' device(s). Review in Approval Queue.',
+            priority:'high',
+            formType:'inv-dept-approval',
+            data:{ kind:'inv-dept-approval', transferId: req.id, campaign: camp }
+          });
+        }
+      });
+      // Sender's bell + inbox — persistent record, not just a toast
+      if(typeof pushNotification === 'function'){
+        pushNotification({
+          toIds:[u.id], toRoles:[], icon:'⏳',
+          title: cfg.label + ' Transfer — Pending Inv Dept Review',
+          body: 'Your transfer of ' + imeis.length + ' device(s) to ' + recipient.name + ' has been submitted. The Inventory Department must approve before ' + recipient.name + ' can take possession. You\'ll be notified when they approve or deny.',
+          priority:'normal',
+          formType:'inv-transfer-outcome',
+          data:{ kind:'inv-transfer-outcome', transferId: req.id, campaign: camp, outcome:'pending' }
+        });
+      }
+    } else if(initStatus === 'pending-holder-approval'){
       // ── Calvin 2026-05-08: HOLDER APPROVAL ROUTE ──
       // Inventory dept is moving devices currently held by an agent. That
       // agent must approve before the transfer flows to the recipient.
@@ -31182,8 +31232,22 @@ function invAssignCommit(deviceIds){
   }
   setTimeout(function(){
     var msg;
+    if(initStatus === 'pending-inv-dept-approval'){
+      // Calvin 2026-05-14: UNMISSABLE POPUP for Inv Dept approval path.
+      // Must be a blocking alert() — not cdFlash — so the manager actually
+      // sees that their request is pending approval and the recipient
+      // hasn't been notified yet.
+      alert('⏳ TRANSFER PENDING APPROVAL\n\n' +
+        'Your request to transfer ' + totalDevices + ' device(s) to ' + recipient.name + ' has been submitted.\n\n' +
+        '→ The Inventory Department must approve this before ' + recipient.name + ' can take possession.\n\n' +
+        '→ ' + recipient.name + ' has NOT been notified yet — they will only be notified after the Inventory Department approves.\n\n' +
+        'You will receive a notification in your bell when the Inventory Department approves or denies your request.');
+      return;
+    }
     if(initStatus === 'pending-agent-signature'){
       msg = '✓ Transfer initiated — '+recipient.name+' must sign for '+totalDevices+' device(s) before they take effect';
+    } else if(initStatus === 'pending-holder-approval'){
+      msg = '✓ Transfer initiated — current holder must approve before '+recipient.name+' is asked to sign';
     } else {
       msg = '✓ Transfer pending approval — your MM will review before '+recipient.name+' is asked to sign';
     }
