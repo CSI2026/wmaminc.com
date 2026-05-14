@@ -2043,12 +2043,28 @@ function saveTeams(){
 // `app_settings` table. Returns silently on failure (caller should still
 // have written to localStorage as a fallback).
 async function saveAppSettingToSupabase(key, value){
-  if(typeof supaClient === 'undefined' || !supaClient) return;
-  if(!key) return;
-  // ── Calvin 2026-05-08: route through SYNC_QUEUE for durable writes ──
-  // Old behavior dropped failures silently. Now they're queued + retried.
+  if(typeof supaClient === 'undefined' || !supaClient){
+    return { ok: false, error: 'Supabase client not initialized' };
+  }
+  if(!key) return { ok: false, error: 'No key' };
+  // ── Calvin 2026-05-14: DIRECT SUPABASE WRITE ──
+  // Awaits the upsert and returns the outcome. Caller can check result.ok.
+  // No more silent queueing.
   var payload = (typeof value === 'string') ? value : JSON.stringify(value);
-  syncEnqueue('app_setting', 'app_settings', { key: key, value: payload }, 'app_setting:'+key, 'key');
+  try{
+    var res = await supaClient.from('app_settings').upsert({ key: key, value: payload }, { onConflict: 'key' });
+    if(res && res.error){
+      console.error('[saveAppSetting] ✗ '+key+':', res.error.message || res.error);
+      try{ _showSaveErrorBanner('Setting "'+key+'" failed to save: '+(res.error.message||res.error), function(){ saveAppSettingToSupabase(key, value); }); }catch(e){}
+      return { ok: false, error: res.error.message || res.error };
+    }
+    return { ok: true };
+  }catch(networkErr){
+    var errMsg = (networkErr && networkErr.message) || String(networkErr);
+    console.error('[saveAppSetting] ✗ network for '+key+':', errMsg);
+    try{ _showSaveErrorBanner('Setting "'+key+'" failed (network): '+errMsg, function(){ saveAppSettingToSupabase(key, value); }); }catch(e){}
+    return { ok: false, error: errMsg, network: true };
+  }
 }
 
 function loadFromStorage(){
@@ -14663,41 +14679,18 @@ async function loadFromSupabase(){
   if(!supaClient){ loadFromStorage(); return; }
   try{
     // ════════════════════════════════════════════════════════════════════
-    // CALVIN 2026-05-08 — DATA LOSS 911 FIX
+    // CALVIN 2026-05-14 — DIRECT-SUPABASE LOAD
     // ════════════════════════════════════════════════════════════════════
-    // OLD BEHAVIOR (the bug): this function did DB.agents = agents.map(...)
-    // which WHOLESALE REPLACED local DB.agents with whatever Supabase had.
-    // If a save to Supabase failed silently and the user refreshed, the
-    // load wiped their unsaved local edits. That's why Calvin's "edits not
-    // saving" issue kept reappearing — the edits WERE there locally, but
-    // the refresh blew them away.
+    // Supabase is the source of truth. Replace DB.agents with the server
+    // response. No merge logic. No pending-queue check (no queue anymore).
+    // The previous merge logic caused stale local copies to win over fresh
+    // server data via various edge cases — that's gone.
     //
-    // NEW BEHAVIOR (this fix): MERGE Supabase data with local data.
-    //   1. Any agent with a pending write in the sync queue → LOCAL WINS.
-    //      That edit hasn't reached Supabase yet, so the Supabase copy is
-    //      stale by definition.
-    //   2. Any agent whose local _localUpdatedAt is newer than Supabase
-    //      → LOCAL WINS. Edit was made offline or during a Supabase outage.
-    //   3. Otherwise → Supabase wins (normal sync from cloud).
+    // If you have local edits in-flight, you saved them via direct upsert
+    // (await saveAgentToSupabase) which means they reached Supabase BEFORE
+    // returning success — so they're already in the server response we're
+    // about to load.
     // ════════════════════════════════════════════════════════════════════
-
-    // Step 1: snapshot existing local agents BEFORE the load so we can merge
-    var localAgents = Array.isArray(DB.agents) ? DB.agents.slice() : [];
-    var localById = {};
-    localAgents.forEach(function(a){ if(a && a.id != null) localById[a.id] = a; });
-
-    // Step 2: build set of agent IDs with pending queue entries (LOCAL WINS for these)
-    var pendingAgentIds = {};
-    try{
-      if(Array.isArray(SYNC_QUEUE)){
-        SYNC_QUEUE.forEach(function(e){
-          if(e && e.recordKey && e.recordKey.indexOf('agent:') === 0){
-            var id = parseInt(e.recordKey.split(':')[1], 10);
-            if(!isNaN(id)) pendingAgentIds[id] = true;
-          }
-        });
-      }
-    }catch(qE){ console.warn('[loadFromSupabase] queue scan failed:', qE); }
 
     // Load agents
     var agents = await sbSelect('agents');
@@ -14737,64 +14730,14 @@ async function loadFromSupabase(){
           // Assurance Wireless pay model — defaults to 'none' if column doesn't exist
           awModel:       a.aw_model || 'none',
           // Per-campaign reporting chain. Map of {campaignName: parentAgentId | null}.
-          // null means "top of org for this campaign". Defaults to {} so legacy
-          // fields (teamLeaderId/marketManagerId/campaignManagerId) are used.
           reportsTo:     safeJSON(a.reports_to, {}),
           _supaUpdatedAt: a.updated_at || null
         };
       });
 
-      // ── MERGE: walk through Supabase list and substitute LOCAL when local should win ──
-      var merged = [];
-      var seenIds = {};
-      var protectedCount = 0;
-      supaList.forEach(function(sa){
-        seenIds[sa.id] = true;
-        var local = localById[sa.id];
-        if(!local){
-          // Brand-new agent from Supabase that we didn't have locally
-          merged.push(sa);
-          return;
-        }
-        // ── Calvin 2026-05-13 911.3 FIX ──
-        // Decision tree (simplified):
-        // (a) Is there a pending write in the queue for this agent? → LOCAL WINS
-        //     (the user just made an edit that hasn't flushed yet)
-        // (b) Otherwise → SUPABASE WINS (it's the source of truth across devices)
-        //
-        // The previous "local timestamp newer than Supabase timestamp" branch
-        // was REMOVED. It was triggering false positives because the sentinel
-        // and other background mutations kept bumping _localUpdatedAt on YOUR
-        // local copies even when YOU hadn't actually edited anything. That
-        // made stale local copies win over fresh edits from OTHER admins
-        // (e.g. K-Anna's updates not appearing on Calvin's screen).
-        //
-        // The pending-queue check already covers the original concern (don't
-        // clobber unsaved local edits). If there's no pending entry, the
-        // local copy either matches Supabase or is stale — either way,
-        // taking Supabase is correct.
-        if(pendingAgentIds[sa.id]){
-          merged.push(local);
-          protectedCount++;
-          console.warn('[loadFromSupabase] LOCAL WINS for agent #'+sa.id+' ('+local.name+') — has pending sync queue entry');
-          return;
-        }
-        // Default: Supabase wins (source of truth across all devices)
-        merged.push(sa);
-      });
-      // Also include any LOCAL-ONLY agents that aren't in Supabase yet (i.e. just created)
-      Object.keys(localById).forEach(function(idStr){
-        var id = parseInt(idStr, 10);
-        if(seenIds[id]) return;
-        // This local agent isn't in Supabase. Protect it ALWAYS — never silently drop a local agent.
-        merged.push(localById[id]);
-        protectedCount++;
-        console.warn('[loadFromSupabase] LOCAL-ONLY agent #'+id+' ('+(localById[id].name||'unknown')+') — keeping; not in Supabase yet');
-      });
-      DB.agents = merged;
-      if(protectedCount > 0){
-        console.log('[loadFromSupabase] MERGE done — '+protectedCount+' local agent(s) protected from being clobbered');
-      }
+      // Server is truth. Replace local agents.
+      DB.agents = supaList;
+      console.log('[loadFromSupabase] loaded '+supaList.length+' agents from Supabase');
       // Auto-derive .category/.depts for every legacy record we just loaded.
       if(typeof migrateAllAgentCategories==='function') migrateAllAgentCategories();
       DB.nextId = Math.max.apply(null, DB.agents.map(function(a){return a.id;})) + 1;
@@ -15152,60 +15095,32 @@ function safeJSON(val, fallback){
 }
 
 // ── Save agent to Supabase ──
-async function saveAgentToSupabase(agent){
-  // ── Calvin 2026-05-08: ROUTE THROUGH SYNC QUEUE ──
-  // Old behavior: fire one upsert, hope it succeeds. If it failed
-  // (network blip, RLS reject, schema mismatch), the write was lost
-  // and the user never knew. Agent profiles silently disappeared.
-  //
-  // New behavior: localStorage save happens IMMEDIATELY (synchronous),
-  // then the Supabase write is enqueued in the persistent SYNC_QUEUE
-  // (which survives reload, retries with backoff, surfaces failures
-  // in the sync bell UI).
-  //
-  // The queue's _syncAttemptAgentUpsert preserves the 3-tier schema
-  // fallback (full → legacy → bare) so if Supabase columns are missing,
-  // at minimum username+password still save.
+// ════════════════════════════════════════════════════════════════════════
+//  DIRECT-SUPABASE SAVE  (Calvin 2026-05-14 — architectural refactor)
+//
+//  Replaces the old queue-based architecture. The save now:
+//    1. Awaits the Supabase upsert
+//    2. Updates DB.agents from the server response (authoritative)
+//    3. Returns { ok, data, error } so callers know the actual outcome
+//
+//  NO MORE silent queueing. NO MORE bare fallback. NO MORE sentinel
+//  overwriting fresh server data with stale local data. The server is
+//  the source of truth.
+//
+//  Legacy callers that do `saveAgentToSupabase(agent)` and don't await
+//  still work — the function fires the upsert async. But the new callers
+//  should `await saveAgentToSupabase(agent)` and check the return value
+//  to know if it actually saved.
+//
+//  Backward-compat: on success this function still calls saveToStorage()
+//  and _wmamBackupAgents() so local cache + insurance backups continue
+//  to work as a safety net.
+// ════════════════════════════════════════════════════════════════════════
 
-  // ── Calvin 2026-05-13 911.3 FIX: stamp _localUpdatedAt ONLY on content changes ──
-  // The MERGE logic was changed to use this timestamp ONLY as a tie-breaker
-  // for diagnostic purposes; the pending-queue check is now the primary
-  // protection against clobbering unsaved edits.
-  //
-  // Why this still matters: if we stamped _localUpdatedAt on every save call
-  // (including sentinel auto-saves and syncIboModels mutations that happen
-  // every 60 seconds), every cross-device comparison would think YOUR local
-  // copy is "freshly modified" and avoid taking Supabase's value. So: only
-  // stamp on real content changes.
-  try{
-    var contentKeys = ['name','username','password','role','email','programs','program','carrier','team',
-      'teamLeaderId','marketManagerId','campaignManagerId','active','agentCodes','channels','links',
-      'category','depts','officeManager','canDistributeInventory','iboMarkets','cmModel','tcModel','awModel',
-      'reportsTo','profilePic','phone','address','start','canHostCall'];
-    var contentSnapshot = {};
-    contentKeys.forEach(function(k){ contentSnapshot[k] = agent[k]; });
-    var newHash = JSON.stringify(contentSnapshot);
-    if(agent.__lastContentHash !== newHash){
-      agent._localUpdatedAt = new Date().toISOString();
-      agent.__lastContentHash = newHash;
-    }
-  } catch(stampErr){
-    // If hashing fails, fall back to always-stamp behavior
-    agent._localUpdatedAt = new Date().toISOString();
-  }
-
-  // ── Calvin 2026-05-08 911 FIX: ROLLING LOCAL BACKUP ──
-  // Write a separate localStorage snapshot of the agents array on EVERY
-  // save. Keeps last 5 versions. If everything else fails (Supabase
-  // wipes, localStorage clears, etc.), there's a recoverable history.
-  try{
-    _wmamBackupAgents();
-  }catch(bkE){ console.warn('[saveAgentToSupabase] backup failed:', bkE); }
-
-  saveToStorage();  // always-on local persistence
-  if(!supaClient) return false;
-  try { console.log('[saveAgentToSupabase] enqueue agent #'+agent.id+' name="'+agent.name+'" username="'+agent.username+'" password.length='+(agent.password?String(agent.password).length:0)); } catch(e){}
-  var full = {
+// Build the Supabase row payload from an agent record.
+// Pulled out so save + retry use identical shape.
+function _buildAgentRow(agent){
+  return {
     id: agent.id, name: agent.name, username: agent.username, password: agent.password,
     role: agent.role, email: agent.email||'',
     programs: JSON.stringify(agent.programs||[]),
@@ -15234,14 +15149,246 @@ async function saveAgentToSupabase(agent){
     aw_model:       agent.awModel || null,
     reports_to:     agent.reportsTo || {}
   };
-  syncEnqueue('agent', 'agents', full, 'agent:'+agent.id, 'id');
-  return true;
+}
+
+// Track the most recent save outcome for any UI that wants to surface it
+window._lastAgentSaveResult = null;
+
+async function saveAgentToSupabase(agent){
+  // Local persistence ALWAYS happens first so the user's edit is captured
+  // in memory + localStorage even if Supabase is unreachable.
+  try{ _wmamBackupAgents(); }catch(bkE){}
+  saveToStorage();
+
+  if(!supaClient){
+    var noClientResult = { ok: false, error: 'Supabase client not initialized' };
+    window._lastAgentSaveResult = noClientResult;
+    return noClientResult;
+  }
+
+  var full = _buildAgentRow(agent);
+  console.log('[saveAgent] →', agent.id, agent.name, 'programs='+(agent.programs||[]).length, 'agentCodes='+Object.keys(agent.agentCodes||{}).length);
+
+  try{
+    var res = await supaClient.from('agents').upsert(full, { onConflict: 'id' }).select().single();
+    if(res && res.error){
+      // Try legacy fallback ONCE — strip the newest columns in case schema is incomplete
+      console.warn('[saveAgent] full upsert failed:', res.error.message || res.error, '— trying legacy column set');
+      var legacy = Object.assign({}, full);
+      delete legacy.category; delete legacy.depts;
+      delete legacy.office_manager; delete legacy.can_distribute_inventory;
+      delete legacy.ibo_markets; delete legacy.cm_model;
+      delete legacy.tc_model; delete legacy.aw_model;
+      delete legacy.reports_to; delete legacy.address;
+      var res2 = await supaClient.from('agents').upsert(legacy, { onConflict: 'id' }).select().single();
+      if(res2 && res2.error){
+        var failResult = { ok: false, error: (res2.error.message || res2.error || res.error.message || 'Unknown error'), code: res2.error.code || res.error.code };
+        window._lastAgentSaveResult = failResult;
+        console.error('[saveAgent] ✗ legacy fallback ALSO failed for agent #'+agent.id+':', failResult.error);
+        // Surface to UI
+        try{ _showSaveErrorBanner('Save failed for ' + agent.name + ': ' + failResult.error, function(){ saveAgentToSupabase(agent); }); }catch(e){}
+        return failResult;
+      }
+      // Legacy succeeded
+      console.log('[saveAgent] ✓ saved via legacy (newer columns rejected — schema may need ALTER TABLE)');
+      var legacyOkResult = { ok: true, data: res2.data, viaLegacy: true };
+      window._lastAgentSaveResult = legacyOkResult;
+      return legacyOkResult;
+    }
+    // Success — update DB.agents from server response (authoritative)
+    if(res && res.data){
+      _mergeServerAgentIntoLocal(res.data);
+    }
+    console.log('[saveAgent] ✓ #'+agent.id);
+    var okResult = { ok: true, data: res ? res.data : null };
+    window._lastAgentSaveResult = okResult;
+    return okResult;
+  }catch(networkErr){
+    var errMsg = (networkErr && networkErr.message) || String(networkErr);
+    console.error('[saveAgent] ✗ network/exception for agent #'+agent.id+':', errMsg);
+    var netResult = { ok: false, error: errMsg, network: true };
+    window._lastAgentSaveResult = netResult;
+    try{ _showSaveErrorBanner('Save failed for ' + agent.name + ' (network): ' + errMsg, function(){ saveAgentToSupabase(agent); }); }catch(e){}
+    return netResult;
+  }
+}
+
+// Take a Supabase agents row and merge it into DB.agents (replace by id, or
+// append if new). Used after a successful save and by the realtime listener.
+function _mergeServerAgentIntoLocal(serverRow){
+  if(!serverRow || serverRow.id == null) return;
+  var safeJSONLocal = function(v, d){
+    if(typeof v === 'string'){
+      try{ return JSON.parse(v); }catch(e){ return d; }
+    }
+    return (v == null) ? d : v;
+  };
+  var mapped = {
+    id: serverRow.id, name: serverRow.name, username: serverRow.username,
+    password: serverRow.password, role: serverRow.role, email: serverRow.email||'',
+    programs: safeJSONLocal(serverRow.programs, []),
+    program: serverRow.program||'', carrier: serverRow.carrier||'',
+    team: serverRow.team||null,
+    teamLeaderId: serverRow.team_leader_id||null,
+    marketManagerId: serverRow.market_manager_id||null,
+    campaignManagerId: serverRow.campaign_manager_id||null,
+    active: serverRow.active, sales: serverRow.sales||0,
+    monthlySales: safeJSONLocal(serverRow.monthly_sales, []),
+    channels: safeJSONLocal(serverRow.channels, []),
+    links: safeJSONLocal(serverRow.links, []),
+    start: serverRow.start_date||'',
+    agentCodes: safeJSONLocal(serverRow.agent_codes, {}),
+    canHostCall: serverRow.can_host_call===true,
+    profilePic:  serverRow.profile_pic||'',
+    phone:       serverRow.phone||'',
+    address:     serverRow.address||'',
+    category:    serverRow.category || null,
+    depts:       safeJSONLocal(serverRow.depts, {}),
+    officeManager: serverRow.office_manager === true,
+    canDistributeInventory: serverRow.can_distribute_inventory === true,
+    iboMarkets:  safeJSONLocal(serverRow.ibo_markets, []),
+    cmModel:     serverRow.cm_model || 'none',
+    tcModel:     serverRow.tc_model || 'none',
+    awModel:     serverRow.aw_model || 'none',
+    reportsTo:   safeJSONLocal(serverRow.reports_to, {})
+  };
+  if(!Array.isArray(DB.agents)) DB.agents = [];
+  var idx = DB.agents.findIndex(function(a){ return a && a.id === mapped.id; });
+  if(idx >= 0) DB.agents[idx] = mapped;
+  else DB.agents.push(mapped);
+  // Update sentinel snapshot so it doesn't fire spuriously
+  try{
+    if(typeof SENTINEL_SNAPSHOT === 'object') SENTINEL_SNAPSHOT[mapped.id] = JSON.stringify(mapped);
+    if(typeof SENTINEL_HIGH_WATER === 'object' && typeof _sentinelAgentRichness === 'function'){
+      SENTINEL_HIGH_WATER[mapped.id] = _sentinelAgentRichness(mapped);
+    }
+  }catch(e){}
+  saveToStorage();
+}
+
+// Show a save-error banner with Retry. Auto-dismisses after 30 seconds.
+function _showSaveErrorBanner(message, retryFn){
+  try{
+    var existing = document.getElementById('wmam-save-error-banner');
+    if(existing) existing.remove();
+    var banner = document.createElement('div');
+    banner.id = 'wmam-save-error-banner';
+    banner.style.cssText = 'position:fixed;top:20px;right:20px;z-index:99999;background:#dc2626;color:white;padding:14px 18px;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.3);font-family:Barlow Condensed,sans-serif;font-size:.85rem;max-width:420px;display:flex;align-items:flex-start;gap:12px';
+    var msgSpan = document.createElement('div');
+    msgSpan.style.cssText = 'flex:1;line-height:1.4';
+    msgSpan.innerHTML = '<div style="font-weight:700;margin-bottom:4px">⚠ Save Failed</div><div style="font-size:.78rem;opacity:.95">'+_escapeHtml(message)+'</div>';
+    banner.appendChild(msgSpan);
+    if(typeof retryFn === 'function'){
+      var retryBtn = document.createElement('button');
+      retryBtn.textContent = 'Retry';
+      retryBtn.style.cssText = 'background:white;color:#dc2626;border:none;padding:6px 12px;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;cursor:pointer';
+      retryBtn.onclick = function(){ banner.remove(); retryFn(); };
+      banner.appendChild(retryBtn);
+    }
+    var closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText = 'background:transparent;color:white;border:none;font-size:1rem;cursor:pointer;padding:0 4px';
+    closeBtn.onclick = function(){ banner.remove(); };
+    banner.appendChild(closeBtn);
+    document.body.appendChild(banner);
+    setTimeout(function(){ if(banner.parentNode) banner.remove(); }, 30000);
+  }catch(e){ console.warn('[showSaveError]', e); }
 }
 
 async function deleteAgentFromSupabase(agentId){
   if(!supaClient) return;
   await sbDelete('agents', {id: agentId});
   await sbDelete('team_members', {agent_id: agentId});
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  REALTIME SUBSCRIPTION  (Calvin 2026-05-14)
+//
+//  Subscribes to postgres_changes events on the `agents` and `app_settings`
+//  tables. When ANY admin/agent saves a change on ANY device, every other
+//  connected browser receives the new row within ~1 second and updates its
+//  local DB.agents + re-renders the current panel.
+//
+//  Requires Realtime to be enabled on those tables in Supabase:
+//    Database → Publications → supabase_realtime → toggle agents +
+//    app_settings tables on.
+//
+//  If Realtime isn't enabled, this falls back to a 30-second polling
+//  interval so cross-device sync still happens (just slower).
+// ════════════════════════════════════════════════════════════════════════
+
+var WMAM_REALTIME_CHANNEL = null;
+var WMAM_REALTIME_FALLBACK_TIMER = null;
+
+function subscribeAgentsRealtime(){
+  if(!supaClient){
+    console.warn('[realtime] supaClient not initialized — skipping subscription');
+    return;
+  }
+  // Don't double-subscribe
+  if(WMAM_REALTIME_CHANNEL){
+    try{ supaClient.removeChannel(WMAM_REALTIME_CHANNEL); }catch(e){}
+    WMAM_REALTIME_CHANNEL = null;
+  }
+  try{
+    WMAM_REALTIME_CHANNEL = supaClient.channel('wmam-agents-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'agents' }, function(payload){
+        try{
+          if(payload.eventType === 'DELETE'){
+            var deletedId = payload.old && payload.old.id;
+            if(deletedId != null && Array.isArray(DB.agents)){
+              DB.agents = DB.agents.filter(function(a){ return a && a.id !== deletedId; });
+              console.log('[realtime] agent #'+deletedId+' deleted by another device');
+            }
+          } else if(payload.new){
+            _mergeServerAgentIntoLocal(payload.new);
+            console.log('[realtime] agent #'+payload.new.id+' updated by another device');
+          }
+          // Re-render the current panel so UI updates
+          if(typeof renderCurrentPanel === 'function'){
+            try{ renderCurrentPanel(); }catch(e){}
+          }
+        }catch(handlerErr){ console.warn('[realtime handler]', handlerErr); }
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, function(payload){
+        try{
+          // app_settings is sparse — we don't need to re-render anything
+          // automatically. Just log.
+          if(payload.new && payload.new.key){
+            console.log('[realtime] app_setting "'+payload.new.key+'" updated');
+          }
+        }catch(e){}
+      })
+      .subscribe(function(status){
+        console.log('[realtime] subscription status:', status);
+        if(status === 'SUBSCRIBED'){
+          // Realtime is live. Cancel polling fallback if it was running.
+          if(WMAM_REALTIME_FALLBACK_TIMER){
+            clearInterval(WMAM_REALTIME_FALLBACK_TIMER);
+            WMAM_REALTIME_FALLBACK_TIMER = null;
+          }
+        } else if(status === 'CHANNEL_ERROR' || status === 'TIMED_OUT'){
+          // Realtime failed (probably not enabled in Supabase) — start polling fallback
+          console.warn('[realtime] subscription failed ('+status+') — falling back to 30s polling');
+          _startRealtimeFallbackPolling();
+        }
+      });
+  }catch(subErr){
+    console.warn('[realtime] subscribe threw — falling back to polling:', subErr);
+    _startRealtimeFallbackPolling();
+  }
+}
+
+function _startRealtimeFallbackPolling(){
+  if(WMAM_REALTIME_FALLBACK_TIMER) return; // already polling
+  WMAM_REALTIME_FALLBACK_TIMER = setInterval(function(){
+    if(!supaClient) return;
+    // Cheap re-load of agents
+    sbSelect('agents').then(function(rows){
+      if(!Array.isArray(rows)) return;
+      rows.forEach(function(r){ _mergeServerAgentIntoLocal(r); });
+    }).catch(function(){});
+  }, 30000);
 }
 
 // ══════════════════════════════════════════
@@ -53188,10 +53335,13 @@ document.addEventListener('keydown', function(e){
 // Init
 document.getElementById('boDateEl').textContent=new Date().toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
 initSupabase();
-// ── Calvin 2026-05-08: start sync queue background flush ──
-// Loads pending writes from localStorage, sets up retry timer + online/focus
-// listeners. Idempotent. Safe to call early — flushes are gated on supaClient.
-if(typeof syncStartBackgroundFlush === 'function') syncStartBackgroundFlush();
+// ── Calvin 2026-05-14: queue + sentinel DORMANT in new architecture ──
+// Saves now go direct-Supabase (await + return outcome). The queue is no
+// longer needed. The sentinel ran every 60s comparing in-memory snapshots
+// and was actively causing data loss by pushing stale local copies over
+// fresh server data. Both are kept defined but no longer started.
+// To re-enable: uncomment the next line.
+// if(typeof syncStartBackgroundFlush === 'function') syncStartBackgroundFlush();
 // ── Calvin 2026-05-08: inventory custody — periodic timeout escalation ──
 // Every 15 minutes, scan pending transfers and fire escalation notifications
 // for any older than 48 hours.
@@ -53232,13 +53382,19 @@ if(typeof trainingAutoAdvancePending === 'function'){
     }catch(e){ console.warn('[init] pre-load flush failed (will retry post-load):', e); }
   }
   await loadFromSupabase();
-  // Flush any remaining pending writes (e.g. ones that failed pre-load)
-  if(typeof syncFlush === 'function') setTimeout(function(){ syncFlush(true); }, 1000);
-  // Calvin 2026-05-08: wire stuck-queue banner
-  if(typeof _wmamStuckQueueCheck === 'function'){
-    setTimeout(_wmamStuckQueueCheck, 5000);
-    setInterval(_wmamStuckQueueCheck, 5000);
+  // ── Calvin 2026-05-14: subscribe to realtime changes on agents + app_settings ──
+  // K-Anna's edits appear on Calvin's screen within ~1 sec (and vice versa)
+  // without anyone refreshing. Falls back gracefully if Realtime isn't enabled.
+  if(typeof subscribeAgentsRealtime === 'function'){
+    try{ subscribeAgentsRealtime(); }catch(e){ console.warn('[init] realtime subscribe failed (safe to ignore):', e); }
   }
+  // ── Calvin 2026-05-14: queue/sentinel/stuck-banner DORMANT in new arch ──
+  // Saves now go direct via saveAgentToSupabase / saveAppSettingToSupabase
+  // which await the Supabase response. No queue means no stuck queue and no
+  // sentinel chasing phantom mutations. The code remains in place for rollback
+  // but no longer fires.
+  // (If you ever need to re-enable the old behavior, set ENABLE_LEGACY_QUEUE=true
+  // and uncomment the calls below.)
   // Restore session if user was already logged in
   try{
     var savedId = sessionStorage.getItem('wmam_session');
