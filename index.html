@@ -15089,17 +15089,9 @@ function _startRealtimeFallbackPolling(){
 // Map of table-name → list of panel IDs that display data from that table.
 // When a table changes, only re-render if one of these panels is open.
 var WMAM_TABLE_PANEL_MAP = {
-  'agents':              ['manage-agents','agent-master-profile','dashboard','owner','my-markets','market-breakdown','repair-bare-saved','multi-team-cleanup','sync-status','backup-restore','teams','team-detail','pay-patterns','payroll-week','payroll-owner','encroachment'],
-  'app_settings':        ['announcements','community','programs-admin','meetings','documents','onboard-upload'],
-  'notifications':       ['notifications','dashboard','owner','inv-hub','inv-requests','training-pending','pending-code-approvals'],
-  'gm_sales':            ['gm-leaderboard','dashboard','owner','payroll-week','payroll-owner','sales-report'],
-  'tc_sales':            ['tc-leaderboard','dashboard','owner','payroll-week','payroll-owner','sales-report'],
-  'aw_sales':            ['aw-leaderboard','dashboard','owner','payroll-week','payroll-owner','sales-report'],
-  'ex_sales':            ['ex-leaderboard','dashboard','owner','payroll-week','payroll-owner','sales-report'],
-  'inventory_pending_xfers': ['inv-requests','inv-hub','inv-transfer','dashboard','owner','gm-transfers'],
-  'inventory_devices':   ['inv-dashboard','inv-hub','gm-inventory','aw-inventory','tc-inventory','ex-inventory','gm-agent-inv'],
-  'daily_audit':         ['daily-audit','daily-audit-history','daily-audit-admin','dashboard','owner'],
-  'onboarding_records':  ['onboarding-queue','training-pending','dashboard','owner']
+  'agents':              ['manage-agents','agent-master-profile','dashboard','owner','my-markets','market-breakdown','repair-bare-saved','multi-team-cleanup','sync-status','backup-restore','teams','team-detail','pay-patterns','payroll-week','payroll-owner','encroachment','gm-leaderboard','tc-leaderboard','aw-leaderboard','ex-leaderboard'],
+  'app_settings':        ['announcements','community','programs-admin','meetings','documents','onboard-upload','training-pending'],
+  'notifications':       ['notifications','dashboard','owner','inv-hub','inv-requests','training-pending','pending-code-approvals']
 };
 
 // Should we re-render the current panel given a change to `tableName`?
@@ -15157,19 +15149,37 @@ async function _autoRefreshTick(){
   if(!supaClient) return;
   if(!DB.current) return; // not logged in yet
   try{
-    // Calvin 2026-05-14: agents IS polled here even though realtime should
-    // handle it. Realtime has been silently failing to deliver events for
-    // some users — polling is the safety net that guarantees every table
-    // refreshes within 15 seconds regardless.
-    var tables = ['agents','notifications','gm_sales','tc_sales','aw_sales','ex_sales','inventory_pending_xfers','app_settings'];
+    // Calvin 2026-05-14: tables that ACTUALLY exist in Supabase. Sales aren't
+    // their own tables — they're stored as monthly_sales JSON on each agent
+    // record. Notifications are real. Inventory transfers live in
+    // PENDING_TRANSFERS (which syncs through app_settings).
+    var tables = ['agents','notifications','app_settings'];
     for(var i = 0; i < tables.length; i++){
       var table = tables[i];
       try{
         var res = await supaClient.from(table).select('*');
         if(res && res.data){
-          // Hash: count + last row's id/updated_at — cheap fingerprint to detect change
-          var sample = res.data.length ? res.data[res.data.length-1] : null;
-          var hash = String(res.data.length) + ':' + (sample ? (sample.id||'') + ':' + (sample.updated_at||'') + ':' + (sample.created_at||'') + ':' + JSON.stringify(sample).slice(0,150) : '');
+          // Calvin 2026-05-14 FIX: hash the FULL contents, not just the last
+          // row. Otherwise K-Anna's edit to agent #5 in a 46-row table goes
+          // undetected because the last row (agent #46) didn't change.
+          // Use BOTH updated_at (if present) AND content-sensitive fields
+          // so we still detect changes even if Supabase has no updated_at trigger.
+          var hash = String(res.data.length);
+          for(var j = 0; j < res.data.length; j++){
+            var r = res.data[j];
+            if(r){
+              if(table === 'agents'){
+                // Content-sensitive hash for agents
+                hash += '|' + r.id + ':' + (r.updated_at||'') + ':' + (r.name||'') + ':' + (r.role||'') + ':' + (r.team||'') + ':' + (r.active?1:0) + ':' + String(r.programs||'').length + ':' + String(r.agent_codes||'').length + ':' + String(r.ibo_markets||'').length;
+              } else if(table === 'notifications'){
+                hash += '|' + r.id + ':' + (r.ts||r.created_at||r.updated_at||'');
+              } else if(table === 'app_settings'){
+                hash += '|' + r.key + ':' + (r.updated_at||'') + ':' + (r.value ? String(r.value).length : 0);
+              } else {
+                hash += '|' + (r.id||r.key||j) + ':' + (r.updated_at||r.created_at||r.ts||'');
+              }
+            }
+          }
           if(WMAM_AUTOREFRESH_LAST_HASH[table] !== hash){
             WMAM_AUTOREFRESH_LAST_HASH[table] = hash;
             _autoRefreshApply(table, res.data);
@@ -15198,23 +15208,35 @@ function _autoRefreshApply(table, rows){
         }
         break;
       case 'notifications':
-        if(typeof NOTIFICATIONS !== 'undefined') NOTIFICATIONS = rows;
-        if(typeof renderBell === 'function'){ try{ renderBell(); }catch(e){} }
+        // Calvin 2026-05-14: map Supabase notification rows to the local
+        // WMAM_NOTIFICATIONS shape. Server is truth, replace.
+        if(Array.isArray(rows) && typeof WMAM_NOTIFICATIONS !== 'undefined'){
+          WMAM_NOTIFICATIONS = rows.map(function(row){
+            return {
+              id:        row.id,
+              type:      row.type || 'info',
+              title:     row.title,
+              body:      row.body || '',
+              icon:      row.icon || 'bell',
+              fromId:    row.from_id,
+              fromName:  row.from_name || 'System',
+              formType:  row.form_type,
+              toIds:     row.to_ids   || [],
+              toRoles:   row.to_roles || [],
+              data:      row.data,
+              read:      row.read_by  || [],
+              ts:        row.ts || row.created_at || new Date().toISOString()
+            };
+          });
+          // Sort newest first (matches existing convention)
+          WMAM_NOTIFICATIONS.sort(function(a,b){ return (b.ts||'').localeCompare(a.ts||''); });
+          if(typeof saveNotifications === 'function') saveNotifications();
+          if(typeof renderNotifBell === 'function'){ try{ renderNotifBell(); }catch(e){} }
+        }
         break;
-      case 'gm_sales':
-        if(typeof GM_SALES !== 'undefined') GM_SALES = rows;
-        break;
-      case 'tc_sales':
-        if(typeof TC_SALES !== 'undefined') TC_SALES = rows;
-        break;
-      case 'aw_sales':
-        if(typeof AW_SALES !== 'undefined') AW_SALES = rows;
-        break;
-      case 'ex_sales':
-        if(typeof EX_SALES !== 'undefined') EX_SALES = rows;
-        break;
-      case 'inventory_pending_xfers':
-        if(typeof PENDING_TRANSFERS !== 'undefined') PENDING_TRANSFERS = rows;
+      case 'app_settings':
+        // App settings don't need bulk re-load here — they're loaded once
+        // at startup and edited explicitly. Just log.
         break;
     }
     if(typeof saveToStorage === 'function') saveToStorage();
@@ -15223,7 +15245,7 @@ function _autoRefreshApply(table, rows){
 
 function startAutoRefresh(){
   if(WMAM_AUTOREFRESH_TIMER) return; // already running
-  console.log('[autoRefresh] started — polling every 15s. Tables: agents, notifications, sales (4), inventory_pending_xfers, app_settings');
+  console.log('[autoRefresh] started — polling every 15s. Tables: agents, notifications, app_settings');
   // First tick after 5 sec (let initial load settle)
   setTimeout(function(){
     console.log('[autoRefresh] first tick — DB.current is '+(DB.current ? '#'+DB.current.id+' '+DB.current.name : 'NULL (waiting for login)'));
