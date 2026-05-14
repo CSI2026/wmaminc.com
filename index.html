@@ -15029,18 +15029,16 @@ function subscribeAgentsRealtime(){
             _mergeServerAgentIntoLocal(payload.new);
             console.log('[realtime] agent #'+payload.new.id+' updated by another device');
           }
-          // Re-render the current panel so UI updates
-          if(typeof renderCurrentPanel === 'function'){
-            try{ renderCurrentPanel(); }catch(e){}
-          }
+          // Smart re-render: refresh visible panel
+          _smartReRender('agents');
         }catch(handlerErr){ console.warn('[realtime handler]', handlerErr); }
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, function(payload){
         try{
-          // app_settings is sparse — we don't need to re-render anything
-          // automatically. Just log.
           if(payload.new && payload.new.key){
             console.log('[realtime] app_setting "'+payload.new.key+'" updated');
+            // Re-load only the affected setting into memory if simple, else nudge a poll
+            _smartReRender('app_settings');
           }
         }catch(e){}
       })
@@ -15072,8 +15070,151 @@ function _startRealtimeFallbackPolling(){
     sbSelect('agents').then(function(rows){
       if(!Array.isArray(rows)) return;
       rows.forEach(function(r){ _mergeServerAgentIntoLocal(r); });
+      _smartReRender('agents');
     }).catch(function(){});
   }, 30000);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SMART RE-RENDER + AUTO-REFRESH  (Calvin 2026-05-14)
+//
+//  When realtime or polling brings in new data, the UI needs to update
+//  without disrupting active work. This module:
+//    1. Maps tables → panels that show that data
+//    2. Re-renders only if the current panel is affected
+//    3. Skips re-render if the user is actively typing in a form
+//       (no blowing away half-typed edits)
+// ════════════════════════════════════════════════════════════════════════
+
+// Map of table-name → list of panel IDs that display data from that table.
+// When a table changes, only re-render if one of these panels is open.
+var WMAM_TABLE_PANEL_MAP = {
+  'agents':              ['manage-agents','agent-master-profile','dashboard','owner','my-markets','market-breakdown','repair-bare-saved','multi-team-cleanup','sync-status','backup-restore','teams','team-detail','pay-patterns','payroll-week','payroll-owner','encroachment'],
+  'app_settings':        ['announcements','community','programs-admin','meetings','documents','onboard-upload'],
+  'notifications':       ['notifications','dashboard','owner','inv-hub','inv-requests','training-pending','pending-code-approvals'],
+  'gm_sales':            ['gm-leaderboard','dashboard','owner','payroll-week','payroll-owner','sales-report'],
+  'tc_sales':            ['tc-leaderboard','dashboard','owner','payroll-week','payroll-owner','sales-report'],
+  'aw_sales':            ['aw-leaderboard','dashboard','owner','payroll-week','payroll-owner','sales-report'],
+  'ex_sales':            ['ex-leaderboard','dashboard','owner','payroll-week','payroll-owner','sales-report'],
+  'inventory_pending_xfers': ['inv-requests','inv-hub','inv-transfer','dashboard','owner','gm-transfers'],
+  'inventory_devices':   ['inv-dashboard','inv-hub','gm-inventory','aw-inventory','tc-inventory','ex-inventory','gm-agent-inv'],
+  'daily_audit':         ['daily-audit','daily-audit-history','daily-audit-admin','dashboard','owner'],
+  'onboarding_records':  ['onboarding-queue','training-pending','dashboard','owner']
+};
+
+// Should we re-render the current panel given a change to `tableName`?
+function _smartReRender(tableName){
+  try{
+    var currentId = window._currentPanelId;
+    if(!currentId) return;
+    // Don't disrupt active form input — if user is typing in an input/textarea
+    var active = document.activeElement;
+    if(active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)){
+      // Mark a pending re-render flag; we'll catch it on next blur or interval
+      window._wmamPendingRerender = tableName;
+      return;
+    }
+    var panels = WMAM_TABLE_PANEL_MAP[tableName] || [];
+    if(panels.indexOf(currentId) >= 0){
+      if(typeof gotoPanel === 'function'){
+        gotoPanel(currentId);
+      }
+    }
+    // Always update the notification bell if notifications changed
+    if(tableName === 'notifications' && typeof renderBell === 'function'){
+      try{ renderBell(); }catch(e){}
+    }
+  }catch(e){ console.warn('[smartReRender]', e); }
+}
+
+// Catch pending re-renders when user finishes typing
+if(typeof document !== 'undefined'){
+  document.addEventListener('focusout', function(){
+    setTimeout(function(){
+      if(window._wmamPendingRerender){
+        var t = window._wmamPendingRerender;
+        delete window._wmamPendingRerender;
+        _smartReRender(t);
+      }
+    }, 300);
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  BACKGROUND AUTO-REFRESH  (Calvin 2026-05-14)
+//
+//  Every 15 seconds, silently re-pulls notifications + pending transfers +
+//  sales tables (the time-sensitive stuff). Triggers smart re-render only
+//  if the data actually changed.
+//
+//  This is what makes notifications appear without manual refresh for
+//  admins and agents who never refresh their browser.
+// ════════════════════════════════════════════════════════════════════════
+var WMAM_AUTOREFRESH_TIMER = null;
+var WMAM_AUTOREFRESH_LAST_HASH = {};
+
+async function _autoRefreshTick(){
+  if(!supaClient) return;
+  if(!DB.current) return; // not logged in yet
+  try{
+    var tables = ['notifications','gm_sales','tc_sales','aw_sales','ex_sales','inventory_pending_xfers'];
+    for(var i = 0; i < tables.length; i++){
+      var table = tables[i];
+      try{
+        var res = await supaClient.from(table).select('*');
+        if(res && res.data){
+          var hash = String(res.data.length) + ':' + (res.data.length ? JSON.stringify(res.data[res.data.length-1]).slice(0,200) : '');
+          if(WMAM_AUTOREFRESH_LAST_HASH[table] !== hash){
+            WMAM_AUTOREFRESH_LAST_HASH[table] = hash;
+            // Dispatch to the right in-memory variable based on table name
+            _autoRefreshApply(table, res.data);
+            _smartReRender(table);
+          }
+        }
+      }catch(tErr){ /* table might not exist or RLS may reject — skip silently */ }
+    }
+  }catch(e){ console.warn('[autoRefresh tick]', e); }
+}
+
+function _autoRefreshApply(table, rows){
+  try{
+    switch(table){
+      case 'notifications':
+        if(typeof NOTIFICATIONS !== 'undefined') NOTIFICATIONS = rows;
+        if(typeof renderBell === 'function'){ try{ renderBell(); }catch(e){} }
+        break;
+      case 'gm_sales':
+        if(typeof GM_SALES !== 'undefined') GM_SALES = rows;
+        break;
+      case 'tc_sales':
+        if(typeof TC_SALES !== 'undefined') TC_SALES = rows;
+        break;
+      case 'aw_sales':
+        if(typeof AW_SALES !== 'undefined') AW_SALES = rows;
+        break;
+      case 'ex_sales':
+        if(typeof EX_SALES !== 'undefined') EX_SALES = rows;
+        break;
+      case 'inventory_pending_xfers':
+        if(typeof PENDING_TRANSFERS !== 'undefined') PENDING_TRANSFERS = rows;
+        break;
+    }
+    if(typeof saveToStorage === 'function') saveToStorage();
+  }catch(e){ console.warn('[autoRefreshApply]', e); }
+}
+
+function startAutoRefresh(){
+  if(WMAM_AUTOREFRESH_TIMER) return; // already running
+  // First tick after 5 sec (let initial load settle)
+  setTimeout(_autoRefreshTick, 5000);
+  WMAM_AUTOREFRESH_TIMER = setInterval(_autoRefreshTick, 15000);
+  console.log('[autoRefresh] started — polls every 15s for notifications/sales/transfers');
+}
+
+if(typeof window !== 'undefined'){
+  window._smartReRender = _smartReRender;
+  window._autoRefreshTick = _autoRefreshTick;
+  window.startAutoRefresh = startAutoRefresh;
 }
 
 // ══════════════════════════════════════════
@@ -23184,6 +23325,8 @@ function panelHeader(title, backLabel){
     +'</div>';
 }
 function gotoPanel(id, params){
+  // Calvin 2026-05-14: track current panel so realtime/polling can re-render it
+  window._currentPanelId = id;
   // Stash optional params so child panels (like payroll-week-detail)
   // can read things like weekId without polluting the URL.
   gotoPanel._params = params || null;
@@ -53054,6 +53197,12 @@ if(typeof trainingAutoAdvancePending === 'function'){
   // without anyone refreshing. Falls back gracefully if Realtime isn't enabled.
   if(typeof subscribeAgentsRealtime === 'function'){
     try{ subscribeAgentsRealtime(); }catch(e){ console.warn('[init] realtime subscribe failed (safe to ignore):', e); }
+  }
+  // Calvin 2026-05-14: auto-refresh for tables not on realtime (notifications,
+  // sales, transfers). Polls every 15s. This is what makes notifications
+  // appear without anyone manually refreshing.
+  if(typeof startAutoRefresh === 'function'){
+    try{ startAutoRefresh(); }catch(e){ console.warn('[init] startAutoRefresh failed:', e); }
   }
   // Restore session if user was already logged in
   try{
