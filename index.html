@@ -4129,6 +4129,16 @@ function subscribeToNotificationsRealtime(){
         if(window._currentPanelId === 'notifications' && typeof gotoPanel === 'function'){
           gotoPanel('notifications');
         }
+        // Calvin 2026-05-14: show a visible toast banner if THIS user can see this notification
+        try{
+          if(DB.current && typeof notifVisibleTo === 'function' && notifVisibleTo(n, DB.current)){
+            if(typeof _showUpdateToast === 'function'){
+              var toastMsg = (n.title || 'New notification');
+              if(n.fromName) toastMsg += ' — from ' + n.fromName;
+              _showUpdateToast(toastMsg, { icon: '🔔', color: '#7c3aed', duration: 6000 });
+            }
+          }
+        }catch(toastErr){}
         console.log('[realtime] new notification #'+n.id+': '+n.title);
       } catch(e){ console.warn('[realtime INSERT] handler failed:', e); }
     });
@@ -11270,18 +11280,14 @@ function gmResolveAutoAssignee(marketName){
       }
     }
   }
-  // Hard fallback: any active CM tied to Gen Mobile
-  var cm = (DB.agents||[]).find(function(a){
-    if(!a.active) return false;
-    if(a.role !== 'Campaign Manager') return false;
-    var hasGM = a.agentCodes && a.agentCodes.hasOwnProperty('Gen Mobile');
-    var isOklahoma = a.cmModel === 'cm-oklahoma';
-    return hasGM || isOklahoma;
-  });
-  if(cm) return { agent: cm, source: 'hard-fallback', market: null };
-  // Hardest fallback: Tanita id 2
-  var tanita = (DB.agents||[]).find(function(a){ return a.id === 2; });
-  if(tanita) return { agent: tanita, source: 'hard-fallback', market: null };
+  // Calvin 2026-05-14 SPEC CHANGE: NO CM hard-fallback.
+  // Per Calvin: "default should be the market MM. If no MM exists for that
+  // market, leave it UNASSIGNED in the pool for Inv Dept review. NEVER
+  // silently default to a CM (Brandon/Tanita)."
+  //
+  // The old behavior would pick the first GM-tied CM, which is how Waco
+  // inventory ended up assigned to Brandon Smith instead of staying unassigned
+  // for Inv Dept to route to Jerry McDonald (Waco's MM).
   return null;
 }
 
@@ -11318,7 +11324,12 @@ function processGMInventoryUpload(csvText, batchId){
     var model= row['Model Name']||'';
     var sku  = row['SKU']||'';
     var devType = (row['Dev. Type']||'').toLowerCase(); // 'free' / 'upsell' / 'sim'
-    var teamName= row['Team Name']||'';
+    // ── Calvin 2026-05-14: support NEW GM CSV columns + keep old as fallback ──
+    // Gen Mobile updated their export format. New header has "Shipped To Team"
+    // and "Current Team" instead of "Team Name", and "Assigned Agent" instead
+    // of "Name". We read BOTH so old AND new CSVs parse correctly.
+    // Priority: Shipped To Team > Current Team > Team Name (old)
+    var teamName= row['Shipped To Team']||row['Current Team']||row['Team Name']||'';
     var soNum   = row['SO Number']||'';
     var soDate  = row['SO Date ']||row['SO Date']||'';
     var dueDate = row['Due Date']||'';
@@ -11344,7 +11355,8 @@ function processGMInventoryUpload(csvText, batchId){
     var rawPurchaseCost = _parseDollar(row['Purchase Cost']);
     var invStatus       = (row['Inv. Status']||'').trim();
     var ownedByAgency   = (row['Owned by Agency']||'').trim().toLowerCase() === 'yes';
-    var recipientName   = (row['Name']||row['Name ']||'').trim();
+    // Calvin 2026-05-14: read NEW "Assigned Agent" column with fallback to old "Name"
+    var recipientName   = (row['Assigned Agent']||row['Name']||row['Name ']||'').trim();
     var carrier         = (row['Carrier']||'').trim();
     var shippingAddr    = (row['Shipping Address']||'').trim();
     // ── Authoritative invoice cost ──
@@ -11527,7 +11539,8 @@ function processGMActivationCSV(csvText){
   rows.forEach(function(row){
     var imei       = row['IMEI']||'';
     var agentUser  = row['Street Agent (Short)']||'';
-    var teamName   = row['Team Name']||'';
+    // Calvin 2026-05-14: support NEW + OLD GM CSV column names
+    var teamName   = row['Shipped To Team']||row['Current Team']||row['Team Name']||'';
     var actDate    = row['Activation Date']||'';
     var saleType   = row['Sale Type']||'';
     var devType    = row['Dev. Type']||'';
@@ -13622,6 +13635,77 @@ if(typeof window !== 'undefined'){
   window.wmamProbeWriteFailure = wmamProbeWriteFailure;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY ROUTING DIAGNOSTIC (Calvin 2026-05-14)
+//  Call from F12 console: wmamDebugInventoryRouting('Waco TX')
+//  Walks every step of the routing logic and prints what's happening.
+// ════════════════════════════════════════════════════════════════════════
+function wmamDebugInventoryRouting(marketName, csvName){
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(' INVENTORY ROUTING DIAGNOSTIC');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(' Market arg: "'+(marketName||'(empty)')+'"');
+  console.log(' CSV Name arg: "'+(csvName||'(empty)')+'"');
+  console.log('');
+
+  // 1. Clean the market name as the parser would
+  var cleaned = (typeof gmCleanMarket === 'function') ? gmCleanMarket(marketName) : marketName;
+  console.log('[1] gmCleanMarket("'+(marketName||'')+'") → "'+cleaned+'"');
+
+  // 2. Look up market in MARKETS
+  if(typeof MARKETS === 'undefined' || !Array.isArray(MARKETS)){
+    console.log('[2] MARKETS array MISSING — cannot resolve MM');
+    return;
+  }
+  console.log('[2] MARKETS contains '+MARKETS.length+' market rows');
+  var matchRow = MARKETS.find(function(m){
+    if(!m || m.active === false) return false;
+    return (m.name||'').toLowerCase().trim() === cleaned.toLowerCase().trim();
+  });
+  if(!matchRow){
+    console.log('[2] ✗ NO MARKETS ROW for "'+cleaned+'". Inventory will be UNASSIGNED.');
+    console.log('    Fix: open the Markets admin and create a "'+cleaned+'" market row with Jerry McDonald as MM.');
+    console.log('    Available market names:');
+    MARKETS.filter(function(m){ return m && m.active !== false; }).forEach(function(m){
+      console.log('      • '+m.name);
+    });
+    return;
+  }
+  console.log('[2] ✓ Market row found: id='+matchRow.id+', name="'+matchRow.name+'"');
+
+  // 3. Check each program section for MM
+  console.log('[3] Program sections:');
+  ['lifeline','internet','aca'].forEach(function(prog){
+    var sec = (matchRow.programs && matchRow.programs[prog]) || {};
+    var mmId = sec.mmId;
+    if(!mmId){
+      console.log('    '+prog+': mmId=(none)');
+      return;
+    }
+    var mm = (DB.agents||[]).find(function(a){ return a && a.id === mmId; });
+    if(!mm) console.log('    '+prog+': mmId='+mmId+' but no matching agent — STALE REFERENCE');
+    else if(!mm.active) console.log('    '+prog+': mmId='+mmId+' → '+mm.name+' but INACTIVE');
+    else console.log('    '+prog+': mmId='+mmId+' → '+mm.name+' ✓ (will be assigned holder)');
+  });
+  console.log('[3] CM: cmId='+(matchRow.cmId||'(none)'));
+
+  // 4. Full resolution
+  console.log('');
+  if(typeof gmResolveUploadRecipient === 'function'){
+    var result = gmResolveUploadRecipient(csvName||'', cleaned);
+    if(result && result.agent){
+      console.log('[4] FINAL: '+result.agent.name+' (id '+result.agent.id+', role '+result.agent.role+') — source: '+result.source);
+    } else {
+      console.log('[4] FINAL: UNASSIGNED (will land in Inv Dept pool for manual routing)');
+    }
+  }
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+}
+
+if(typeof window !== 'undefined'){
+  window.wmamDebugInventoryRouting = wmamDebugInventoryRouting;
+}
+
 
 // ════════════════════════════════════════════════════════════════════════
 //  SYNC STATUS PANEL  (gotoPanel('sync-status'))
@@ -15181,10 +15265,18 @@ async function _autoRefreshTick(){
             }
           }
           if(WMAM_AUTOREFRESH_LAST_HASH[table] !== hash){
+            var isFirstSeen = (WMAM_AUTOREFRESH_LAST_HASH[table] === undefined);
             WMAM_AUTOREFRESH_LAST_HASH[table] = hash;
             _autoRefreshApply(table, res.data);
             _smartReRender(table);
             console.log('[autoRefresh] '+table+' changed ('+res.data.length+' rows) — re-rendered');
+            // Show a subtle update toast ONLY for subsequent updates, not
+            // the initial load (we don't want a toast every page refresh).
+            if(!isFirstSeen && typeof _showUpdateToast === 'function'){
+              if(table === 'agents')             _showUpdateToast('Agent records updated', { icon:'👤' });
+              else if(table === 'notifications') _showUpdateToast('New notification activity', { icon:'🔔', color:'#7c3aed' });
+              else if(table === 'app_settings')  _showUpdateToast('Settings updated', { icon:'⚙' });
+            }
           }
         }
       }catch(tErr){ /* table might not exist or RLS may reject — skip silently */ }
@@ -15243,21 +15335,110 @@ function _autoRefreshApply(table, rows){
   }catch(e){ console.warn('[autoRefreshApply]', e); }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  AUTO-REFRESH (robust against browser throttling) — Calvin 2026-05-14
+//
+//  Chrome aggressively throttles setInterval in background tabs (and the
+//  throttle is even worse when DevTools is closed). Our 15-sec interval
+//  was sometimes firing every 60+ seconds or not at all.
+//
+//  Strategy:
+//    1. Run the interval (15s) — works when tab is foreground
+//    2. ALSO poll immediately when:
+//       - Tab regains visibility (user comes back to it)
+//       - Window regains focus (user clicks back into Chrome)
+//       - 'online' event fires (network reconnect)
+//    3. Use a time-based guard so we don't double-fire if multiple events
+//       trigger at once
+//
+//  Plus: emit a visible toast banner when data actually changes, so users
+//  see WHY their screen just refreshed.
+// ════════════════════════════════════════════════════════════════════════
+
+var WMAM_AUTOREFRESH_LAST_RUN = 0;
+var WMAM_AUTOREFRESH_MIN_GAP_MS = 3000; // never run more than once every 3 seconds
+
+async function _autoRefreshTickGuarded(reason){
+  var now = Date.now();
+  if(now - WMAM_AUTOREFRESH_LAST_RUN < WMAM_AUTOREFRESH_MIN_GAP_MS) return;
+  WMAM_AUTOREFRESH_LAST_RUN = now;
+  if(reason && reason !== 'interval'){
+    console.log('[autoRefresh] tick ('+reason+')');
+  }
+  await _autoRefreshTick();
+}
+
 function startAutoRefresh(){
   if(WMAM_AUTOREFRESH_TIMER) return; // already running
-  console.log('[autoRefresh] started — polling every 15s. Tables: agents, notifications, app_settings');
+  console.log('[autoRefresh] started — polls every 15s + immediately on tab focus/visibility');
   // First tick after 5 sec (let initial load settle)
   setTimeout(function(){
     console.log('[autoRefresh] first tick — DB.current is '+(DB.current ? '#'+DB.current.id+' '+DB.current.name : 'NULL (waiting for login)'));
-    _autoRefreshTick();
+    _autoRefreshTickGuarded('initial');
   }, 5000);
-  WMAM_AUTOREFRESH_TIMER = setInterval(_autoRefreshTick, 15000);
+  // Periodic interval (works in foreground; may be throttled in background)
+  WMAM_AUTOREFRESH_TIMER = setInterval(function(){ _autoRefreshTickGuarded('interval'); }, 15000);
+  // CRITICAL: poll immediately when tab regains visibility or focus —
+  // this is what handles the case where the user has been on another tab
+  // and Chrome has throttled the background interval.
+  if(typeof document !== 'undefined'){
+    document.addEventListener('visibilitychange', function(){
+      if(document.visibilityState === 'visible'){
+        _autoRefreshTickGuarded('visibilitychange');
+      }
+    });
+  }
+  if(typeof window !== 'undefined'){
+    window.addEventListener('focus', function(){ _autoRefreshTickGuarded('focus'); });
+    window.addEventListener('online', function(){ _autoRefreshTickGuarded('online'); });
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  UPDATE TOAST  (Calvin 2026-05-14)
+//
+//  When auto-refresh brings in new data, show a small banner so the user
+//  knows their screen just got fresh info. Auto-dismisses after 4 seconds.
+//  Stacks if multiple updates happen in quick succession.
+// ════════════════════════════════════════════════════════════════════════
+function _showUpdateToast(message, opts){
+  try{
+    opts = opts || {};
+    var container = document.getElementById('wmam-update-toast-container');
+    if(!container){
+      container = document.createElement('div');
+      container.id = 'wmam-update-toast-container';
+      container.style.cssText = 'position:fixed;top:80px;right:20px;z-index:99997;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:340px';
+      document.body.appendChild(container);
+    }
+    var toast = document.createElement('div');
+    var bg = opts.color || '#059669';
+    toast.style.cssText = 'background:'+bg+';color:white;padding:10px 14px;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.25);font-family:Barlow Condensed,sans-serif;font-size:.82rem;line-height:1.35;pointer-events:auto;cursor:pointer;opacity:0;transform:translateX(20px);transition:opacity .25s, transform .25s';
+    toast.innerHTML = '<div style="display:flex;align-items:center;gap:10px"><div style="font-size:1.1rem">'+(opts.icon||'↻')+'</div><div style="flex:1">'+_escapeHtml(message)+'</div></div>';
+    container.appendChild(toast);
+    // Slide in
+    requestAnimationFrame(function(){
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateX(0)';
+    });
+    // Auto-dismiss after 4 seconds (or longer if specified)
+    var dismissMs = opts.duration || 4000;
+    var dismiss = function(){
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateX(20px)';
+      setTimeout(function(){ if(toast.parentNode) toast.remove(); }, 300);
+    };
+    setTimeout(dismiss, dismissMs);
+    toast.addEventListener('click', dismiss);
+  }catch(e){ /* DOM unavailable — silent */ }
 }
 
 if(typeof window !== 'undefined'){
   window._smartReRender = _smartReRender;
   window._autoRefreshTick = _autoRefreshTick;
+  window._autoRefreshTickGuarded = _autoRefreshTickGuarded;
   window.startAutoRefresh = startAutoRefresh;
+  window._showUpdateToast = _showUpdateToast;
 }
 
 // ══════════════════════════════════════════
@@ -34418,6 +34599,38 @@ function gmProcessInventoryUpload(){
       html += '<div style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:#D97706">⚠️ '+(dupes.length-flagged.length)+' duplicate IMEI(s) skipped (already in system)</div>';
     }
     html += '</div>';
+
+    // ── Calvin 2026-05-14: ROUTING REPORT (always-on) ──
+    // Show market → recipient → source for every group, before user clicks
+    // confirm. Highlight unassigned routes so the user can fix them via the
+    // Market Manager assignment instead of silently committing wrong routing.
+    var rr = result.routingReport || {};
+    var rrKeys = Object.keys(rr);
+    if(rrKeys.length){
+      var unassignedCount = 0;
+      rrKeys.forEach(function(k){ if(k.indexOf('UNASSIGNED') >= 0) unassignedCount += rr[k]; });
+      var rrBg = unassignedCount > 0 ? 'rgba(217,119,6,.06)' : 'rgba(0,53,148,.04)';
+      var rrBorder = unassignedCount > 0 ? 'rgba(217,119,6,.35)' : 'rgba(0,53,148,.2)';
+      var rrColor = unassignedCount > 0 ? '#D97706' : 'var(--blue)';
+      html += '<div style="background:'+rrBg+';border:1.5px solid '+rrBorder+';border-radius:8px;padding:14px;margin-bottom:12px">';
+      html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:'+rrColor+';font-weight:700;margin-bottom:10px">🎯 Routing — Where will these devices go?</div>';
+      rrKeys.sort().forEach(function(key){
+        var count = rr[key];
+        var isUnassigned = key.indexOf('UNASSIGNED') >= 0;
+        var rowColor = isUnassigned ? '#D97706' : 'var(--brown)';
+        var icon = isUnassigned ? '⚠ ' : '✓ ';
+        html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;padding:5px 0;border-bottom:1px solid '+rrBorder+'">';
+        html += '<span style="color:'+rowColor+';flex:1">'+icon+_escapeHtml(key)+'</span>';
+        html += '<span style="font-weight:700;color:'+rowColor+';flex-shrink:0">'+count+' '+(count===1?'device':'devices')+'</span>';
+        html += '</div>';
+      });
+      if(unassignedCount > 0){
+        html += '<div style="margin-top:10px;padding:10px 12px;background:rgba(217,119,6,.08);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);line-height:1.5">';
+        html += '<strong style="color:#D97706">⚠ '+unassignedCount+' device(s) have no Market Manager set.</strong> They will land in the UNASSIGNED pool for Inv Dept to route manually. To fix this automatically, set a Market Manager on the affected market(s) in the Markets admin panel, then re-upload — the devices will route to that MM.';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
 
     if(nd.length){
       html += '<button onclick="gmConfirmInventoryUpload(\''+batchId+'\')" class="btn-fire" style="width:100%;justify-content:center;font-size:.72rem;padding:12px">✅ Confirm — Add '+nd.length+' Devices to System →</button>';
