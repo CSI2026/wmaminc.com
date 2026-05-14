@@ -1971,61 +1971,9 @@ if(typeof window !== 'undefined'){
   window.wmamRestoreBackup = wmamRestoreBackup;
 }
 
-// ════════════════════════════════════════════════════════════════════════
-//  STUCK-QUEUE WARNING BANNER  (Calvin 2026-05-08 — 911 fix)
-// ════════════════════════════════════════════════════════════════════════
-//  If the sync queue has anything pending and >30 seconds have passed
-//  since it was last empty, show a LOUD, NON-DISMISSIBLE red banner at
-//  the top of every page. This is what Calvin needs to see when a write
-//  is silently failing — no more guessing.
-// ════════════════════════════════════════════════════════════════════════
-var _wmamLastEmptyAt = Date.now();
-function _wmamStuckQueueCheck(){
-  try{
-    if(typeof SYNC_QUEUE === 'undefined' || !Array.isArray(SYNC_QUEUE)) return;
-    if(!SYNC_QUEUE.length){
-      _wmamLastEmptyAt = Date.now();
-      var existing = document.getElementById('wmam-stuck-banner');
-      if(existing) existing.remove();
-      return;
-    }
-    var stuckMs = Date.now() - _wmamLastEmptyAt;
-    if(stuckMs < 30000) return;  // grace period — normal sync
-    // Build / refresh the banner
-    var banner = document.getElementById('wmam-stuck-banner');
-    var oldestAgeMin = Math.floor(stuckMs / 60000);
-    var oldestAgeSec = Math.floor((stuckMs % 60000) / 1000);
-    var ageStr = oldestAgeMin > 0 ? oldestAgeMin+'m '+oldestAgeSec+'s' : oldestAgeSec+'s';
-    var firstErr = '';
-    for(var i=0;i<SYNC_QUEUE.length;i++){
-      if(SYNC_QUEUE[i] && SYNC_QUEUE[i].lastError){
-        firstErr = SYNC_QUEUE[i].lastError;
-        break;
-      }
-    }
-    var html = '<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
-      +'<div style="font-size:1.4rem">🚨</div>'
-      +'<div style="flex:1;min-width:260px">'
-      +  '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px">SYNC STUCK — '+SYNC_QUEUE.length+' WRITE'+(SYNC_QUEUE.length===1?'':'S')+' NOT REACHING SUPABASE ('+ageStr+')</div>'
-      +  '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.92;margin-top:2px">Your edits are saved LOCALLY but Supabase is rejecting them. DO NOT close this tab. ' + (firstErr ? 'Error: <code style="background:rgba(0,0,0,.2);padding:1px 5px;border-radius:3px">'+_escapeHtml(firstErr).slice(0,80)+'</code>' : 'Click the bell icon to see details.') + '</div>'
-      +'</div>'
-      +'<button onclick="if(typeof syncFlush===\'function\') syncFlush(true)" style="background:white;color:#CC0000;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0">↻ Retry Now</button>'
-      +'<button onclick="gotoPanel(\'sync-status\')" style="background:rgba(255,255,255,.2);border:1px solid white;color:white;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0">View Details</button>'
-      +'</div>';
-    if(!banner){
-      banner = document.createElement('div');
-      banner.id = 'wmam-stuck-banner';
-      banner.style.cssText = 'position:sticky;top:0;left:0;right:0;z-index:99998;background:linear-gradient(135deg,#CC0000,#8b0000);color:white;padding:14px 18px;box-shadow:0 4px 12px rgba(0,0,0,.3);border-bottom:2px solid #ffd700';
-      banner.innerHTML = html;
-      // Insert at top of body
-      if(document.body){
-        document.body.insertBefore(banner, document.body.firstChild);
-      }
-    } else {
-      banner.innerHTML = html;
-    }
-  }catch(e){ console.warn('[_wmamStuckQueueCheck] failed:', e); }
-}
+// (STUCK-QUEUE BANNER removed Calvin 2026-05-14 — no queue in new architecture.
+//  Save failures now surface immediately via _showSaveErrorBanner from
+//  saveAgentToSupabase / saveAppSettingToSupabase.)
 
 
 // Convenience wrapper used by Markets editor — same end result as
@@ -13270,486 +13218,25 @@ async function sbDelete(table, filters){
   } catch(e){ console.warn('sbDelete error:', e); return false; }
 }
 
+
 // ════════════════════════════════════════════════════════════════════════
-//  SYNC QUEUE  (Calvin 2026-05-08)
-//
-//  Bulletproof save pipeline. Every write goes through this queue:
-//    1. Enqueue to localStorage FIRST (survives crash/refresh/close)
-//    2. Attempt Supabase write
-//    3. On success: remove from queue
-//    4. On failure: stays in queue, retried with exponential backoff
-//
-//  The queue persists across page reloads, browser closes, and offline
-//  periods. It auto-flushes on:
-//    - page load
-//    - every 30 seconds
-//    - the 'online' event (regained connection)
-//    - the 'focus' event (user came back to tab)
-//
-//  Each pending write surfaces in the sync-status bell. Owner can view
-//  the full pending list at gotoPanel('sync-status'), inspect errors,
-//  manually retry or discard stuck items.
+//  DIRECT-SUPABASE STUBS (Calvin 2026-05-14)
+//  Replaces the deleted SYNC_QUEUE infrastructure. In the new
+//  architecture, saves are awaited directly so there's no queue to
+//  monitor. The syncStatus stub returns sensible values so the existing
+//  Save Status panel + sync bell continue to render without error.
 // ════════════════════════════════════════════════════════════════════════
-var SYNC_QUEUE = [];               // in-memory copy of the queue
-var SYNC_FLUSHING = false;         // mutex — only one flush at a time
-var SYNC_STATUS_LISTENERS = [];    // callbacks for UI updates
-var SYNC_FLUSH_TIMER = null;
-var SYNC_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;  // 14 days — never auto-discard
-var SYNC_BACKOFFS = [0, 30000, 60000, 120000, 300000, 600000, 600000];
-
-// Each entry shape:
-// {
-//   id: string (unique),
-//   kind: 'agent' | 'app_setting' | 'lifeline_team' | 'inventory_device' | 'notification' | ...
-//   table: string (Supabase table)
-//   payload: object (the row to upsert)
-//   conflictCol: string (default 'id')
-//   attempts: number,
-//   lastError: string,
-//   lastAttempt: ms epoch,
-//   nextAttempt: ms epoch,
-//   createdAt: ms epoch,
-//   recordKey: string (a stable id for dedup, e.g. "agent:101" or "app_setting:lifeline_teams")
-// }
-
-function syncLoadQueue(){
-  try{
-    var raw = localStorage.getItem('wmam_sync_queue');
-    if(raw){
-      var parsed = JSON.parse(raw);
-      if(Array.isArray(parsed)) SYNC_QUEUE = parsed;
-    }
-  }catch(e){ console.warn('[sync] load queue failed:', e); SYNC_QUEUE = []; }
-  // Discard ancient entries that are unrecoverable
-  var now = Date.now();
-  SYNC_QUEUE = SYNC_QUEUE.filter(function(e){
-    return e && (now - (e.createdAt||now)) < SYNC_MAX_AGE_MS;
-  });
-}
-
-function syncSaveQueue(){
-  try{
-    localStorage.setItem('wmam_sync_queue', JSON.stringify(SYNC_QUEUE));
-  }catch(e){
-    console.error('[sync] persist queue FAILED — quota? Re-trying after pruning oldest entries.', e);
-    // Last-resort: if localStorage is full, drop the oldest 10 entries and try again
-    SYNC_QUEUE.sort(function(a,b){ return (a.createdAt||0) - (b.createdAt||0); });
-    SYNC_QUEUE = SYNC_QUEUE.slice(10);
-    try{ localStorage.setItem('wmam_sync_queue', JSON.stringify(SYNC_QUEUE)); }catch(_){}
-  }
-}
-
-// Add a write to the queue. Always succeeds (writes to localStorage first).
-// recordKey is used to dedup repeat saves of the same record (e.g. saving
-// agent #101 three times in a row coalesces into ONE pending write with
-// the latest payload).
-function syncEnqueue(kind, table, payload, recordKey, conflictCol){
-  if(!table || !payload){
-    console.warn('[sync] enqueue called with empty table/payload');
-    return null;
-  }
-  var entry = {
-    id: 'sq_' + Date.now() + '_' + Math.floor(Math.random()*100000),
-    kind: kind || 'other',
-    table: table,
-    payload: payload,
-    conflictCol: conflictCol || 'id',
-    attempts: 0,
-    lastError: '',
-    lastAttempt: 0,
-    nextAttempt: Date.now(),
-    createdAt: Date.now(),
-    recordKey: recordKey || (kind + ':' + (payload.id || payload.key || JSON.stringify(payload).slice(0,40)))
-  };
-  // Dedup — replace any earlier pending write for the same recordKey
-  var existingIdx = SYNC_QUEUE.findIndex(function(e){ return e.recordKey === entry.recordKey; });
-  if(existingIdx >= 0){
-    // Preserve the createdAt and attempt count from the first try
-    var existing = SYNC_QUEUE[existingIdx];
-    entry.createdAt = existing.createdAt;
-    entry.attempts = existing.attempts;
-    entry.lastError = existing.lastError;
-    SYNC_QUEUE[existingIdx] = entry;
-  } else {
-    SYNC_QUEUE.push(entry);
-  }
-  syncSaveQueue();
-  syncNotifyListeners();
-  // Kick a flush in the background (non-blocking)
-  setTimeout(syncFlush, 0);
-  return entry;
-}
-
-// Public status — for the sync bell + Owner panel
 function syncStatus(){
-  var now = Date.now();
-  var pending = 0, failed = 0, retrying = 0;
-  var lastError = '';
-  SYNC_QUEUE.forEach(function(e){
-    if(e.attempts >= 3) failed++;
-    else if(e.attempts > 0) retrying++;
-    else pending++;
-    if(e.lastError && (!lastError || e.lastAttempt > 0)) lastError = e.lastError;
-  });
   return {
-    total: SYNC_QUEUE.length,
-    pending: pending,        // never tried yet
-    retrying: retrying,      // tried 1-2 times, will retry
-    failed: failed,          // tried 3+ times, still failing
-    lastError: lastError,
-    online: navigator.onLine !== false
+    online: (typeof navigator === 'undefined' || navigator.onLine !== false),
+    total: 0,
+    pending: 0,
+    failed: 0,
+    nextAttemptAt: null,
+    entries: []
   };
 }
 
-function syncOnStatusChange(cb){
-  if(typeof cb !== 'function') return;
-  SYNC_STATUS_LISTENERS.push(cb);
-}
-function syncNotifyListeners(){
-  SYNC_STATUS_LISTENERS.forEach(function(cb){
-    try{ cb(syncStatus()); }catch(e){ console.warn('[sync] listener error:', e); }
-  });
-  // Also refresh the bell UI if it exists
-  if(typeof renderSyncBell === 'function'){
-    try{ renderSyncBell(); }catch(e){}
-  }
-}
-
-// Attempt to flush the queue. Walks each entry, respecting nextAttempt
-// timestamps (backoff). Mutex-protected so concurrent flush calls (from
-// timer + online event + manual) don't double-fire.
-async function syncFlush(force){
-  if(SYNC_FLUSHING) return;
-  if(!supaClient) return;
-  if(!SYNC_QUEUE.length) return;
-  SYNC_FLUSHING = true;
-  try{
-    var now = Date.now();
-    // Snapshot — walk a copy so removals during iteration don't break us
-    var entries = SYNC_QUEUE.slice();
-    for(var i=0; i<entries.length; i++){
-      var entry = entries[i];
-      // Verify it's still in the live queue (could have been removed mid-flush)
-      var liveIdx = SYNC_QUEUE.findIndex(function(e){ return e.id === entry.id; });
-      if(liveIdx < 0) continue;
-      // Honor backoff unless force=true
-      if(!force && entry.nextAttempt > now) continue;
-      // Try the write
-      entry.attempts++;
-      entry.lastAttempt = now;
-      var ok = await _syncAttemptUpsert(entry);
-      if(ok){
-        // Success — drop from queue
-        SYNC_QUEUE = SYNC_QUEUE.filter(function(e){ return e.id !== entry.id; });
-        syncSaveQueue();
-        syncNotifyListeners();
-      } else {
-        // Failure — schedule retry with backoff
-        var err = (window._lastSbError && (window._lastSbError.message || window._lastSbError.code))
-                  || 'unknown error';
-        entry.lastError = String(err);
-        var backoffIdx = Math.min(entry.attempts, SYNC_BACKOFFS.length - 1);
-        entry.nextAttempt = now + SYNC_BACKOFFS[backoffIdx];
-        // Replace in queue with updated attempt info
-        var idx = SYNC_QUEUE.findIndex(function(e){ return e.id === entry.id; });
-        if(idx >= 0) SYNC_QUEUE[idx] = entry;
-        syncSaveQueue();
-        syncNotifyListeners();
-        // Don't continue hammering on a persistent failure during this flush —
-        // back off and let the next scheduled flush try again.
-        if(entry.attempts >= 3){
-          console.warn('[sync] entry '+entry.recordKey+' has failed '+entry.attempts+' times. Last error: '+err);
-        }
-      }
-    }
-  } catch(e){
-    console.error('[sync] flush crashed:', e);
-  } finally {
-    SYNC_FLUSHING = false;
-  }
-}
-
-// Manual force-retry — Owner can click "Retry All" on the sync panel
-function syncRetryAll(){
-  SYNC_QUEUE.forEach(function(e){ e.nextAttempt = 0; });
-  syncSaveQueue();
-  syncFlush(true);
-}
-
-// Manual discard — Owner can drop a stuck entry (last resort)
-function syncDiscard(id){
-  SYNC_QUEUE = SYNC_QUEUE.filter(function(e){ return e.id !== id; });
-  syncSaveQueue();
-  syncNotifyListeners();
-}
-
-// ── Per-kind upsert handlers ──
-// For most kinds, a plain sbUpsert is enough. For 'agent', we preserve
-// the 3-tier schema-mismatch fallback that the original saveAgentToSupabase
-// had (full → legacy → bare). This way we don't lose intelligence by
-// going through the queue.
-async function _syncAttemptUpsert(entry){
-  if(entry.kind === 'agent'){
-    return await _syncAttemptAgentUpsert(entry);
-  }
-  return await sbUpsert(entry.table, entry.payload, entry.conflictCol);
-}
-
-async function _syncAttemptAgentUpsert(entry){
-  // ── Calvin 2026-05-08 911.2 fix ──
-  // The BARE fallback at the end of this function (id+name+username+password+
-  // role+email+active only) was the silent culprit for "edits not saving."
-  // When the full upsert failed (schema mismatch, RLS, etc) we'd retry as
-  // legacy, then as bare. Bare success made the queue say "success" and drop
-  // the entry — but programs, campaigns, agentCodes, team, marketManagerId
-  // etc were NEVER written. From the user's perspective: agent exists, but
-  // everything they edited is gone.
-  //
-  // New behavior:
-  //   - Full schema first.
-  //   - Legacy fallback (strips newest columns) — if this works, fine.
-  //   - If both fail: LOUD WARNING, KEEP IN QUEUE for retry, DO NOT proceed
-  //     to bare. The user sees the stuck-queue banner and can act on it.
-  //   - Bare fallback ONLY runs for genuinely new agents (no existing row)
-  //     where we'd rather have the username+password than nothing at all.
-  //     For updates of existing agents, bare is forbidden.
-
-  // Strip local-only fields that have no Supabase column
-  var payload = Object.assign({}, entry.payload);
-  delete payload._localUpdatedAt;
-  delete payload._supaUpdatedAt;
-  delete payload._pendingInventoryHolds; // saved separately
-
-  // Full schema first
-  var ok = await sbUpsert('agents', payload, 'id');
-  if(ok) return true;
-
-  // Capture the first error so it's visible
-  var firstError = window._lastSbError;
-
-  // Legacy fallback — strip newest columns
-  var legacy = Object.assign({}, payload);
-  delete legacy.category;
-  delete legacy.depts;
-  delete legacy.office_manager;
-  delete legacy.can_distribute_inventory;
-  delete legacy.ibo_markets;
-  delete legacy.cm_model;
-  delete legacy.tc_model;
-  delete legacy.aw_model;
-  delete legacy.reports_to;
-  delete legacy.address;
-  var retryOk = await sbUpsert('agents', legacy, 'id');
-  if(retryOk){
-    console.warn('[sync] agent #'+payload.id+' saved via LEGACY fallback (some newer columns missing in Supabase schema)');
-    return true;
-  }
-
-  // Both failed. KEEP IN QUEUE. Do NOT silently fall back to bare for updates.
-  // The bare fallback ONLY runs if this agent doesn't exist in Supabase at all,
-  // so we have a record (username+password) for them. For existing-agent updates,
-  // we refuse to silently drop fields.
-  console.error('[sync] agent #'+payload.id+' ('+payload.name+') FAILED to save (full + legacy both rejected). KEEPING IN QUEUE. First error:', firstError);
-
-  // Check whether the agent exists in Supabase at all — only fall back to bare for genuinely new agents
-  var existsCheck = null;
-  try{
-    if(supaClient && supaClient.from){
-      existsCheck = await supaClient.from('agents').select('id').eq('id', payload.id).limit(1);
-    }
-  }catch(e){}
-  var alreadyExists = existsCheck && Array.isArray(existsCheck.data) && existsCheck.data.length > 0;
-
-  if(!alreadyExists){
-    // Brand-new agent — bare is better than nothing
-    var bare = {
-      id: payload.id, name: payload.name,
-      username: payload.username, password: payload.password,
-      role: payload.role, email: payload.email||'',
-      active: payload.active
-    };
-    var bareOk = await sbUpsert('agents', bare, 'id');
-    if(bareOk){
-      console.warn('[sync] BRAND-NEW agent #'+payload.id+' saved via BARE fallback (will need re-save with full data once schema is fixed)');
-      // Still mark as failed so user knows there's a schema problem
-      // Actually no — if bare succeeded, the agent at least exists.
-      // Re-enqueue the full payload so next flush retries the rich fields.
-      try{
-        if(typeof syncEnqueue === 'function'){
-          syncEnqueue('agent', 'agents', entry.payload, 'agent:'+payload.id, 'id');
-        }
-      }catch(e){}
-      return true;
-    }
-  }
-
-  // Total failure — keep in queue, surface the error in the stuck-queue banner
-  return false;
-}
-
-// Set up background flusher + online/focus listeners. Idempotent — safe
-// to call multiple times.
-function syncStartBackgroundFlush(){
-  syncLoadQueue();
-  if(SYNC_FLUSH_TIMER) return;
-  SYNC_FLUSH_TIMER = setInterval(syncFlush, 30000);
-  if(typeof window !== 'undefined'){
-    window.addEventListener('online', function(){
-      console.log('[sync] back online — flushing queue');
-      syncFlush(true);
-    });
-    window.addEventListener('focus', function(){ syncFlush(); });
-    // Warn user if they try to close with pending writes — last line of defense
-    window.addEventListener('beforeunload', function(e){
-      var st = syncStatus();
-      if(st.total > 0){
-        e.preventDefault();
-        e.returnValue = 'You have '+st.total+' unsaved change(s) that are still syncing. Wait a moment, or your work may be lost.';
-        return e.returnValue;
-      }
-    });
-  }
-  // ── Calvin 2026-05-08: SAFETY NET SENTINEL ──
-  // Every 60 seconds, check DB.agents for changes since the last snapshot.
-  // If we detect a change that's NOT already in the sync queue (meaning
-  // some code path mutated DB without calling saveAgentToSupabase), force-
-  // enqueue that agent. This is the catch-all that guarantees no work is
-  // ever silently lost even if a future bug introduces a new path that
-  // forgets to save.
-  syncStartSentinel();
-}
-
-// ── Safety net sentinel ──
-// Periodically diffs DB.agents against its last-known-saved snapshot. Any
-// agent whose JSON has changed AND isn't already in the queue gets force-
-// enqueued. Defense in depth against forgotten save calls.
-var SENTINEL_SNAPSHOT = {};  // {agentId: jsonString}
-var SENTINEL_TIMER = null;
-function syncStartSentinel(){
-  if(SENTINEL_TIMER) return;
-  // Build initial snapshot
-  syncRebaselineSentinel();
-  SENTINEL_TIMER = setInterval(syncSentinelCheck, 60000);
-}
-
-function syncRebaselineSentinel(){
-  if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return;
-  SENTINEL_SNAPSHOT = {};
-  // Calvin 2026-05-13 911.4: also initialize high-water richness marks
-  // from this snapshot. Anything thinner than this in the future is a
-  // regression and the sentinel will reject it instead of propagating.
-  SENTINEL_HIGH_WATER = {};
-  DB.agents.forEach(function(a){
-    if(a && a.id != null){
-      try{ SENTINEL_SNAPSHOT[a.id] = JSON.stringify(a); }catch(e){}
-      try{ SENTINEL_HIGH_WATER[a.id] = _sentinelAgentRichness(a); }catch(e){}
-    }
-  });
-}
-
-// Count "richness" of an agent record — number of non-empty meaningful fields.
-// Used by the sentinel to detect regressions (in-memory record got thinner
-// than the snapshot, which means something stripped data and we should NOT
-// force-save the thinner version to Supabase). Calvin 2026-05-13 911.4.
-function _sentinelAgentRichness(a){
-  if(!a) return 0;
-  var score = 0;
-  // Identity fields (count low — most agents have these)
-  if(a.name)     score += 1;
-  if(a.username) score += 1;
-  if(a.password) score += 1;
-  if(a.role)     score += 1;
-  if(a.email)    score += 1;
-  if(a.active)   score += 1;
-  // RICH fields — these are the ones that get silently stripped
-  if(Array.isArray(a.programs)   && a.programs.length)              score += 3;
-  if(a.agentCodes && Object.keys(a.agentCodes).length)              score += 3;
-  if(a.team)                                                        score += 2;
-  if(Array.isArray(a.iboMarkets) && a.iboMarkets.length)            score += 3;
-  if(a.teamLeaderId)                                                score += 2;
-  if(a.marketManagerId)                                             score += 2;
-  if(a.campaignManagerId)                                           score += 2;
-  if(a.reportsTo && Object.keys(a.reportsTo).length)                score += 2;
-  if(Array.isArray(a.channels)   && a.channels.length)              score += 1;
-  if(Array.isArray(a.links)      && a.links.length)                 score += 1;
-  if(a.start)                                                       score += 1;
-  if(a.phone)                                                       score += 1;
-  if(a.address)                                                     score += 1;
-  if(a.profilePic)                                                  score += 1;
-  if(a.category)                                                    score += 1;
-  if(a.depts && Object.keys(a.depts).length)                        score += 1;
-  return score;
-}
-
-// Track the highest richness we've ever observed per agent. The sentinel
-// uses this to reject regressions — never push a thinner version than the
-// fullest one we've seen. Reset on load (because Supabase brings the truth).
-var SENTINEL_HIGH_WATER = {};
-
-function syncSentinelCheck(){
-  if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return;
-  if(!supaClient) return;
-  var changed = 0;
-  var enqueued = 0;
-  var blocked = 0;
-  DB.agents.forEach(function(a){
-    if(!a || a.id == null) return;
-    var current;
-    try{ current = JSON.stringify(a); }catch(e){ return; }
-    var prior = SENTINEL_SNAPSHOT[a.id];
-    if(prior !== current){
-      changed++;
-      // ── Calvin 2026-05-13 911.4 FIX ──
-      // BEFORE force-saving, check if the in-memory version is THINNER
-      // than the high-water mark we've observed for this agent. If yes,
-      // something stripped fields out of the in-memory record — do NOT
-      // propagate that to Supabase. Instead, restore the local copy from
-      // the snapshot (which has the richer data).
-      var currentRichness = _sentinelAgentRichness(a);
-      var highWater       = SENTINEL_HIGH_WATER[a.id] || 0;
-      if(highWater > 0 && currentRichness < highWater - 2){
-        // Regression detected. The in-memory record is significantly thinner
-        // than what we've seen before. DO NOT push to Supabase.
-        console.error('[sentinel] ⛔ BLOCKED save of agent #'+a.id+' ('+a.name+') — current richness '+currentRichness+' < high-water '+highWater+'. Something stripped data. Re-pulling from Supabase to restore.');
-        blocked++;
-        // Attempt to restore from Supabase
-        if(typeof syncPullFreshAgent === 'function'){
-          try{ syncPullFreshAgent(a.id); }catch(e){ console.warn('[sentinel restore]', e); }
-        }
-        // Don't update SENTINEL_SNAPSHOT — we want next tick to retry the comparison
-        return;
-      }
-      // Otherwise, update high-water mark
-      if(currentRichness > highWater) SENTINEL_HIGH_WATER[a.id] = currentRichness;
-
-      // Check whether this agent already has a pending write in the queue
-      var alreadyQueued = SYNC_QUEUE.some(function(e){ return e.recordKey === 'agent:'+a.id; });
-      if(!alreadyQueued){
-        // FORCE-enqueue — some code path mutated this agent without saving
-        if(typeof saveAgentToSupabase === 'function'){
-          console.warn('[sentinel] agent #'+a.id+' ('+a.name+') changed but NOT in sync queue — forcing save. Some code path mutated the agent without calling save.');
-          try{ saveAgentToSupabase(a); enqueued++; }catch(e){ console.error('[sentinel] force-enqueue failed', e); }
-        }
-      }
-      SENTINEL_SNAPSHOT[a.id] = current;
-    }
-  });
-  // Detect deletions too — agent vanished from DB
-  Object.keys(SENTINEL_SNAPSHOT).forEach(function(idStr){
-    var id = parseInt(idStr, 10);
-    if(!DB.agents.some(function(a){ return a.id === id; })){
-      console.warn('[sentinel] agent #'+id+' disappeared from DB.agents. Snapshot cleared (no auto-delete from Supabase — Owner must explicitly delete).');
-      delete SENTINEL_SNAPSHOT[idStr];
-      delete SENTINEL_HIGH_WATER[idStr];
-    }
-  });
-  if(changed > 0){
-    var msg = '[sentinel] checked DB.agents: '+changed+' changed, '+enqueued+' force-enqueued';
-    if(blocked > 0) msg += ', '+blocked+' BLOCKED (regression detected)';
-    msg += ' (the rest were already in queue)';
-    console.log(msg);
-  }
-}
 
 
 // Re-pull a single agent's record from Supabase (Owner / admin use only).
@@ -13969,12 +13456,9 @@ async function wmamDebugDump(agentId){
   console.log('Online: ' + (navigator.onLine !== false));
   console.log('Supabase client: ' + (supaClient ? 'CONNECTED' : 'DISCONNECTED'));
   console.log('Local DB.agents count: ' + (DB.agents ? DB.agents.length : 0));
-  console.log('SYNC_QUEUE depth: ' + (SYNC_QUEUE ? SYNC_QUEUE.length : 0));
-  if(SYNC_QUEUE && SYNC_QUEUE.length){
-    console.log('--- Pending writes ---');
-    SYNC_QUEUE.forEach(function(e){
-      console.log('  '+e.recordKey+' (attempts='+e.attempts+(e.lastError?', error="'+e.lastError+'"':'')+')');
-    });
+  console.log('Save architecture: DIRECT-SUPABASE (no queue)');
+  if(window._lastAgentSaveResult){
+    console.log('Last save result:', window._lastAgentSaveResult);
   }
   if(window._lastSbError){
     console.log('Last Supabase error: ', window._lastSbError);
@@ -14106,11 +13590,17 @@ async function wmamProbeWriteFailure(){
   if(typeof saveAgentToSupabase !== 'function'){ console.error('saveAgentToSupabase not available.'); return; }
   window._lastSbError = null;
   console.log('Forcing a save of your own agent record to probe Supabase response...');
-  await saveAgentToSupabase(a);
-  // Give the flush a tick
-  await new Promise(function(r){ setTimeout(r, 1500); });
-  if(typeof syncFlush === 'function') await syncFlush(true);
-  await new Promise(function(r){ setTimeout(r, 1500); });
+  var probeResult = await saveAgentToSupabase(a);
+  if(probeResult && !probeResult.ok){
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('  ⚠ WRITE PROBE FAILED — Supabase rejected the upsert');
+    console.error('═══════════════════════════════════════════════════════════');
+    console.error('  message:', probeResult.error || '(none)');
+    console.error('  code:   ', probeResult.code || '(none)');
+    console.error('');
+    console.error('Send this output to Claude. The error reveals exactly why writes are failing.');
+    return probeResult;
+  }
   if(window._lastSbError){
     console.error('═══════════════════════════════════════════════════════════');
     console.error('  ⚠ WRITE PROBE FAILED — Supabase rejected the upsert');
@@ -14428,6 +13918,276 @@ if(typeof window !== 'undefined') window._repairBareSavedApply = _repairBareSave
 
 
 // ════════════════════════════════════════════════════════════════════════
+//  BACKUP RESTORE  (Calvin 2026-05-14)
+//
+//  Owner / admin tool. Paste the contents of a wmam-backup-YYYY-MM-DD.txt
+//  file (generated by `JSON.stringify(wmamListBackups())` in console) to
+//  browse snapshots and selectively restore agents.
+//
+//  Flow:
+//    1. User pastes the JSON into the textarea
+//    2. Parse and list the snapshots with timestamps + agent counts
+//    3. User picks a snapshot → see all agents in it
+//    4. For each agent, compare snapshot version vs current Supabase
+//       version → user picks "Restore" on the ones they want to recover
+//    5. Restore = save the snapshot agent record via saveAgentToSupabase
+//       (which goes through the new direct-Supabase path, so the result
+//       is confirmed before showing success)
+// ════════════════════════════════════════════════════════════════════════
+
+// Parse pasted JSON; tolerate either an array of snapshots or a single one
+function _backupRestoreParse(rawText){
+  if(!rawText || !rawText.trim()) return null;
+  try{
+    var parsed = JSON.parse(rawText.trim());
+    if(Array.isArray(parsed)){
+      // It's the wmamListBackups() output — array of snapshots
+      return parsed.filter(function(s){ return s && Array.isArray(s.agents); });
+    }
+    if(parsed && Array.isArray(parsed.agents)){
+      // Single snapshot
+      return [parsed];
+    }
+    if(parsed && Array.isArray(parsed.backups)){
+      // The wrapped storage format
+      return parsed.backups.filter(function(s){ return s && Array.isArray(s.agents); });
+    }
+  }catch(e){
+    console.warn('[backupRestore] parse error:', e);
+  }
+  return null;
+}
+
+// Compare a snapshot agent to the current local copy. Returns
+// { added: [], changed: [], unchanged: [] } at the field level.
+function _backupRestoreDiff(snapAgent){
+  if(!snapAgent || snapAgent.id == null) return null;
+  var current = (DB.agents || []).find(function(a){ return a && a.id === snapAgent.id; });
+  var richFields = ['name','role','programs','agentCodes','team','iboMarkets',
+    'teamLeaderId','marketManagerId','campaignManagerId','reportsTo',
+    'cmModel','tcModel','awModel','depts','category','phone','address',
+    'email','active'];
+  var summary = { added: [], changed: [], unchanged: [], missingInSnap: [] };
+  if(!current){
+    summary.exists = false;
+    return summary;
+  }
+  summary.exists = true;
+  richFields.forEach(function(f){
+    var sv = snapAgent[f];
+    var cv = current[f];
+    var sStr = JSON.stringify(sv == null ? null : sv);
+    var cStr = JSON.stringify(cv == null ? null : cv);
+    var sEmpty = (sv == null || sv === '' || (Array.isArray(sv) && sv.length === 0) || (typeof sv === 'object' && !Array.isArray(sv) && sv && Object.keys(sv).length === 0));
+    var cEmpty = (cv == null || cv === '' || (Array.isArray(cv) && cv.length === 0) || (typeof cv === 'object' && !Array.isArray(cv) && cv && Object.keys(cv).length === 0));
+    if(sStr === cStr){
+      summary.unchanged.push(f);
+    } else if(!sEmpty && cEmpty){
+      summary.added.push(f);  // Snapshot has data, current doesn't → recovery opportunity
+    } else if(sEmpty && !cEmpty){
+      summary.missingInSnap.push(f);  // Current has data, snapshot doesn't
+    } else {
+      summary.changed.push(f);  // Both differ, both have values
+    }
+  });
+  return summary;
+}
+
+// State for the backup restore panel — persists across renders within one session
+var WMAM_BACKUP_RESTORE_STATE = {
+  rawText:  '',
+  parsed:   null,    // array of snapshots
+  selectedSnapIdx: null,
+  error:    ''
+};
+
+function _backupRestoreReset(){
+  WMAM_BACKUP_RESTORE_STATE = { rawText: '', parsed: null, selectedSnapIdx: null, error: '' };
+}
+
+function _backupRestoreOnPaste(){
+  try{
+    var ta = document.getElementById('backupRestoreTextarea');
+    if(!ta) return;
+    WMAM_BACKUP_RESTORE_STATE.rawText = ta.value;
+    var snapshots = _backupRestoreParse(ta.value);
+    if(!snapshots || snapshots.length === 0){
+      WMAM_BACKUP_RESTORE_STATE.parsed = null;
+      WMAM_BACKUP_RESTORE_STATE.error = 'Could not parse — paste the FULL contents of your wmam-backup file. Should start with [ and contain "agents" arrays.';
+    } else {
+      WMAM_BACKUP_RESTORE_STATE.parsed = snapshots;
+      WMAM_BACKUP_RESTORE_STATE.error = '';
+      // Auto-select newest snapshot
+      WMAM_BACKUP_RESTORE_STATE.selectedSnapIdx = 0;
+    }
+    gotoPanel('backup-restore');
+  }catch(e){ console.warn('[backupRestoreOnPaste]', e); }
+}
+
+function _backupRestoreSelectSnap(idx){
+  WMAM_BACKUP_RESTORE_STATE.selectedSnapIdx = idx;
+  gotoPanel('backup-restore');
+}
+
+// Restore ONE agent from the selected snapshot. Goes through direct save.
+async function _backupRestoreOneAgent(agentId){
+  var st = WMAM_BACKUP_RESTORE_STATE;
+  if(!st.parsed || st.selectedSnapIdx == null) return;
+  var snap = st.parsed[st.selectedSnapIdx];
+  if(!snap || !Array.isArray(snap.agents)) return;
+  var snapAgent = snap.agents.find(function(a){ return a && a.id === agentId; });
+  if(!snapAgent){ alert('Agent #'+agentId+' not found in this snapshot.'); return; }
+  if(!confirm('Restore '+snapAgent.name+' (#'+agentId+') from snapshot dated '+new Date(snap.ts).toLocaleString()+'?\n\nTheir current record will be replaced with the snapshot version. This save goes directly to Supabase.')){ return; }
+  // Replace local copy
+  var idx = DB.agents.findIndex(function(a){ return a && a.id === agentId; });
+  if(idx >= 0) DB.agents[idx] = JSON.parse(JSON.stringify(snapAgent));
+  else DB.agents.push(JSON.parse(JSON.stringify(snapAgent)));
+  // Direct save (returns {ok, error})
+  var result = await saveAgentToSupabase(DB.agents[idx >= 0 ? idx : DB.agents.length - 1]);
+  if(result && result.ok){
+    alert('✓ Restored '+snapAgent.name+'. Refresh the page to verify everywhere.');
+    gotoPanel('backup-restore');
+  } else {
+    alert('✗ Restore failed: '+((result && result.error) || 'unknown error')+'\n\nThe red banner has details.');
+  }
+}
+
+// Restore ALL agents from selected snapshot
+async function _backupRestoreAll(){
+  var st = WMAM_BACKUP_RESTORE_STATE;
+  if(!st.parsed || st.selectedSnapIdx == null) return;
+  var snap = st.parsed[st.selectedSnapIdx];
+  if(!snap || !Array.isArray(snap.agents)) return;
+  if(!confirm('Restore ALL '+snap.agents.length+' agents from snapshot dated '+new Date(snap.ts).toLocaleString()+'?\n\nThis OVERWRITES every agent record with the snapshot version. Goes through direct Supabase saves so each save is confirmed.\n\nContinue?')){ return; }
+  var done = 0, failed = 0;
+  for(var i = 0; i < snap.agents.length; i++){
+    var snapAgent = snap.agents[i];
+    if(!snapAgent || snapAgent.id == null) continue;
+    var idx = DB.agents.findIndex(function(a){ return a && a.id === snapAgent.id; });
+    if(idx >= 0) DB.agents[idx] = JSON.parse(JSON.stringify(snapAgent));
+    else DB.agents.push(JSON.parse(JSON.stringify(snapAgent)));
+    var localCopy = DB.agents.find(function(a){ return a && a.id === snapAgent.id; });
+    var result = await saveAgentToSupabase(localCopy);
+    if(result && result.ok) done++;
+    else failed++;
+  }
+  alert('Restore complete.\n  ✓ Saved: '+done+'\n  ✗ Failed: '+failed+'\n\nIf any failed, check the red error banners and retry individually.');
+  gotoPanel('backup-restore');
+}
+
+if(typeof window !== 'undefined'){
+  window._backupRestoreParse        = _backupRestoreParse;
+  window._backupRestoreDiff         = _backupRestoreDiff;
+  window._backupRestoreReset        = _backupRestoreReset;
+  window._backupRestoreOnPaste      = _backupRestoreOnPaste;
+  window._backupRestoreSelectSnap   = _backupRestoreSelectSnap;
+  window._backupRestoreOneAgent     = _backupRestoreOneAgent;
+  window._backupRestoreAll          = _backupRestoreAll;
+}
+
+function panelBackupRestore(){
+  var u = DB.current;
+  var canAccess = (typeof isOwner === 'function' && isOwner(u)) || (u && u.role === 'admin');
+  if(!canAccess){
+    return panelHeader('💾 Backup Restore')
+      + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Owner / admin only.</div></div>';
+  }
+  var h = panelHeader('💾 Backup Restore');
+  var st = WMAM_BACKUP_RESTORE_STATE;
+
+  // Intro
+  h += '<div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">'
+    + '<strong>What this is.</strong> Paste the contents of a <code>wmam-backup-YYYY-MM-DD.txt</code> file (created by running <code>copy(JSON.stringify(wmamListBackups()))</code> in F12 console and pasting into TextEdit). The tool will read every snapshot, let you pick one, and restore agents from that snapshot. Each restore goes through the new direct-Supabase save and is confirmed before showing success.'
+    + '</div>';
+
+  // Step 1: paste textarea
+  h += '<div class="bo-card" style="margin-bottom:18px;padding:18px">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;margin-bottom:10px">Step 1 — Paste backup file contents</div>';
+  h += '<textarea id="backupRestoreTextarea" style="width:100%;min-height:140px;font-family:monospace;font-size:.7rem;padding:10px;border:1px solid var(--sand);border-radius:5px;resize:vertical" placeholder="Paste the entire contents of your wmam-backup file here. Should start with [ and contain agent data...">'+_escapeHtml(st.rawText || '')+'</textarea>';
+  h += '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">';
+  h += '<button onclick="_backupRestoreOnPaste()" class="btn-fire" style="padding:10px 18px;font-size:.74rem">📂 Load Backup</button>';
+  h += '<button onclick="_backupRestoreReset(); gotoPanel(\'backup-restore\')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer">Clear</button>';
+  h += '</div>';
+  if(st.error){
+    h += '<div style="margin-top:10px;padding:10px;background:rgba(220,38,38,.08);border-left:3px solid #dc2626;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#991b1b">'+_escapeHtml(st.error)+'</div>';
+  }
+  h += '</div>';
+
+  if(!st.parsed){
+    return h;
+  }
+
+  // Step 2: pick a snapshot
+  h += '<div class="bo-card" style="margin-bottom:18px;padding:18px">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;margin-bottom:10px">Step 2 — Pick a snapshot ('+st.parsed.length+' available)</div>';
+  st.parsed.forEach(function(snap, idx){
+    var selected = (idx === st.selectedSnapIdx);
+    var dateStr = snap.ts ? new Date(snap.ts).toLocaleString() : '(no timestamp)';
+    var count = snap.count || (snap.agents ? snap.agents.length : 0);
+    h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:'+(selected?'rgba(124,58,237,.1)':'transparent')+';border:1px solid '+(selected?'#7c3aed':'var(--sand)')+';border-radius:6px;margin-bottom:8px;cursor:pointer" onclick="_backupRestoreSelectSnap('+idx+')">';
+    h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;color:var(--brown);font-weight:600">'+(selected?'● ':'○ ')+'Snapshot #'+(idx+1)+' — '+_escapeHtml(dateStr)+'</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">'+count+' agents in this snapshot</div></div>';
+    if(selected){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:#7c3aed;text-transform:uppercase">SELECTED</div>';
+    }
+    h += '</div>';
+  });
+  h += '</div>';
+
+  // Step 3: browse agents in selected snapshot
+  var selSnap = st.parsed[st.selectedSnapIdx];
+  if(!selSnap){
+    return h + '<div class="bo-card" style="padding:20px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Pick a snapshot above to see its agents.</div>';
+  }
+  h += '<div class="bo-card" style="margin-bottom:18px;padding:18px">';
+  h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px">Step 3 — Restore agents from snapshot</div>';
+  h += '<button onclick="_backupRestoreAll()" style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:5px;cursor:pointer;font-weight:700">⚠ Restore ALL ('+selSnap.agents.length+')</button>';
+  h += '</div>';
+
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-bottom:14px;line-height:1.5"><strong>Tip:</strong> Look for agents marked <span style="color:#059669;font-weight:700">RECOVERY OPPORTUNITY</span> — those have rich data in the snapshot that is MISSING from the current record. Those are the ones likely worth restoring.</div>';
+
+  // Sort agents: recovery opportunities first
+  var sortedAgents = selSnap.agents.slice().filter(function(a){ return a && a.id != null; }).map(function(a){
+    var diff = _backupRestoreDiff(a);
+    return { agent: a, diff: diff, score: diff ? diff.added.length * 2 + diff.changed.length : 0 };
+  }).sort(function(a, b){ return b.score - a.score; });
+
+  sortedAgents.forEach(function(entry){
+    var a = entry.agent;
+    var diff = entry.diff;
+    var isRecovery = diff && diff.added.length > 0;
+    var bgColor = isRecovery ? 'rgba(5,150,105,.04)' : 'transparent';
+    var borderColor = isRecovery ? '#059669' : 'var(--sand)';
+    h += '<div style="padding:12px 14px;background:'+bgColor+';border:1px solid '+borderColor+';border-radius:6px;margin-bottom:8px">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">';
+    h += '<div style="flex:1;min-width:220px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;color:var(--brown);font-weight:600">'+_escapeHtml(a.name||'(no name)')+' <span style="color:var(--muted);font-weight:400">— '+_escapeHtml(a.role||'(no role)')+' #'+a.id+'</span></div>';
+    if(isRecovery){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:#059669;font-weight:700;margin-top:3px">★ RECOVERY OPPORTUNITY — snapshot has data missing from current record</div>';
+    }
+    if(diff && diff.added.length){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-top:4px"><strong>Snapshot has data for:</strong> '+_escapeHtml(diff.added.join(', '))+'</div>';
+    }
+    if(diff && diff.changed.length){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-top:2px"><strong>Different from current:</strong> '+_escapeHtml(diff.changed.join(', '))+'</div>';
+    }
+    if(diff && !diff.exists){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:#dc2626;margin-top:4px;font-weight:700">⚠ Agent does NOT exist in current DB — restoring will RECREATE</div>';
+    }
+    h += '</div>';
+    h += '<button onclick="_backupRestoreOneAgent('+a.id+')" class="btn-fire" style="padding:8px 14px;font-size:.7rem">Restore</button>';
+    h += '</div></div>';
+  });
+
+  h += '</div>';
+  return h;
+}
+
+if(typeof window !== 'undefined') window.panelBackupRestore = panelBackupRestore;
+
+
+// ════════════════════════════════════════════════════════════════════════
 //  MULTI-TEAM CLEANUP  (Calvin 2026-05-13)
 //
 //  Owner / Inventory dept tool. Finds every agent who's listed in MORE
@@ -14575,70 +14335,34 @@ function panelSyncStatus(){
     summaryBg = 'rgba(100,100,100,.08)';
     summaryColor = '#444';
     summaryHeading = '📴 You are OFFLINE';
-  } else if(st.total === 0){
+  } else {
     summaryBg = 'rgba(5,150,105,.08)';
     summaryColor = '#059669';
-    summaryHeading = '✓ All changes saved';
-  } else if(st.failed > 0){
-    summaryBg = 'rgba(204,0,0,.08)';
-    summaryColor = '#CC0000';
-    summaryHeading = '⚠ '+st.failed+' write(s) FAILED — '+st.retrying+' retrying, '+st.pending+' new';
-  } else {
-    summaryBg = 'rgba(217,119,6,.08)';
-    summaryColor = '#D97706';
-    summaryHeading = '↻ '+st.total+' change(s) syncing…';
+    summaryHeading = '✓ Direct-sync active';
   }
   h += '<div class="bo-card" style="padding:20px 24px;margin-bottom:18px;background:'+summaryBg+';border:1px solid '+summaryColor+'40">'
     +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px;color:'+summaryColor+';margin-bottom:4px">'+summaryHeading+'</div>'
-    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted)">All changes you make are saved locally first, then synced to the cloud. If a sync fails, it will retry automatically. Your work is never lost.</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted)">Every save goes directly to Supabase and is confirmed before showing success. If a save fails, you see a red error banner with a Retry button. No silent queue — what you see is what is saved.</div>'
     +'</div>';
 
-  // Action buttons
-  if(st.total > 0){
-    h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">';
-    h += '<button onclick="syncRetryAll();setTimeout(function(){gotoPanel(\'sync-status\');},500)" style="background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">↻ Retry All Now</button>';
-    h += '</div>';
-  }
+  h += '<div class="bo-card" style="padding:20px 24px;margin-bottom:18px">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px;margin-bottom:8px">How saves work now</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.6">'
+    +'<strong>1.</strong> You click Save on an agent or setting.<br>'
+    +'<strong>2.</strong> The change is sent directly to Supabase and we wait for a response.<br>'
+    +'<strong>3.</strong> Success → the record updates from the server\'s authoritative copy. Done.<br>'
+    +'<strong>4.</strong> Failure → a red banner appears with the exact error and a Retry button. The change is also kept in local backup.<br><br>'
+    +'<strong>Realtime sync:</strong> when another admin saves a change on their device, your screen receives the new data within ~1 second and updates automatically (no refresh needed).'
+    +'</div>'
+    +'</div>';
 
-  // Pending writes list
-  if(SYNC_QUEUE.length === 0){
-    h += '<div class="bo-card" style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No pending writes. Everything is saved.</div>';
-  } else {
-    h += '<div class="bo-card" style="padding:0;overflow:hidden">';
-    h += '<div style="background:var(--offwhite);padding:12px 20px;border-bottom:1px solid var(--border);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Pending Writes ('+SYNC_QUEUE.length+')</div>';
-    SYNC_QUEUE.forEach(function(e){
-      var ageSec = Math.round((Date.now() - (e.createdAt||0))/1000);
-      var ageStr = ageSec < 60 ? ageSec+'s ago'
-                 : ageSec < 3600 ? Math.round(ageSec/60)+'m ago'
-                 : ageSec < 86400 ? Math.round(ageSec/3600)+'h ago'
-                 : Math.round(ageSec/86400)+'d ago';
-      var statusColor = e.attempts >= 3 ? '#CC0000' : e.attempts > 0 ? '#D97706' : '#059669';
-      var statusLabel = e.attempts >= 3 ? 'FAILED ('+e.attempts+' tries)'
-                      : e.attempts > 0 ? 'RETRYING ('+e.attempts+' tries)'
-                      : 'PENDING';
-      h += '<div style="padding:14px 20px;border-bottom:1px solid rgba(0,0,0,.05);display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap">';
-      h += '<div style="flex:1;min-width:240px">';
-      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;font-weight:700">'+_escapeHtml(e.recordKey || (e.kind+':'+e.payload.id))+' <span style="color:'+statusColor+';font-size:.62rem;letter-spacing:1.5px;margin-left:8px">'+statusLabel+'</span></div>';
-      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px">Table: '+_escapeHtml(e.table)+' &middot; Created '+ageStr+'</div>';
-      if(e.lastError){
-        h += '<div style="margin-top:6px;padding:6px 10px;background:rgba(204,0,0,.06);border-left:3px solid #CC0000;font-family:monospace;font-size:.72rem;color:#991B1B;word-break:break-all">'+_escapeHtml(e.lastError)+'</div>';
-      }
-      h += '</div>';
-      // Action buttons — only Owner+admin can discard
-      if(typeof isOwner === 'function' && (isOwner(u) || u.role === 'admin')){
-        h += '<button onclick="if(confirm(\'Discard this pending write? The change has been saved locally but will NOT sync to Supabase.\')){ syncDiscard(\''+e.id+'\'); setTimeout(function(){gotoPanel(\'sync-status\');},100); }" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.3);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">Discard</button>';
-      }
-      h += '</div>';
-    });
-    h += '</div>';
-  }
-
-  // Owner-only bulk refresh tools
+  // Owner-only recovery tools
   if(typeof isOwner === 'function' && (isOwner(u) || u.role === 'admin')){
     h += '<div class="bo-card" style="padding:20px 24px;margin-top:18px">';
     h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;margin-bottom:6px">⚙️ Recovery Tools</div>';
     h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:12px">If a user reports stale or missing data, force a fresh pull from Supabase. This overwrites the local copy with whatever is in the cloud.</div>';
-    h += '<button onclick="syncPullFreshAllAgents()" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:5px;cursor:pointer;font-weight:700">🔄 Refresh All Agents from Supabase</button>';
+    h += '<button onclick="syncPullFreshAllAgents()" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:5px;cursor:pointer;font-weight:700;margin-right:8px">🔄 Refresh All Agents from Supabase</button>';
+    h += '<button onclick="gotoPanel(\'backup-restore\')" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 16px;border-radius:5px;cursor:pointer;font-weight:700">💾 Restore from Backup File</button>';
     h += '</div>';
   }
 
@@ -14741,22 +14465,6 @@ async function loadFromSupabase(){
       // Auto-derive .category/.depts for every legacy record we just loaded.
       if(typeof migrateAllAgentCategories==='function') migrateAllAgentCategories();
       DB.nextId = Math.max.apply(null, DB.agents.map(function(a){return a.id;})) + 1;
-
-      // ── Calvin 2026-05-13: rebaseline sentinel snapshot AFTER load+migrations ──
-      // Without this, the sentinel sees post-load normalizations (syncIboModels,
-      // migrateAllAgentCategories, role corrections) as "unsynced changes" on
-      // its first check and force-enqueues every agent. Polluts the console
-      // and creates Supabase write churn. Rebaselining here makes the sentinel
-      // start with a clean snapshot of the post-migration state.
-      try{
-        if(typeof syncRebaselineSentinel === 'function'){
-          // Delay rebaseline until any synchronous post-load mutations settle.
-          setTimeout(function(){
-            try{ syncRebaselineSentinel(); console.log('[sentinel] rebaselined after loadFromSupabase completed'); }
-            catch(e){ console.warn('[sentinel rebaseline]', e); }
-          }, 2000);
-        }
-      } catch(e){}
 
       // ── ONE-TIME ROLE MIGRATION: TANITA FLOWERS (id 2) ──
       // Tanita's correct role is Campaign Manager (cm-oklahoma pay model).
@@ -14886,24 +14594,8 @@ async function loadFromSupabase(){
     // Load settings (EmailJS keys)
     var settings = await sbSelect('app_settings');
     if(settings){
-      // ── Calvin 2026-05-08 911 FIX: skip any app_setting that has a
-      // pending sync queue entry. The local version is newer and the
-      // queue will push it up shortly.
-      var pendingSettingKeys = {};
-      try{
-        if(Array.isArray(SYNC_QUEUE)){
-          SYNC_QUEUE.forEach(function(e){
-            if(e && e.recordKey && e.recordKey.indexOf('app_setting:') === 0){
-              pendingSettingKeys[e.recordKey.substring('app_setting:'.length)] = true;
-            }
-          });
-        }
-      }catch(qE){}
+      // Calvin 2026-05-14: app_settings load is direct now — no queue check needed
       settings.forEach(function(s){
-        if(s && s.key && pendingSettingKeys[s.key]){
-          console.warn('[loadFromSupabase] SKIPPING app_setting:'+s.key+' from Supabase — has pending local write in queue');
-          return;
-        }
         if(s.key==='brevo_key' && s.value) BREVO_API_KEY=s.value;
         if(s.key==='prog_thresholds' && s.value){ try{PROG_THRESHOLDS=JSON.parse(s.value);}catch(e){} }
         if(s.key==='departments_cfg' && s.value){ try{var dc=JSON.parse(s.value);if(dc&&Array.isArray(dc))WMAM_DEPARTMENTS=dc;}catch(e){} }
@@ -15256,13 +14948,6 @@ function _mergeServerAgentIntoLocal(serverRow){
   var idx = DB.agents.findIndex(function(a){ return a && a.id === mapped.id; });
   if(idx >= 0) DB.agents[idx] = mapped;
   else DB.agents.push(mapped);
-  // Update sentinel snapshot so it doesn't fire spuriously
-  try{
-    if(typeof SENTINEL_SNAPSHOT === 'object') SENTINEL_SNAPSHOT[mapped.id] = JSON.stringify(mapped);
-    if(typeof SENTINEL_HIGH_WATER === 'object' && typeof _sentinelAgentRichness === 'function'){
-      SENTINEL_HIGH_WATER[mapped.id] = _sentinelAgentRichness(mapped);
-    }
-  }catch(e){}
   saveToStorage();
 }
 
@@ -23585,6 +23270,7 @@ function gotoPanel(id, params){
     'my-markets':'My Markets','market-breakdown':'Market Breakdown',
     'repair-bare-saved':'Repair Bare-Saved Agents',
     'multi-team-cleanup':'Multi-Team Cleanup',
+    'backup-restore':'Backup Restore',
     'inv-dashboard':'All Inventory','inv-upload':'Upload Devices',
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
@@ -23627,6 +23313,7 @@ function gotoPanel(id, params){
     'my-markets':panelMyMarkets,'market-breakdown':panelMarketBreakdown,
     'repair-bare-saved':panelRepairBareSaved,
     'multi-team-cleanup':panelMultiTeamCleanup,
+    'backup-restore':panelBackupRestore,
     'gm-inventory':panelGMInventory,'gm-upload':panelGMUpload,
     'gm-transfers':panelGMTransfers,'gm-agent-inv':panelGMAgentInventory,
     'gm-pricelist':panelGMPricelist,
@@ -23678,6 +23365,7 @@ function gotoPanel(id, params){
     'market-breakdown':panelMarketBreakdown,
     'repair-bare-saved':panelRepairBareSaved,
     'multi-team-cleanup':panelMultiTeamCleanup,
+    'backup-restore':panelBackupRestore,
     'onboard-upload':panelOnboardUpload,
     'bg-auth':panelBgAuth,
     'gm-ticket':panelGmTicket,
@@ -53335,13 +53023,6 @@ document.addEventListener('keydown', function(e){
 // Init
 document.getElementById('boDateEl').textContent=new Date().toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
 initSupabase();
-// ── Calvin 2026-05-14: queue + sentinel DORMANT in new architecture ──
-// Saves now go direct-Supabase (await + return outcome). The queue is no
-// longer needed. The sentinel ran every 60s comparing in-memory snapshots
-// and was actively causing data loss by pushing stale local copies over
-// fresh server data. Both are kept defined but no longer started.
-// To re-enable: uncomment the next line.
-// if(typeof syncStartBackgroundFlush === 'function') syncStartBackgroundFlush();
 // ── Calvin 2026-05-08: inventory custody — periodic timeout escalation ──
 // Every 15 minutes, scan pending transfers and fire escalation notifications
 // for any older than 48 hours.
@@ -53365,36 +53046,15 @@ if(typeof trainingAutoAdvancePending === 'function'){
 }
 // Load data async then init page
 (async function(){
-  // ── Calvin 2026-05-08 911 FIX: PUSH BEFORE PULL ──
-  // Old order: load from Supabase (which clobbered local edits), THEN
-  // flush queue. New order: flush queue FIRST so pending local writes
-  // reach Supabase, THEN load (with merge logic so anything still pending
-  // stays local).
-  //
-  // We have to load the queue from localStorage before we can flush it,
-  // which syncStartBackgroundFlush already does. That ran above. So at
-  // this point SYNC_QUEUE is populated with any prior-session pending writes.
-  if(typeof syncFlush === 'function' && typeof SYNC_QUEUE !== 'undefined' && Array.isArray(SYNC_QUEUE) && SYNC_QUEUE.length){
-    try{
-      console.log('[init] FLUSH BEFORE LOAD — '+SYNC_QUEUE.length+' pending write(s) from prior session');
-      await syncFlush(true);
-      console.log('[init] flush complete, queue length now '+SYNC_QUEUE.length);
-    }catch(e){ console.warn('[init] pre-load flush failed (will retry post-load):', e); }
-  }
+  // Calvin 2026-05-14: DIRECT-SUPABASE INIT
+  // Just load from Supabase and subscribe to realtime. No queue to flush.
   await loadFromSupabase();
-  // ── Calvin 2026-05-14: subscribe to realtime changes on agents + app_settings ──
+  // ── Subscribe to realtime changes on agents + app_settings ──
   // K-Anna's edits appear on Calvin's screen within ~1 sec (and vice versa)
   // without anyone refreshing. Falls back gracefully if Realtime isn't enabled.
   if(typeof subscribeAgentsRealtime === 'function'){
     try{ subscribeAgentsRealtime(); }catch(e){ console.warn('[init] realtime subscribe failed (safe to ignore):', e); }
   }
-  // ── Calvin 2026-05-14: queue/sentinel/stuck-banner DORMANT in new arch ──
-  // Saves now go direct via saveAgentToSupabase / saveAppSettingToSupabase
-  // which await the Supabase response. No queue means no stuck queue and no
-  // sentinel chasing phantom mutations. The code remains in place for rollback
-  // but no longer fires.
-  // (If you ever need to re-enable the old behavior, set ENABLE_LEGACY_QUEUE=true
-  // and uncomment the calls below.)
   // Restore session if user was already logged in
   try{
     var savedId = sessionStorage.getItem('wmam_session');
