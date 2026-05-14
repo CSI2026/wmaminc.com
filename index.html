@@ -30504,7 +30504,38 @@ function invDeptApprove(transferId, campaign){
       formType:'inv-transfer-outcome', data:{kind:'inv-transfer-outcome', transferId:req.id, campaign:campaign, outcome:'approved'}
     });
   }
+  // Calvin 2026-05-14: Remove the original Inv Dept approval notifications
+  // for this transfer so they stop showing in everyone's bell.
+  _invDeptResolveNotifications(transferId);
   return true;
+}
+
+// ── Calvin 2026-05-14: Resolve (remove) all 'inv-dept-approval' notifications
+// for a given transfer. Called after approve OR deny so the request stops
+// showing in every Inv Dept member's bell. Also pushes the deletion to
+// Supabase so other devices stop showing it too.
+function _invDeptResolveNotifications(transferId){
+  try{
+    if(typeof WMAM_NOTIFICATIONS !== 'object' || !Array.isArray(WMAM_NOTIFICATIONS)) return;
+    var toRemove = [];
+    WMAM_NOTIFICATIONS = WMAM_NOTIFICATIONS.filter(function(n){
+      var isMatch = n && n.formType === 'inv-dept-approval'
+                 && n.data && n.data.transferId === transferId;
+      if(isMatch) toRemove.push(n);
+      return !isMatch;
+    });
+    if(typeof saveNotifications === 'function') saveNotifications();
+    if(typeof renderNotifBell === 'function') renderNotifBell();
+    // Best-effort delete from Supabase so other devices clear the bell too
+    if(typeof supaClient !== 'undefined' && supaClient){
+      toRemove.forEach(function(n){
+        try{
+          supaClient.from('notifications').delete().eq('id', n.id)
+            .then(function(){}).catch(function(){});
+        }catch(e){}
+      });
+    }
+  }catch(e){ console.warn('[_invDeptResolveNotifications]', e); }
 }
 
 function invDeptDeny(transferId, campaign, reason){
@@ -30543,6 +30574,8 @@ function invDeptDeny(transferId, campaign, reason){
       formType:'inv-transfer-outcome', data:{kind:'inv-transfer-outcome', transferId:req.id, campaign:campaign, outcome:'denied'}
     });
   }
+  // Calvin 2026-05-14: clear the original approval notifications from all bells
+  _invDeptResolveNotifications(transferId);
   return true;
 }
 
@@ -52189,6 +52222,7 @@ function panelPendingTransfers(){
   var needsMyMmApproval     = [];
   var needsMySignature      = [];
   var needsMyHolderApproval = [];
+  var needsMyInvDeptApproval = []; // Calvin 2026-05-14
   var waitingOnOthers       = [];
   if(typeof CAMPAIGN_REGISTRY === 'object'){
     Object.keys(CAMPAIGN_REGISTRY).forEach(function(camp){
@@ -52206,9 +52240,13 @@ function panelPendingTransfers(){
         } else if(t.status === 'pending-holder-approval'){
           // Calvin 2026-05-08: holder-approval bucket
           if(t.holderIdForApproval === u.id || isOwner(u) || isInv) needsMyHolderApproval.push(entry);
+        } else if(t.status === 'pending-inv-dept-approval'){
+          // Calvin 2026-05-14: Inv Dept must approve before recipient is asked to sign
+          if(isOwner(u) || isInv) needsMyInvDeptApproval.push(entry);
+          else if(t.fromId === u.id) waitingOnOthers.push(entry);
         } else if(t.status === 'pending-agent-signature' && t.toId === u.id){
           needsMySignature.push(entry);
-        } else if(t.fromId === u.id && (t.status === 'pending-mm-approval' || t.status === 'pending-holder-approval' || t.status === 'pending-agent-signature')){
+        } else if(t.fromId === u.id && (t.status === 'pending-mm-approval' || t.status === 'pending-holder-approval' || t.status === 'pending-inv-dept-approval' || t.status === 'pending-agent-signature')){
           waitingOnOthers.push(entry);
         }
       });
@@ -52217,6 +52255,55 @@ function panelPendingTransfers(){
 
   var h='';
   h += panelHeader('🔄 Pending Transfers');
+
+  // ── Calvin 2026-05-14: INV DEPT APPROVAL QUEUE — top section ──
+  // Manager→agent transfers awaiting Inv Dept review. Approval/denial
+  // is done from this panel — no need to navigate to a separate one.
+  if(needsMyInvDeptApproval.length){
+    h += '<div style="background:linear-gradient(135deg,rgba(124,58,237,.1),rgba(91,33,182,.06));border:2px solid #7c3aed;border-radius:10px;padding:18px;margin-bottom:18px">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:4px">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:#7c3aed;letter-spacing:2px">🛡️ INV DEPT APPROVAL — '+needsMyInvDeptApproval.length+' AWAITING</div>';
+    h += '<button onclick="gotoPanel(\'inv-dept-approvals\')" style="background:white;border:1px solid #7c3aed;color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700">Full Approval Queue →</button>';
+    h += '</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:12px;line-height:1.5">A manager (CM/MM/IBO/TL) is trying to transfer inventory to an agent. They do NOT have the "Transfer Without Approval" flag, so the Inventory Department must approve or deny before the recipient is asked to sign. Approve → recipient gets the invoice-signature notification. Deny → sender is notified with your reason.</div>';
+    needsMyInvDeptApproval.forEach(function(entry){
+      var t = entry.transfer;
+      var ageMs = Date.now() - (t.createdAt ? new Date(t.createdAt).getTime() : 0);
+      var ageMin = Math.floor(ageMs / 60000);
+      var ageStr = ageMin < 60 ? ageMin+'m ago'
+                 : ageMin < 1440 ? Math.floor(ageMin/60)+'h ago'
+                 : Math.floor(ageMin/1440)+'d ago';
+      var totalCost = (t.devices||[]).reduce(function(s,d){
+        var resolved = (typeof invDeviceInvoiceCost === 'function') ? invDeviceInvoiceCost(d) : {cost: d.devCost||0};
+        return s + resolved.cost;
+      }, 0);
+      h += '<div style="background:white;border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:14px;margin-bottom:10px" data-transfer-id="'+_escapeAttr(t.id)+'">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:8px">';
+      h += '<div style="flex:1;min-width:240px">';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:#7c3aed">'+_escapeHtml(entry.label)+' &middot; '+t.imeis.length+' device'+(t.imeis.length===1?'':'s')+'</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.86rem;color:var(--brown);margin-top:3px"><strong>'+_escapeHtml(t.fromName)+'</strong> <span style="color:var(--muted);font-size:.74rem">('+_escapeHtml(t.fromRole||'')+')</span> → <strong>'+_escapeHtml(t.toName)+'</strong> <span style="color:var(--muted);font-size:.74rem">('+_escapeHtml(t.toRole||'')+')</span></div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:3px">Requested '+ageStr+(t.reason?' &middot; Reason: <em>'+_escapeHtml(t.reason)+'</em>':'')+(t.marketLocked ? ' &middot; Market: <strong>'+_escapeHtml(t.marketLocked)+'</strong>' : '')+'</div>';
+      h += '</div>';
+      if(totalCost > 0){
+        h += '<div style="text-align:right;flex-shrink:0">';
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted)">Invoice Value</div>';
+        h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--brown)">$'+totalCost.toFixed(2)+'</div>';
+        h += '</div>';
+      }
+      h += '</div>';
+      // IMEI preview
+      var imeiPrev = t.imeis.slice(0,4).join(', ');
+      if(t.imeis.length > 4) imeiPrev += ', +'+(t.imeis.length-4)+' more';
+      h += '<div style="background:rgba(124,58,237,.04);border:1px solid rgba(124,58,237,.12);border-radius:5px;padding:7px 12px;font-family:monospace;font-size:.72rem;color:var(--brown);margin-bottom:10px;word-break:break-all">'+_escapeHtml(imeiPrev)+'</div>';
+      // Action buttons — Approve / Deny inline
+      h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+      h += '<button onclick="if(invDeptApprove(\''+_escapeAttr(t.id)+'\',\''+_escapeAttr(entry.campaign)+'\')) gotoPanel(\'pending-transfers\')" class="btn-fire" style="flex:1;min-width:130px;justify-content:center;padding:11px;font-size:.78rem;background:linear-gradient(135deg,#059669,#047857);color:white;border:none">✓ APPROVE</button>';
+      h += '<button onclick="(function(){ var r = prompt(\'Reason for denial (the sender will see this):\\\\n\\\\nExamples: wrong recipient, exceeds market quota, agent not yet trained\'); if(r && invDeptDeny(\''+_escapeAttr(t.id)+'\',\''+_escapeAttr(entry.campaign)+'\', r)) gotoPanel(\'pending-transfers\'); })()" style="flex:1;min-width:130px;justify-content:center;padding:11px;font-size:.78rem;background:white;color:#dc2626;border:1.5px solid #dc2626;font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">✗ DENY</button>';
+      h += '</div>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
 
   // ── Section: SIGNATURE REQUIRED (my incoming campaign transfers) ──
   if(needsMySignature.length){
@@ -52372,7 +52459,7 @@ function panelPendingTransfers(){
     h+='</div></div>';
   }
   var all=PENDING_TRANSFERS.filter(function(p){return p.status==='Approved'||p.status==='Denied'||p.status==='Rejected by Recipient';});
-  if(!myIncoming.length&&!awaitingApproval.length&&!all.length&&!needsMySignature.length&&!needsMyMmApproval.length&&!needsMyHolderApproval.length&&!waitingOnOthers.length){
+  if(!myIncoming.length&&!awaitingApproval.length&&!all.length&&!needsMySignature.length&&!needsMyMmApproval.length&&!needsMyHolderApproval.length&&!needsMyInvDeptApproval.length&&!waitingOnOthers.length){
     h+='<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No pending or completed transfers yet.</div>';
   }
   return h;
