@@ -6059,12 +6059,12 @@ function payrollComputeDealSplit(opts){
   var aIsTL = (agent.role === 'Team Leader');
   var aIsMM = (agent.role === 'Market Manager');
   var aIsCM = (agent.role === 'Campaign Manager');
+  var aIsIBO = (agent.role === 'IBO');
 
   // Look up CM for tcModel (Tanita's market vs standard)
-  // If agent IS a CM, use their own tcModel/cmModel directly (they don't have
-  // a campaignManagerId pointing to themselves).
+  // If agent IS a CM or IBO, use their own tcModel/cmModel directly.
   var cmAgent;
-  if(aIsCM){
+  if(aIsCM || aIsIBO){
     cmAgent = agent;
   } else {
     cmAgent = cmId ? DB.agents.find(function(x){return x.id===cmId;}) : null;
@@ -6073,6 +6073,29 @@ function payrollComputeDealSplit(opts){
   var cmModel = (cmAgent && cmAgent.cmModel) || 'none';
 
   if(carrier === 'TruConnect'){
+    // ════════════════════════════════════════════════════════════════
+    //  IBO tc-cm-consolidated (Juan Rincon) — locked spec
+    //    Juan gets paid for ALL enrollments in his consolidated market
+    //    (his own + every agent's). Agents under Juan get $0 from the
+    //    company because Juan pays them privately outside the system.
+    //    NLAD: $10 flat (always to Juan).  Tribal: $25 flat (always to Juan).
+    // ════════════════════════════════════════════════════════════════
+    if(tcModel === 'tc-cm-consolidated'){
+      // Find the IBO (Juan). If the enroller IS the IBO, that's him.
+      // Otherwise it's the cmId of the enrolling agent (which points at Juan
+      // since Juan is set as both the "CM" of his market and the IBO).
+      var iboId = aIsIBO ? aid : cmId;
+      if(iboId){
+        if(opts.isTribal){
+          splits.push({aid:iboId, role:(aIsIBO?'ibo-personal':'ibo-consolidated'), cents:2500});
+        } else {
+          splits.push({aid:iboId, role:(aIsIBO?'ibo-personal':'ibo-consolidated'), cents:1000});
+        }
+      }
+      // Note: the agent (if not the IBO themselves) intentionally gets NO split.
+      return splits;
+    }
+
     if(opts.isTribal){
       // ── TC TRIBAL ── ceiling $28 per deal
       var tribalTotal = opts.agentTribalTotalThatWeek || 1;
@@ -6086,17 +6109,19 @@ function payrollComputeDealSplit(opts){
         splits.push({aid:aid, role:'cm-personal', cents:agentRate*100});
         return splits;
       } else if(aIsTL){
-        agentRate = inTier2 ? 25 : 23;  // TL sliding
+        agentRate = inTier2 ? 23 : 18;  // TL personal same as agent rate
       } else {
         agentRate = inTier2 ? 23 : 18;  // agent sliding
       }
       splits.push({aid:aid, role:(aIsTL?'tl-personal':'agent'), cents:agentRate*100});
 
-      // TL diff override (if agent is field agent reporting to a TL)
+      // TL diff override — "TL gets difference up to agent's tier" per spec.
+      // The TL fills from agent's rate up to $23 (the max agent tier), capped
+      // at the gap. When agent already at $23, TL diff = $0.
       var tlOverride = 0;
       if(tlId && agent.role === 'Field Agent'){
-        var tlRate = inTier2 ? 25 : 23;
-        tlOverride = tlRate - agentRate;
+        var tlTargetCap = 23;
+        tlOverride = Math.max(0, tlTargetCap - agentRate);
         if(tlOverride > 0){
           splits.push({aid:tlId, role:'tl-diff', cents:tlOverride*100});
         }
@@ -6345,6 +6370,330 @@ function payrollClearDebt(agentId, cents, reason, weekId){
 function payrollGetDebt(agentId){
   if(!PAYROLL_DEBT_LEDGER[agentId]) return 0;
   return PAYROLL_DEBT_LEDGER[agentId].balanceCents || 0;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  PAYROLL APPROVAL WORKFLOW (Calvin 2026-05-15)
+//
+//  Per-campaign approval flow. Each weekly campaign (TC, GM, AW, Excess,
+//  Internet) gets uploaded, processed, and reviewed. Once correct, the
+//  Payroll Dept or Owner clicks APPROVE → the week's status flips to
+//  'approved' and feeds into the per-agent weekly rollup.
+//
+//  Editing after approval: Payroll Dept can still edit; system auto-
+//  notifies the Owner so they have full visibility. Write-off of
+//  uncollectable debt is Owner-only.
+// ════════════════════════════════════════════════════════════════════════
+
+// Approve a campaign-week. Returns true if successful.
+function payrollApproveWeek(weekId){
+  if(typeof PAYROLL_WEEKS !== 'object' || !Array.isArray(PAYROLL_WEEKS)) return false;
+  var w = PAYROLL_WEEKS.find(function(x){ return x.id === weekId; });
+  if(!w){ return false; }
+  if(w.status === 'approved'){ return false; }
+  var u = DB.current;
+  if(!u){ return false; }
+  // Permission gate: Owner or anyone with depts.payroll=true (or role=Payroll)
+  var canApprove = (typeof isOwner === 'function' && isOwner(u))
+                || (u && u.role === 'Payroll')
+                || (u && u.depts && u.depts.payroll === true);
+  if(!canApprove){ return false; }
+  w.status = 'approved';
+  w.approvedBy = u.id;
+  w.approvedByName = u.name;
+  w.approvedAt = new Date().toISOString();
+  // Audit trail: record this in the week
+  if(!Array.isArray(w.approvalHistory)) w.approvalHistory = [];
+  w.approvalHistory.push({
+    action:    'approved',
+    actorId:   u.id,
+    actorName: u.name,
+    at:        w.approvedAt
+  });
+  if(typeof savePayrollWeeks === 'function') savePayrollWeeks();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+
+// Unapprove a week. Owner-only. Useful if a mistake was caught right after approval.
+function payrollUnapproveWeek(weekId, reason){
+  if(typeof PAYROLL_WEEKS !== 'object' || !Array.isArray(PAYROLL_WEEKS)) return false;
+  var w = PAYROLL_WEEKS.find(function(x){ return x.id === weekId; });
+  if(!w) return false;
+  if(w.status !== 'approved') return false;
+  var u = DB.current;
+  if(!u) return false;
+  if(typeof isOwner !== 'function' || !isOwner(u)) return false; // Owner only
+  w.status = 'draft';
+  if(!Array.isArray(w.approvalHistory)) w.approvalHistory = [];
+  w.approvalHistory.push({
+    action:    'unapproved',
+    actorId:   u.id,
+    actorName: u.name,
+    reason:    reason || '',
+    at:        new Date().toISOString()
+  });
+  if(typeof savePayrollWeeks === 'function') savePayrollWeeks();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+
+// Edit a specific field on an approved week's row. Notifies Owner of the change.
+// changes: { rowIndex, field, from, to }   (the row index in week.rows)
+function payrollEditApprovedWeek(weekId, changes){
+  if(typeof PAYROLL_WEEKS !== 'object' || !Array.isArray(PAYROLL_WEEKS)) return false;
+  var w = PAYROLL_WEEKS.find(function(x){ return x.id === weekId; });
+  if(!w) return false;
+  if(w.status !== 'approved') return false;
+  var u = DB.current;
+  if(!u) return false;
+  var canEdit = (typeof isOwner === 'function' && isOwner(u))
+             || (u && u.role === 'Payroll')
+             || (u && u.depts && u.depts.payroll === true);
+  if(!canEdit) return false;
+  if(!changes || typeof changes.rowIndex !== 'number' || !changes.field) return false;
+  var row = w.rows[changes.rowIndex];
+  if(!row) return false;
+  // Apply the change
+  row[changes.field] = changes.to;
+  // Flag and audit
+  w.editedAfterApproval = true;
+  if(!Array.isArray(w.editHistory)) w.editHistory = [];
+  var editEntry = {
+    editedBy:   u.id,
+    editedByName: u.name,
+    editedAt:   new Date().toISOString(),
+    changes:    {
+      rowIndex: changes.rowIndex,
+      agentId:  row.agentId,
+      agentName: row.agentName,
+      field:    changes.field,
+      from:     changes.from,
+      to:       changes.to
+    }
+  };
+  w.editHistory.push(editEntry);
+  // Notify Owner — but only if the editor isn't already the Owner
+  if(typeof isOwner === 'function' && !isOwner(u)){
+    if(typeof pushNotification === 'function' && typeof DB !== 'undefined'){
+      var owners = (DB.agents || []).filter(function(a){ return a && a.role === 'owner' && a.active !== false; });
+      owners.forEach(function(o){
+        pushNotification({
+          toIds: [o.id], toRoles: [], icon: '⚠️',
+          title: 'Payroll EDITED After Approval',
+          body: u.name + ' edited approved ' + (w.carrier||'') + ' week ' + (w.periodEnd||'') +
+                ' — row for ' + (row.agentName||'agent #'+row.agentId) +
+                ', field "' + changes.field + '" changed from ' + JSON.stringify(changes.from) +
+                ' to ' + JSON.stringify(changes.to) + '.',
+          priority: 'high',
+          formType: 'payroll-post-approval-edit',
+          data: { kind: 'payroll-post-approval-edit', weekId: w.id, editIndex: w.editHistory.length - 1 }
+        });
+      });
+    }
+  }
+  if(typeof savePayrollWeeks === 'function') savePayrollWeeks();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+
+// Build a per-agent rollup across every approved campaign for a given periodEnd date.
+// Returns: { periodEnd, agents: {agentId: {name, lines:[{carrier, grossCents, chargebackCents, kind}], grossCents, chargebackCents, carryoverAppliedCents, netCents}}, totals:{...} }
+//
+// Lines breakdown each carrier/program. Carryover debt appears as a separate
+// negative line so the agent can see WHY their deposit was reduced.
+function payrollBuildWeeklyRollup(periodEnd){
+  var result = { periodEnd: periodEnd, agents: {}, totals: { grossCents:0, chargebackCents:0, carryoverAppliedCents:0, netCents:0 } };
+  if(typeof PAYROLL_WEEKS !== 'object' || !Array.isArray(PAYROLL_WEEKS)) return result;
+  // First pass — aggregate per-agent gross & chargebacks across approved weeks matching periodEnd
+  PAYROLL_WEEKS.forEach(function(w){
+    if(!w || w.status !== 'approved') return;
+    if(w.periodEnd !== periodEnd) return;
+    (w.rows || []).forEach(function(row){
+      if(!row || !row.agentId) return;
+      var aid = row.agentId;
+      if(!result.agents[aid]){
+        result.agents[aid] = {
+          agentId: aid,
+          agentName: row.agentName || ('Agent #'+aid),
+          lines: [],
+          grossCents: 0,
+          chargebackCents: 0,
+          carryoverAppliedCents: 0,
+          netCents: 0
+        };
+      }
+      var a = result.agents[aid];
+      var lineGross = row.grossCents || 0;
+      var lineCb    = row.chargebackTotal || 0;
+      a.lines.push({
+        carrier:        w.carrier,
+        weekId:         w.id,
+        grossCents:     lineGross,
+        chargebackCents: lineCb,
+        kind:           'carrier-line'
+      });
+      a.grossCents += lineGross;
+      a.chargebackCents += lineCb;
+    });
+  });
+  // Second pass — apply carryover debt as a negative line per agent
+  Object.keys(result.agents).forEach(function(aid){
+    var a = result.agents[aid];
+    var debtBalance = (PAYROLL_DEBT_LEDGER && PAYROLL_DEBT_LEDGER[aid]) ? (PAYROLL_DEBT_LEDGER[aid].balanceCents || 0) : 0;
+    if(debtBalance > 0){
+      // We can only apply what gross-minus-chargebacks can cover
+      var availableForCarryover = Math.max(0, a.grossCents - a.chargebackCents);
+      var applied = Math.min(debtBalance, availableForCarryover);
+      if(applied > 0){
+        a.carryoverAppliedCents = applied;
+        a.lines.push({
+          carrier:    'Carryover Debt',
+          weekId:     null,
+          grossCents: -applied,
+          chargebackCents: 0,
+          kind:       'carryover'
+        });
+      }
+    }
+    a.netCents = a.grossCents - a.chargebackCents - a.carryoverAppliedCents;
+    if(a.netCents < 0) a.netCents = 0; // never negative deposit; remainder stays in debt ledger
+    result.totals.grossCents += a.grossCents;
+    result.totals.chargebackCents += a.chargebackCents;
+    result.totals.carryoverAppliedCents += a.carryoverAppliedCents;
+    result.totals.netCents += a.netCents;
+  });
+  return result;
+}
+
+// Write off an agent's outstanding carryover debt as uncollectable.
+// Owner-only. Moves the balance from "AR" to "Loss" on the P&L.
+function payrollWriteOffDebt(agentId, reason){
+  var u = DB.current;
+  if(!u) return false;
+  if(typeof isOwner !== 'function' || !isOwner(u)) return false; // Owner only
+  if(!PAYROLL_DEBT_LEDGER[agentId]) return false;
+  var ledger = PAYROLL_DEBT_LEDGER[agentId];
+  var balance = ledger.balanceCents || 0;
+  if(balance <= 0) return false;
+  ledger.history = ledger.history || [];
+  ledger.history.push({
+    deltaCents:    -balance,
+    date:          new Date().toISOString().slice(0,10),
+    reason:        reason || 'Debt written off as uncollectable',
+    weekId:        null,
+    kind:          'write-off',
+    writtenOffBy:  u.id,
+    writtenOffByName: u.name,
+    writtenOffAt:  new Date().toISOString()
+  });
+  ledger.balanceCents = 0;
+  if(typeof savePayrollDebtLedger === 'function') savePayrollDebtLedger();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+
+// Generate a CSV string of the weekly rollup, ready for download.
+function payrollWeeklyRollupCSV(periodEnd){
+  var rollup = payrollBuildWeeklyRollup(periodEnd);
+  var lines = [];
+  // Header
+  lines.push('Agent,Campaign/Program,Gross,Chargebacks,Net Line');
+  Object.keys(rollup.agents).forEach(function(aid){
+    var a = rollup.agents[aid];
+    a.lines.forEach(function(L){
+      var lineNet = (L.grossCents - (L.chargebackCents||0)) / 100;
+      lines.push([
+        '"'+(a.agentName||'').replace(/"/g,'""')+'"',
+        '"'+(L.carrier||'').replace(/"/g,'""')+'"',
+        (L.grossCents/100).toFixed(2),
+        ((L.chargebackCents||0)/100).toFixed(2),
+        lineNet.toFixed(2)
+      ].join(','));
+    });
+    // Agent total row
+    lines.push([
+      '"'+(a.agentName||'').replace(/"/g,'""')+'"',
+      '"TOTAL DEPOSIT"',
+      (a.grossCents/100).toFixed(2),
+      ((a.chargebackCents + a.carryoverAppliedCents)/100).toFixed(2),
+      (a.netCents/100).toFixed(2)
+    ].join(','));
+    lines.push(''); // blank line between agents
+  });
+  // Grand totals
+  lines.push('');
+  lines.push('"GRAND TOTAL","ALL AGENTS",'+(rollup.totals.grossCents/100).toFixed(2)+','+
+             ((rollup.totals.chargebackCents+rollup.totals.carryoverAppliedCents)/100).toFixed(2)+','+
+             (rollup.totals.netCents/100).toFixed(2));
+  return lines.join('\n');
+}
+
+// Build a P&L snapshot for the week. Three buckets:
+//   - totalPayoutCents:        money paid out to agents (expense)
+//   - chargebacksRecoveredCents: chargebacks deducted from this week's pay (recovered)
+//   - outstandingARCents:       sum of all positive debt-ledger balances (AR — not yet a loss)
+//   - writtenOffCents:          total ever written off (real loss to company)
+function payrollPLSnapshot(periodEnd){
+  var snap = {
+    periodEnd: periodEnd,
+    totalPayoutCents: 0,
+    chargebacksRecoveredCents: 0,
+    outstandingARCents: 0,
+    writtenOffCents: 0
+  };
+  if(typeof PAYROLL_WEEKS !== 'object' || !Array.isArray(PAYROLL_WEEKS)) return snap;
+  PAYROLL_WEEKS.forEach(function(w){
+    if(!w || w.status !== 'approved') return;
+    if(periodEnd && w.periodEnd !== periodEnd) return;
+    (w.rows || []).forEach(function(row){
+      if(!row) return;
+      snap.totalPayoutCents += (row.grossCents || 0);
+      snap.chargebacksRecoveredCents += (row.chargebackTotal || 0);
+    });
+  });
+  // AR + write-offs from debt ledger (all-time, not period-specific)
+  if(typeof PAYROLL_DEBT_LEDGER === 'object'){
+    Object.keys(PAYROLL_DEBT_LEDGER).forEach(function(aid){
+      var ledger = PAYROLL_DEBT_LEDGER[aid];
+      if(!ledger) return;
+      if((ledger.balanceCents||0) > 0){
+        snap.outstandingARCents += ledger.balanceCents;
+      }
+      (ledger.history||[]).forEach(function(h){
+        if(h && h.kind === 'write-off'){
+          // deltaCents is negative for write-offs (it reduces the balance);
+          // the absolute value is the loss
+          snap.writtenOffCents += Math.abs(h.deltaCents || 0);
+        }
+      });
+    });
+  }
+  return snap;
+}
+
+// Save helpers (mirror the existing pattern)
+function savePayrollWeeks(){
+  try{ localStorage.setItem('wmam_payroll_weeks', JSON.stringify(PAYROLL_WEEKS)); }catch(e){}
+  if(typeof saveAppSettingToSupabase === 'function'){
+    saveAppSettingToSupabase('payroll_weeks', JSON.stringify(PAYROLL_WEEKS)).catch(function(){});
+  }
+}
+function savePayrollDebtLedger(){
+  try{ localStorage.setItem('wmam_payroll_debt_ledger', JSON.stringify(PAYROLL_DEBT_LEDGER)); }catch(e){}
+  if(typeof saveAppSettingToSupabase === 'function'){
+    saveAppSettingToSupabase('payroll_debt_ledger', JSON.stringify(PAYROLL_DEBT_LEDGER)).catch(function(){});
+  }
+}
+
+if(typeof window !== 'undefined'){
+  window.payrollApproveWeek = payrollApproveWeek;
+  window.payrollUnapproveWeek = payrollUnapproveWeek;
+  window.payrollEditApprovedWeek = payrollEditApprovedWeek;
+  window.payrollBuildWeeklyRollup = payrollBuildWeeklyRollup;
+  window.payrollWriteOffDebt = payrollWriteOffDebt;
+  window.payrollWeeklyRollupCSV = payrollWeeklyRollupCSV;
+  window.payrollPLSnapshot = payrollPLSnapshot;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -6671,6 +7020,49 @@ function payrollApplyDeductions(opts){
     var splitData = (typeof payrollLookupDealPay === 'function' && d.orderNum)
                     ? payrollLookupDealPay(d.orderNum, carrier) : null;
     var useSplitMath = !!(splitData && splitData.splits && splitData.splits.length);
+
+    // ── Calvin 2026-05-15 PERMANENT FIX ──
+    // If we don't have historical splits saved (sales week missing, agent-
+    // code mismatch on original commit, etc.) we previously fell back to the
+    // old broken cascade that charged the named agent the FULL carrier cap.
+    // That's the −$28 bug Calvin keeps seeing.
+    //
+    // Better: compute the split ON-THE-FLY using payrollComputeDealSplit
+    // with the chargeback row's own data (named agent + tribal flag). This
+    // gives us the correct per-recipient breakdown using current spec, even
+    // when the historical record wasn't saved cleanly.
+    //
+    // We can't know the agent's exact slide-tier from the chargeback row
+    // alone, so we use the conservative under-tier rate (the lower amount).
+    // This is intentional: it's "fair" in Calvin's words — we never claw
+    // back more than we paid. If anything, we claw back slightly LESS than
+    // a tier-2 agent earned, which is a small acceptable variance compared
+    // to wrongly clawing back the full $28.
+    if(!useSplitMath && carrier === 'TruConnect' && agent && typeof payrollComputeDealSplit === 'function'){
+      try {
+        var computed = payrollComputeDealSplit({
+          carrier: 'TruConnect',
+          agentId: agent.id,
+          isTribal: !!d.isTribal,
+          agentTribalTotalThatWeek: 1,  // conservative: under-tier rate
+          agentNladTotalThatWeek:   1
+        });
+        if(computed && computed.length){
+          splitData = {
+            date: '',
+            orderNum: d.orderNum || '',
+            tribal: !!d.isTribal,
+            enrollerAid: agent.id,
+            enrollerName: agent.name,
+            splits: computed,
+            recomputed: true   // audit flag: this was on-the-fly
+          };
+          useSplitMath = true;
+        }
+      } catch(e){
+        console.warn('[payrollApplyDeductions] on-the-fly split compute failed:', e);
+      }
+    }
 
     if(useSplitMath){
       // Charge each split-recipient their own share independently
@@ -23762,6 +24154,9 @@ function gotoPanel(id, params){
     'repair-bare-saved':'Repair Bare-Saved Agents',
     'multi-team-cleanup':'Multi-Team Cleanup',
     'backup-restore':'Backup Restore',
+    'payroll-process':'Payroll Processing',
+    'payroll-rollup':'Weekly Rollup',
+    'payroll-debt':'Debt Ledger',
     'inv-dept-approvals':'Inv Dept Approvals',
     'inv-dashboard':'All Inventory','inv-upload':'Upload Devices',
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
@@ -23806,6 +24201,9 @@ function gotoPanel(id, params){
     'repair-bare-saved':panelRepairBareSaved,
     'multi-team-cleanup':panelMultiTeamCleanup,
     'backup-restore':panelBackupRestore,
+    'payroll-process':panelPayrollProcess,
+    'payroll-rollup':panelPayrollRollup,
+    'payroll-debt':panelPayrollDebt,
     'inv-dept-approvals':panelInvDeptApprovals,
     'gm-inventory':panelGMInventory,'gm-upload':panelGMUpload,
     'gm-transfers':panelGMTransfers,'gm-agent-inv':panelGMAgentInventory,
@@ -23859,6 +24257,9 @@ function gotoPanel(id, params){
     'repair-bare-saved':panelRepairBareSaved,
     'multi-team-cleanup':panelMultiTeamCleanup,
     'backup-restore':panelBackupRestore,
+    'payroll-process':panelPayrollProcess,
+    'payroll-rollup':panelPayrollRollup,
+    'payroll-debt':panelPayrollDebt,
     'inv-dept-approvals':panelInvDeptApprovals,
     'onboard-upload':panelOnboardUpload,
     'bg-auth':panelBgAuth,
@@ -27622,6 +28023,354 @@ function panelPayrollWeekDetail(){
   }
   return h;
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  PAYROLL PROCESSING PANEL (Calvin 2026-05-15)
+//  gotoPanel('payroll-process') — Owner only for now (Payroll Dept later).
+//
+//  Workflow:
+//    1) Upload sales file via existing Payroll Upload panel (already there)
+//    2) Once parsed and committed, the week appears here as 'draft'
+//    3) Owner reviews per-agent rows + chargebacks + carryover applied
+//    4) Click APPROVE — week status flips, feeds into Weekly Rollup panel
+//    5) If a mistake is found after approval, edit in place — system
+//       records the change in editHistory and (if editor isn't Owner)
+//       fires a notification to the Owner.
+// ════════════════════════════════════════════════════════════════════════
+function panelPayrollProcess(){
+  var u = DB.current;
+  if(!u || !isOwner(u)){
+    return panelHeader('💰 Payroll Processing')
+      + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Owner-only during beta. Payroll Department access will be enabled after testing.</div></div>';
+  }
+  var h = panelHeader('💰 Payroll Processing — Per-Campaign Approval');
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);line-height:1.55">';
+  h += '<strong>How this works:</strong> Each uploaded carrier file (TruConnect, Gen Mobile, Assurance, Excess, Internet programs) appears below as a draft week. Review the per-agent rows, then click <strong>APPROVE</strong>. Approved weeks feed into the Weekly Rollup, which calculates the actual deposit each agent receives across every campaign. If you find a mistake after approval, you can edit in place — every edit is logged.';
+  h += '</div>';
+  h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">';
+  h += '<button onclick="gotoPanel(\'payroll-rollup\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">📊 Weekly Rollup →</button>';
+  h += '<button onclick="gotoPanel(\'payroll-debt\')" style="font-size:.72rem;padding:10px 20px;background:white;border:1.5px solid var(--brown);color:var(--brown);font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">🧾 Debt Ledger / Write-Off →</button>';
+  h += '<button onclick="gotoPanel(\'payroll-upload\')" style="font-size:.72rem;padding:10px 20px;background:white;border:1.5px solid var(--brown);color:var(--brown);font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">📤 Upload New Carrier File →</button>';
+  h += '</div>';
+
+  // Group weeks by periodEnd, then by carrier
+  var weeks = (PAYROLL_WEEKS || []).slice().sort(function(a,b){
+    return (b.periodEnd||'').localeCompare(a.periodEnd||'');
+  });
+  if(!weeks.length){
+    h += '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No payroll weeks yet. Upload a carrier file to begin.</div>';
+    return h;
+  }
+  // Bucket by periodEnd
+  var byPeriod = {};
+  weeks.forEach(function(w){
+    var p = w.periodEnd || '(no date)';
+    if(!byPeriod[p]) byPeriod[p] = [];
+    byPeriod[p].push(w);
+  });
+  Object.keys(byPeriod).forEach(function(pe){
+    var list = byPeriod[pe];
+    var approvedCount = list.filter(function(w){return w.status==='approved';}).length;
+    var draftCount    = list.filter(function(w){return w.status==='draft';}).length;
+    h += '<div class="bo-card" style="margin-bottom:18px;padding:16px 18px">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px">';
+    h += '<div>';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px;color:var(--brown)">Week ending '+_escapeHtml(pe)+'</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">'+approvedCount+' approved &middot; '+draftCount+' draft &middot; '+list.length+' total</div>';
+    h += '</div>';
+    if(approvedCount === list.length && list.length > 0){
+      h += '<button onclick="gotoPanel(\'payroll-rollup\',{periodEnd:\''+_escapeAttr(pe)+'\'})" class="btn-fire" style="font-size:.7rem;padding:9px 18px;background:linear-gradient(135deg,#059669,#047857);color:white;border:none">📊 Open Rollup →</button>';
+    }
+    h += '</div>';
+    list.forEach(function(w){
+      var sumGross  = (w.rows||[]).reduce(function(s,r){return s+(r.grossCents||0);}, 0);
+      var sumCb     = (w.rows||[]).reduce(function(s,r){return s+(r.chargebackTotal||0);}, 0);
+      var sumNet    = sumGross - sumCb;
+      var statusBg, statusFg, statusLabel;
+      if(w.status === 'approved'){
+        statusBg = '#059669'; statusFg = 'white';
+        statusLabel = '✓ APPROVED'+(w.editedAfterApproval?' (edited)':'');
+      } else {
+        statusBg = '#D97706'; statusFg = 'white';
+        statusLabel = 'DRAFT';
+      }
+      h += '<div style="border-top:1px solid var(--sand);padding:10px 0;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+      h += '<div style="flex:1;min-width:200px">';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.92rem;letter-spacing:1.5px;color:var(--brown)">'+_escapeHtml(w.carrier||'?')+'</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px">'+(w.rows||[]).length+' agent rows &middot; gross $'+(sumGross/100).toFixed(2)+' &middot; chargebacks $'+(sumCb/100).toFixed(2)+' &middot; net $'+(sumNet/100).toFixed(2)+'</div>';
+      if(w.editedAfterApproval && Array.isArray(w.editHistory)){
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#D97706;margin-top:3px">⚠ Edited '+w.editHistory.length+' time'+(w.editHistory.length===1?'':'s')+' after approval</div>';
+      }
+      h += '</div>';
+      h += '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">';
+      h += '<span style="background:'+statusBg+';color:'+statusFg+';font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:4px 10px;border-radius:4px;font-weight:700">'+statusLabel+'</span>';
+      h += '<button onclick="gotoPanel(\'payroll-week-detail\',{weekId:\''+_escapeAttr(w.id)+'\'})" style="background:white;border:1px solid var(--brown);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.64rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 11px;border-radius:4px;cursor:pointer;font-weight:700">View</button>';
+      if(w.status === 'draft'){
+        h += '<button onclick="payrollPromptApprove(\''+_escapeAttr(w.id)+'\')" class="btn-fire" style="font-size:.64rem;padding:6px 14px;background:linear-gradient(135deg,#059669,#047857);color:white;border:none">✓ APPROVE</button>';
+      } else if(w.status === 'approved'){
+        h += '<button onclick="payrollPromptUnapprove(\''+_escapeAttr(w.id)+'\')" style="background:white;border:1px solid #dc2626;color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;padding:5px 11px;border-radius:4px;cursor:pointer;font-weight:700">Unapprove</button>';
+      }
+      h += '</div>';
+      h += '</div>';
+    });
+    h += '</div>';
+  });
+  return h;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  WEEKLY ROLLUP PANEL — Calvin 2026-05-15
+//  Aggregates every approved campaign-week for a single periodEnd date.
+//  Shows per-agent breakdown (carrier lines + carryover line) + grand total.
+//  Provides CSV download.
+// ════════════════════════════════════════════════════════════════════════
+function panelPayrollRollup(){
+  var u = DB.current;
+  if(!u || !isOwner(u)){
+    return panelHeader('📊 Weekly Payroll Rollup')
+      + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Owner-only during beta.</div></div>';
+  }
+  // Determine periodEnd — either from window._panelParams or pick the most recent
+  var periodEnd = (window._panelParams && window._panelParams.periodEnd) || null;
+  if(!periodEnd){
+    // Pick the newest periodEnd from approved weeks
+    var approved = (PAYROLL_WEEKS||[]).filter(function(w){return w.status==='approved';});
+    if(approved.length){
+      approved.sort(function(a,b){return (b.periodEnd||'').localeCompare(a.periodEnd||'');});
+      periodEnd = approved[0].periodEnd;
+    }
+  }
+  var h = panelHeader('📊 Weekly Payroll Rollup' + (periodEnd ? ' — Week of '+periodEnd : ''));
+  // Period selector
+  var allPeriods = {};
+  (PAYROLL_WEEKS||[]).filter(function(w){return w.status==='approved';}).forEach(function(w){
+    if(w.periodEnd) allPeriods[w.periodEnd] = true;
+  });
+  var periodList = Object.keys(allPeriods).sort().reverse();
+  if(periodList.length > 1){
+    h += '<div style="margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.8rem">';
+    h += '<label style="color:var(--muted);margin-right:8px">Week:</label>';
+    h += '<select onchange="gotoPanel(\'payroll-rollup\',{periodEnd:this.value})" style="padding:6px 12px;font-family:Barlow Condensed,sans-serif">';
+    periodList.forEach(function(p){
+      var sel = (p === periodEnd) ? ' selected' : '';
+      h += '<option value="'+_escapeAttr(p)+'"'+sel+'>'+_escapeHtml(p)+'</option>';
+    });
+    h += '</select>';
+    h += '</div>';
+  }
+  if(!periodEnd){
+    h += '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No approved weeks yet. Approve at least one campaign in the Payroll Processing panel first.</div>';
+    return h;
+  }
+  var rollup = payrollBuildWeeklyRollup(periodEnd);
+  var agentIds = Object.keys(rollup.agents).sort(function(a,b){
+    return (rollup.agents[b].netCents || 0) - (rollup.agents[a].netCents || 0);
+  });
+  if(!agentIds.length){
+    h += '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No agent earnings for this week yet.</div>';
+    return h;
+  }
+  // Summary card
+  h += '<div class="bo-card" style="margin-bottom:18px;padding:18px;background:linear-gradient(135deg,rgba(5,150,105,.08),rgba(4,120,87,.05));border-left:4px solid #059669">';
+  h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px">';
+  h += '<div>';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:#047857">WEEKLY DEPOSIT TOTAL</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-top:2px">'+agentIds.length+' agent'+(agentIds.length===1?'':'s')+' &middot; gross $'+(rollup.totals.grossCents/100).toFixed(2)+' &middot; chargebacks $'+(rollup.totals.chargebackCents/100).toFixed(2)+' &middot; carryover applied $'+(rollup.totals.carryoverAppliedCents/100).toFixed(2)+'</div>';
+  h += '</div>';
+  h += '<div style="text-align:right">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:2rem;color:#047857">$'+(rollup.totals.netCents/100).toFixed(2)+'</div>';
+  h += '<button onclick="payrollDownloadRollupCSV(\''+_escapeAttr(periodEnd)+'\')" class="btn-fire" style="font-size:.66rem;padding:7px 14px;margin-top:4px">⬇ Download CSV</button>';
+  h += '</div>';
+  h += '</div>';
+  h += '</div>';
+  // Per-agent cards
+  agentIds.forEach(function(aid){
+    var a = rollup.agents[aid];
+    h += '<div class="bo-card" style="margin-bottom:14px;padding:14px 18px">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px">';
+    h += '<div>';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;letter-spacing:1.8px;color:var(--brown)">'+_escapeHtml(a.agentName)+'</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:2px">'+a.lines.length+' line'+(a.lines.length===1?'':'s')+' &middot; gross $'+(a.grossCents/100).toFixed(2)+'</div>';
+    h += '</div>';
+    h += '<div style="text-align:right">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Net Deposit</div>';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.6rem;color:#047857">$'+(a.netCents/100).toFixed(2)+'</div>';
+    h += '</div>';
+    h += '</div>';
+    h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+    h += '<thead><tr style="border-bottom:1px solid var(--sand);color:var(--muted)">';
+    h += '<th style="text-align:left;padding:4px 6px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase">Campaign / Program</th>';
+    h += '<th style="text-align:right;padding:4px 6px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase">Gross</th>';
+    h += '<th style="text-align:right;padding:4px 6px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase">Chargebacks</th>';
+    h += '<th style="text-align:right;padding:4px 6px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase">Line Net</th>';
+    h += '</tr></thead><tbody>';
+    a.lines.forEach(function(L){
+      var color = (L.kind === 'carryover') ? '#D97706' : 'var(--brown)';
+      var lineNet = L.grossCents - (L.chargebackCents||0);
+      h += '<tr style="border-bottom:1px solid var(--offwhite)">';
+      h += '<td style="padding:6px;color:'+color+'">'+_escapeHtml(L.carrier)+'</td>';
+      h += '<td style="text-align:right;padding:6px;color:'+(L.grossCents<0?'#dc2626':color)+'">'+(L.grossCents<0?'-':'')+'$'+(Math.abs(L.grossCents)/100).toFixed(2)+'</td>';
+      h += '<td style="text-align:right;padding:6px;color:'+(L.chargebackCents?'#dc2626':'var(--muted)')+'">'+(L.chargebackCents?'-':'')+'$'+((L.chargebackCents||0)/100).toFixed(2)+'</td>';
+      h += '<td style="text-align:right;padding:6px;color:'+color+'">'+(lineNet<0?'-':'')+'$'+(Math.abs(lineNet)/100).toFixed(2)+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table>';
+    h += '</div>';
+  });
+  return h;
+}
+
+// CSV download helper (browser-side)
+function payrollDownloadRollupCSV(periodEnd){
+  if(typeof payrollWeeklyRollupCSV !== 'function') return;
+  var csv = payrollWeeklyRollupCSV(periodEnd);
+  var filename = 'payroll-rollup-'+(periodEnd||'unknown')+'.csv';
+  var blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  DEBT LEDGER / WRITE-OFF PANEL — Calvin 2026-05-15
+//  Lists every agent with an outstanding carryover-debt balance.
+//  Owner can write off uncollectable debt for terminated agents.
+//  Shows three buckets: AR (outstanding), recovered (from approved weeks), and written-off.
+// ════════════════════════════════════════════════════════════════════════
+function panelPayrollDebt(){
+  var u = DB.current;
+  if(!u || !isOwner(u)){
+    return panelHeader('🧾 Carryover Debt Ledger')
+      + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Owner-only.</div></div>';
+  }
+  var h = panelHeader('🧾 Carryover Debt Ledger / Write-Off');
+  // P&L bucket summary
+  var pl = payrollPLSnapshot();
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:18px">';
+  h += '<div class="bo-card" style="padding:14px;border-left:4px solid #059669">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Recovered (Approved Weeks)</div>';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:#047857;margin-top:4px">$'+(pl.chargebacksRecoveredCents/100).toFixed(2)+'</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-top:2px">Chargebacks clawed back from this week\'s pay</div>';
+  h += '</div>';
+  h += '<div class="bo-card" style="padding:14px;border-left:4px solid #D97706">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Outstanding AR</div>';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:#D97706;margin-top:4px">$'+(pl.outstandingARCents/100).toFixed(2)+'</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-top:2px">Money agents still owe — applies against future earnings</div>';
+  h += '</div>';
+  h += '<div class="bo-card" style="padding:14px;border-left:4px solid #dc2626">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Written Off (P&L Loss)</div>';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:#dc2626;margin-top:4px">$'+(pl.writtenOffCents/100).toFixed(2)+'</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-top:2px">Permanent loss — agent gone, debt uncollectable</div>';
+  h += '</div>';
+  h += '</div>';
+  // List agents with outstanding debt
+  var outstandingAgents = Object.keys(PAYROLL_DEBT_LEDGER || {}).map(function(aid){
+    var ledger = PAYROLL_DEBT_LEDGER[aid];
+    return { agentId: Number(aid), balance: ledger.balanceCents || 0, ledger: ledger };
+  }).filter(function(x){ return x.balance > 0; })
+    .sort(function(a,b){ return b.balance - a.balance; });
+  if(!outstandingAgents.length){
+    h += '<div class="bo-card" style="padding:24px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No outstanding debt. All caught up.</div>';
+    return h;
+  }
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);margin-bottom:10px"><strong>'+outstandingAgents.length+'</strong> agent'+(outstandingAgents.length===1?'':'s')+' with outstanding carryover debt</div>';
+  outstandingAgents.forEach(function(item){
+    var agent = (DB.agents||[]).find(function(a){return a && a.id === item.agentId;});
+    var name = agent ? agent.name : ('Agent #'+item.agentId);
+    var statusInfo = '';
+    if(agent && agent.active === false){
+      statusInfo = ' <span style="background:#dc2626;color:white;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1.5px;text-transform:uppercase;padding:3px 8px;border-radius:3px;margin-left:8px;font-weight:700">TERMINATED</span>';
+    }
+    h += '<div class="bo-card" style="margin-bottom:12px;padding:14px 18px">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">';
+    h += '<div style="flex:1;min-width:220px">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.8px;color:var(--brown)">'+_escapeHtml(name)+statusInfo+'</div>';
+    var recentHistory = (item.ledger.history||[]).slice(-3).reverse();
+    if(recentHistory.length){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:6px">Recent activity:</div>';
+      recentHistory.forEach(function(hh){
+        var deltaStr = hh.deltaCents > 0 ? '+$'+(hh.deltaCents/100).toFixed(2) : '-$'+(Math.abs(hh.deltaCents)/100).toFixed(2);
+        var deltaColor = hh.deltaCents > 0 ? '#dc2626' : '#059669';
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--brown);margin-top:2px">';
+        h += '<span style="color:'+deltaColor+';font-weight:700">'+deltaStr+'</span> &middot; ' + _escapeHtml(hh.date||'') + ' &middot; ' + _escapeHtml(hh.reason||'') + (hh.kind==='write-off'?' <em>(written off by '+_escapeHtml(hh.writtenOffByName||'')+')</em>':'');
+        h += '</div>';
+      });
+    }
+    h += '</div>';
+    h += '<div style="text-align:right;flex-shrink:0">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Balance Owed</div>';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:#D97706">$'+(item.balance/100).toFixed(2)+'</div>';
+    h += '<button onclick="payrollPromptWriteOff('+item.agentId+')" style="background:white;color:#dc2626;border:1.5px solid #dc2626;font-family:Barlow Condensed,sans-serif;font-size:.64rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer;font-weight:700;margin-top:6px">✗ Write Off</button>';
+    h += '</div>';
+    h += '</div>';
+    h += '</div>';
+  });
+  return h;
+}
+
+if(typeof window !== 'undefined'){
+  window.panelPayrollProcess = panelPayrollProcess;
+  window.panelPayrollRollup = panelPayrollRollup;
+  window.panelPayrollDebt = panelPayrollDebt;
+  window.payrollDownloadRollupCSV = payrollDownloadRollupCSV;
+  window.payrollPromptWriteOff = payrollPromptWriteOff;
+  window.payrollPromptApprove = payrollPromptApprove;
+  window.payrollPromptUnapprove = payrollPromptUnapprove;
+}
+
+// Browser-side helper invoked by the Approve button on a draft week.
+function payrollPromptApprove(weekId){
+  if(typeof PAYROLL_WEEKS !== 'object' || !Array.isArray(PAYROLL_WEEKS)) return;
+  var w = PAYROLL_WEEKS.find(function(x){ return x.id === weekId; });
+  if(!w){ alert('Week not found.'); return; }
+  var ok = confirm(
+    'Approve this ' + (w.carrier || '') + ' week (ending ' + (w.periodEnd || '?') + ')?\n\n' +
+    'Once approved, it feeds into the Weekly Rollup and the P&L. You can edit it afterward — every edit is logged and the Owner is notified.'
+  );
+  if(!ok) return;
+  if(payrollApproveWeek(weekId)){
+    if(typeof gotoPanel === 'function') gotoPanel('payroll-process');
+  } else {
+    alert('Approval failed. You may not have permission, or the week is already approved.');
+  }
+}
+
+// Browser-side helper invoked by the Unapprove button on an approved week.
+function payrollPromptUnapprove(weekId){
+  var reason = prompt('Reason for unapproving (will be logged):');
+  if(!reason || !reason.trim()) return;
+  if(payrollUnapproveWeek(weekId, reason.trim())){
+    if(typeof gotoPanel === 'function') gotoPanel('payroll-process');
+  } else {
+    alert('Unapprove failed. Owner permission required.');
+  }
+}
+
+// Browser-side helper invoked by the Write Off button
+function payrollPromptWriteOff(agentId){
+  var ledger = (typeof PAYROLL_DEBT_LEDGER === 'object') ? PAYROLL_DEBT_LEDGER[agentId] : null;
+  if(!ledger || !ledger.balanceCents){
+    alert('No outstanding debt for this agent.');
+    return;
+  }
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  var name = agent ? agent.name : ('Agent #'+agentId);
+  var balance = (ledger.balanceCents/100).toFixed(2);
+  var reason = prompt(
+    'WRITE OFF $'+balance+' for '+name+'?\n\n' +
+    'This moves the debt from AR to a permanent P&L loss.\n\n' +
+    'Enter reason (e.g., "Agent terminated 2026-05-12, uncollectable"):'
+  );
+  if(!reason || !reason.trim()) return;
+  if(payrollWriteOffDebt(agentId, reason.trim())){
+    if(typeof gotoPanel === 'function') gotoPanel('payroll-debt');
+  } else {
+    alert('Write-off failed. Check console for details.');
+  }
+}
+
 
 function ppFinalizeWeek(weekId){
   // Calvin 2026-05-08: Owner OR Administrator (K-Anna) — admins do payroll
