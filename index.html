@@ -11908,8 +11908,28 @@ function gmAgentSignTransfer(transferId, confirmed){
     var market = dev.market;
     var mcfg = gmEnsureMarket(market);
 
+    // ── Calvin 2026-05-15 CRITICAL FIX ──
+    // The display column "Expires" reads dev.expiryDate. This legacy path
+    // previously only set dev.agentExpiresAt / dev.tlExpiresAt (separate
+    // fields), leaving dev.expiryDate at the original upload value (e.g.
+    // 60-day vendor due date). Result: Rebecca's dashboard showed 43d
+    // instead of the policy-required 14d for Field Agents.
+    //
+    // Single source of truth: use resolveTransferExpiry — same helper the
+    // new invFinalizeTransferAccept path uses. Caps:
+    //   Field Agent / Team Leader → 14d
+    //   Manager (CM/IBO/MM)       → no cap (inherits sender's remaining)
+    var senderExpiry = dev.expiryDate || dev.originalExpiryDate || null;
+    var recipientRole = (toAgent && toAgent.role) || 'Field Agent';
+    if(typeof resolveTransferExpiry === 'function'){
+      dev.expiryDate = resolveTransferExpiry(senderExpiry, recipientRole, now.getTime());
+    }
+
     if(isAgent){
-      var agentDays = mcfg.agentDays||10;
+      // Calvin 2026-05-15: per policy, Field Agent gets 14 days (not 10).
+      // Per-market override still works via mcfg.agentDays. If not set,
+      // default is 14 to match the resolveTransferExpiry role cap.
+      var agentDays = mcfg.agentDays||14;
       // Cap: agent gets min of their allotted days OR remaining days from original expiry
       var mmRemaining = dev.mmExpiresAt ? Math.ceil((new Date(dev.mmExpiresAt)-now)/86400000) : agentDays;
       var actualDays  = Math.min(agentDays, mmRemaining);
@@ -11923,9 +11943,13 @@ function gmAgentSignTransfer(transferId, confirmed){
 
     dev.assignedTo     = req.toId;
     dev.assignedToName = req.toName;
+    dev.holderId       = req.toId;
+    dev.holderName     = req.toName;
     dev.assignedAt     = now.toISOString();
+    dev.assignedDate   = now.toISOString().slice(0,10);
     dev.status         = 'assigned';
-    dev.chainOfCustody.push({from:req.fromName,fromId:req.fromId,to:req.toName,toId:req.toId,at:now.toISOString(),type:'transfer'});
+    if(!dev.chainOfCustody) dev.chainOfCustody=[];
+    dev.chainOfCustody.push({from:req.fromName,fromId:req.fromId,to:req.toName,toId:req.toId,at:now.toISOString(),type:'transfer',priorExpiry:senderExpiry});
   });
 
   // Deduct from fromId personal count (market total stays same)
@@ -13721,6 +13745,63 @@ function wmamDebugInventoryRouting(marketName, csvName){
 if(typeof window !== 'undefined'){
   window.wmamDebugInventoryRouting = wmamDebugInventoryRouting;
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  EXPIRY BACKFILL (Calvin 2026-05-15)
+//
+//  Fixes devices that were transferred to TLs/Field Agents through the
+//  legacy gmAgentSignTransfer path. That path didn't update dev.expiryDate
+//  so the dashboard still shows the original vendor due date (e.g. 43d)
+//  instead of the role-capped 14d.
+//
+//  Algorithm: walk every assigned device. If the holder is a TL/Field
+//  Agent AND expiryDate > 14 days from their assignedAt (or now if no
+//  assignedAt), reset expiryDate to assignedAt + 14 days.
+//
+//  Safe to re-run. Only updates devices that are actually wrong.
+//  Run from F12 console: wmamBackfillExpiryDates()
+// ════════════════════════════════════════════════════════════════════════
+function wmamBackfillExpiryDates(){
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(' EXPIRY BACKFILL — fixing TL/Field Agent device expiries');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  var ROLE_CAPS = { 'Team Leader': 14, 'Field Agent': 14, 'Sales Rep': 14 };
+  var changed = 0;
+  var pools = [];
+  if(typeof GM_INVENTORY !== 'undefined' && Array.isArray(GM_INVENTORY)) pools.push({name:'GM_INVENTORY', pool:GM_INVENTORY});
+  if(typeof TC_INVENTORY !== 'undefined' && Array.isArray(TC_INVENTORY)) pools.push({name:'TC_INVENTORY', pool:TC_INVENTORY});
+  if(typeof AW_INVENTORY !== 'undefined' && Array.isArray(AW_INVENTORY)) pools.push({name:'AW_INVENTORY', pool:AW_INVENTORY});
+  if(typeof EX_INVENTORY !== 'undefined' && Array.isArray(EX_INVENTORY)) pools.push({name:'EX_INVENTORY', pool:EX_INVENTORY});
+  pools.forEach(function(p){
+    p.pool.forEach(function(d){
+      if(!d || d.status !== 'assigned') return;
+      var holderId = d.holderId || d.assignedTo;
+      if(!holderId) return;
+      var holder = (DB.agents||[]).find(function(a){return a && a.id === holderId;});
+      if(!holder) return;
+      var cap = ROLE_CAPS[holder.role];
+      if(!cap) return; // not a role with a cap
+      // Anchor: when did the holder receive this device?
+      var anchor = d.assignedAt || d.assignedDate || null;
+      var anchorMs = anchor ? new Date(anchor).getTime() : Date.now();
+      var capExpiry = new Date(anchorMs + cap*86400000).toISOString().slice(0,10);
+      // Only adjust if current expiryDate is OUTSIDE the cap (i.e. too far in the future)
+      if(d.expiryDate && d.expiryDate > capExpiry){
+        var oldExp = d.expiryDate;
+        d.expiryDate = capExpiry;
+        console.log('  ['+p.name+'] '+d.imei+' ('+holder.name+', '+holder.role+'): '+oldExp+' → '+capExpiry);
+        changed++;
+      }
+    });
+  });
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(' Done. '+changed+' device(s) corrected. Refresh the page to see changes.');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  return changed;
+}
+if(typeof window !== 'undefined') window.wmamBackfillExpiryDates = wmamBackfillExpiryDates;
 
 
 // ════════════════════════════════════════════════════════════════════════
@@ -30970,6 +31051,28 @@ function invAssignCommit(deviceIds){
     }
   }
 
+  // ════════════════════════════════════════════════════════════════════
+  //  10-DAY GAP PREFLIGHT (Calvin 2026-05-15)
+  //  Per spec: TL/Field Agent recipients always need a 10-day buffer
+  //  between their inherited expiry and the sender's. If any device in
+  //  this batch has ≤10 days left, REFUSE the transfer entirely with a
+  //  clear message naming the IMEIs. Skips entirely for manager
+  //  recipients (CM/MM/IBO) and for UP/RETURN direction (handing back
+  //  up the chain is always allowed regardless of buffer).
+  // ════════════════════════════════════════════════════════════════════
+  if(direction === 'down' && typeof invTransferPreflightCheck === 'function'){
+    var allDevicesInBatch = [];
+    Object.keys(byCampaign).forEach(function(c){
+      (byCampaign[c]||[]).forEach(function(d){ allDevicesInBatch.push(d); });
+    });
+    var pf = invTransferPreflightCheck(allDevicesInBatch, recipient);
+    if(!pf.ok){
+      console.warn('[invAssignCommit] BLOCKED by 10-day gap rule:', pf.blockedDevices);
+      alert(pf.message);
+      return;
+    }
+  }
+
   // ── Build pending transfer records (one per campaign) ──
   // Status:
   //   - down (Owner/Inv sender, or down-the-chain): 'pending-agent-signature'
@@ -36413,6 +36516,26 @@ function invInitiateTransfer(campaign){
   var to = DB.agents.find(function(a){return a.id===toId;});
   if(!to){ if(fbEl) fbEl.innerHTML = '<div style="color:#CC0000">Recipient not found.</div>'; return; }
 
+  // ══════════════════════════════════════════════════════════════════════
+  //  10-DAY GAP PREFLIGHT  (Calvin 2026-05-15)
+  //  TL/Field Agent recipients always need a 10-day buffer between their
+  //  inherited expiry and the sender's. If any IMEI in this batch has
+  //  ≤10 days left, refuse with a clear message naming the IMEIs.
+  //  Managers (CM/MM/IBO) inherit full sender remaining, no gap.
+  // ══════════════════════════════════════════════════════════════════════
+  if(typeof invTransferPreflightCheck === 'function'){
+    var pfPool = cfg.inventory();
+    var pfDevices = imeis.map(function(imei){
+      return pfPool.find(function(x){ return x.imei === imei; });
+    }).filter(Boolean);
+    var pf = invTransferPreflightCheck(pfDevices, to);
+    if(!pf.ok){
+      console.warn('[invInitiateTransfer] BLOCKED by 10-day gap rule:', pf.blockedDevices);
+      alert(pf.message);
+      return;
+    }
+  }
+
   var preApproved = (u.canApproveInventory === true) || isOwner(u) || u.role==='admin' || isInventory(u);
 
   // ══════════════════════════════════════════════════════════════════════
@@ -37116,18 +37239,46 @@ function resolveTransferExpiry(senderExpiryDate, recipientRole, todayMs, vendorD
     'Field Agent':      14
   };
   var roleCap = ROLE_CAPS.hasOwnProperty(recipientRole) ? ROLE_CAPS[recipientRole] : 14;
+  var recipientIsManager = (roleCap === null);
+
+  // ── Calvin 2026-05-15: 10-DAY GAP BUFFER ──
+  // For TL/Field Agent recipients ONLY: subtract a 10-day buffer from
+  // the sender's remaining time. This guarantees the sender always has
+  // 10 days after the recipient's deadline to claw the device back and
+  // activate it themselves before any chargeback hits. Protects against
+  // the nightmare scenario of a device sitting with an agent until it
+  // expires with no time for anyone upstream to recover.
+  //
+  // If sender has ≤10 days left, the transfer is BLOCKED entirely
+  // (function returns null — callers must check and refuse the transfer).
+  // Managers (CM/MM/IBO) skip both the gap AND the block — they inherit
+  // the sender's full remaining time. The 10-day buffer is about
+  // protecting the chain of custody for low-tier holders.
+  var GAP_DAYS = 10;
+
+  if(!recipientIsManager && senderRemainingDays !== null && senderRemainingDays <= GAP_DAYS){
+    // BLOCK SIGNAL: sender doesn't have enough runway to safely hand off
+    // to a TL or Field Agent. The transfer should be refused at the call
+    // site with a clear error message.
+    return null;
+  }
 
   // ── Compute final allowed days ──
   // Start with sender's remaining (the inheritance base).
   // If no sender expiry, treat as 30 (upload-from-Inv-Dept default).
   var allowedDays = (senderRemainingDays === null) ? 30 : senderRemainingDays;
 
+  // Apply the 10-day gap (TL/FA only — protected by the block above)
+  if(!recipientIsManager){
+    allowedDays = allowedDays - GAP_DAYS;
+  }
+
   // Apply role cap if any (TL/FA only). NEVER extend, only clamp down.
   if(roleCap !== null && roleCap !== undefined){
     if(allowedDays > roleCap) allowedDays = roleCap;
   }
 
-  // Apply vendor cap (hardest ceiling)
+  // Apply vendor cap (hardest ceiling) — applies to everyone
   if(vendorCapDays !== null && allowedDays > vendorCapDays){
     allowedDays = vendorCapDays;
   }
@@ -37137,6 +37288,68 @@ function resolveTransferExpiry(senderExpiryDate, recipientRole, todayMs, vendorD
 
   return new Date(t0 + allowedDays*86400000).toISOString().slice(0,10);
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  invTransferPreflightCheck — Calvin 2026-05-15
+//
+//  Pre-transfer gate: before creating a transfer record, check every
+//  device in the batch against the 10-day gap rule for the intended
+//  recipient. If any device has ≤10 days left AND the recipient is a
+//  TL or Field Agent, refuse the entire batch with a clear message
+//  listing which IMEIs are too close to expiry.
+//
+//  Returns: { ok: bool, blockedDevices: [{imei, daysLeft}], message: string }
+//
+//  Managers (CM/MM/IBO) recipients NEVER hit this gate — they inherit
+//  full remaining days with no buffer requirement.
+// ════════════════════════════════════════════════════════════════════════
+function invTransferPreflightCheck(devices, recipient){
+  if(!recipient){
+    return { ok: false, blockedDevices: [], message: 'No recipient selected.' };
+  }
+  var MANAGER_ROLES = ['Campaign Manager','Market Manager','IBO'];
+  // Manager recipients always pass — they get full sender remaining
+  if(MANAGER_ROLES.indexOf(recipient.role) >= 0){
+    return { ok: true, blockedDevices: [], message: '' };
+  }
+  // TL/FA recipients: every device needs > 10 days remaining
+  var GAP = 10;
+  var t0 = Date.now();
+  var blocked = [];
+  (devices || []).forEach(function(d){
+    if(!d || !d.expiryDate) return; // can't check, let it through
+    try {
+      var ms = new Date(d.expiryDate).getTime();
+      if(isNaN(ms)) return;
+      var daysLeft = Math.ceil((ms - t0) / 86400000);
+      if(daysLeft <= GAP){
+        blocked.push({ imei: d.imei || d.id || '(unknown)', daysLeft: daysLeft, expiryDate: d.expiryDate });
+      }
+    } catch(e){}
+  });
+  if(blocked.length === 0){
+    return { ok: true, blockedDevices: [], message: '' };
+  }
+  // Build a clear error message naming the IMEIs
+  var msg = '⛔ TRANSFER BLOCKED — Insufficient time for ' + (recipient.role || 'recipient') + '\n\n';
+  msg += 'The following ' + blocked.length + ' device(s) have 10 days or less remaining. Transferring them to a ' + (recipient.role || 'Field Agent') + ' would leave no buffer to recover the device if not activated in time:\n\n';
+  blocked.slice(0, 10).forEach(function(b){
+    var d = b.daysLeft;
+    var label = d < 0 ? 'EXPIRED ('+Math.abs(d)+'d ago)' : (d === 0 ? 'EXPIRES TODAY' : d + ' day(s) left');
+    msg += '  • ' + b.imei + '  →  ' + label + '\n';
+  });
+  if(blocked.length > 10){
+    msg += '  …and ' + (blocked.length - 10) + ' more.\n';
+  }
+  msg += '\nWhat to do:\n';
+  msg += '  • Activate these device(s) yourself before they expire, OR\n';
+  msg += '  • Return them to your Inventory Department for re-routing, OR\n';
+  msg += '  • Transfer them only to another manager (CM/MM/IBO) who can carry the full remaining time.\n\n';
+  msg += 'The 10-day buffer protects everyone — without it, lost activations could result in chargebacks against your payroll.';
+  return { ok: false, blockedDevices: blocked, message: msg };
+}
+
+if(typeof window !== 'undefined') window.invTransferPreflightCheck = invTransferPreflightCheck;
 
 
 // Finalize the device handover (extracted from old invAcceptTransfer body)
