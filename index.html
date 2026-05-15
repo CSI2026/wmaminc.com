@@ -1647,6 +1647,21 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
               </span>
             </label>
           </div>
+          <!-- ── Calvin 2026-05-15: TC Tribal Locked Rate ── -->
+          <!-- For TLs whose TC Tribal rate is locked at a flat $/enrollment
+               instead of the standard $23/$25 slide. Najee Burns is the
+               first such TL (locked at $25). Empty = standard slide. -->
+          <div id="apTribalLockedRateRow" style="background:rgba(5,150,105,.05);border:1px solid rgba(5,150,105,.2);border-radius:6px;padding:12px 14px;margin-top:10px;display:none">
+            <label style="display:block;font-family:Barlow Condensed,sans-serif">
+              <span style="font-weight:700;color:#047857;font-size:.86rem">🔒 TC Tribal — Locked Rate Override</span>
+              <span style="display:block;color:var(--muted);font-size:.72rem;margin-top:3px;line-height:1.45">If set, this TL gets a FLAT Tribal rate per enrollment (no sliding). Leave blank for the standard $23 (under 30) / $25 (over 30) slide. Example: enter <code>25</code> to lock at $25 per Tribal enrollment regardless of weekly count.</span>
+              <div style="margin-top:8px;display:flex;align-items:center;gap:8px">
+                <span style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">$</span>
+                <input type="number" id="apTribalLockedRate" min="0" max="28" step="1" placeholder="(blank = sliding)" style="width:120px;padding:6px 10px;font-family:Barlow Condensed,sans-serif;border:1px solid rgba(5,150,105,.4);border-radius:4px" oninput="if(window._apForm){ var v = this.value.trim(); window._apForm.tribalLockedRate = (v === '') ? null : Number(v); }">
+                <span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">per Tribal enrollment</span>
+              </div>
+            </label>
+          </div>
         </div>
 
         <!-- ── DANGER ZONE (edit mode only) ── -->
@@ -6098,38 +6113,84 @@ function payrollComputeDealSplit(opts){
 
     if(opts.isTribal){
       // ── TC TRIBAL ── ceiling $28 per deal
+      //
+      // Locked spec (Calvin 2026-05-15):
+      //   Field Agent personal: $18 (under 30) / $23 (30+) sliding
+      //   Team Leader personal: $23 (under 30) / $25 (30+) sliding
+      //                         OR tribalLockedRate if set on TL profile
+      //                         (Najee Burns is locked at $25)
+      //   Market Manager personal: $25 flat
+      //   CM Tanita personal:      $28 flat
+      //
+      //   Back-end overrides (applied in order, each fills the gap to the
+      //   NEXT cap above):
+      //     TL diff up to agent's TL-rate
+      //     MM diff up to $25 cap
+      //     CM fill up to $28 cap (tc-cm-difference markets only)
+      //
+      //   No double-payment: once a tier is reached, the override is $0.
       var tribalTotal = opts.agentTribalTotalThatWeek || 1;
       var inTier2 = tribalTotal > 30;
 
-      // Agent's personal Tribal rate
-      var agentRate;
+      // ── Tanita personal: flat $28, no further splits ──
       if(aIsCM && tcModel === 'tc-cm-difference'){
-        // Tanita personal: $28 flat, no TL/CM split
-        agentRate = 28;
-        splits.push({aid:aid, role:'cm-personal', cents:agentRate*100});
+        splits.push({aid:aid, role:'cm-personal', cents:2800});
         return splits;
-      } else if(aIsTL){
-        agentRate = inTier2 ? 23 : 18;  // TL personal same as agent rate
-      } else {
-        agentRate = inTier2 ? 23 : 18;  // agent sliding
       }
-      splits.push({aid:aid, role:(aIsTL?'tl-personal':'agent'), cents:agentRate*100});
 
-      // TL diff override — "TL gets difference up to agent's tier" per spec.
-      // The TL fills from agent's rate up to $23 (the max agent tier), capped
-      // at the gap. When agent already at $23, TL diff = $0.
+      // ── Determine TL's personal rate (with lock override) ──
+      //   For a TL: look at THEIR own profile.
+      //   For a FA: look at their TL's profile.
+      var tlRate; // dollars
+      var tlProfile = aIsTL ? agent : (tlId ? DB.agents.find(function(x){return x.id===tlId;}) : null);
+      if(tlProfile && typeof tlProfile.tribalLockedRate === 'number'){
+        tlRate = tlProfile.tribalLockedRate;          // Najee = $25 locked
+      } else {
+        tlRate = inTier2 ? 25 : 23;                    // Standard slide
+      }
+
+      // ── Determine the enrolling person's personal rate ──
+      var agentRate;
+      var enrollerRole;
+      if(aIsMM){
+        agentRate = 25;                                // MM flat $25 personal
+        enrollerRole = 'mm-personal';
+      } else if(aIsTL){
+        agentRate = tlRate;                            // TL personal (locked or sliding)
+        enrollerRole = 'tl-personal';
+      } else {
+        agentRate = inTier2 ? 23 : 18;                 // FA slide
+        enrollerRole = 'agent';
+      }
+      splits.push({aid:aid, role:enrollerRole, cents:agentRate*100});
+
+      // ── TL back-end override (only on FA enrollments) ──
+      // TL fills the gap from agent's rate up to TL's own rate.
+      // If TL has tribalLockedRate, that's the ceiling; otherwise it's the sliding rate.
       var tlOverride = 0;
       if(tlId && agent.role === 'Field Agent'){
-        var tlTargetCap = 23;
-        tlOverride = Math.max(0, tlTargetCap - agentRate);
+        tlOverride = Math.max(0, tlRate - agentRate);
         if(tlOverride > 0){
           splits.push({aid:tlId, role:'tl-diff', cents:tlOverride*100});
         }
       }
 
-      // CM fill — only in tc-cm-difference markets (Tanita)
+      // ── MM back-end override (option A — applies to FA and TL enrollments) ──
+      // MM fills the gap from the prior tier up to $25.
+      // For MM personal enrollment: MM already got $25, override is $0.
+      // For TL/FA enrollment: MM fills from (agent+TL) up to $25.
+      var mmOverride = 0;
+      if(mmId && !aIsMM && (agent.role === 'Field Agent' || aIsTL)){
+        var afterTL = agentRate + tlOverride;
+        mmOverride = Math.max(0, 25 - afterTL);
+        if(mmOverride > 0){
+          splits.push({aid:mmId, role:'mm-diff', cents:mmOverride*100});
+        }
+      }
+
+      // ── CM fill (tc-cm-difference markets only — Tanita) ──
       if(tcModel === 'tc-cm-difference' && cmId){
-        var cmFill = 28 - agentRate - tlOverride;
+        var cmFill = 28 - agentRate - tlOverride - mmOverride;
         if(cmFill > 0){
           splits.push({aid:cmId, role:'cm-fill', cents:cmFill*100});
         }
@@ -13718,6 +13779,7 @@ async function syncPullFreshAgent(agentId){
       officeManager: a.office_manager === true,
       canDistributeInventory: a.can_distribute_inventory === true,
       canTransferWithoutApproval: a.can_transfer_without_approval === true,
+      tribalLockedRate: (typeof a.tribal_locked_rate === 'number') ? a.tribal_locked_rate : null,
       iboMarkets:    safeJSON(a.ibo_markets, []),
       cmModel:       a.cm_model || 'none',
       tcModel:       a.tc_model || 'none',
@@ -13774,6 +13836,7 @@ async function syncPullFreshAllAgents(){
         officeManager: a.office_manager === true,
         canDistributeInventory: a.can_distribute_inventory === true,
       canTransferWithoutApproval: a.can_transfer_without_approval === true,
+      tribalLockedRate: (typeof a.tribal_locked_rate === 'number') ? a.tribal_locked_rate : null,
         iboMarkets:    safeJSON(a.ibo_markets, []),
         cmModel:       a.cm_model || 'none',
         tcModel:       a.tc_model || 'none',
@@ -15020,6 +15083,7 @@ async function loadFromSupabase(){
           officeManager: a.office_manager === true,
           canDistributeInventory: a.can_distribute_inventory === true,
       canTransferWithoutApproval: a.can_transfer_without_approval === true,
+      tribalLockedRate: (typeof a.tribal_locked_rate === 'number') ? a.tribal_locked_rate : null,
           iboMarkets:    safeJSON(a.ibo_markets, []),
           // Gen Mobile pay model — defaults to 'none' if column doesn't exist
           cmModel:       a.cm_model || 'none',
@@ -15410,6 +15474,7 @@ function _buildAgentRow(agent){
     office_manager: agent.officeManager === true,
     can_distribute_inventory: agent.canDistributeInventory === true,
     can_transfer_without_approval: agent.canTransferWithoutApproval === true,
+    tribal_locked_rate: (typeof agent.tribalLockedRate === 'number') ? agent.tribalLockedRate : null,
     ibo_markets:    JSON.stringify(agent.iboMarkets || []),
     cm_model:       agent.cmModel || null,
     tc_model:       agent.tcModel || null,
@@ -15445,6 +15510,7 @@ async function saveAgentToSupabase(agent){
       delete legacy.category; delete legacy.depts;
       delete legacy.office_manager; delete legacy.can_distribute_inventory;
       delete legacy.can_transfer_without_approval;
+      delete legacy.tribal_locked_rate;
       delete legacy.ibo_markets; delete legacy.cm_model;
       delete legacy.tc_model; delete legacy.aw_model;
       delete legacy.reports_to; delete legacy.address;
@@ -15515,6 +15581,7 @@ function _mergeServerAgentIntoLocal(serverRow){
     officeManager: serverRow.office_manager === true,
     canDistributeInventory: serverRow.can_distribute_inventory === true,
     canTransferWithoutApproval: serverRow.can_transfer_without_approval === true,
+    tribalLockedRate: (typeof serverRow.tribal_locked_rate === 'number') ? serverRow.tribal_locked_rate : null,
     iboMarkets:  safeJSONLocal(serverRow.ibo_markets, []),
     cmModel:     serverRow.cm_model || 'none',
     tcModel:     serverRow.tc_model || 'none',
@@ -45838,6 +45905,17 @@ function apPickRole(role){
     if(twaEl && window._apForm){
       twaEl.checked = !!window._apForm.canTransferWithoutApproval;
     }
+    // Calvin 2026-05-15: show + init the TC Tribal Locked-Rate row
+    // Owner-only field, only for TLs (since the locking only applies to TLs)
+    var tlrRow = document.getElementById('apTribalLockedRateRow');
+    var tlrEl  = document.getElementById('apTribalLockedRate');
+    var ownerEditing = (typeof isOwner === 'function' && isOwner(DB.current));
+    var isTeamLeader = (role === 'Team Leader');
+    if(tlrRow) tlrRow.style.display = (ownerEditing && isTeamLeader) ? '' : 'none';
+    if(tlrEl && window._apForm){
+      var v = window._apForm.tribalLockedRate;
+      tlrEl.value = (v === null || v === undefined) ? '' : String(v);
+    }
   }
 
   apRenderPlacement();
@@ -46461,6 +46539,8 @@ function openEditPerson(agentId){
   f.canDistributeInventory = !!agent.canDistributeInventory;
   // Calvin 2026-05-14: load transfer-without-approval flag (CM/MM/IBO/TL only)
   f.canTransferWithoutApproval = !!agent.canTransferWithoutApproval;
+  // Calvin 2026-05-15: load TC Tribal locked-rate override (null/undef = use sliding)
+  f.tribalLockedRate = (typeof agent.tribalLockedRate === 'number') ? agent.tribalLockedRate : null;
 
   // Programs
   f.programs = Array.isArray(agent.programs) ? agent.programs.slice()
@@ -47014,6 +47094,14 @@ async function apSavePerson(){
       agent.canDistributeInventory = !!f.canDistributeInventory;
       // Calvin 2026-05-14: same permission gate for the new transfer-without-approval flag
       agent.canTransferWithoutApproval = !!f.canTransferWithoutApproval;
+    }
+    // Calvin 2026-05-15: TC Tribal locked-rate override — Owner only (real money)
+    if(typeof isOwner === 'function' && isOwner(DB.current)){
+      if(f.tribalLockedRate === null || f.tribalLockedRate === undefined || isNaN(f.tribalLockedRate)){
+        delete agent.tribalLockedRate;
+      } else {
+        agent.tribalLockedRate = Number(f.tribalLockedRate);
+      }
     }
 
     // ── Save to local + Supabase ──
