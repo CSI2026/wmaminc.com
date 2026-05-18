@@ -10701,6 +10701,7 @@ function canAccess(u, area){
 
     // ── Pricelist: Owner + Inventory only (per Calvin spec) ──
     case 'gm-pricelist':
+    case 'inv-trash':
       return (typeof isOwner === 'function' && isOwner(u))
           || isInventory(u);
 
@@ -12171,21 +12172,137 @@ function applyGMActivations(activations, uploadBatchId){
     // Add to activations list
     act.uploadBatchId = uploadBatchId;
     GM_ACTIVATIONS.push(act);
-    // Update agent sales count if matched
+    // ── Calvin 2026-05-18: COMPLETE counter update ──
+    // Scoreboard / leaderboard / dashboard read FOUR fields. Previously
+    // only sales + agent.sales were bumped, so weekly scoreboard always
+    // showed 0 and audit trail was empty for activated devices.
+    //   (1) monthlySales[].sales              — month bucket
+    //   (2) monthlySales[].weekSales[weekKey] — week bucket (scoreboard reads)
+    //   (3) monthlySales[].entries[]          — date-stamped audit trail
+    //   (4) agent.sales                       — top-level aggregate (leaderboard)
     if(act.agentId && act.commEligible){
       var agent = DB.agents.find(function(a){return a.id===act.agentId;});
       if(agent){
-        var month = act.activationDate ? act.activationDate.slice(0,7) : new Date().toISOString().slice(0,7);
+        var month   = act.activationDate ? act.activationDate.slice(0,7) : new Date().toISOString().slice(0,7);
+        var weekKey = (typeof getWeekKey === 'function')
+                    ? getWeekKey(new Date(act.activationDate || Date.now()), '')
+                    : (act.activationDate || new Date().toISOString().slice(0,10));
+        var dateStr = act.activationDate || new Date().toISOString().slice(0,10);
         if(!agent.monthlySales) agent.monthlySales=[];
         var entry = agent.monthlySales.find(function(m){return m.month===month&&m.program==='Lifeline';});
-        if(entry){ entry.sales=(entry.sales||0)+1; }
-        else { agent.monthlySales.push({month:month,program:'Lifeline',sales:1}); }
+        if(!entry){
+          entry = {month:month, program:'Lifeline', sales:0, weekSales:{}, entries:[]};
+          agent.monthlySales.push(entry);
+        }
+        entry.sales = (entry.sales||0) + 1;
+        if(!entry.weekSales) entry.weekSales = {};
+        entry.weekSales[weekKey] = (entry.weekSales[weekKey]||0) + 1;
+        if(!entry.entries) entry.entries = [];
+        entry.entries.push({date:dateStr, count:1, imei:act.imei, tribal:!!act.tribal, source:'gm-activation-upload'});
+        // Top-level aggregate (leaderboard + dashboard read this)
+        agent.sales = (agent.sales || 0) + 1;
       }
     }
   });
   saveInventory();
   saveToStorage();
   return {updated:updated, notInInv:notInInv, phantomCreated:phantomCreated};
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY DELETE — Calvin 2026-05-18
+//
+//  Two-stage delete to preserve data during testing.
+//    invSoftDelete   — status='deleted', record preserved, reversible
+//    invHardDelete   — splices from pool (only works on soft-deleted)
+//    invRestoreDeleted — flips back to prior status
+//    invListSoftDeleted — list for trash UI
+//  Permission: Inv-Dept (depts.inv=true) + Owner. Works on all 4 campaigns.
+// ════════════════════════════════════════════════════════════════════════
+function _invDeleteResolvePool(campaign){
+  if(campaign === 'Gen Mobile')          return (typeof GM_INVENTORY !== 'undefined') ? GM_INVENTORY : null;
+  if(campaign === 'TruConnect')          return (typeof TC_INVENTORY !== 'undefined') ? TC_INVENTORY : null;
+  if(campaign === 'Assurance Wireless')  return (typeof AW_INVENTORY !== 'undefined') ? AW_INVENTORY : null;
+  if(campaign === 'Excess Telecom')      return (typeof EX_INVENTORY !== 'undefined') ? EX_INVENTORY : null;
+  return null;
+}
+function _invDeleteAuthorized(){
+  var u = DB.current;
+  if(!u) return false;
+  if(typeof isOwner === 'function' && isOwner(u)) return true;
+  if(typeof isInventory === 'function' && isInventory(u)) return true;
+  return false;
+}
+function invSoftDelete(campaign, imei, reason){
+  if(!_invDeleteAuthorized()) return false;
+  var pool = _invDeleteResolvePool(campaign);
+  if(!pool) return false;
+  var dev = pool.find(function(d){ return d && (d.imei === imei || d.id === imei); });
+  if(!dev) return false;
+  if(dev.status === 'deleted') return false;
+  var u = DB.current;
+  dev._priorStatus  = dev.status;
+  dev.status        = 'deleted';
+  dev.deletedBy     = u.id;
+  dev.deletedByName = u.name;
+  dev.deletedAt     = new Date().toISOString();
+  dev.deleteReason  = reason || '';
+  if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody = [];
+  dev.chainOfCustody.push({
+    type:'soft-delete', at:dev.deletedAt, by:u.name, byId:u.id,
+    reason:reason||'', priorStatus:dev._priorStatus
+  });
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+function invHardDelete(campaign, imei){
+  if(!_invDeleteAuthorized()) return false;
+  var pool = _invDeleteResolvePool(campaign);
+  if(!pool) return false;
+  var idx = pool.findIndex(function(d){ return d && (d.imei === imei || d.id === imei); });
+  if(idx < 0) return false;
+  if(pool[idx].status !== 'deleted') return false;
+  pool.splice(idx, 1);
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+function invRestoreDeleted(campaign, imei){
+  if(!_invDeleteAuthorized()) return false;
+  var pool = _invDeleteResolvePool(campaign);
+  if(!pool) return false;
+  var dev = pool.find(function(d){ return d && (d.imei === imei || d.id === imei); });
+  if(!dev) return false;
+  if(dev.status !== 'deleted') return false;
+  var u = DB.current;
+  dev.status = dev._priorStatus || 'available';
+  delete dev._priorStatus;
+  delete dev.deletedBy;
+  delete dev.deletedByName;
+  delete dev.deletedAt;
+  delete dev.deleteReason;
+  if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody = [];
+  dev.chainOfCustody.push({type:'restore', at:new Date().toISOString(), by:u.name, byId:u.id});
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+function invListSoftDeleted(){
+  var out = [];
+  ['Gen Mobile','TruConnect','Assurance Wireless','Excess Telecom'].forEach(function(camp){
+    var pool = _invDeleteResolvePool(camp);
+    if(!pool) return;
+    pool.forEach(function(d){ if(d && d.status === 'deleted') out.push({campaign:camp, device:d}); });
+  });
+  out.sort(function(a,b){ return (b.device.deletedAt||'').localeCompare(a.device.deletedAt||''); });
+  return out;
+}
+if(typeof window !== 'undefined'){
+  window.invSoftDelete = invSoftDelete;
+  window.invHardDelete = invHardDelete;
+  window.invRestoreDeleted = invRestoreDeleted;
+  window.invListSoftDeleted = invListSoftDeleted;
 }
 
 // ── GM Transfer helpers ──
@@ -13598,6 +13715,11 @@ function scoreboardInventory(user){
     if(!inScope) return;
 
     var st = d.status;
+    // Calvin 2026-05-18: soft-deleted devices are excluded from all
+    // scoreboard counts (total, sold, available) — they're "in the trash"
+    // and shouldn't influence any visible metric. Owner can still see them
+    // in panelInvTrash for restore/empty-trash actions.
+    if(st === 'deleted') return;
     var isSold = (st === 'sold' || st === 'activated' || d.soldAt);
     out.total++;
     if(isSold) out.sold++;
@@ -13605,6 +13727,141 @@ function scoreboardInventory(user){
   });
 
   return out;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY SOFT-DELETE + EMPTY TRASH (Calvin 2026-05-18)
+//
+//  Makenzie (and anyone with depts.inv=true) + Owner can soft-delete any
+//  inventory device from any campaign. Soft delete sets status='deleted'
+//  and stashes the prior status so the device can be restored. The Empty
+//  Trash action is Owner-only and permanently removes all status='deleted'
+//  devices from every pool.
+//
+//  Why soft delete by default: Calvin frequently tests with real data and
+//  needs to be able to undo mistakes. Hard delete is reserved for the
+//  explicit Empty Trash action.
+//
+//  PRESERVATION RULE (Calvin's #1 frustration): never silently drop any
+//  user's data. Soft-deleted devices remain in the pool with their full
+//  metadata intact and can be restored via invRestoreDevice.
+// ════════════════════════════════════════════════════════════════════════
+function invSoftDeleteDevice(deviceId, reason){
+  var u = (typeof DB !== 'undefined') ? DB.current : null;
+  if(!u) return false;
+  // Permission gate: Owner OR depts.inv=true (Makenzie has this)
+  var canDelete = (typeof isOwner === 'function' && isOwner(u))
+               || (typeof isInventory === 'function' && isInventory(u));
+  if(!canDelete) return false;
+  // Find the device across every pool
+  var pools = [
+    (typeof GM_INVENTORY  !== 'undefined') ? GM_INVENTORY  : null,
+    (typeof TC_INVENTORY  !== 'undefined') ? TC_INVENTORY  : null,
+    (typeof AW_INVENTORY  !== 'undefined') ? AW_INVENTORY  : null,
+    (typeof EX_INVENTORY  !== 'undefined') ? EX_INVENTORY  : null,
+    (typeof INVENTORY_DEVICES !== 'undefined') ? INVENTORY_DEVICES : null
+  ];
+  var dev = null;
+  for(var i=0;i<pools.length;i++){
+    if(!pools[i]) continue;
+    dev = pools[i].find(function(d){ return d && d.id === deviceId; });
+    if(dev) break;
+  }
+  if(!dev) return false;
+  if(dev.status === 'deleted') return false; // already deleted
+  // Stash prior status for restore
+  dev._statusBeforeDelete = dev.status;
+  dev.status = 'deleted';
+  dev.deletedAt = new Date().toISOString();
+  dev.deletedBy = u.id;
+  dev.deletedByName = u.name || '';
+  dev.deletedReason = reason || '';
+  // Chain of custody entry
+  if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody = [];
+  dev.chainOfCustody.push({
+    type:   'soft-delete',
+    at:     dev.deletedAt,
+    by:     u.name || '',
+    byId:   u.id,
+    reason: reason || ''
+  });
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+
+function invRestoreDevice(deviceId){
+  var u = (typeof DB !== 'undefined') ? DB.current : null;
+  if(!u) return false;
+  var canRestore = (typeof isOwner === 'function' && isOwner(u))
+                || (typeof isInventory === 'function' && isInventory(u));
+  if(!canRestore) return false;
+  var pools = [
+    (typeof GM_INVENTORY  !== 'undefined') ? GM_INVENTORY  : null,
+    (typeof TC_INVENTORY  !== 'undefined') ? TC_INVENTORY  : null,
+    (typeof AW_INVENTORY  !== 'undefined') ? AW_INVENTORY  : null,
+    (typeof EX_INVENTORY  !== 'undefined') ? EX_INVENTORY  : null,
+    (typeof INVENTORY_DEVICES !== 'undefined') ? INVENTORY_DEVICES : null
+  ];
+  var dev = null;
+  for(var i=0;i<pools.length;i++){
+    if(!pools[i]) continue;
+    dev = pools[i].find(function(d){ return d && d.id === deviceId; });
+    if(dev) break;
+  }
+  if(!dev) return false;
+  if(dev.status !== 'deleted') return false;
+  // Restore prior status (default to 'unassigned' if missing)
+  dev.status = dev._statusBeforeDelete || 'unassigned';
+  delete dev._statusBeforeDelete;
+  delete dev.deletedAt;
+  delete dev.deletedBy;
+  delete dev.deletedByName;
+  delete dev.deletedReason;
+  if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody = [];
+  dev.chainOfCustody.push({
+    type: 'restored',
+    at:   new Date().toISOString(),
+    by:   u.name || '',
+    byId: u.id
+  });
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return true;
+}
+
+// Owner-only: permanently remove all status='deleted' devices across every pool.
+// Returns the count of devices removed.
+function invEmptyTrash(){
+  var u = (typeof DB !== 'undefined') ? DB.current : null;
+  if(!u) return 0;
+  if(!(typeof isOwner === 'function' && isOwner(u))) return 0;
+  var removed = 0;
+  var pools = [
+    {name: 'GM_INVENTORY',  arr: (typeof GM_INVENTORY  !== 'undefined') ? GM_INVENTORY  : null},
+    {name: 'TC_INVENTORY',  arr: (typeof TC_INVENTORY  !== 'undefined') ? TC_INVENTORY  : null},
+    {name: 'AW_INVENTORY',  arr: (typeof AW_INVENTORY  !== 'undefined') ? AW_INVENTORY  : null},
+    {name: 'EX_INVENTORY',  arr: (typeof EX_INVENTORY  !== 'undefined') ? EX_INVENTORY  : null},
+    {name: 'INVENTORY_DEVICES', arr: (typeof INVENTORY_DEVICES !== 'undefined') ? INVENTORY_DEVICES : null}
+  ];
+  pools.forEach(function(p){
+    if(!p.arr) return;
+    for(var i = p.arr.length - 1; i >= 0; i--){
+      if(p.arr[i] && p.arr[i].status === 'deleted'){
+        p.arr.splice(i, 1);
+        removed++;
+      }
+    }
+  });
+  if(typeof saveInventory === 'function') saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
+  return removed;
+}
+
+if(typeof window !== 'undefined'){
+  window.invSoftDeleteDevice = invSoftDeleteDevice;
+  window.invRestoreDevice = invRestoreDevice;
+  window.invEmptyTrash = invEmptyTrash;
 }
 
 function devicesHeldBy(agentId, type){
@@ -24272,6 +24529,7 @@ function gotoPanel(id, params){
     'payroll-rollup':panelPayrollRollup,
     'payroll-debt':panelPayrollDebt,
     'inv-dept-approvals':panelInvDeptApprovals,
+    'inv-trash':panelInvTrash,
     'gm-inventory':panelGMInventory,'gm-upload':panelGMUpload,
     'gm-transfers':panelGMTransfers,'gm-agent-inv':panelGMAgentInventory,
     'gm-pricelist':panelGMPricelist,
@@ -31587,6 +31845,175 @@ if(typeof window !== 'undefined'){
   window.panelInvDeptApprovals = panelInvDeptApprovals;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  PANEL: INVENTORY TRASH — Calvin 2026-05-18
+//
+//  Lists soft-deleted devices across all four campaigns. Inv-Dept + Owner
+//  can Restore (back to prior status) or Hard Delete (permanently remove).
+//  Soft-deleted devices stay here until hard-deleted or restored — your
+//  safety net during testing.
+// ════════════════════════════════════════════════════════════════════════
+function panelInvTrash(){
+  var u = DB.current;
+  var canManage = (typeof isOwner === 'function' && isOwner(u)) || isInventory(u);
+  if(!canManage){
+    return panelHeader('🗑 Inventory Trash') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner or Inventory team only.</div></div>';
+  }
+  var list = (typeof invListSoftDeleted === 'function') ? invListSoftDeleted() : [];
+  var h = panelHeader('🗑 Inventory Trash');
+  // Top bar
+  h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px;align-items:center">';
+  h += '<button onclick="gotoPanel(\'gm-inventory\')" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:9px 16px;border-radius:4px;cursor:pointer">← Back to Inventory</button>';
+  h += '<div style="flex:1"></div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">'+list.length+' device(s) in trash</div>';
+  if(list.length > 0){
+    h += '<button onclick="invTrashEmptyAll()" style="background:rgba(204,0,0,.08);border:1.5px solid rgba(204,0,0,.4);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:9px 16px;border-radius:4px;cursor:pointer;font-weight:700">⚠ Empty Trash ('+list.length+')</button>';
+  }
+  h += '</div>';
+
+  // Explanation card
+  h += '<div class="bo-card" style="margin-bottom:18px;background:rgba(0,53,148,.04);border:1px solid rgba(0,53,148,.2)"><div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.55">';
+  h += '<strong style="color:var(--blue)">🛟 Two-stage delete:</strong> When you delete inventory from any campaign page, the device is soft-deleted into here. The record is preserved and hidden from normal views but can be restored. To permanently remove a device, click <em>Hard Delete</em> below — or <em>Empty Trash</em> to clear everything at once. Use this when testing so you don\'t lose work.';
+  h += '</div></div>';
+
+  // Quick-delete tool: look up an IMEI from ANY campaign and send to trash
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">🔍 Quick Delete — Find IMEI Across All Campaigns</div></div>';
+  h += '<div style="padding:14px 18px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);margin-bottom:10px;line-height:1.5">Type an IMEI from any campaign (Gen Mobile, TruConnect, Assurance Wireless, Excess Telecom) to find and soft-delete it. The device record is preserved — you can restore it from this panel.</div>';
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+  h += '<input id="inv-trash-imei-input" type="text" placeholder="Enter IMEI" style="flex:1;min-width:240px;padding:9px 12px;border:1px solid var(--border);border-radius:5px;font-family:monospace;font-size:.86rem">';
+  h += '<input id="inv-trash-reason-input" type="text" placeholder="Reason (optional)" style="flex:1;min-width:200px;padding:9px 12px;border:1px solid var(--border);border-radius:5px;font-family:Barlow Condensed,sans-serif;font-size:.82rem">';
+  h += '<button onclick="invTrashQuickDelete()" style="background:#CC0000;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 22px;border-radius:5px;cursor:pointer;font-weight:700">🗑 Find & Delete</button>';
+  h += '</div></div></div>';
+
+  if(list.length === 0){
+    h += '<div class="bo-card"><div style="padding:50px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2.5rem;margin-bottom:8px">🗑</div><div>Trash is empty — no soft-deleted devices.</div></div></div>';
+    return h;
+  }
+
+  // Group by campaign
+  var byCamp = {};
+  list.forEach(function(x){
+    if(!byCamp[x.campaign]) byCamp[x.campaign] = [];
+    byCamp[x.campaign].push(x.device);
+  });
+
+  Object.keys(byCamp).forEach(function(camp){
+    var devs = byCamp[camp];
+    h += '<div class="bo-card" style="margin-bottom:18px">';
+    h += '<div class="bo-card-head"><div class="bo-card-title">'+_escapeHtml(camp)+' — '+devs.length+' device(s)</div></div>';
+    h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.82rem">';
+    h += '<thead><tr style="border-bottom:2px solid var(--border);background:var(--cream)">';
+    ['IMEI','Model','Market','Prior Status','Deleted By','Deleted At','Reason','Actions'].forEach(function(c){
+      h += '<th style="padding:8px 10px;text-align:left;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--brown);font-weight:700">'+c+'</th>';
+    });
+    h += '</tr></thead><tbody>';
+    devs.forEach(function(d){
+      var imei = _escapeHtml(d.imei || '');
+      var campEsc = camp.replace(/'/g,"\\'");
+      var imeiEsc = (d.imei || '').replace(/'/g,"\\'");
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:8px 10px;font-family:monospace;font-size:.74rem">'+imei+'</td>';
+      h += '<td style="padding:8px 10px">'+_escapeHtml(d.model || '—')+'</td>';
+      h += '<td style="padding:8px 10px">'+_escapeHtml(d.market || '—')+'</td>';
+      h += '<td style="padding:8px 10px;color:var(--muted)">'+_escapeHtml(d._priorStatus || '—')+'</td>';
+      h += '<td style="padding:8px 10px">'+_escapeHtml(d.deletedByName || '—')+'</td>';
+      h += '<td style="padding:8px 10px;font-size:.72rem;color:var(--muted)">'+_escapeHtml((d.deletedAt||'').slice(0,16).replace('T',' '))+'</td>';
+      h += '<td style="padding:8px 10px;font-size:.72rem">'+_escapeHtml(d.deleteReason || '')+'</td>';
+      h += '<td style="padding:8px 10px;white-space:nowrap">';
+      h += '<button onclick="invTrashRestore(\''+campEsc+'\',\''+imeiEsc+'\')" style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.4);color:#059669;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 10px;border-radius:4px;cursor:pointer;margin-right:6px">↩ Restore</button>';
+      h += '<button onclick="invTrashHardDelete(\''+campEsc+'\',\''+imeiEsc+'\')" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.4);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 10px;border-radius:4px;cursor:pointer">🗑 Hard Delete</button>';
+      h += '</td></tr>';
+    });
+    h += '</tbody></table></div></div>';
+  });
+  return h;
+}
+
+// UI handlers for the trash panel
+function invTrashRestore(campaign, imei){
+  if(!confirm('Restore this device from trash?\n\nCampaign: '+campaign+'\nIMEI: '+imei+'\n\nThe device will return to its prior status.')) return;
+  var ok = invRestoreDeleted(campaign, imei);
+  if(ok){ if(typeof cdFlash === 'function') cdFlash('Device restored'); renderApp(); }
+  else { alert('Restore failed — not authorized or device not in trash.'); }
+}
+function invTrashHardDelete(campaign, imei){
+  var msg = '⚠ PERMANENT DELETE\n\nThis will permanently remove the device record from the system. This CANNOT be undone.\n\nCampaign: '+campaign+'\nIMEI: '+imei+'\n\nType DELETE to confirm:';
+  var c = prompt(msg);
+  if(c !== 'DELETE'){ if(c !== null) alert('Cancelled.'); return; }
+  var ok = invHardDelete(campaign, imei);
+  if(ok){ if(typeof cdFlash === 'function') cdFlash('Device permanently deleted'); renderApp(); }
+  else { alert('Hard delete failed — not authorized or device not in trash.'); }
+}
+function invTrashEmptyAll(){
+  var list = invListSoftDeleted();
+  if(!list.length){ alert('Trash is already empty.'); return; }
+  var msg = '⚠ EMPTY TRASH\n\nThis will permanently delete '+list.length+' device record(s). This CANNOT be undone.\n\nType EMPTY to confirm:';
+  var c = prompt(msg);
+  if(c !== 'EMPTY'){ if(c !== null) alert('Cancelled.'); return; }
+  var n = 0;
+  list.forEach(function(x){ if(invHardDelete(x.campaign, x.device.imei)) n++; });
+  if(typeof cdFlash === 'function') cdFlash(n+' device(s) permanently deleted');
+  renderApp();
+}
+
+// Per-device delete handler — wired from inventory row buttons
+function invDeleteDevicePrompt(campaign, imei){
+  if(typeof DB === 'undefined' || !DB.current){ alert('Not logged in.'); return; }
+  var u = DB.current;
+  var canManage = (typeof isOwner === 'function' && isOwner(u)) || isInventory(u);
+  if(!canManage){ alert('Only Owner / Inventory team can delete devices.'); return; }
+  var reason = prompt('Delete this device?\n\nCampaign: '+campaign+'\nIMEI: '+imei+'\n\nThe device will be moved to Trash (soft-delete). You can restore it later.\n\nReason (optional):');
+  if(reason === null) return;
+  var ok = invSoftDelete(campaign, imei, reason || '');
+  if(ok){
+    if(typeof cdFlash === 'function') cdFlash('Device moved to Trash');
+    renderApp();
+  } else {
+    alert('Delete failed — device not found or already deleted.');
+  }
+}
+
+// Quick-delete from trash panel: find IMEI in ANY campaign and soft-delete
+function invTrashQuickDelete(){
+  var imeiEl = document.getElementById('inv-trash-imei-input');
+  var reasonEl = document.getElementById('inv-trash-reason-input');
+  if(!imeiEl){ alert('Form error.'); return; }
+  var imei = (imeiEl.value || '').trim();
+  var reason = reasonEl ? (reasonEl.value || '').trim() : '';
+  if(!imei){ alert('Please enter an IMEI.'); return; }
+  // Find which campaign holds this IMEI
+  var campaigns = ['Gen Mobile','TruConnect','Assurance Wireless','Excess Telecom'];
+  var foundCamp = null, foundDev = null;
+  campaigns.forEach(function(c){
+    if(foundDev) return;
+    var pool = _invDeleteResolvePool(c);
+    if(!pool) return;
+    var d = pool.find(function(x){ return x && x.imei === imei; });
+    if(d){ foundCamp = c; foundDev = d; }
+  });
+  if(!foundDev){ alert('IMEI not found in any campaign: '+imei); return; }
+  if(foundDev.status === 'deleted'){ alert('IMEI '+imei+' is already in trash.'); return; }
+  if(!confirm('Found in '+foundCamp+':\n\nIMEI: '+imei+'\nModel: '+(foundDev.model||'—')+'\nMarket: '+(foundDev.market||'—')+'\nStatus: '+foundDev.status+(foundDev.holderName?'\nHolder: '+foundDev.holderName:'')+'\n\nMove to trash?')) return;
+  var ok = invSoftDelete(foundCamp, imei, reason);
+  if(ok){
+    if(typeof cdFlash === 'function') cdFlash('Device moved to Trash');
+    renderApp();
+  } else {
+    alert('Delete failed.');
+  }
+}
+
+if(typeof window !== 'undefined'){
+  window.panelInvTrash = panelInvTrash;
+  window.invTrashRestore = invTrashRestore;
+  window.invTrashHardDelete = invTrashHardDelete;
+  window.invTrashEmptyAll = invTrashEmptyAll;
+  window.invTrashQuickDelete = invTrashQuickDelete;
+  window.invDeleteDevicePrompt = invDeleteDevicePrompt;
+}
+
 // Periodic timeout check — scans all pending transfers across all
 // campaigns and fires escalation notifications for any that are
 // older than 48 hours. Stamps escalatedAt on the record so we don't
@@ -32362,6 +32789,19 @@ function panelInvDashboard(){
     }
   }
 
+  // ── Calvin 2026-05-18: Bulk Delete tool button — Owner + Inv Dept ──
+  // Surfaces panelOwnerInvDelete so Makenzie can find it from the nav.
+  if(isOwner(u) || isInventory(u)){
+    h += '<div style="background:linear-gradient(135deg,rgba(204,0,0,.06),rgba(204,0,0,.02));border:1.5px solid rgba(204,0,0,.25);border-radius:10px;padding:14px 18px;margin-bottom:18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+    h += '<div style="font-size:1.6rem">🗑️</div>';
+    h += '<div style="flex:1">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;letter-spacing:2px;color:var(--red)">Bulk Delete Inventory (Test Cleanup)</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);margin-top:2px">Soft-delete IMEIs / SIMs from any campaign — used during testing. Owner can also Empty Trash to permanently free up IMEIs for re-upload.</div>';
+    h += '</div>';
+    h += '<button onclick="gotoPanel(\'owner-inv-delete\')" style="background:var(--red);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 18px;border-radius:5px;cursor:pointer;font-weight:700">Open Delete Tool →</button>';
+    h += '</div>';
+  }
+
   // ── Deletion approval tasks (owner only) ──
   if(isOwner(u) && pendingDels > 0){
     h += '<div style="background:rgba(204,0,0,.06);border:2px solid rgba(204,0,0,.35);border-radius:10px;padding:16px 20px;margin-bottom:18px">';
@@ -32970,7 +33410,16 @@ function panelInvExport(){
 
 function panelMyInventory(){
   var u = DB.current;
-  var myDevices = devicesHeldBy(u.id, null);
+  var allDevices = devicesHeldBy(u.id, null);
+  // ── Calvin 2026-05-18 FIX ──
+  // Once a device is activated/sold, it shouldn't appear in the working
+  // inventory view because it's no longer transferable — it's with the
+  // customer. The device record stays on the agent (for audit + scoreboard
+  // sold counts), but the "My Inventory" working view filters them out.
+  var myDevices = allDevices.filter(function(d){
+    return d && d.status !== 'activated' && d.status !== 'sold' && d.status !== 'deleted' && !d.soldAt;
+  });
+  var soldCount = allDevices.length - myDevices.length;
   var mySupply = [];
   SUPPLY_CATALOG.forEach(function(item){
     var stock = SUPPLY_INVENTORY[item.id]||{assigned:{}};
@@ -32978,7 +33427,9 @@ function panelMyInventory(){
     if(qty>0) mySupply.push({item:item,qty:qty});
   });
   var h = '<div class="bo-card" style="margin-bottom:16px"><div class="bo-card-head"><div class="bo-card-title">My Device Inventory ('+myDevices.length+')</div>'
-        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">Devices currently in your possession — transfer them out below</div></div>';
+        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">Devices currently in your possession — transfer them out below'
+        + (soldCount > 0 ? ' &middot; <span style="color:#059669;font-weight:700">'+soldCount+' activated/sold this period</span> (not shown — see Sold Reports for history)' : '')
+        + '</div></div>';
   if(!myDevices.length){
     h += '<div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No devices currently assigned to you.</div>';
   } else {
@@ -35509,6 +35960,7 @@ function panelGMInventory(){
   if(isInv) h += '<button onclick="gotoPanel(\'gm-upload\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">⬆ Upload CSV</button>';
   h += '<button onclick="gotoPanel(\'gm-transfers\')" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 20px;border-radius:4px;cursor:pointer">🔄 Transfers</button>';
   if(isInv) h += '<button onclick="gmOpenMarketSettings()" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 20px;border-radius:4px;cursor:pointer">⚙️ Market Settings</button>';
+  if(isInv) h += '<button onclick="gotoPanel(\'inv-trash\')" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.25);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 20px;border-radius:4px;cursor:pointer">🗑 Trash</button>';
   h += '</div>';
 
   // Market breakdown — now includes reconciliation math per Calvin 2026-05-03
@@ -48218,6 +48670,42 @@ function srImportManualRows(rows, carrier, uploadedBy){
       raw:           r
     });
     if(entry) added++;
+
+    // ════════════════════════════════════════════════════════════════════
+    //  Calvin 2026-05-18 — SYSTEMATIC ROOT-CAUSE FIX
+    //
+    //  Previous bug: srAddSoldReport only added a row to SOLD_REPORTS. It
+    //  did NOT update the matching inventory device's status, did NOT
+    //  bump agent.sales (which the leaderboard reads), and did NOT add
+    //  to monthlySales. So after a sold-upload the scoreboard still
+    //  showed the device as available AND the leaderboard showed the
+    //  agent with 0 sales.
+    //
+    //  This block runs in EVERY upload (manual + auto-derived) and
+    //  systematically updates every counter that should react. Applies
+    //  to every carrier (Gen Mobile, TruConnect, Assurance, Excess, etc.)
+    //  in one place — no carrier-specific patching needed.
+    //
+    //  Order of operations:
+    //    1. Find the matching inventory device by IMEI across all pools
+    //    2. Set status='sold', soldAt, soldByAgentId
+    //    3. Bump agent.sales (top-level total — leaderboard source)
+    //    4. Add to agent.monthlySales[] (month bucket)
+    //    5. Append to chainOfCustody for traceability
+    // ════════════════════════════════════════════════════════════════════
+    if(typeof invMarkAsSold === 'function'){
+      invMarkAsSold({
+        imei:        r.imei,
+        carrier:     carrier || r.carrier,
+        soldAt:      r.soldAt || new Date().toISOString().slice(0,10),
+        agentId:     agent ? agent.id : null,
+        agentName:   agent ? agent.name : (r.agentCode || ''),
+        orderNumber: r.orderNumber || '',
+        customerName: r.customerName || '',
+        source:      'sold-report-upload',
+        batchId:     batchId
+      });
+    }
   });
   SOLD_REPORT_BATCHES.push({
     id: batchId,
@@ -48230,7 +48718,104 @@ function srImportManualRows(rows, carrier, uploadedBy){
     count: added
   });
   saveInventory();
+  if(typeof saveToStorage === 'function') saveToStorage();
   return added;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  invMarkAsSold — SYSTEMATIC sold-event handler (Calvin 2026-05-18)
+//
+//  Single source of truth for "this device just sold." Called by every
+//  upload path (manual sold-report, derived sold-report, future carrier
+//  hooks). Updates every counter that should react:
+//
+//    - Finds the inventory device by IMEI across every pool
+//    - Sets status='sold' + soldAt + soldByAgentId + soldByAgentName
+//    - Records chainOfCustody entry for traceability
+//    - Bumps agent.sales (the rolling total that leaderboards read)
+//    - Adds to agent.monthlySales[] (month-bucketed)
+//
+//  Idempotent: if the device is already status='sold' or 'activated',
+//  the function is a no-op. So re-uploading the same report doesn't
+//  double-count.
+// ════════════════════════════════════════════════════════════════════════
+function invMarkAsSold(opts){
+  if(!opts || !opts.imei) return false;
+  var normImei = String(opts.imei).replace(/\D/g,'');
+  if(!normImei) return false;
+  // Find the device across every pool
+  var pool = null, dev = null;
+  var pools = [
+    {name: 'GM_INVENTORY',  arr: (typeof GM_INVENTORY  !== 'undefined') ? GM_INVENTORY  : null},
+    {name: 'TC_INVENTORY',  arr: (typeof TC_INVENTORY  !== 'undefined') ? TC_INVENTORY  : null},
+    {name: 'AW_INVENTORY',  arr: (typeof AW_INVENTORY  !== 'undefined') ? AW_INVENTORY  : null},
+    {name: 'EX_INVENTORY',  arr: (typeof EX_INVENTORY  !== 'undefined') ? EX_INVENTORY  : null},
+    {name: 'INVENTORY_DEVICES', arr: (typeof INVENTORY_DEVICES !== 'undefined') ? INVENTORY_DEVICES : null}
+  ];
+  for(var i=0;i<pools.length;i++){
+    if(!pools[i].arr) continue;
+    dev = pools[i].arr.find(function(d){
+      return d && String(d.imei||'').replace(/\D/g,'') === normImei;
+    });
+    if(dev){ pool = pools[i]; break; }
+  }
+  if(!dev){
+    // No matching inventory record. The sold-report is still saved
+    // (a row exists in SOLD_REPORTS) but no device counter updates.
+    return false;
+  }
+  // Idempotency: already-sold devices are a no-op
+  if(dev.status === 'sold' || dev.status === 'activated'){
+    return false;
+  }
+  // ── Update device ──
+  dev._statusBeforeSold = dev.status; // for potential rollback
+  dev.status = 'sold';
+  dev.soldAt = opts.soldAt || new Date().toISOString().slice(0,10);
+  dev.soldByAgentId = opts.agentId || null;
+  dev.soldByAgentName = opts.agentName || '';
+  if(opts.orderNumber) dev.soldOrderNumber = opts.orderNumber;
+  if(opts.customerName) dev.customerName = opts.customerName;
+  // Chain of custody entry
+  if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody = [];
+  dev.chainOfCustody.push({
+    type:   'sold',
+    at:     dev.soldAt,
+    by:     opts.agentName || '',
+    byId:   opts.agentId || null,
+    source: opts.source || 'sold-report',
+    batchId: opts.batchId || null,
+    orderNumber: opts.orderNumber || '',
+    customerName: opts.customerName || ''
+  });
+  // ── Update agent counters ──
+  if(opts.agentId){
+    var agent = (DB.agents||[]).find(function(a){ return a && a.id === opts.agentId; });
+    if(agent){
+      // 1. Rolling total (leaderboard reads this)
+      agent.sales = (agent.sales || 0) + 1;
+      // 2. Month bucket (monthly sales breakdowns)
+      if(!Array.isArray(agent.monthlySales)) agent.monthlySales = [];
+      var month = (opts.soldAt && /^\d{4}-\d{2}/.test(opts.soldAt))
+                  ? opts.soldAt.slice(0,7)
+                  : new Date().toISOString().slice(0,7);
+      // Bucket by month + program (Lifeline for the carriers we handle)
+      var carrier = opts.carrier || dev.campaign || '';
+      var LIFELINE = ['Gen Mobile','TruConnect','Assurance','Assurance Wireless','Excess','Excess Telecom'];
+      var program = LIFELINE.indexOf(carrier) >= 0 ? 'Lifeline' : (carrier || 'Other');
+      var bucket = agent.monthlySales.find(function(m){ return m && m.month === month && m.program === program; });
+      if(bucket){
+        bucket.sales = (bucket.sales || 0) + 1;
+      } else {
+        agent.monthlySales.push({month: month, program: program, sales: 1});
+      }
+    }
+  }
+  return true;
+}
+
+if(typeof window !== 'undefined'){
+  window.invMarkAsSold = invMarkAsSold;
 }
 
 // ── PANEL: IMEI SEARCH ──
