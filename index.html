@@ -10812,6 +10812,315 @@ function agentCodedCampaigns(agent){
   var carriers = (agent.carrier||'').split(',').map(function(c){return c.trim();}).filter(Boolean);
   return carriers.filter(function(c){ return agentIsCoded(agent, c); });
 }
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY SYNC — PATH A (Calvin 2026-05-18)
+//
+//  WHY: Inventory is already saved to Supabase via saveInventory (existing
+//  keys: gm_inventory, tc_inventory, etc. in app_settings). But there's
+//  no PULL on navigation and no VERSION CHECK — so different browsers
+//  silently overwrite each other. Symptom: Makenzie deletes 59 devices on
+//  her Chrome, Calvin opens Safari and still sees them because his page
+//  was loaded BEFORE her save and never re-pulled.
+//
+//  HOW THIS LAYER WORKS:
+//   - We sit ON TOP of the existing inventory push (no key changes)
+//   - For each pool we store a companion version key:
+//       gm_inventory      → existing devices array (unchanged)
+//       gm_inventory_meta → {version, lastWriter, lastWriterId, lastWrittenAt}
+//   - Every saveInventory():
+//       * Bump local version
+//       * Push the meta key alongside the existing data key
+//   - Every gotoPanel():
+//       * Pull all 5 meta keys (debounced, max once / 3s)
+//       * If remote version > local version for any pool → show banner
+//       * Banner offers "Refresh Now" (pulls fresh data) or "Dismiss"
+//   - Before a save commits, inventorySyncPreSaveCheck() warns if there's
+//     a known conflict — Save Anyway = explicit overwrite, never silent.
+//
+//  PRESERVATION (Calvin's #1 frustration): NEVER silently overwrite. The
+//  pull only updates the meta state. Local data isn't touched until the
+//  user clicks Refresh Now. Save Anyway requires a confirm() — explicit.
+// ════════════════════════════════════════════════════════════════════════
+
+// Pools we sync. Each maps to its existing app_settings data key.
+var INV_SYNC_POOLS = [
+  {key:'gm',     dataSettingKey:'gm_inventory', label:'Gen Mobile'},
+  {key:'tc',     dataSettingKey:'tc_inventory', label:'TruConnect'},
+  {key:'aw',     dataSettingKey:'aw_inventory', label:'Assurance'},
+  {key:'ex',     dataSettingKey:'ex_inventory', label:'Excess'},
+  {key:'legacy', dataSettingKey:'inv_devices',  label:'Legacy'}
+];
+function _invSyncMetaKey(poolKey){ return _invSyncDataKey(poolKey) + '_meta'; }
+function _invSyncDataKey(poolKey){
+  var p = INV_SYNC_POOLS.find(function(x){return x.key===poolKey;});
+  return p ? p.dataSettingKey : null;
+}
+function _invSyncPoolForKey(poolKey){
+  switch(poolKey){
+    case 'gm':     return (typeof GM_INVENTORY     !== 'undefined') ? GM_INVENTORY     : null;
+    case 'tc':     return (typeof TC_INVENTORY     !== 'undefined') ? TC_INVENTORY     : null;
+    case 'aw':     return (typeof AW_INVENTORY     !== 'undefined') ? AW_INVENTORY     : null;
+    case 'ex':     return (typeof EX_INVENTORY     !== 'undefined') ? EX_INVENTORY     : null;
+    case 'legacy': return (typeof INVENTORY_DEVICES!== 'undefined') ? INVENTORY_DEVICES : null;
+    default: return null;
+  }
+}
+function _invSyncReplacePool(poolKey, devices){
+  if(!Array.isArray(devices)) return false;
+  switch(poolKey){
+    case 'gm':     if(typeof GM_INVENTORY     !== 'undefined'){ GM_INVENTORY.length=0;     Array.prototype.push.apply(GM_INVENTORY,     devices); return true; } break;
+    case 'tc':     if(typeof TC_INVENTORY     !== 'undefined'){ TC_INVENTORY.length=0;     Array.prototype.push.apply(TC_INVENTORY,     devices); return true; } break;
+    case 'aw':     if(typeof AW_INVENTORY     !== 'undefined'){ AW_INVENTORY.length=0;     Array.prototype.push.apply(AW_INVENTORY,     devices); return true; } break;
+    case 'ex':     if(typeof EX_INVENTORY     !== 'undefined'){ EX_INVENTORY.length=0;     Array.prototype.push.apply(EX_INVENTORY,     devices); return true; } break;
+    case 'legacy': if(typeof INVENTORY_DEVICES !== 'undefined'){ INVENTORY_DEVICES.length=0; Array.prototype.push.apply(INVENTORY_DEVICES, devices); return true; } break;
+  }
+  return false;
+}
+
+// Local version state — bumped on every save. Persisted to localStorage.
+var INV_SYNC_LOCAL_VERSION = {gm:0, tc:0, aw:0, ex:0, legacy:0};
+// What we last knew the remote version to be — for conflict detection.
+var INV_SYNC_REMOTE_VERSION = {gm:0, tc:0, aw:0, ex:0, legacy:0};
+// Pending conflict banner state — set by inventorySyncPull, rendered by
+// renderInventoryConflictBanner inside every gotoPanel-rendered panel.
+var INV_SYNC_CONFLICT = null; // {pool, remoteVersion, localVersion, remoteWriter, remoteAt} or null
+// Pull debounce — max once per N ms even on rapid gotoPanel calls.
+var INV_SYNC_LAST_PULL_AT = 0;
+var INV_SYNC_PULL_MIN_INTERVAL_MS = 3000;
+
+function _invSyncLoadVersionState(){
+  try{
+    var s = localStorage.getItem('wmam_inv_sync_versions');
+    if(s){
+      var v = JSON.parse(s);
+      if(v && typeof v === 'object'){
+        ['gm','tc','aw','ex','legacy'].forEach(function(k){
+          if(typeof v[k] === 'number') INV_SYNC_LOCAL_VERSION[k] = v[k];
+        });
+      }
+    }
+  }catch(e){}
+}
+function _invSyncSaveVersionState(){
+  try{ localStorage.setItem('wmam_inv_sync_versions', JSON.stringify(INV_SYNC_LOCAL_VERSION)); }catch(e){}
+}
+
+// Build the meta payload for a pool — version stamp + who-wrote-it.
+function _invSyncBuildMeta(poolKey){
+  var u = (typeof DB !== 'undefined' && DB.current) ? DB.current : null;
+  var nextVersion = (INV_SYNC_LOCAL_VERSION[poolKey] || 0) + 1;
+  return {
+    version:       nextVersion,
+    lastWriterId:  u ? u.id : null,
+    lastWriter:    u ? (u.name || u.username || '') : '',
+    lastWrittenAt: new Date().toISOString()
+  };
+}
+
+// Push meta keys for every pool. Data keys are pushed by the existing
+// saveInventory body — we only add version stamps here.
+function inventorySyncSave(){
+  if(typeof supaClient === 'undefined' || !supaClient) return; // offline-safe
+  INV_SYNC_POOLS.forEach(function(p){
+    var meta = _invSyncBuildMeta(p.key);
+    INV_SYNC_LOCAL_VERSION[p.key]  = meta.version;
+    INV_SYNC_REMOTE_VERSION[p.key] = meta.version; // we just made it the remote
+    try{
+      supaClient.from('app_settings').upsert(
+        {key:_invSyncMetaKey(p.key), value:JSON.stringify(meta)},
+        {onConflict:'key'}
+      ).then(function(){}, function(err){
+        console.warn('[inventorySyncSave] '+p.key+' meta push failed:', err);
+      });
+    }catch(e){
+      console.warn('[inventorySyncSave] '+p.key+' threw:', e);
+    }
+  });
+  _invSyncSaveVersionState();
+}
+
+// Pull all meta keys. If any remote version > local, queue a banner.
+// Debounced to avoid hammering Supabase on rapid panel renders.
+async function inventorySyncPull(){
+  if(typeof supaClient === 'undefined' || !supaClient) return;
+  var now = Date.now();
+  if(now - INV_SYNC_LAST_PULL_AT < INV_SYNC_PULL_MIN_INTERVAL_MS) return;
+  INV_SYNC_LAST_PULL_AT = now;
+  try{
+    var metaKeys = INV_SYNC_POOLS.map(function(p){ return _invSyncMetaKey(p.key); });
+    var res = await supaClient.from('app_settings').select('key,value').in('key', metaKeys);
+    if(!res || !res.data) return;
+    var conflictDetected = null;
+    res.data.forEach(function(row){
+      // Reverse the key to figure out which pool
+      var metaKey = row.key;
+      var pool = INV_SYNC_POOLS.find(function(p){ return _invSyncMetaKey(p.key) === metaKey; });
+      if(!pool) return;
+      var meta;
+      try{ meta = JSON.parse(row.value); }catch(e){ return; }
+      if(!meta || typeof meta.version !== 'number') return;
+      var localV = INV_SYNC_LOCAL_VERSION[pool.key] || 0;
+      INV_SYNC_REMOTE_VERSION[pool.key] = meta.version;
+      if(meta.version > localV){
+        // Don't overwrite — surface the banner. Pick the most recent.
+        if(!conflictDetected || (meta.lastWrittenAt||'') > (conflictDetected.remoteAt||'')){
+          conflictDetected = {
+            pool:          pool.key,
+            poolLabel:     pool.label,
+            remoteVersion: meta.version,
+            localVersion:  localV,
+            remoteWriter:  meta.lastWriter || 'someone',
+            remoteWriterId:meta.lastWriterId || null,
+            remoteAt:      meta.lastWrittenAt || ''
+          };
+        }
+      }
+    });
+    if(conflictDetected){
+      // Don't show the banner if THIS user is the one who wrote the remote
+      // version (e.g., they saved on another tab — no point warning).
+      var meIsWriter = (typeof DB !== 'undefined' && DB.current
+                       && DB.current.id === conflictDetected.remoteWriterId);
+      if(!meIsWriter){
+        INV_SYNC_CONFLICT = conflictDetected;
+        // Re-render so the banner appears immediately
+        try{
+          if(window._currentPanelId && typeof gotoPanel === 'function'){
+            // Use a microtask so we don't recurse inside the pull-triggering
+            // gotoPanel call.
+            setTimeout(function(){ gotoPanel(window._currentPanelId); }, 0);
+          }
+        }catch(e){}
+      } else {
+        // Same user, different tab — silently accept the remote version
+        INV_SYNC_LOCAL_VERSION[conflictDetected.pool] = conflictDetected.remoteVersion;
+        _invSyncSaveVersionState();
+      }
+    }
+  }catch(e){
+    console.warn('[inventorySyncPull] failed:', e);
+  }
+}
+
+// User clicked "Refresh Now" — pull every pool's DATA from Supabase,
+// replace local arrays, persist to localStorage, and re-render.
+async function inventorySyncRefreshFromRemote(){
+  if(typeof supaClient === 'undefined' || !supaClient){ alert('Sync unavailable.'); return; }
+  try{
+    // Fetch both data + meta keys in one call
+    var keys = [];
+    INV_SYNC_POOLS.forEach(function(p){
+      keys.push(p.dataSettingKey);
+      keys.push(_invSyncMetaKey(p.key));
+    });
+    var res = await supaClient.from('app_settings').select('key,value').in('key', keys);
+    if(!res || !res.data){ alert('Could not fetch latest inventory.'); return; }
+    var byKey = {};
+    res.data.forEach(function(r){ byKey[r.key] = r.value; });
+    var applied = 0;
+    INV_SYNC_POOLS.forEach(function(p){
+      var dataRaw = byKey[p.dataSettingKey];
+      var metaRaw = byKey[_invSyncMetaKey(p.key)];
+      if(!dataRaw) return;
+      var devices;
+      try{ devices = JSON.parse(dataRaw); }catch(e){ return; }
+      if(!Array.isArray(devices)) return;
+      if(_invSyncReplacePool(p.key, devices)){
+        applied++;
+        if(metaRaw){
+          try{
+            var meta = JSON.parse(metaRaw);
+            if(meta && typeof meta.version === 'number'){
+              INV_SYNC_LOCAL_VERSION[p.key]  = meta.version;
+              INV_SYNC_REMOTE_VERSION[p.key] = meta.version;
+            }
+          }catch(e){}
+        }
+      }
+    });
+    _invSyncSaveVersionState();
+    // Persist to localStorage WITHOUT re-pushing to Supabase (we just pulled it).
+    try{ _invSyncWriteLocalOnly(); }catch(e){}
+    INV_SYNC_CONFLICT = null;
+    if(window._currentPanelId && typeof gotoPanel === 'function'){
+      gotoPanel(window._currentPanelId);
+    }
+    alert('✓ Inventory refreshed from latest ('+applied+' pool(s) updated).');
+  }catch(e){
+    console.warn('[inventorySyncRefreshFromRemote] failed:', e);
+    alert('Refresh failed — see console.');
+  }
+}
+
+// User clicked "Dismiss" — keep working, next save will prompt conflict.
+function inventorySyncDismissConflict(){
+  INV_SYNC_CONFLICT = null;
+  if(window._currentPanelId && typeof gotoPanel === 'function'){
+    gotoPanel(window._currentPanelId);
+  }
+}
+
+// localStorage-only writes (used after a remote refresh — we don't want to
+// re-push the data we just pulled).
+function _invSyncWriteLocalOnly(){
+  try{
+    if(typeof GM_INVENTORY      !== 'undefined') localStorage.setItem('wmam_gm_inventory', JSON.stringify(GM_INVENTORY));
+    if(typeof TC_INVENTORY      !== 'undefined') localStorage.setItem('wmam_tc_inventory', JSON.stringify(TC_INVENTORY));
+    if(typeof AW_INVENTORY      !== 'undefined') localStorage.setItem('wmam_aw_inventory', JSON.stringify(AW_INVENTORY));
+    if(typeof EX_INVENTORY      !== 'undefined') localStorage.setItem('wmam_ex_inventory', JSON.stringify(EX_INVENTORY));
+    if(typeof INVENTORY_DEVICES !== 'undefined') localStorage.setItem('wmam_inv_devices',  JSON.stringify(INVENTORY_DEVICES));
+  }catch(e){}
+}
+
+// Banner HTML — rendered by panelHeader / gotoPanel wrapping when conflict set.
+function renderInventoryConflictBanner(){
+  if(!INV_SYNC_CONFLICT) return '';
+  var c = INV_SYNC_CONFLICT;
+  var poolLabel = c.poolLabel || c.pool;
+  var when = c.remoteAt ? new Date(c.remoteAt).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
+  var esc = (typeof _escapeHtml === 'function') ? _escapeHtml : function(s){ return String(s||''); };
+  return '<div style="background:linear-gradient(135deg,#fffbeb,#fef3c7);border:1.5px solid #d97706;border-radius:10px;padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+    +'<div style="font-size:1.6rem">⚠️</div>'
+    +'<div style="flex:1;min-width:220px">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:#92400e;letter-spacing:1.5px">Inventory updated by '+esc(c.remoteWriter)+'</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#78350f;margin-top:2px;line-height:1.5">'
+    +'<strong>'+esc(poolLabel)+'</strong> inventory was changed '+(when?'on <strong>'+esc(when)+'</strong>':'')+'. Your local copy is older. Refresh to pull the latest, or keep working — you\'ll be asked again before your next save.'
+    +'</div></div>'
+    +'<button onclick="inventorySyncRefreshFromRemote()" style="background:#d97706;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer;font-weight:700">↻ Refresh Now</button>'
+    +'<button onclick="inventorySyncDismissConflict()" style="background:white;border:1px solid #d97706;color:#92400e;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 14px;border-radius:6px;cursor:pointer">Dismiss</button>'
+    +'</div>';
+}
+
+// Pre-save guard. Returns true if save should proceed, false to abort.
+function inventorySyncPreSaveCheck(){
+  if(!INV_SYNC_CONFLICT) return true;
+  var c = INV_SYNC_CONFLICT;
+  var poolLabel = c.poolLabel || c.pool;
+  var msg = '⚠ Inventory conflict\n\n'
+          + poolLabel + ' was updated by ' + (c.remoteWriter || 'someone else') + ' '
+          + (c.remoteAt ? 'on ' + new Date(c.remoteAt).toLocaleString() : '')
+          + '.\n\nYour local copy is older. If you save now, you will OVERWRITE their changes.\n\n'
+          + 'Click OK to save anyway (their changes will be lost).\n'
+          + 'Click Cancel to stop — then click "Refresh Now" on the banner to pull their changes first.';
+  var ok = confirm(msg);
+  if(ok){
+    // User chose Save Anyway. Bump local past remote so the save sticks.
+    INV_SYNC_LOCAL_VERSION[c.pool] = (c.remoteVersion || 0) + 1;
+    INV_SYNC_CONFLICT = null;
+    _invSyncSaveVersionState();
+  }
+  return ok;
+}
+
+if(typeof window !== 'undefined'){
+  window.inventorySyncSave              = inventorySyncSave;
+  window.inventorySyncPull              = inventorySyncPull;
+  window.inventorySyncRefreshFromRemote = inventorySyncRefreshFromRemote;
+  window.inventorySyncDismissConflict   = inventorySyncDismissConflict;
+  window.inventorySyncPreSaveCheck      = inventorySyncPreSaveCheck;
+  window.renderInventoryConflictBanner  = renderInventoryConflictBanner;
+}
+
 function saveInventory(){
   try{
     localStorage.setItem('wmam_inv_devices',   JSON.stringify(INVENTORY_DEVICES));
@@ -10950,8 +11259,17 @@ function saveInventory(){
     pushKey('markets',              MARKETS);
     pushKey('market_nextid',        MARKET_NEXT_ID);
   }
+
+  // ── Calvin 2026-05-18 — PATH A inventory sync versioning ──
+  // After the existing data push above, also push version meta keys so
+  // other browsers can detect that THIS user just changed inventory.
+  // Safe to call even if Supabase is unavailable (it's a no-op).
+  try{ if(typeof inventorySyncSave === 'function') inventorySyncSave(); }catch(e){ console.warn('[saveInventory] inventorySyncSave failed:', e); }
 }
 function loadInventory(){
+  // Calvin 2026-05-18: load the inventory sync version state alongside the
+  // inventory data itself so we know what version we're starting at.
+  try{ if(typeof _invSyncLoadVersionState === 'function') _invSyncLoadVersionState(); }catch(e){}
   try{
     var d=localStorage.getItem('wmam_inv_devices');   if(d) INVENTORY_DEVICES=JSON.parse(d);
     var b=localStorage.getItem('wmam_inv_batches');   if(b) INVENTORY_BATCHES=JSON.parse(b);
@@ -21406,6 +21724,16 @@ function ownerInvDeleteCommit(){
     return;
   }
 
+  // ── Calvin 2026-05-18 — PATH A pre-save conflict check ──
+  // If another user updated inventory since this user loaded the page,
+  // warn before allowing a destructive overwrite. Save Anyway = explicit,
+  // Cancel = bail out so user can click "Refresh Now" on the banner.
+  if(typeof inventorySyncPreSaveCheck === 'function' && !inventorySyncPreSaveCheck()){
+    OWNER_INV_DELETE.feedback = '⏸ Save canceled — click "Refresh Now" on the banner to pull latest first.';
+    gotoPanel('owner-inv-delete');
+    return;
+  }
+
   // Final hard-delete
   var pool = ownerInvDevicePool(OWNER_INV_DELETE.campaign);
   var removed = 0;
@@ -24431,6 +24759,14 @@ function panelHeader(title, backLabel){
 function gotoPanel(id, params){
   // Calvin 2026-05-14: track current panel so realtime/polling can re-render it
   window._currentPanelId = id;
+
+  // ── Calvin 2026-05-18 — INVENTORY SYNC PULL ──
+  // Pull latest inventory version metadata on EVERY navigation. Internally
+  // debounced (max once per 3s) so rapid panel switches don't hammer
+  // Supabase. If a remote version is newer than local, a banner is set
+  // and the panel re-renders with the warning. Fire and forget — async,
+  // doesn't block panel render.
+  try{ if(typeof inventorySyncPull === 'function') inventorySyncPull(); }catch(e){}
   // Stash optional params so child panels (like payroll-week-detail)
   // can read things like weekId without polluting the URL.
   gotoPanel._params = params || null;
@@ -24667,7 +25003,12 @@ function gotoPanel(id, params){
   };
 
   try{
-    document.getElementById('boBody').innerHTML = (map[id]||panelBO)();
+    // Calvin 2026-05-18: prepend the inventory sync conflict banner to
+    // every panel so the user can see + act on it from wherever they are.
+    // Empty string if no conflict (renderInventoryConflictBanner handles it).
+    var _invBanner = (typeof renderInventoryConflictBanner === 'function')
+      ? renderInventoryConflictBanner() : '';
+    document.getElementById('boBody').innerHTML = _invBanner + (map[id]||panelBO)();
     setTimeout(startSBClock, 60);
   }catch(e){
     console.error('Panel error for '+id+':', e);
@@ -26521,6 +26862,35 @@ function panelBO(){
         +'<button data-room="'+rid3+'" data-rname="'+prog+' Team Call" onclick="'+btnAction3+'(this.dataset.room,this.dataset.rname)" style="background:'+btnBg3+';border:none;color:'+btnFg3+';font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:7px 12px;border-radius:6px;cursor:pointer;white-space:nowrap">'+btnLabel3+'</button>'
         +'</div></div>';
     });
+
+    // ── Calvin 2026-05-18 ──
+    // Admin Office row — appears for anyone canJoinRoom permits (Owner,
+    // admin, office staff, AND explicit extraInvitees like Tanita id=2).
+    // Driven by the SAME gate as the Meetings panel, so the dashboard tile
+    // and the full Meetings page can never disagree.
+    var officeRoom = CALL_ROOMS.find(function(r){ return r.id==='room-office'; });
+    if(officeRoom && canJoinRoom(u, officeRoom)){
+      var offLive   = ACTIVE_CALLS['room-office'] && ACTIVE_CALLS['room-office'].active;
+      var offCanHost= canHostRoom(u, 'room-office');
+      var offAction = offCanHost ? 'startCall' : 'joinCall';
+      var offLabel  = offCanHost
+        ? (offLive ? '🎥 Restart as Host' : '🎥 Start Call')
+        : (offLive ? '📞 Join Now'        : '⏳ Join / Wait');
+      var offBg = (offLive || offCanHost) ? officeRoom.color : 'rgba(0,53,148,.1)';
+      var offFg = (offLive || offCanHost) ? 'white' : 'var(--blue)';
+      html += '<div style="background:'+(offLive?'rgba(124,58,237,.06)':'var(--offwhite)')+';border-radius:8px;padding:12px 14px;margin-bottom:10px;border:1px solid '+(offLive?officeRoom.color+'66':'var(--border)')+'">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">'
+        +'<div>'
+        +'<div style="display:flex;align-items:center;gap:6px">'
+        +'<span style="font-size:.9rem">🏢</span>'
+        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;font-weight:700;color:var(--black)">Admin Office Meeting</div>'
+        +(offLive?'<span style="background:'+officeRoom.color+';color:white;font-family:Barlow Condensed,sans-serif;font-size:.5rem;letter-spacing:1px;padding:2px 6px;border-radius:100px">● LIVE</span>':'')
+        +'</div>'
+        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);margin-top:2px">Mondays 10:00 AM CST</div>'
+        +'</div>'
+        +'<button data-room="room-office" data-rname="Admin Office Meeting" onclick="'+offAction+'(this.dataset.room,this.dataset.rname)" style="background:'+offBg+';border:none;color:'+offFg+';font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:7px 12px;border-radius:6px;cursor:pointer;white-space:nowrap">'+offLabel+'</button>'
+        +'</div></div>';
+    }
 
     html += '</div></div>'; // end Team Calls
     html += '</div>'; // end 2-col grid
