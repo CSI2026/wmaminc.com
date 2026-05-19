@@ -11262,6 +11262,9 @@ async function invDbUpsertDevice(poolKey, device){
   if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
   var table = _invPoolTableName(poolKey);
   if(!table) return {ok:false, error:'unknown-pool'};
+  // Calvin 2026-05-19: stamp with editor session so realtime can identify
+  // own-writes (and skip the banner) + conflict detection can see who wrote.
+  if(typeof stampDeviceEdit === 'function') stampDeviceEdit(device);
   var row = _invDeviceToRow(device, INV_SYNC_POOLS.find(function(p){return p.key===poolKey;}).label);
   if(!row || !row.id) return {ok:false, error:'no-id'};
   try{
@@ -17444,6 +17447,471 @@ function _startRealtimeFallbackPolling(){
     }).catch(function(){});
   }, 30000);
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY REALTIME + CONFLICT QUEUE + NOTIFY FRAMEWORK
+//  Calvin Williams · 2026-05-19
+//
+//  Three things in one block, intentionally co-located so they stay in
+//  sync as we evolve them:
+//
+//  1. Realtime subs for the 5 inventory tables + pending_inventory_changes
+//     (the queue Makenzie reviews when two users hit the same device).
+//
+//  2. Conflict detection: every inventory write timestamps the device.
+//     On submit, if the cloud row's lastEditAt is newer than what we
+//     started editing, we route the write into pending_inventory_changes
+//     instead of overwriting.
+//
+//  3. notifyByEmail() framework: every event handler calls this to fire
+//     an email through the Edge Function. Respects per-user overrides.
+//     Logs every attempt to notification_log for audit.
+//
+//  PATH B is the source of truth — these layers sit on top of the per-row
+//  Supabase writes we proved out in earlier work.
+// ════════════════════════════════════════════════════════════════════════
+
+// Persistent browser session id (survives reloads, unique per tab/session).
+// Every Path B write tags itself with this so the realtime listener can
+// distinguish "my own change" from "someone else's change".
+var WMAM_SESSION_ID = (function(){
+  try{
+    var k = 'wmam_session_id';
+    var existing = sessionStorage.getItem(k);
+    if(existing) return existing;
+    var fresh = 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2,9);
+    sessionStorage.setItem(k, fresh);
+    return fresh;
+  }catch(e){
+    return 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2,9);
+  }
+})();
+
+// Realtime channel handles — kept so we can unsubscribe / resubscribe cleanly
+var WMAM_INV_CHANNEL = null;
+var WMAM_PIC_CHANNEL = null;  // pending_inventory_changes channel
+
+// Banner state — drives the "🔄 X updates from others — click to refresh" pill
+var WMAM_RT_BANNER = {
+  updateCount: 0,        // unread events from OTHER sessions
+  lastUpdate: null,      // {table, type, at}
+  byPool: {gm:0, tc:0, aw:0, ex:0, legacy:0}
+};
+
+// Tracks devices the current user is actively editing in this browser.
+// Populated by the edit-form panels when the user opens an editor; consumed
+// by realtime to detect "someone else just changed THIS device" conflicts
+// and by the submit handlers to know when to enqueue instead of commit.
+//   key   = poolKey + ':' + deviceId
+//   value = { startedAt, fields:[], baseSnapshot, otherEdit:{by,at}|null }
+var WMAM_ACTIVE_EDITS = {};
+
+if(typeof window !== 'undefined'){
+  window.WMAM_SESSION_ID    = WMAM_SESSION_ID;
+  window.WMAM_RT_BANNER     = WMAM_RT_BANNER;
+  window.WMAM_ACTIVE_EDITS  = WMAM_ACTIVE_EDITS;
+}
+
+// Helpers
+function _poolKeyForTable(t){
+  switch(t){
+    case 'gm_inventory':      return 'gm';
+    case 'tc_inventory':      return 'tc';
+    case 'aw_inventory':      return 'aw';
+    case 'ex_inventory':      return 'ex';
+    case 'inventory_devices': return 'legacy';
+  }
+  return null;
+}
+function _poolArrayFor(p){
+  switch(p){
+    case 'gm':     return (typeof GM_INVENTORY     !== 'undefined') ? GM_INVENTORY     : null;
+    case 'tc':     return (typeof TC_INVENTORY     !== 'undefined') ? TC_INVENTORY     : null;
+    case 'aw':     return (typeof AW_INVENTORY     !== 'undefined') ? AW_INVENTORY     : null;
+    case 'ex':     return (typeof EX_INVENTORY     !== 'undefined') ? EX_INVENTORY     : null;
+    case 'legacy': return (typeof INVENTORY_DEVICES!== 'undefined') ? INVENTORY_DEVICES : null;
+  }
+  return null;
+}
+
+// Was this realtime event caused by THIS browser session? (self-write filter)
+function _isOwnEvent(payload){
+  try{
+    var row = payload.new || payload.old || {};
+    var raw = row.raw;
+    if(raw && typeof raw === 'string'){ try{ raw = JSON.parse(raw); }catch(e){ raw = {}; } }
+    if(!raw || typeof raw !== 'object') return false;
+    return raw._lastEditSession === WMAM_SESSION_ID;
+  }catch(e){ return false; }
+}
+
+// Stamp a device with editor session/time before Path B write. The realtime
+// listener uses this to identify own-writes and detect conflicts.
+function stampDeviceEdit(dev, opts){
+  if(!dev || typeof dev !== 'object') return dev;
+  opts = opts || {};
+  dev._lastEditAt      = new Date().toISOString();
+  dev._lastEditBy      = (DB.current && DB.current.id) || null;
+  dev._lastEditByName  = (DB.current && DB.current.name) || '';
+  dev._lastEditSession = WMAM_SESSION_ID;
+  if(opts.changeType) dev._lastChangeType = opts.changeType;
+  return dev;
+}
+if(typeof window !== 'undefined'){ window.stampDeviceEdit = stampDeviceEdit; }
+
+// Subscribe to all 5 inventory tables + pending_inventory_changes
+function subscribeInventoryRealtime(){
+  if(!supaClient){ console.warn('[realtime/inv] supaClient missing — skip'); return; }
+  if(WMAM_INV_CHANNEL){
+    try{ supaClient.removeChannel(WMAM_INV_CHANNEL); }catch(e){}
+    WMAM_INV_CHANNEL = null;
+  }
+  if(WMAM_PIC_CHANNEL){
+    try{ supaClient.removeChannel(WMAM_PIC_CHANNEL); }catch(e){}
+    WMAM_PIC_CHANNEL = null;
+  }
+  try{
+    // ── Inventory tables ──
+    WMAM_INV_CHANNEL = supaClient.channel('wmam-inventory-changes');
+    ['gm_inventory','tc_inventory','aw_inventory','ex_inventory','inventory_devices'].forEach(function(table){
+      WMAM_INV_CHANNEL = WMAM_INV_CHANNEL.on('postgres_changes', {event:'*', schema:'public', table:table}, function(payload){
+        try{
+          // Skip events caused by THIS session — we already applied them locally
+          if(_isOwnEvent(payload)){
+            // Still apply to be safe, but don't bump the banner
+            _applyRealtimeInventoryEvent(payload, table, /*fromSelf=*/true);
+            return;
+          }
+          _applyRealtimeInventoryEvent(payload, table, /*fromSelf=*/false);
+          // Bump the banner
+          var pool = _poolKeyForTable(table);
+          if(pool){
+            WMAM_RT_BANNER.updateCount++;
+            WMAM_RT_BANNER.byPool[pool] = (WMAM_RT_BANNER.byPool[pool]||0) + 1;
+            WMAM_RT_BANNER.lastUpdate = {
+              table: table,
+              type: payload.eventType || payload.type,
+              by: (payload.new && payload.new.raw && (function(){try{var r=typeof payload.new.raw==='string'?JSON.parse(payload.new.raw):payload.new.raw;return r._lastEditByName||'';}catch(e){return '';}})()) || '',
+              at: Date.now()
+            };
+            _renderRTBanner();
+          }
+          // Conflict signal: if user is actively editing this device, mark it
+          _checkActiveEditConflict(table, payload);
+        }catch(handlerErr){
+          console.warn('[realtime/inv] handler error for '+table+':', handlerErr);
+        }
+      });
+    });
+    WMAM_INV_CHANNEL.subscribe(function(status){
+      console.log('[realtime/inv] subscription status:', status);
+    });
+
+    // ── Pending conflict queue (Makenzie's review feed) ──
+    WMAM_PIC_CHANNEL = supaClient.channel('wmam-pending-changes')
+      .on('postgres_changes', {event:'*', schema:'public', table:'pending_inventory_changes'}, function(payload){
+        try{
+          // When a new conflict lands, the in-app notification panel + the
+          // pending-conflicts UI both need a nudge. The email is sent by the
+          // SUBMITTER's browser at the moment they enqueue, NOT by the
+          // realtime listener (otherwise everyone would try to send the
+          // email and we'd get duplicates).
+          _smartReRender('pending_inventory_changes');
+          if(payload.eventType === 'INSERT' && payload.new && DB.current){
+            // If THIS user is Makenzie / Owner / K-Anna, surface an in-app toast
+            var u = DB.current;
+            var canSee = (typeof isOwner === 'function' && isOwner(u))
+                      || (typeof isInventory === 'function' && isInventory(u))
+                      || (u && u.depts && u.depts.inv);
+            if(canSee && typeof pushNotification === 'function'){
+              pushNotification({
+                toIds:[u.id], toRoles:[], icon:'🛑',
+                title:'Inventory Conflict Queued',
+                body: (payload.new.submitter_name||'Someone')+' edited '+(payload.new.imei||'a device')+' — needs your review.',
+                panel:'pending-conflicts', priority:'high'
+              });
+            }
+          }
+        }catch(e){ console.warn('[realtime/pic] handler error:', e); }
+      })
+      .subscribe(function(status){
+        console.log('[realtime/pic] subscription status:', status);
+      });
+  }catch(subErr){
+    console.warn('[realtime/inv] subscribe threw:', subErr);
+  }
+}
+
+// Apply a realtime event to in-memory inventory arrays.
+function _applyRealtimeInventoryEvent(payload, table, fromSelf){
+  var pool = _poolKeyForTable(table);
+  if(!pool) return;
+  var arr = _poolArrayFor(pool);
+  if(!arr) return;
+  var row = payload.new || payload.old;
+  if(!row || !row.id) return;
+  if(payload.eventType === 'DELETE' || payload.type === 'DELETE'){
+    var idx = arr.findIndex(function(d){ return String(d.id) === String(row.id); });
+    if(idx >= 0) arr.splice(idx, 1);
+    return;
+  }
+  // INSERT or UPDATE — map row → device shape
+  if(typeof _invRowToDevice !== 'function') return;
+  var dev = _invRowToDevice(row);
+  if(!dev) return;
+  var existing = arr.findIndex(function(d){ return String(d.id) === String(dev.id); });
+  if(existing >= 0){
+    // Merge: preserve any local-only fields the row doesn't carry
+    arr[existing] = Object.assign({}, arr[existing], dev);
+  } else {
+    arr.push(dev);
+  }
+  // If this came from another browser, also touch localStorage so a refresh
+  // doesn't lose the change. saveInventory is the only safe path.
+  if(!fromSelf){
+    try{ if(typeof saveInventory === 'function') saveInventory(); }catch(e){}
+  }
+}
+
+// If the user is actively editing this device, flag the conflict
+function _checkActiveEditConflict(table, payload){
+  var pool = _poolKeyForTable(table);
+  if(!pool || !payload.new) return;
+  var key = pool + ':' + payload.new.id;
+  var active = WMAM_ACTIVE_EDITS[key];
+  if(!active) return;
+  // Someone else just touched a device the user is editing — record it.
+  // The submit handler will check this before writing.
+  var raw = payload.new.raw;
+  if(raw && typeof raw === 'string'){ try{ raw = JSON.parse(raw); }catch(e){ raw = {}; } }
+  active.otherEdit = {
+    byId:   (raw && raw._lastEditBy)     || null,
+    byName: (raw && raw._lastEditByName) || '',
+    at:     (raw && raw._lastEditAt)     || new Date().toISOString()
+  };
+  console.warn('[realtime/inv] CONFLICT signal — '+key+' was edited by '+(active.otherEdit.byName||'someone')+' while you have it open. On submit, this will go into the pending queue.');
+}
+
+// Banner render — fixed pill bottom-right; click to refresh + clear
+function _renderRTBanner(){
+  if(!WMAM_RT_BANNER.updateCount){
+    var existing = document.getElementById('wmam-rt-banner');
+    if(existing) existing.remove();
+    return;
+  }
+  var el = document.getElementById('wmam-rt-banner');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'wmam-rt-banner';
+    el.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#003594;color:white;padding:12px 18px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.2);font-family:Barlow Condensed,sans-serif;font-size:.85rem;cursor:pointer;z-index:9999;letter-spacing:1px;text-transform:uppercase';
+    el.onclick = function(){
+      // Click to refresh — re-render the visible panel + clear counter
+      WMAM_RT_BANNER.updateCount = 0;
+      WMAM_RT_BANNER.byPool = {gm:0, tc:0, aw:0, ex:0, legacy:0};
+      WMAM_RT_BANNER.lastUpdate = null;
+      var current = (typeof CURRENT_PANEL === 'string') ? CURRENT_PANEL : null;
+      if(current && typeof gotoPanel === 'function') gotoPanel(current);
+      el.remove();
+    };
+    document.body.appendChild(el);
+  }
+  var last = WMAM_RT_BANNER.lastUpdate;
+  var byTxt = last && last.by ? (' · '+last.by) : '';
+  el.innerHTML = '🔄 '+WMAM_RT_BANNER.updateCount+' update'+(WMAM_RT_BANNER.updateCount===1?'':'s')+' from others'+byTxt+' · click to refresh';
+}
+
+// Edit-tracker API — panels call these so we know when to enqueue vs commit
+function beginActiveEdit(poolKey, deviceId, fields){
+  var key = poolKey + ':' + deviceId;
+  var arr = _poolArrayFor(poolKey);
+  var base = arr ? arr.find(function(d){return String(d.id)===String(deviceId);}) : null;
+  WMAM_ACTIVE_EDITS[key] = {
+    startedAt: new Date().toISOString(),
+    fields:    fields || [],
+    baseSnapshot: base ? JSON.parse(JSON.stringify(base)) : null,
+    otherEdit: null
+  };
+}
+function endActiveEdit(poolKey, deviceId){
+  var key = poolKey + ':' + deviceId;
+  delete WMAM_ACTIVE_EDITS[key];
+}
+function getActiveEdit(poolKey, deviceId){
+  return WMAM_ACTIVE_EDITS[poolKey + ':' + deviceId] || null;
+}
+if(typeof window !== 'undefined'){
+  window.subscribeInventoryRealtime = subscribeInventoryRealtime;
+  window.beginActiveEdit = beginActiveEdit;
+  window.endActiveEdit   = endActiveEdit;
+  window.getActiveEdit   = getActiveEdit;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  CONFLICT-QUEUE WRITER — enqueues a write instead of committing when
+//  same-device-same-time conflict detected.
+// ════════════════════════════════════════════════════════════════════════
+async function enqueueInventoryConflict(opts){
+  // opts: {poolKey, deviceId, proposedDevice, currentDb, changeType,
+  //        fieldsChanged, conflictWith}
+  if(!supaClient) return {ok:false, error:'no-supabase'};
+  var u = DB.current || {};
+  var row = {
+    pool_key:        opts.poolKey,
+    device_id:       String(opts.deviceId),
+    imei:            (opts.proposedDevice && opts.proposedDevice.imei) || (opts.currentDb && opts.currentDb.imei) || '',
+    market:          (opts.proposedDevice && opts.proposedDevice.market) || (opts.currentDb && opts.currentDb.market) || '',
+    submitter_id:    u.id || null,
+    submitter_name:  u.name || '',
+    submitter_session: WMAM_SESSION_ID,
+    conflict_with_id:   (opts.conflictWith && opts.conflictWith.byId) || null,
+    conflict_with_name: (opts.conflictWith && opts.conflictWith.byName) || '',
+    conflict_with_session: (opts.conflictWith && opts.conflictWith.session) || null,
+    conflict_window_seconds: opts.conflictWindowSeconds || null,
+    change_type:     opts.changeType || 'edit',
+    fields_changed:  opts.fieldsChanged || [],
+    proposed:        opts.proposedDevice || null,
+    current_db:      opts.currentDb || null,
+    status:          'pending'
+  };
+  try{
+    var res = await supaClient.from('pending_inventory_changes').insert(row).select().single();
+    if(res && res.error){
+      console.warn('[enqueueInventoryConflict] insert failed:', res.error);
+      return {ok:false, error:res.error};
+    }
+    var inserted = res.data || row;
+    // Fire email to Makenzie
+    notifyByEmail({
+      toAgentLookup: function(){
+        return (DB.agents||[]).find(function(a){
+          return a && a.email && /makenzie/i.test(a.name||'') && a.active;
+        }) || {email:'makenzie@wmaminc.com', name:'Makenzie Gibson', id:3};
+      },
+      eventType: 'inventory.conflict.queued',
+      payload: {
+        imei:           row.imei,
+        market:         row.market,
+        poolKey:        row.pool_key,
+        submitterName:  row.submitter_name,
+        conflictWithName: row.conflict_with_name,
+        changeType:     row.change_type,
+        fieldsChanged:  row.fields_changed
+      },
+      conflictRowId: inserted.id
+    });
+    return {ok:true, id: inserted.id};
+  }catch(e){
+    console.warn('[enqueueInventoryConflict] threw:', e);
+    return {ok:false, error:e};
+  }
+}
+if(typeof window !== 'undefined'){ window.enqueueInventoryConflict = enqueueInventoryConflict; }
+
+// ════════════════════════════════════════════════════════════════════════
+//  NOTIFY FRAMEWORK — notifyByEmail({toAgentLookup, toAgent, eventType, payload})
+//
+//  Resolves recipient → checks notification_overrides → posts to Edge
+//  Function → logs to notification_log.
+//
+//  toAgent: {id, name, email}  — direct
+//  toAgentLookup: () => agent  — function form, useful when caller hasn't
+//                                resolved the recipient yet
+//
+//  Per Calvin's spec: silently skips if no email on file (logs to console).
+// ════════════════════════════════════════════════════════════════════════
+function _edgeUrl(){
+  // Build URL from supabase client config
+  try{
+    if(typeof SUPABASE_URL !== 'undefined' && SUPABASE_URL){
+      return SUPABASE_URL.replace(/\/$/,'') + '/functions/v1/notify';
+    }
+    if(typeof supaClient !== 'undefined' && supaClient && supaClient.supabaseUrl){
+      return supaClient.supabaseUrl.replace(/\/$/,'') + '/functions/v1/notify';
+    }
+  }catch(e){}
+  return null;
+}
+function _edgeApiKey(){
+  try{
+    if(typeof SUPABASE_ANON_KEY !== 'undefined' && SUPABASE_ANON_KEY) return SUPABASE_ANON_KEY;
+    if(typeof supaClient !== 'undefined' && supaClient && supaClient.supabaseKey) return supaClient.supabaseKey;
+  }catch(e){}
+  return null;
+}
+
+async function notifyByEmail(opts){
+  opts = opts || {};
+  var u = DB.current || {};
+  // Resolve recipient
+  var recipient = opts.toAgent || (typeof opts.toAgentLookup === 'function' ? opts.toAgentLookup() : null);
+  if(!recipient){
+    console.warn('[notifyByEmail] no recipient resolved for event '+opts.eventType);
+    return {ok:false, status:'no-recipient'};
+  }
+  if(!recipient.email){
+    console.log('[notifyByEmail] '+opts.eventType+' → '+ (recipient.name||recipient.id) +' has no email on file — skipping');
+    await _logNotification({event_type:opts.eventType, to_agent_id:recipient.id||null, to_email:'', payload:opts.payload, status:'skipped-no-email'});
+    return {ok:false, status:'skipped-no-email'};
+  }
+  // Check overrides (notification_overrides table)
+  try{
+    if(supaClient && recipient.id){
+      var ov = await supaClient.from('notification_overrides')
+                .select('enabled').eq('agent_id', recipient.id).eq('event_type', opts.eventType).maybeSingle();
+      if(ov && ov.data && ov.data.enabled === false){
+        await _logNotification({event_type:opts.eventType, to_agent_id:recipient.id, to_email:recipient.email, payload:opts.payload, status:'skipped-disabled'});
+        console.log('[notifyByEmail] '+opts.eventType+' → '+recipient.name+' disabled by override — skipping');
+        return {ok:false, status:'skipped-disabled'};
+      }
+    }
+  }catch(e){ /* table may not exist yet; silent and continue */ }
+
+  // Post to Edge Function
+  var url = _edgeUrl();
+  var key = _edgeApiKey();
+  if(!url){
+    console.warn('[notifyByEmail] no edge function URL — cannot send. Recipient: '+recipient.email);
+    await _logNotification({event_type:opts.eventType, to_agent_id:recipient.id||null, to_email:recipient.email, payload:opts.payload, status:'failed', error_message:'no-edge-url'});
+    return {ok:false, status:'no-edge-url'};
+  }
+  var body = {
+    eventType: opts.eventType,
+    toEmail:   recipient.email,
+    toName:    recipient.name || '',
+    payload:   opts.payload || {}
+  };
+  try{
+    var resp = await fetch(url, {
+      method:'POST',
+      headers: {'Content-Type':'application/json', 'Authorization':'Bearer '+(key||''), 'apikey': key||''},
+      body: JSON.stringify(body)
+    });
+    var data = await resp.json().catch(function(){return {};});
+    if(resp.ok){
+      await _logNotification({event_type:opts.eventType, to_agent_id:recipient.id||null, to_email:recipient.email, payload:opts.payload, status:'sent', edge_response:data});
+      console.log('[notifyByEmail] sent '+opts.eventType+' → '+recipient.email);
+      return {ok:true, status:'sent', id:data.id};
+    }
+    await _logNotification({event_type:opts.eventType, to_agent_id:recipient.id||null, to_email:recipient.email, payload:opts.payload, status:'failed', error_message:JSON.stringify(data), edge_response:data});
+    console.warn('[notifyByEmail] edge function returned '+resp.status, data);
+    return {ok:false, status:'failed', error:data};
+  }catch(e){
+    await _logNotification({event_type:opts.eventType, to_agent_id:recipient.id||null, to_email:recipient.email, payload:opts.payload, status:'failed', error_message:String(e)});
+    console.warn('[notifyByEmail] fetch threw:', e);
+    return {ok:false, status:'failed', error:e};
+  }
+}
+async function _logNotification(row){
+  if(!supaClient) return;
+  try{ await supaClient.from('notification_log').insert(row); }catch(e){}
+}
+if(typeof window !== 'undefined'){
+  window.notifyByEmail = notifyByEmail;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  END realtime + conflict + notify block
+// ════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════
 //  SMART RE-RENDER + AUTO-REFRESH  (Calvin 2026-05-14)
@@ -26048,6 +26516,7 @@ function gotoPanel(id, params){
     'inv-hub':'Inventory Hub',
     'aw-inventory':'Assurance Wireless Inventory','aw-upload':'Assurance Upload','aw-transfers':'Assurance Transfers',
     'tc-inventory':'TruConnect Inventory','tc-upload':'TruConnect Upload','tc-transfers':'TruConnect Transfers',
+    'pending-conflicts':'Pending Inventory Conflicts',
     'ex-inventory':'Excess Telecom Inventory','ex-upload':'Excess Upload','ex-transfers':'Excess Transfers',
     'inv-export':'Export to Excel','inv-my-inventory':'My Inventory',
     'inv-distribute':'Distribute Inventory',
@@ -26099,6 +26568,7 @@ function gotoPanel(id, params){
     'tc-upload':   function(){ return panelCampaignUpload('TruConnect'); },
     'tc-transfers':function(){ return panelCampaignTransfers('TruConnect'); },
     'tc-set-expiry':function(){ return panelTCSetExpiry(); },
+    'pending-conflicts':function(){ return panelPendingConflicts(); },
     'ex-inventory':function(){ return panelCampaignInventory('Excess'); },
     'ex-upload':   function(){ return panelCampaignUpload('Excess'); },
     'ex-transfers':function(){ return panelCampaignTransfers('Excess'); },
@@ -39151,6 +39621,7 @@ function panelCampaignInventory(campaign){
     h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">';
     h += '<button onclick="gotoPanel(\'tc-set-expiry\')" style="background:var(--blue);border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer;font-weight:700">📅 Set Downstream Expiry →</button>';
     h += '<button onclick="gotoPanel(\'tc-upload\')" style="background:white;border:1px solid var(--border);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">📤 Upload More TC Inventory</button>';
+    h += '<button onclick="gotoPanel(\'pending-conflicts\')" style="background:white;border:1px solid #CC0000;color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">🛑 Pending Conflicts</button>';
     h += '</div>';
   }
 
@@ -39422,6 +39893,47 @@ async function invSetDownstreamExpiry(poolKey, deviceId, newExpiryISO, opts){
     return {ok:false, error:'past-vendor-date', vendorDueDate:dev.vendorDueDate};
   }
 
+  // ── Calvin 2026-05-19: same-device-same-time conflict check ──
+  // If realtime flagged that another session edited this device while the
+  // user had it open, OR the device was edited by someone else in the last
+  // 60 seconds (covers the case where realtime hadn't arrived yet but the
+  // cloud row shows another writer), enqueue the change for Makenzie's
+  // review instead of overwriting.
+  var conflictWindow = 60 * 1000; // 60s
+  var activeEdit = (typeof getActiveEdit === 'function') ? getActiveEdit(poolKey, deviceId) : null;
+  var lastEditAt = dev._lastEditAt ? new Date(dev._lastEditAt).getTime() : 0;
+  var lastEditBySomeoneElse = dev._lastEditSession && dev._lastEditSession !== WMAM_SESSION_ID;
+  var withinWindow = lastEditAt && (Date.now() - lastEditAt) < conflictWindow;
+  if((activeEdit && activeEdit.otherEdit) || (lastEditBySomeoneElse && withinWindow)){
+    var other = (activeEdit && activeEdit.otherEdit) || {
+      byId: dev._lastEditBy, byName: dev._lastEditByName, at: dev._lastEditAt, session: dev._lastEditSession
+    };
+    if(opts && opts.skipConflictCheck){
+      // approved-via-queue path bypasses the check
+    } else {
+      // Build proposed device (what would be written if not for conflict)
+      var proposed = Object.assign({}, dev, {expiryDate: newExpiryISO});
+      if(typeof enqueueInventoryConflict === 'function'){
+        var enqResult = await enqueueInventoryConflict({
+          poolKey:        poolKey,
+          deviceId:       deviceId,
+          proposedDevice: proposed,
+          currentDb:      dev,
+          changeType:     'expiry-set',
+          fieldsChanged:  ['expiryDate'],
+          conflictWith:   other,
+          conflictWindowSeconds: Math.floor((Date.now() - lastEditAt) / 1000)
+        });
+        if(enqResult && enqResult.ok){
+          if(typeof endActiveEdit === 'function') endActiveEdit(poolKey, deviceId);
+          return {ok:false, error:'queued-for-review', queueId:enqResult.id, conflictWith:other};
+        }
+        // If enqueue failed, fall through and commit anyway — better than losing the edit
+        console.warn('[invSetDownstreamExpiry] enqueue failed, committing locally:', enqResult);
+      }
+    }
+  }
+
   // Apply
   var oldExpiry = dev.expiryDate || '';
   dev.expiryDate = newExpiryISO;
@@ -39453,6 +39965,8 @@ async function invSetDownstreamExpiry(poolKey, deviceId, newExpiryISO, opts){
       return {ok:false, error:'path-b-threw', detail:e};
     }
   }
+  // Calvin 2026-05-19: edit complete — clear the active-edit marker
+  if(typeof endActiveEdit === 'function') endActiveEdit(poolKey, deviceId);
   return {ok:true};
 }
 
@@ -39636,6 +40150,8 @@ async function tcSetExpiryOne(devId){
     alert('✅ Expiry set to '+newDate+'.');
   } else if(res.error === 'past-vendor-date'){
     alert('🛑 Date '+newDate+' is past the vendor due date ('+res.vendorDueDate+'). Pick an earlier date.');
+  } else if(res.error === 'queued-for-review'){
+    alert('⏳ Your edit was queued for Makenzie\'s review.\n\nSomeone else ('+(res.conflictWith && res.conflictWith.byName || 'another user')+') edited this same device at almost the same time. Makenzie will see both versions and approve one.\n\nShe\'s been emailed.');
   } else {
     alert('⚠ Update failed: '+res.error+'\n\nSee F12 console for detail.');
   }
@@ -39784,6 +40300,196 @@ if(typeof window !== 'undefined'){
   window.tcSetExpiryOne              = tcSetExpiryOne;
   window.tcSetExpiryRefreshList      = tcSetExpiryRefreshList;
   window.panelTCSetExpiry            = panelTCSetExpiry;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  PENDING INVENTORY CONFLICTS PANEL — Calvin 2026-05-19
+//
+//  When two users edit the same device within ~60 seconds, the SECOND
+//  write goes into pending_inventory_changes instead of overwriting.
+//  This panel shows them to Makenzie/Owner/K-Anna for approve/deny.
+// ════════════════════════════════════════════════════════════════════════
+var PENDING_CONFLICTS_CACHE = [];
+var PENDING_CONFLICTS_LAST_LOADED = 0;
+
+async function loadPendingConflicts(){
+  if(typeof supaClient === 'undefined' || !supaClient){ PENDING_CONFLICTS_CACHE = []; return; }
+  try{
+    var res = await supaClient.from('pending_inventory_changes').select('*').eq('status','pending').order('created_at', {ascending:false}).limit(100);
+    if(res && !res.error && Array.isArray(res.data)){
+      PENDING_CONFLICTS_CACHE = res.data;
+      PENDING_CONFLICTS_LAST_LOADED = Date.now();
+    }
+  }catch(e){ console.warn('[loadPendingConflicts] error:', e); }
+}
+
+function _diffFields(proposed, currentDb){
+  if(!proposed || !currentDb) return [];
+  var diffs = [];
+  ['expiryDate','vendorDueDate','holderId','holderName','status','market','mmId','mmName','assignedTo'].forEach(function(k){
+    var p = proposed[k], c = currentDb[k];
+    if(JSON.stringify(p) !== JSON.stringify(c)){
+      diffs.push({field:k, current:c, proposed:p});
+    }
+  });
+  return diffs;
+}
+
+function panelPendingConflicts(){
+  var u = DB.current;
+  var canSee = (typeof isOwner === 'function' && isOwner(u))
+            || (typeof isInventory === 'function' && isInventory(u))
+            || (u && u.depts && u.depts.inv);
+  if(!canSee){
+    return panelHeader('🛑 Access Denied') + '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Owner or Inventory Department only.</div>';
+  }
+  // Lazy load on entry — fire-and-forget; renders empty initially, then re-renders
+  if(Date.now() - PENDING_CONFLICTS_LAST_LOADED > 5000){
+    loadPendingConflicts().then(function(){
+      if(typeof CURRENT_PANEL === 'string' && CURRENT_PANEL === 'pending-conflicts') gotoPanel('pending-conflicts');
+    });
+  }
+
+  var h = panelHeader('🛑 Pending Inventory Conflicts');
+  h += '<div class="bo-card">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">Same-device-same-time edits awaiting review</div></div>';
+  h += '<div style="padding:18px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.55">';
+  h += '<p>These changes were queued because another user had already edited the same device within the previous ~60 seconds. Pick which version wins.</p>';
+  h += '<p style="margin-top:6px"><strong>Approve:</strong> the submitter\'s proposed version overwrites the current cloud row · <strong>Deny:</strong> submitter\'s edit is discarded, current row stays.</p>';
+  h += '</div>';
+
+  if(!PENDING_CONFLICTS_CACHE.length){
+    h += '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.95rem">No pending conflicts. 🎉</div>';
+    h += '</div>';
+    return h;
+  }
+
+  h += '<div style="padding:18px;border-top:1px solid var(--border)">';
+  PENDING_CONFLICTS_CACHE.forEach(function(row){
+    var diffs = _diffFields(row.proposed, row.current_db);
+    h += '<div style="border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:14px;background:white">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">';
+    h += '<div>';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:1.5px;color:var(--blue)">'+(row.imei||row.device_id)+' · '+(row.market||'')+'</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);margin-top:4px">'+(row.pool_key||'').toUpperCase()+' · '+(row.change_type||'edit')+' · '+new Date(row.created_at).toLocaleString()+'</div>';
+    h += '</div>';
+    h += '<div style="text-align:right;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">';
+    h += '<div><strong>Submitter:</strong> '+_escapeHtml(row.submitter_name||'')+'</div>';
+    h += '<div><strong>Conflicts with:</strong> '+_escapeHtml(row.conflict_with_name||'')+'</div>';
+    if(row.conflict_window_seconds) h += '<div style="color:var(--muted)">~'+row.conflict_window_seconds+'s gap</div>';
+    h += '</div>';
+    h += '</div>';
+
+    if(diffs.length){
+      h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.82rem;margin:8px 0">';
+      h += '<thead><tr style="background:var(--offwhite);border-bottom:1px solid var(--border)"><th style="text-align:left;padding:6px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">FIELD</th><th style="text-align:left;padding:6px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">CURRENT (cloud)</th><th style="text-align:left;padding:6px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">PROPOSED ('+_escapeHtml(row.submitter_name||'submitter')+')</th></tr></thead><tbody>';
+      diffs.forEach(function(d){
+        h += '<tr style="border-bottom:1px solid var(--border)">';
+        h += '<td style="padding:6px 10px;font-weight:600">'+d.field+'</td>';
+        h += '<td style="padding:6px 10px;color:var(--brown)">'+_escapeHtml(String(d.current==null?'(empty)':d.current))+'</td>';
+        h += '<td style="padding:6px 10px;color:var(--blue);font-weight:600">'+_escapeHtml(String(d.proposed==null?'(empty)':d.proposed))+'</td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table>';
+    }
+
+    h += '<div style="display:flex;gap:10px;margin-top:12px">';
+    h += '<button onclick="resolveConflict(\''+row.id+'\', \'approved\')" class="btn-fire" style="background:var(--green);padding:9px 18px;font-size:.74rem">✓ Approve (submitter wins)</button>';
+    h += '<button onclick="resolveConflict(\''+row.id+'\', \'denied\')" style="background:white;border:1px solid var(--red);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 18px;border-radius:6px;cursor:pointer;font-weight:700">✗ Deny (keep current)</button>';
+    h += '</div>';
+    h += '</div>';
+  });
+  h += '</div></div>';
+  return h;
+}
+
+async function resolveConflict(rowId, decision){
+  try{
+    var u = DB.current;
+    var canResolve = (typeof isOwner === 'function' && isOwner(u))
+                  || (typeof isInventory === 'function' && isInventory(u))
+                  || (u && u.depts && u.depts.inv);
+    if(!canResolve){ alert('Owner or Inventory Department only.'); return; }
+    var note = prompt('Optional review note (empty to skip):') || '';
+
+    // Fetch the row fresh so we have proposed/current_db
+    var fetched = await supaClient.from('pending_inventory_changes').select('*').eq('id', rowId).single();
+    if(!fetched || fetched.error || !fetched.data){
+      alert('⚠ Could not load conflict row: '+(fetched && fetched.error && fetched.error.message || 'not found'));
+      return;
+    }
+    var row = fetched.data;
+
+    if(decision === 'approved'){
+      // Apply the proposed device to the cloud + in-memory
+      var proposed = row.proposed;
+      if(!proposed){ alert('⚠ Proposed row missing from queue entry.'); return; }
+      // Re-apply via the same path the original change took, with skipConflictCheck=true
+      if(row.change_type === 'expiry-set' && proposed.expiryDate){
+        // Use invSetDownstreamExpiry with bypass
+        // First put the proposed version back into in-memory so the function operates on it
+        var arr = _poolArrayFor(row.pool_key);
+        if(arr){
+          var idx = arr.findIndex(function(d){ return String(d.id) === String(row.device_id); });
+          if(idx >= 0) arr[idx] = Object.assign({}, arr[idx], proposed);
+        }
+        var setRes = await invSetDownstreamExpiry(row.pool_key, row.device_id, proposed.expiryDate, {skipConflictCheck:true});
+        if(!setRes.ok){
+          alert('⚠ Approve failed: '+setRes.error);
+          return;
+        }
+      } else {
+        // Generic path — write the proposed row via Path B
+        var arr2 = _poolArrayFor(row.pool_key);
+        if(arr2){
+          var idx2 = arr2.findIndex(function(d){ return String(d.id) === String(row.device_id); });
+          if(idx2 >= 0) arr2[idx2] = Object.assign({}, arr2[idx2], proposed);
+          else arr2.push(proposed);
+        }
+        try{ saveInventory(); }catch(e){}
+        await invDbUpsertDevice(row.pool_key, arr2.find(function(d){return String(d.id)===String(row.device_id);}));
+      }
+    }
+    // Mark the queue row resolved either way
+    var updated = await supaClient.from('pending_inventory_changes').update({
+      status: decision,
+      reviewed_at: new Date().toISOString(),
+      reviewed_by_id: u.id,
+      reviewed_by_name: u.name,
+      review_note: note
+    }).eq('id', rowId).select().single();
+    if(updated && updated.error){
+      alert('⚠ Could not mark resolved: '+updated.error.message);
+      return;
+    }
+    // Notify the submitter
+    if(typeof notifyByEmail === 'function' && row.submitter_id){
+      notifyByEmail({
+        toAgentLookup: function(){
+          return (DB.agents||[]).find(function(a){ return a && a.id === row.submitter_id; }) || null;
+        },
+        eventType: 'inventory.conflict.resolved',
+        payload: {
+          imei:             row.imei,
+          decision:         decision,
+          reviewedByName:   u.name,
+          reviewNote:       note
+        }
+      });
+    }
+    PENDING_CONFLICTS_CACHE = PENDING_CONFLICTS_CACHE.filter(function(r){ return r.id !== rowId; });
+    alert('✅ Marked '+decision+'.');
+    gotoPanel('pending-conflicts');
+  }catch(err){
+    console.error('[resolveConflict] error:', err);
+    alert('⚠ Resolve failed: '+(err && err.message || String(err)));
+  }
+}
+
+if(typeof window !== 'undefined'){
+  window.panelPendingConflicts = panelPendingConflicts;
+  window.loadPendingConflicts  = loadPendingConflicts;
+  window.resolveConflict       = resolveConflict;
 }
 
 function panelCampaignTransfers(campaign){
@@ -57856,6 +58562,10 @@ if(typeof trainingAutoAdvancePending === 'function'){
   // without anyone refreshing. Falls back gracefully if Realtime isn't enabled.
   if(typeof subscribeAgentsRealtime === 'function'){
     try{ subscribeAgentsRealtime(); }catch(e){ console.warn('[init] realtime subscribe failed (safe to ignore):', e); }
+  }
+  // Calvin 2026-05-19: inventory realtime + conflict queue + notify framework
+  if(typeof subscribeInventoryRealtime === 'function'){
+    try{ subscribeInventoryRealtime(); }catch(e){ console.warn('[init] inventory realtime subscribe failed:', e); }
   }
   // Calvin 2026-05-14: auto-refresh for tables not on realtime (notifications,
   // sales, transfers). Polls every 15s. This is what makes notifications
