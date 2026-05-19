@@ -15159,6 +15159,74 @@ if(typeof window !== 'undefined'){
 }
 
 // ════════════════════════════════════════════════════════════════════════
+//  RECOVERY: wmamRecoverFromBlobs (Calvin 2026-05-18)
+//
+//  If localStorage got wiped (e.g., by the earlier boot-order bug), this
+//  pulls inventory from the Path A blob keys in Supabase app_settings
+//  (which the old saveInventory was writing to) and uses that as the
+//  source to populate the Path B per-row tables + in-memory + localStorage.
+//
+//  Run in F12 console: await wmamRecoverFromBlobs()
+//
+//  Output: per-pool count of devices recovered. If nothing comes back, the
+//  blob data was also wiped — in that case run wmamListBackups() and
+//  restore from a JSON backup, or scan/upload the devices fresh.
+// ════════════════════════════════════════════════════════════════════════
+async function wmamRecoverFromBlobs(){
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(' INVENTORY RECOVERY FROM PATH A BLOBS');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  if(typeof supaClient === 'undefined' || !supaClient){
+    console.log('⚠ Supabase unavailable.');
+    return 'Failed';
+  }
+  var pools = [
+    {key:'gm',     dataKey:'gm_inventory'},
+    {key:'tc',     dataKey:'tc_inventory'},
+    {key:'aw',     dataKey:'aw_inventory'},
+    {key:'ex',     dataKey:'ex_inventory'},
+    {key:'legacy', dataKey:'inv_devices'}
+  ];
+  // 1. Pull all 5 blobs
+  var keys = pools.map(function(p){ return p.dataKey; });
+  var res = await supaClient.from('app_settings').select('key,value').in('key', keys);
+  if(!res || res.error || !res.data){
+    console.log('⚠ Could not fetch app_settings:', res && res.error);
+    return 'Failed';
+  }
+  var byKey = {};
+  res.data.forEach(function(r){ byKey[r.key] = r.value; });
+  var summary = {};
+  for(var i=0;i<pools.length;i++){
+    var p = pools[i];
+    var blobRaw = byKey[p.dataKey];
+    if(!blobRaw){ summary[p.key] = '(no blob)'; continue; }
+    var devices;
+    try{ devices = JSON.parse(blobRaw); }catch(e){ summary[p.key] = '(parse error)'; continue; }
+    if(!Array.isArray(devices)){ summary[p.key] = '(not an array)'; continue; }
+    // 2. Restore in-memory
+    _invSyncReplacePool(p.key, devices);
+    summary[p.key] = devices.length + ' devices restored to memory';
+  }
+  console.log('Step 1 — restored to in-memory:', summary);
+  // 3. Persist to localStorage
+  try{ _invSyncWriteLocalOnly(); console.log('Step 2 — written to localStorage'); }
+  catch(e){ console.warn('localStorage write failed:', e); }
+  // 4. Push to Path B tables
+  if(typeof invDbMigrateFromBlobs === 'function'){
+    console.log('Step 3 — pushing to Path B tables…');
+    var mig = await invDbMigrateFromBlobs();
+    console.log('Step 3 result:', mig);
+  }
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('Done. Run wmamInventorySyncProbe() to verify all 3 layers match.');
+  return summary;
+}
+if(typeof window !== 'undefined'){
+  window.wmamRecoverFromBlobs = wmamRecoverFromBlobs;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 //  INVENTORY ROUTING DIAGNOSTIC (Calvin 2026-05-14)
 //  Call from F12 console: wmamDebugInventoryRouting('Waco TX')
 //  Walks every step of the routing logic and prints what's happening.
@@ -56508,30 +56576,66 @@ if(typeof trainingAutoAdvancePending === 'function'){
   // Try to load inventory from the real Supabase tables. If they exist
   // and are populated, they take precedence over the Path A blobs that
   // loadFromSupabase loaded above. If they exist but are empty, do a
-  // one-time migration to push current localStorage inventory into them.
-  // If they don't exist (SQL migration not run yet), this is a silent
-  // no-op and Path A keeps working.
+  // one-time migration to push localStorage inventory into them. If they
+  // don't exist (SQL migration not run yet), this is a silent no-op and
+  // Path A keeps working.
+  //
+  // CRITICAL ORDER OF OPERATIONS (Calvin 2026-05-18 root-cause fix):
+  //  - Snapshot localStorage counts BEFORE any Supabase load. The load
+  //    function _invSyncReplacePool clears in-memory arrays before
+  //    populating them, so reading GM_INVENTORY.length AFTER the load
+  //    would always show 0 when tables are empty, breaking the migration
+  //    detection. Previous version had this bug — it loaded empty tables
+  //    into memory, then asked "is memory empty?" → yes → "is memory
+  //    non-empty (hasLocal)?" → no → skipped migration → data effectively
+  //    deleted from Makenzie's session.
+  //  - If tables empty AND localStorage has data, restore in-memory from
+  //    localStorage first, then migrate. Re-load tables after.
   try{
     if(typeof invDbLoadAllFromTables === 'function'){
+      // 1. Snapshot localStorage counts (these are pre-load, so they're
+      //    the truth before we touch anything)
+      function _lsCount(key){
+        try{ var raw = localStorage.getItem(key); if(!raw) return 0; var arr = JSON.parse(raw); return Array.isArray(arr) ? arr.length : 0; }
+        catch(e){ return 0; }
+      }
+      var localCounts = {
+        gm:     _lsCount('wmam_gm_inventory'),
+        tc:     _lsCount('wmam_tc_inventory'),
+        aw:     _lsCount('wmam_aw_inventory'),
+        ex:     _lsCount('wmam_ex_inventory'),
+        legacy: _lsCount('wmam_inv_devices')
+      };
+      var hasLocalStorage = Object.values(localCounts).some(function(n){ return n > 0; });
+      console.log('[init] Path B: localStorage snapshot', localCounts, 'hasLocalStorage='+hasLocalStorage);
+
+      // 2. Load from Supabase tables
       var loadResult = await invDbLoadAllFromTables();
       if(loadResult && loadResult.ok){
-        // Check whether all 5 tables are empty AND we have local data —
-        // if so, this is first boot post-SQL-migration; push local data up.
         var allEmpty = true;
         Object.keys(loadResult.counts).forEach(function(k){
           if(typeof loadResult.counts[k] === 'number' && loadResult.counts[k] > 0) allEmpty = false;
         });
-        var hasLocal = (typeof GM_INVENTORY !== 'undefined' && GM_INVENTORY.length)
-                    || (typeof TC_INVENTORY !== 'undefined' && TC_INVENTORY.length)
-                    || (typeof AW_INVENTORY !== 'undefined' && AW_INVENTORY.length)
-                    || (typeof EX_INVENTORY !== 'undefined' && EX_INVENTORY.length)
-                    || (typeof INVENTORY_DEVICES !== 'undefined' && INVENTORY_DEVICES.length);
-        if(allEmpty && hasLocal){
-          console.log('[init] Path B tables empty + local has data → migrating once');
+        // 3. If tables are empty but localStorage has data, this is first
+        //    boot after the SQL migration. Restore in-memory from localStorage
+        //    (the load above wiped it), then migrate to the new tables.
+        if(allEmpty && hasLocalStorage){
+          console.log('[init] Path B tables empty + localStorage has data → restoring from localStorage and migrating');
+          // Restore each pool from localStorage
+          try{
+            var gmRaw = localStorage.getItem('wmam_gm_inventory'); if(gmRaw){ var v = JSON.parse(gmRaw); if(Array.isArray(v)) _invSyncReplacePool('gm', v); }
+            var tcRaw = localStorage.getItem('wmam_tc_inventory'); if(tcRaw){ var v = JSON.parse(tcRaw); if(Array.isArray(v)) _invSyncReplacePool('tc', v); }
+            var awRaw = localStorage.getItem('wmam_aw_inventory'); if(awRaw){ var v = JSON.parse(awRaw); if(Array.isArray(v)) _invSyncReplacePool('aw', v); }
+            var exRaw = localStorage.getItem('wmam_ex_inventory'); if(exRaw){ var v = JSON.parse(exRaw); if(Array.isArray(v)) _invSyncReplacePool('ex', v); }
+            var lgRaw = localStorage.getItem('wmam_inv_devices');  if(lgRaw){ var v = JSON.parse(lgRaw); if(Array.isArray(v)) _invSyncReplacePool('legacy', v); }
+            console.log('[init] Path B: restored from localStorage — GM='+GM_INVENTORY.length+', TC='+TC_INVENTORY.length+', AW='+AW_INVENTORY.length+', EX='+EX_INVENTORY.length+', Legacy='+INVENTORY_DEVICES.length);
+          }catch(e){ console.warn('[init] Path B restore from localStorage failed:', e); }
+          // Push to the new tables (idempotent — upsert by id)
           if(typeof invDbMigrateFromBlobs === 'function'){
             await invDbMigrateFromBlobs();
-            // Re-load from the now-populated tables so we have canonical IDs
+            // Re-load from the now-populated tables so we have canonical row data
             await invDbLoadAllFromTables();
+            console.log('[init] Path B migration complete — GM='+GM_INVENTORY.length+', TC='+TC_INVENTORY.length+', AW='+AW_INVENTORY.length+', EX='+EX_INVENTORY.length+', Legacy='+INVENTORY_DEVICES.length);
           }
         }
       }
