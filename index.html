@@ -12399,51 +12399,187 @@ function gmResolveMarketMMOnly(marketName){
 //           or { agent: null, source: null } when nothing matches.
 // ════════════════════════════════════════════════════════════════════════
 function resolveUploadRecipient(marketName, campaignKey){
-  if(!marketName || typeof MARKETS === 'undefined') return {agent:null, source:null};
+  // Diagnostic recorder — when we can't resolve, fill this in so the upload
+  // UI can show Calvin exactly what shape the data was in.
+  var debug = { tried: [], marketName: marketName, campaignKey: campaignKey };
+
+  if(!marketName || typeof MARKETS === 'undefined'){
+    debug.reason = 'no-market-name-or-MARKETS-undefined';
+    return {agent:null, source:null, debug:debug};
+  }
   var cfg = (typeof campaignCfg === 'function') ? campaignCfg(campaignKey) : null;
-  if(!cfg) return {agent:null, source:null};
+  if(!cfg) { debug.reason = 'campaign-not-registered'; return {agent:null, source:null, debug:debug}; }
   var programKey = cfg.program || 'lifeline';
 
-  // Find the active market row
-  var marketRow = MARKETS.find(function(m){
-    if(!m || m.active === false) return false;
-    return (m.name || '').toLowerCase().trim() === marketName.toLowerCase().trim();
-  });
-  if(!marketRow || !marketRow.programs) return {agent:null, source:null};
+  // ── Find market: try multiple strategies in order ──
+  // Calvin 2026-05-19: live system uses different market name formats than
+  // the test sandbox. Be permissive: case, punctuation, "City, State" vs
+  // "City State", partial substring, market.id, market.displayName, etc.
+  var target = String(marketName).toLowerCase().trim();
+  var targetNoCommas = target.replace(/,/g, '');
+  var targetNoSpaces = target.replace(/[\s,]/g, '');
+  var marketRow = null;
+  var matchStrategy = null;
 
-  var sec = marketRow.programs[programKey];
-  if(!sec) return {agent:null, source:null};
+  for(var i=0;i<MARKETS.length;i++){
+    var m = MARKETS[i];
+    if(!m || m.active === false) continue;
+    // Build all candidate strings for this market row
+    var candidates = [
+      m.name, m.displayName, m.label, m.title, m.market, m.marketName, m.city
+    ].filter(Boolean).map(function(x){ return String(x).toLowerCase().trim(); });
+    debug.tried.push({i:i, id:m.id, candidates:candidates});
 
-  // Step 1: MM in this market+program
-  if(sec.mmId){
-    var mm = (DB.agents||[]).find(function(a){ return a.id === sec.mmId && a.active; });
-    if(mm) return {agent: mm, source: 'market-mm'};
+    // Exact match
+    if(candidates.indexOf(target) >= 0){
+      marketRow = m; matchStrategy = 'exact'; break;
+    }
+    // No-comma match (e.g., "Tulsa OK" vs "Tulsa, OK")
+    if(candidates.some(function(c){ return c.replace(/,/g,'').trim() === targetNoCommas; })){
+      marketRow = m; matchStrategy = 'no-commas'; break;
+    }
+    // No-spaces/commas match (e.g., "TulsaOK")
+    if(candidates.some(function(c){ return c.replace(/[\s,]/g,'') === targetNoSpaces; })){
+      marketRow = m; matchStrategy = 'no-spaces-commas'; break;
+    }
+    // Substring match — but ONLY if the target has 4+ chars (avoid false positives)
+    if(target.length >= 4){
+      if(candidates.some(function(c){ return c.indexOf(target) >= 0 || target.indexOf(c) >= 0; })){
+        marketRow = m; matchStrategy = 'substring'; break;
+      }
+    }
   }
 
-  // Step 2: CM of this market+program — but ONLY if they cover this campaign.
-  // The channels[] check is the "Tanita is CM for Lifeline (TC/GM/AW), so a
-  // TC device falls back to her — but only if she covers TC" gate.
+  if(!marketRow){
+    debug.reason = 'market-not-found-in-MARKETS-table';
+    debug.totalMarkets = MARKETS.length;
+    debug.allMarketNames = MARKETS.map(function(m){
+      return (m && (m.name||m.displayName||m.label||m.id)) || '(no-name)';
+    });
+    console.warn('[resolveUploadRecipient] could not find market for "'+marketName+'":', debug);
+
+    // ── Calvin 2026-05-19: cmModel last-resort fallback ──
+    // If the MARKETS table doesn't have this market row at all (data shape
+    // mismatch), but a CM exists whose cmModel implies they own this market,
+    // use them. Example: Tanita has cmModel='cm-oklahoma'; if marketName
+    // ends in "OK" or contains "Oklahoma", she owns it.
+    var stateAbbr = '';
+    var m2 = marketName.match(/\b([A-Z]{2})\b\s*$/); if(m2) stateAbbr = m2[1].toLowerCase();
+    var stateFromName = {
+      'ok':'oklahoma','tx':'texas','ca':'california','az':'arizona','nm':'newmexico',
+      'co':'colorado','la':'louisiana','ar':'arkansas','ks':'kansas','mo':'missouri',
+      'fl':'florida','ga':'georgia','nc':'northcarolina','sc':'southcarolina','va':'virginia',
+      'tn':'tennessee','al':'alabama','ms':'mississippi','ky':'kentucky','wv':'westvirginia'
+    };
+    var stateLong = stateFromName[stateAbbr] || '';
+    var marketLower = marketName.toLowerCase().replace(/[\s,]/g,'');
+    // Find any CM whose cmModel string mentions the state
+    var matchingCM = (DB.agents||[]).find(function(a){
+      if(!a || !a.active) return false;
+      if(a.role !== 'Campaign Manager') return false;
+      if(!a.cmModel) return false;
+      var model = String(a.cmModel).toLowerCase().replace(/[\s-_]/g,'');
+      // Direct hits: cm-oklahoma covers any OK market
+      if(stateLong && model.indexOf(stateLong) >= 0) return true;
+      // Also try the abbreviation
+      if(stateAbbr && model.indexOf(stateAbbr) >= 0 && stateAbbr.length === 2){
+        // require that the abbreviation isn't a substring of something unrelated
+        // by anchoring it as a whole-word in the original cmModel
+        return new RegExp('\\b'+stateAbbr+'\\b').test(String(a.cmModel).toLowerCase());
+      }
+      // Or the market city/region
+      if(marketLower && model.indexOf(marketLower) >= 0) return true;
+      return false;
+    });
+    if(matchingCM){
+      // Same channel coverage check as the normal CM path
+      var cfg2 = (typeof campaignCfg === 'function') ? campaignCfg(campaignKey) : null;
+      if(cfg2){
+        var altChannels = {
+          'tc': ['truconnect','tc'],
+          'gm': ['genmobile','gen mobile','gm'],
+          'aw': ['assurance','assurance wireless','aw'],
+          'ex': ['excess','excess telecom','ex']
+        };
+        var coverList = altChannels[cfg2.id] || [(cfg2.id||'').toLowerCase()];
+        var chs = (matchingCM.channels || []).map(function(c){ return String(c).toLowerCase().trim(); });
+        var covers = coverList.some(function(c){ return chs.indexOf(c) >= 0; });
+        debug.cmModelFallback = {cmName:matchingCM.name, cmModel:matchingCM.cmModel, covers:covers};
+        if(covers){
+          debug.reason = 'matched-cm-via-cmModel-fallback';
+          console.log('[resolveUploadRecipient] ✓ Routed via cmModel fallback to '+matchingCM.name+' for '+marketName);
+          return {agent: matchingCM, source: 'cm-model-fallback', debug:debug};
+        }
+      }
+    }
+    return {agent:null, source:null, debug:debug};
+  }
+  debug.matchedMarket = {id:marketRow.id, name:marketRow.name||marketRow.displayName, strategy:matchStrategy};
+
+  if(!marketRow.programs){
+    debug.reason = 'market-found-but-no-programs-object';
+    console.warn('[resolveUploadRecipient] '+marketName+' has no programs section:', debug);
+    return {agent:null, source:null, debug:debug};
+  }
+
+  // Try the program section. If exact key (e.g. 'lifeline') is missing,
+  // also try case-variants and the full program label.
+  var sec = marketRow.programs[programKey];
+  if(!sec && cfg.label){
+    // Try lowercased label key
+    var altKey = cfg.label.toLowerCase();
+    if(marketRow.programs[altKey]) sec = marketRow.programs[altKey];
+  }
+  if(!sec){
+    // Try ANY program section that has an MM or CM set — better than null
+    var fallbackKeys = Object.keys(marketRow.programs);
+    for(var k=0;k<fallbackKeys.length;k++){
+      var trial = marketRow.programs[fallbackKeys[k]];
+      if(trial && (trial.mmId || trial.cmId)){ sec = trial; debug.usedFallbackProgram = fallbackKeys[k]; break; }
+    }
+  }
+  if(!sec){
+    debug.reason = 'no-program-section-for-'+programKey;
+    debug.programsAvailable = Object.keys(marketRow.programs);
+    console.warn('[resolveUploadRecipient] no program section:', debug);
+    return {agent:null, source:null, debug:debug};
+  }
+  debug.programSection = {mmId:sec.mmId, cmId:sec.cmId, tlIds:sec.tlIds};
+
+  // Step 1: MM
+  if(sec.mmId){
+    var mm = (DB.agents||[]).find(function(a){ return a.id === sec.mmId && a.active; });
+    if(mm){ debug.reason = 'matched-mm'; return {agent: mm, source: 'market-mm', debug:debug}; }
+    debug.mmIdSetButInactive = sec.mmId;
+  }
+
+  // Step 2: CM-of-market — BUT only if they cover this campaign
   if(sec.cmId){
     var cm = (DB.agents||[]).find(function(a){ return a.id === sec.cmId && a.active; });
     if(cm){
-      var campaignChannel = (cfg.id || '').toLowerCase();          // 'tc','gm','aw','ex'
-      var labelChannel    = (cfg.label || '').toLowerCase();        // 'truconnect','gen mobile', etc
+      var campaignChannel = (cfg.id || '').toLowerCase();
       var altChannels = {
         'tc': ['truconnect','tc'],
         'gm': ['genmobile','gen mobile','gm'],
         'aw': ['assurance','assurance wireless','aw'],
         'ex': ['excess','excess telecom','ex']
       };
-      var coverList = (altChannels[cfg.id]||[campaignChannel]);
+      var coverList = altChannels[cfg.id] || [campaignChannel];
       var chs = (cm.channels || []).map(function(c){ return String(c).toLowerCase().trim(); });
       var covers = coverList.some(function(c){ return chs.indexOf(c) >= 0; });
-      if(covers) return {agent: cm, source: 'market-cm'};
-      // If the CM doesn't cover this campaign, do NOT route to them.
-      // Falling through to unassigned is the safe choice.
+      debug.cmCoverageCheck = {cmName:cm.name, cmChannels:chs, requiredAnyOf:coverList, covers:covers};
+      if(covers){ debug.reason = 'matched-cm-fallback'; return {agent: cm, source: 'market-cm', debug:debug}; }
+      debug.reason = 'cm-found-but-does-not-cover-campaign';
+    } else {
+      debug.cmIdSetButInactive = sec.cmId;
     }
+  } else {
+    debug.noCmSet = true;
   }
 
-  return {agent:null, source:null};
+  if(!debug.reason) debug.reason = 'no-mm-no-matching-cm';
+  console.warn('[resolveUploadRecipient] '+marketName+' resolved to UNASSIGNED:', debug);
+  return {agent:null, source:null, debug:debug};
 }
 if(typeof window !== 'undefined'){ window.resolveUploadRecipient = resolveUploadRecipient; }
 
@@ -12869,6 +13005,7 @@ function processTCInventoryUpload(htmlText, batchId){
   var marketBreakdown = {};
   var carrierBreakdown = {};
   var routingBreakdown = {}; // Calvin 2026-05-19: per-market routing audit
+  var routingDiagnosticsByMarket = {}; // Calvin 2026-05-19: capture debug info per market
   var skippedBlank = 0;
   var nowISO = new Date().toISOString();
 
@@ -12912,7 +13049,30 @@ function processTCInventoryUpload(htmlText, batchId){
       resolution = resolveUploadRecipient(market, 'TruConnect') || {agent:null, source:null};
     }
     var autoRecipient = resolution.agent;
-    var routeSource   = resolution.source; // 'market-mm' | 'market-cm' | null
+    var routeSource   = resolution.source;
+
+    // ── Diagnostic capture ──
+    // First time we see this market, record the resolver's debug info.
+    // This surfaces to the upload UI so Calvin can see WHY devices land
+    // unassigned without opening F12.
+    if(!routingDiagnosticsByMarket[market]){
+      routingDiagnosticsByMarket[market] = {
+        market: market,
+        assignedCount: 0,
+        unassignedCount: 0,
+        recipientName: autoRecipient ? autoRecipient.name : null,
+        recipientRole: autoRecipient ? autoRecipient.role : null,
+        source: routeSource,
+        reason: (resolution.debug && resolution.debug.reason) || (autoRecipient ? 'routed' : 'unassigned'),
+        allMarketNames: (resolution.debug && resolution.debug.allMarketNames) || null,
+        programsAvailable: (resolution.debug && resolution.debug.programsAvailable) || null,
+        cmCoverageCheck: (resolution.debug && resolution.debug.cmCoverageCheck) || null,
+        cmModelFallback:  (resolution.debug && resolution.debug.cmModelFallback)  || null
+      };
+    }
+    if(autoRecipient) routingDiagnosticsByMarket[market].assignedCount++;
+    else              routingDiagnosticsByMarket[market].unassignedCount++;
+
     var devStatus    = autoRecipient ? 'assigned' : 'unassigned';
     var devHolderId  = autoRecipient ? autoRecipient.id   : null;
     var devHolderName= autoRecipient ? autoRecipient.name : '';
@@ -12920,10 +13080,11 @@ function processTCInventoryUpload(htmlText, batchId){
     if(autoRecipient){
       var roleTag = (routeSource === 'market-mm') ? ' (MM)'
                   : (routeSource === 'market-cm') ? ' (CM)'
+                  : (routeSource === 'cm-model-fallback') ? ' (CM via cmModel)'
                   : '';
       routeKey = market + ' → ' + autoRecipient.name + roleTag;
     } else {
-      routeKey = market + ' → UNASSIGNED (no MM/CM for this campaign)';
+      routeKey = market + ' → UNASSIGNED ('+(resolution.debug && resolution.debug.reason || 'no MM/CM')+')';
     }
     if(!routingBreakdown[routeKey]) routingBreakdown[routeKey] = 0;
     routingBreakdown[routeKey]++;
@@ -13024,6 +13185,7 @@ function processTCInventoryUpload(htmlText, batchId){
     marketBreakdown: marketBreakdown,
     carrierBreakdown: carrierBreakdown,
     routingBreakdown: routingBreakdown,
+    routingDiagnostics: Object.keys(routingDiagnosticsByMarket).map(function(k){ return routingDiagnosticsByMarket[k]; }),
     batchId: batchId
   };
 }
@@ -39164,6 +39326,32 @@ function tcProcessInventoryUpload(){
           html += '<li>'+k+': '+r.routingBreakdown[k]+'</li>';
         });
         html += '</ul>';
+      }
+      // ── Calvin 2026-05-19: diagnostic when devices landed unassigned ──
+      // Show WHY so Calvin can see the data-shape mismatch without F12.
+      if(r.routingDiagnostics && r.routingDiagnostics.length){
+        var anyUnassigned = r.routingDiagnostics.some(function(d){ return d.unassignedCount > 0; });
+        if(anyUnassigned){
+          html += '<div style="margin-top:14px;padding:14px;background:rgba(204,0,0,.06);border-left:3px solid #CC0000;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5">';
+          html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:#CC0000;margin-bottom:8px">🛑 SOME DEVICES LANDED UNASSIGNED — REASON BELOW</div>';
+          r.routingDiagnostics.forEach(function(d){
+            if(d.unassignedCount > 0){
+              html += '<div style="margin:6px 0"><strong>'+d.market+'</strong> ('+d.unassignedCount+' devices): <code style="background:rgba(0,0,0,.04);padding:2px 6px;border-radius:3px;font-size:.72rem">'+(d.reason||'unknown')+'</code></div>';
+              if(d.allMarketNames){
+                var nameList = d.allMarketNames.slice(0,8).join(', ') + (d.allMarketNames.length>8 ? ', …' : '');
+                html += '<div style="margin-left:20px;color:var(--muted);font-size:.72rem">Markets I checked: '+nameList+'</div>';
+              }
+              if(d.programsAvailable){
+                html += '<div style="margin-left:20px;color:var(--muted);font-size:.72rem">Programs in this market: '+d.programsAvailable.join(', ')+'</div>';
+              }
+              if(d.cmCoverageCheck){
+                html += '<div style="margin-left:20px;color:var(--muted);font-size:.72rem">CM '+d.cmCoverageCheck.cmName+' channels: '+(d.cmCoverageCheck.cmChannels||[]).join(', ')+' — needed any of: '+(d.cmCoverageCheck.requiredAnyOf||[]).join(', ')+'</div>';
+              }
+            }
+          });
+          html += '<div style="margin-top:10px;padding:8px;background:rgba(255,255,255,.5);border-radius:3px;font-size:.74rem">Send this entire box to Claude so he can fix the matching logic. He needs to see the actual market names + program structure in your live system.</div>';
+          html += '</div>';
+        }
       }
       // Path B sync status
       if(result.pathBOk){
