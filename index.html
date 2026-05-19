@@ -10446,6 +10446,23 @@ function isOnboarding(u){
 function isHRorInv(u)    { return isHR(u)||isInventory(u); }
 function isOfficeRole(u) { return isHR(u)||isInventory(u)||isPayroll(u)||isOnboarding(u); }
 
+// ── Calvin 2026-05-19 — Vendor-due-date visibility ──
+// TC inventory has TWO dates: vendorDueDate (the real cap from the carrier,
+// e.g., TruConnect's "return by" date) and expiryDate (the date Inv Dept
+// sets for MMs/TLs/agents, which drives the 10-day gap rule). Vendor due
+// date must be invisible to anyone outside Owner/Inv Dept/Payroll so that
+// downstream staff can't game the actual deadline.
+function canSeeVendorDueDate(u){
+  if(!u) return false;
+  if(isOwner(u)) return true;
+  if(typeof isInventory === 'function' && isInventory(u)) return true;
+  if(typeof isPayroll   === 'function' && isPayroll(u))   return true;
+  // Admin role also qualifies — they wear all hats
+  if(u.role === 'admin') return true;
+  return false;
+}
+if(typeof window !== 'undefined'){ window.canSeeVendorDueDate = canSeeVendorDueDate; }
+
 // ════════════════════════════════════════════════════════════════════════
 //  DISTRIBUTE-INVENTORY PERMISSION (Calvin 2026-05-03)
 //  Inventory assignment is gated. By default only Owner and Inventory
@@ -11977,9 +11994,13 @@ var CAMPAIGN_REGISTRY = {
     activations: function(){ return TC_ACTIVATIONS; },
     transfers:   function(){ return TC_TRANSFERS; },
     marketMap:   function(){ return TC_MARKET_MAP; },
-    parseInventoryCSV:  null, // TODO: plug in TruConnect CSV parser
+    // ── Calvin 2026-05-19: TC inventory upload wired ──
+    // Source format is HTML-as-.xls from the TruConnect dealer portal.
+    // parseInventoryCSV here is a misnomer kept for consistency with the
+    // registry shape — the parser handles HTML tables, not CSV.
+    parseInventoryCSV:  function(text){ return parseTCInventoryHTML(text); },
     parseActivationCSV: null,
-    processInventoryUpload:  null,
+    processInventoryUpload:  function(text, batchId){ return processTCInventoryUpload(text, batchId); },
     processActivationUpload: null,
     applyActivations:        null
   },
@@ -12648,6 +12669,274 @@ function processGMInventoryUpload(csvText, batchId){
   };
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  TRUCONNECT INVENTORY UPLOAD — Calvin 2026-05-19
+//
+//  Source: TruConnect dealer portal exports an HTML-as-.xls file (not real
+//  Excel — it's actually an HTML table). 12 columns.
+//
+//  Per Calvin's spec (locked):
+//   - Campaign:        'TC (TruConnect)' on every device
+//   - Carrier:         T-Mobile or Verizon — kept as sub-carrier on device
+//   - IMEI:            15-digit serial
+//   - vendorDueDate:   office-only (Owner/Inv Dept). Real vendor return-by date.
+//                      Hidden from MMs/TLs/agents.
+//   - expiryDate:      starts EMPTY. Inv Dept sets this manually before
+//                      transferring devices downstream. The 10-day rule
+//                      runs against THIS date (same as GM).
+//   - Device Cost:     $65 → numeric 65
+//   - Market:          'TC Tulsa (WIL)-01' → 'Tulsa OK' (and same for
+//                      future markets: San Antonio, Corpus Christi)
+//   - Model:           full product name string
+//   - Status:          DROPPED — every uploaded device lands 'unassigned'
+//   - Person Assigned: DROPPED — Inv Dept assigns inside the app
+//
+//  Routes through Path B per-row Supabase writes (invDbUpsertDevice) so
+//  uploads sync across browsers the same way GM bulk-delete does.
+// ════════════════════════════════════════════════════════════════════════
+
+// Parse the HTML-as-xls file. Returns array of {col0..col11} arrays.
+function parseTCInventoryHTML(htmlText){
+  if(!htmlText || typeof htmlText !== 'string') return {headers:[], rows:[]};
+  // Extract every <tr>...</tr> block (greedy across newlines)
+  var trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  var trMatch, allRows = [];
+  while((trMatch = trRegex.exec(htmlText)) !== null){
+    var inner = trMatch[1];
+    // Extract every <td> or <th> cell inside this row
+    var cellRegex = /<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/gi;
+    var cellMatch, cells = [];
+    while((cellMatch = cellRegex.exec(inner)) !== null){
+      // Strip any nested HTML, decode common entities, trim
+      var v = cellMatch[1]
+        .replace(/<[^>]+>/g, '')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, ' ')
+        .trim();
+      cells.push(v);
+    }
+    if(cells.length) allRows.push(cells);
+  }
+  if(!allRows.length) return {headers:[], rows:[]};
+  return {headers: allRows[0], rows: allRows.slice(1)};
+}
+
+// Translate the TruConnect "Team DD" column into the canonical market name
+// used elsewhere in the system. Tulsa OK is shared with Gen Mobile (per
+// Calvin's confirmation). San Antonio and Corpus Christi exist for TC but
+// not necessarily for GM — they still map to the same canonical labels.
+function tcMarketTranslate(teamDd){
+  if(!teamDd) return '';
+  var t = String(teamDd).trim();
+  var lc = t.toLowerCase();
+  // Tulsa variants: "TC Tulsa (WIL)-01", "TC Tulsa OK", etc.
+  if(/tulsa/i.test(lc))            return 'Tulsa OK';
+  if(/san\s*antonio/i.test(lc))    return 'San Antonio TX';
+  if(/corpus\s*christi/i.test(lc)) return 'Corpus Christi TX';
+  // Fallback: strip "TC " prefix and "-NN" suffix so "TC Houston (X)-02"
+  // becomes "Houston (X)" — still recognizable but flagged for review.
+  var cleaned = t.replace(/^TC\s+/i, '').replace(/-\d+$/,'').trim();
+  return cleaned || t;
+}
+
+// Parse a money string like "$65.00" or "65" → numeric. Returns 0 on junk.
+function _tcParseCost(v){
+  if(v === null || v === undefined) return 0;
+  var s = String(v).trim().replace(/[$,\s]/g,'');
+  if(!s) return 0;
+  var n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+// Generate the next TC device id. Mirrors gmNextId pattern.
+function _tcNextId(){
+  // Find highest numeric suffix already used
+  var maxN = 0;
+  TC_INVENTORY.forEach(function(d){
+    if(d && typeof d.id === 'string'){
+      var m = d.id.match(/^tc-(\d+)$/);
+      if(m){ var n = parseInt(m[1], 10); if(n > maxN) maxN = n; }
+    }
+  });
+  return 'tc-' + (maxN + 1);
+}
+
+// Main upload processor. Returns {newDevices, duplicates, total, unknownMarkets, batchId}.
+// Caller should then call invDbUpsertDevice for each new device for Path B sync.
+function processTCInventoryUpload(htmlText, batchId){
+  var parsed = parseTCInventoryHTML(htmlText);
+  var rows = parsed.rows;
+  if(!rows.length){
+    return {newDevices:[], duplicates:[], total:0, unknownMarkets:{}, error:'No rows found in file', batchId:batchId};
+  }
+
+  // Dedup against existing TC inventory by IMEI
+  var existingIMEIs = {};
+  TC_INVENTORY.forEach(function(d){ if(d.imei) existingIMEIs[String(d.imei)] = d; });
+
+  var newDevices = [];
+  var duplicates = [];
+  var unknownMarkets = {};
+  var marketBreakdown = {};
+  var carrierBreakdown = {};
+  var skippedBlank = 0;
+  var nowISO = new Date().toISOString();
+
+  rows.forEach(function(cells){
+    // Column layout from the TC dealer portal export (locked 2026-05-19):
+    //   0: Purchase Order: PO Auto ID  (we don't store this — order tracker only)
+    //   1: Purchase Order: Carrier     → subCarrier (T-Mobile / Verizon)
+    //   2: Status                      → DROPPED (per spec)
+    //   3: Serial Number               → imei (15 digits)
+    //   4: Packing Slip Number         → we don't need
+    //   5: Shipped Date (US)           → we don't need
+    //   6: Due Date (US)               → vendorDueDate (office-only)
+    //   7: Person Assigned             → DROPPED (per spec)
+    //   8: Device Cost                 → cost (numeric)
+    //   9: Team DD                     → market (translated via tcMarketTranslate)
+    //  10: Purchase Order Number       → we don't need
+    //  11: Product Name                → model
+    var subCarrier = cells[1] || '';
+    var imei       = (cells[3] || '').replace(/\D/g, ''); // digits only
+    var vendorDue  = cells[6] || '';
+    var cost       = _tcParseCost(cells[8]);
+    var teamDd     = cells[9] || '';
+    var model      = cells[11] || '';
+
+    // Skip rows without an IMEI — they're empty or malformed
+    if(!imei){ skippedBlank++; return; }
+
+    // Dedup: re-uploading the same file is a no-op for already-known IMEIs
+    if(existingIMEIs[imei]){ duplicates.push(imei); return; }
+
+    var market = tcMarketTranslate(teamDd);
+    if(!market) unknownMarkets[teamDd || '(blank)'] = (unknownMarkets[teamDd || '(blank)'] || 0) + 1;
+
+    // Normalize the date — TC's format is M/D/YYYY (e.g., "5/17/2026").
+    // Store as YYYY-MM-DD for consistency with the rest of the system.
+    var vendorDueISO = '';
+    if(vendorDue){
+      var m = vendorDue.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+      if(m){
+        var mm = String(parseInt(m[1],10)).padStart(2,'0');
+        var dd = String(parseInt(m[2],10)).padStart(2,'0');
+        vendorDueISO = m[3] + '-' + mm + '-' + dd;
+      } else {
+        vendorDueISO = vendorDue; // store raw if we can't parse
+      }
+    }
+
+    var dev = {
+      id:             _tcNextId(),
+      imei:           imei,
+      campaign:       'TC (TruConnect)',
+      subCarrier:     subCarrier,
+      model:          model,
+      cost:           cost,
+      market:         market,
+      teamDd:         teamDd,  // preserve original team-DD code for audit
+      status:         'unassigned',
+      holderId:       null,
+      holderName:     '',
+      vendorDueDate:  vendorDueISO,    // office-only — hidden from MMs/agents
+      expiryDate:     '',              // Inv Dept sets this before transferring
+      uploadedAt:     nowISO,
+      uploadBatchId:  batchId,
+      chainOfCustody: [{
+        type:   'uploaded',
+        at:     nowISO,
+        source: 'tc-portal-upload',
+        batchId: batchId,
+        vendorDueDate: vendorDueISO,
+        cost:   cost,
+        market: market
+      }]
+    };
+    // Track for the batch — we'll bulk-add after the loop so we don't
+    // mutate TC_INVENTORY mid-iteration and trip up _tcNextId.
+    newDevices.push(dev);
+    existingIMEIs[imei] = dev; // prevent duplicate within same upload
+
+    marketBreakdown[market]   = (marketBreakdown[market] || 0) + 1;
+    carrierBreakdown[subCarrier] = (carrierBreakdown[subCarrier] || 0) + 1;
+  });
+
+  // Commit to local inventory pool
+  newDevices.forEach(function(d){ TC_INVENTORY.push(d); });
+
+  // Record the batch
+  if(typeof TC_BATCHES === 'undefined'){ window.TC_BATCHES = []; }
+  TC_BATCHES.push({
+    id: batchId,
+    uploadedAt: nowISO,
+    count: newDevices.length,
+    duplicateCount: duplicates.length,
+    skippedBlank: skippedBlank,
+    markets: marketBreakdown,
+    carriers: carrierBreakdown,
+    source: 'tc-dealer-portal'
+  });
+
+  // Persist locally (writes localStorage + Supabase Path A blob)
+  try { saveInventory(); } catch(e){ console.warn('[processTCInventoryUpload] saveInventory failed:', e); }
+
+  return {
+    newDevices: newDevices,
+    duplicates: duplicates,
+    total: rows.length,
+    skippedBlank: skippedBlank,
+    unknownMarkets: unknownMarkets,
+    marketBreakdown: marketBreakdown,
+    carrierBreakdown: carrierBreakdown,
+    batchId: batchId
+  };
+}
+
+// Wrapper that ALSO does Path B per-row writes after processing.
+// Returns Promise resolving to {result, pathBOk, pathBError}.
+async function processTCInventoryUploadWithSync(htmlText, batchId){
+  var result = processTCInventoryUpload(htmlText, batchId);
+  if(!result.newDevices || !result.newDevices.length){
+    return {result:result, pathBOk:true, pathBError:null};
+  }
+  // Push each new device to the TC Supabase table — true per-row writes
+  var pathBOk = true, pathBError = null;
+  if(typeof invDbUpsertDevice === 'function'){
+    for(var i=0;i<result.newDevices.length;i++){
+      try{
+        var res = await invDbUpsertDevice('tc', result.newDevices[i]);
+        if(!res || !res.ok){
+          pathBOk = false;
+          pathBError = (res && res.error) ? res.error : 'unknown';
+          console.warn('[processTCInventoryUploadWithSync] device '+result.newDevices[i].id+' upsert failed:', pathBError);
+        }
+      }catch(e){
+        pathBOk = false;
+        pathBError = e;
+        console.warn('[processTCInventoryUploadWithSync] device '+result.newDevices[i].id+' threw:', e);
+      }
+    }
+  } else {
+    pathBOk = false;
+    pathBError = 'invDbUpsertDevice not available';
+  }
+  return {result:result, pathBOk:pathBOk, pathBError:pathBError};
+}
+
+if(typeof window !== 'undefined'){
+  window.parseTCInventoryHTML            = parseTCInventoryHTML;
+  window.tcMarketTranslate               = tcMarketTranslate;
+  window.processTCInventoryUpload        = processTCInventoryUpload;
+  window.processTCInventoryUploadWithSync= processTCInventoryUploadWithSync;
+}
+
+// Ensure TC_BATCHES exists (parallel to GM_BATCHES)
+if(typeof TC_BATCHES === 'undefined'){ var TC_BATCHES = []; }
+
 // ── Process Gen Mobile Activation Report CSV ──
 // Returns {matched, unmatched, chargebacks, duplicates}
 function processGMActivationCSV(csvText){
@@ -13147,7 +13436,10 @@ function gmAgentSignTransfer(transferId, confirmed){
     var senderExpiry = dev.expiryDate || dev.originalExpiryDate || null;
     var recipientRole = (toAgent && toAgent.role) || 'Field Agent';
     if(typeof resolveTransferExpiry === 'function'){
-      dev.expiryDate = resolveTransferExpiry(senderExpiry, recipientRole, now.getTime());
+      // Calvin 2026-05-19: pass vendorDueDate so transfers can't exceed
+      // the carrier's return-by date. Optional param — campaigns without
+      // a vendor date (GM) leave it null and behavior is unchanged.
+      dev.expiryDate = resolveTransferExpiry(senderExpiry, recipientRole, now.getTime(), dev.vendorDueDate || null);
     }
 
     if(isAgent){
@@ -38624,8 +38916,98 @@ function panelCampaignUpload(campaign){
   // Gen Mobile is wired — redirect to its existing upload panel
   if(campaign==='Gen Mobile') return panelGMUpload();
 
+  // ── Calvin 2026-05-19 — TruConnect upload ──
+  if(campaign==='TruConnect'){
+    h += '<div class="bo-card">';
+    h += '<div class="bo-card-head"><div class="bo-card-title">📤 TruConnect Inventory Upload</div></div>';
+    h += '<div style="padding:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.55">';
+    h += '<p>Upload the TruConnect dealer-portal inventory export (the <code>.xls</code> file you download from TC). Devices land as <strong>unassigned</strong> — Inv Dept assigns them inside the app.</p>';
+    h += '<p style="margin-top:8px;padding:10px;background:rgba(217,119,6,.06);border-left:3px solid #d97706;border-radius:4px"><strong>Office-only:</strong> The vendor Due Date in the file is visible only to Owner / Inv Dept / Payroll. MMs and agents see only the downstream expiry you set after upload.</p>';
+    h += '<p style="margin-top:10px"><strong>Markets handled automatically:</strong> Tulsa OK · San Antonio TX · Corpus Christi TX (and any other TC market — labels are normalized).</p>';
+    h += '<p style="margin-top:6px"><strong>Carriers preserved:</strong> T-Mobile and Verizon are kept as sub-carrier on each device.</p>';
+    h += '<p style="margin-top:6px"><strong>Dedup:</strong> Re-uploading the same file is safe — devices with IMEIs already in inventory are skipped.</p>';
+    h += '</div>';
+
+    h += '<div style="padding:18px;border-top:1px solid var(--border)">';
+    h += '<input type="file" id="tc-inv-file" accept=".xls,.html,.htm,.xlsx" style="margin-bottom:12px;font-family:Barlow Condensed,sans-serif;font-size:.85rem">';
+    h += '<button onclick="tcProcessInventoryUpload()" class="btn-fire" style="width:100%;justify-content:center;font-size:.72rem;padding:12px">📦 Parse & Import →</button>';
+    h += '</div>';
+
+    h += '<div id="tc-inv-preview" style="padding:18px;border-top:1px solid var(--border)"></div>';
+    h += '</div>';
+    return h;
+  }
+
   return h;
 }
+
+// ── Calvin 2026-05-19 — TruConnect upload trigger (wired to button above) ──
+function tcProcessInventoryUpload(){
+  var fileEl  = document.getElementById('tc-inv-file');
+  var preview = document.getElementById('tc-inv-preview');
+  if(!fileEl || !fileEl.files || !fileEl.files[0]){ alert('Please select a TruConnect .xls file.'); return; }
+  var file = fileEl.files[0];
+  var reader = new FileReader();
+  reader.onload = async function(e){
+    try{
+      var batchId = 'tcb-'+Date.now();
+      var text = e.target.result;
+      if(!text || typeof text !== 'string'){
+        if(preview) preview.innerHTML = '<div style="color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.85rem">Could not read file.</div>';
+        return;
+      }
+      // Sanity check — is this actually the TC HTML-table format?
+      if(text.indexOf('<th') < 0 || text.indexOf('Serial Number') < 0){
+        if(preview) preview.innerHTML = '<div style="background:rgba(204,0,0,.06);border:2px solid #CC0000;border-radius:8px;padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.55"><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:#CC0000;letter-spacing:2px;margin-bottom:8px">🛑 FORMAT NOT RECOGNIZED</div>This file does not look like the TruConnect dealer-portal export. Expected an HTML-table file with a "Serial Number" column. Pick the correct export and try again.</div>';
+        return;
+      }
+      // Process + Path B sync (per-row Supabase upserts)
+      var result;
+      if(typeof processTCInventoryUploadWithSync === 'function'){
+        result = await processTCInventoryUploadWithSync(text, batchId);
+      } else {
+        var localOnly = processTCInventoryUpload(text, batchId);
+        result = {result: localOnly, pathBOk:false, pathBError:'sync helper not loaded'};
+      }
+      var r = result.result || {};
+      var html = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.6">';
+      html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--green);letter-spacing:1.5px;margin-bottom:10px">✓ Imported '+(r.newDevices?r.newDevices.length:0)+' device(s)</div>';
+      html += '<div><strong>Total rows in file:</strong> '+(r.total||0)+'</div>';
+      html += '<div><strong>New devices added:</strong> '+(r.newDevices?r.newDevices.length:0)+'</div>';
+      html += '<div><strong>Duplicate IMEIs skipped:</strong> '+(r.duplicates?r.duplicates.length:0)+'</div>';
+      if(r.skippedBlank) html += '<div><strong>Rows with no IMEI:</strong> '+r.skippedBlank+'</div>';
+      if(r.marketBreakdown && Object.keys(r.marketBreakdown).length){
+        html += '<div style="margin-top:8px"><strong>Markets:</strong></div><ul style="margin:4px 0 4px 20px">';
+        Object.keys(r.marketBreakdown).forEach(function(m){
+          html += '<li>'+m+': '+r.marketBreakdown[m]+'</li>';
+        });
+        html += '</ul>';
+      }
+      if(r.carrierBreakdown && Object.keys(r.carrierBreakdown).length){
+        html += '<div style="margin-top:8px"><strong>Sub-carriers:</strong></div><ul style="margin:4px 0 4px 20px">';
+        Object.keys(r.carrierBreakdown).forEach(function(c){
+          html += '<li>'+c+': '+r.carrierBreakdown[c]+'</li>';
+        });
+        html += '</ul>';
+      }
+      // Path B sync status
+      if(result.pathBOk){
+        html += '<div style="margin-top:14px;padding:10px;background:rgba(5,150,105,.08);border-left:3px solid #059669;border-radius:4px"><strong style="color:#059669">✓ Supabase sync complete.</strong> Every device written as a row to the <code>tc_inventory</code> table. Other browsers see this within seconds.</div>';
+      } else if(result.pathBError){
+        var errMsg = (result.pathBError && result.pathBError.message) ? result.pathBError.message : String(result.pathBError);
+        html += '<div style="margin-top:14px;padding:10px;background:rgba(217,119,6,.08);border-left:3px solid #d97706;border-radius:4px"><strong style="color:#92400e">⚠ Cloud sync issue.</strong> Local save succeeded. Supabase write reported: <code style="font-size:.75rem">'+errMsg+'</code></div>';
+      }
+      html += '<div style="margin-top:14px"><button onclick="gotoPanel(\'tc-inventory\')" class="btn-fire" style="padding:10px 22px">View TC Inventory →</button></div>';
+      html += '</div>';
+      if(preview) preview.innerHTML = html;
+    }catch(err){
+      console.error('[tcProcessInventoryUpload] error:', err);
+      if(preview) preview.innerHTML = '<div style="color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.85rem">Upload failed: '+ (err && err.message ? err.message : String(err)) +'</div>';
+    }
+  };
+  reader.readAsText(file);
+}
+if(typeof window !== 'undefined'){ window.tcProcessInventoryUpload = tcProcessInventoryUpload; }
 
 function panelCampaignTransfers(campaign){
   var u = DB.current;
@@ -39638,7 +40020,14 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
     // Replaces the prior "preserve original expiry" rule per Calvin's
     // updated policy: a Field Agent receiving a 60-day device should
     // not inherit 60 days of dwell time.
-    dev.expiryDate = resolveTransferExpiry(senderExpiry, recipientRole, todayMs);
+    // ── Calvin 2026-05-19: vendor-due-date cap ──
+    // If the device has a vendorDueDate (TC inventory has this from upload),
+    // pass it through so resolveTransferExpiry caps the recipient's expiry
+    // at the vendor's actual return-by date. This way no transfer can grant
+    // a downstream holder MORE time than we have with the vendor. Other
+    // campaigns (GM) currently don't store vendorDueDate; the param is
+    // optional so this is safe everywhere.
+    dev.expiryDate = resolveTransferExpiry(senderExpiry, recipientRole, todayMs, dev.vendorDueDate || null);
     if(to){
       if(to.role==='Market Manager' || to.role==='Campaign Manager' || to.role==='IBO'){
         dev.mmId = to.id; dev.mmName = to.name;
