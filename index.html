@@ -11958,6 +11958,7 @@ var CAMPAIGN_REGISTRY = {
     icon:        '📱',
     color:       '#7c3aed',
     active:      true,
+    program:     'lifeline',  // Calvin 2026-05-19: which Market.programs[] section to consult
     inventory:   function(){ return GM_INVENTORY; },
     activations: function(){ return GM_ACTIVATIONS; },
     transfers:   function(){ return GM_TRANSFERS; },
@@ -11974,6 +11975,7 @@ var CAMPAIGN_REGISTRY = {
     icon:        '📶',
     color:       '#b45309',
     active:      true,
+    program:     'lifeline',  // Calvin 2026-05-19
     inventory:   function(){ return AW_INVENTORY; },
     activations: function(){ return AW_ACTIVATIONS; },
     transfers:   function(){ return AW_TRANSFERS; },
@@ -11990,6 +11992,7 @@ var CAMPAIGN_REGISTRY = {
     icon:        '📡',
     color:       '#1a7a4a',
     active:      true,
+    program:     'lifeline',  // Calvin 2026-05-19
     inventory:   function(){ return TC_INVENTORY; },
     activations: function(){ return TC_ACTIVATIONS; },
     transfers:   function(){ return TC_TRANSFERS; },
@@ -12010,6 +12013,7 @@ var CAMPAIGN_REGISTRY = {
     icon:        '📳',
     color:       '#0891b2',
     active:      true,
+    program:     'lifeline',  // Calvin 2026-05-19
     inventory:   function(){ return EX_INVENTORY; },
     activations: function(){ return EX_ACTIVATIONS; },
     transfers:   function(){ return EX_TRANSFERS; },
@@ -12374,6 +12378,76 @@ function gmResolveMarketMMOnly(marketName){
 }
 
 // ════════════════════════════════════════════════════════════════════════
+//  resolveUploadRecipient — Calvin 2026-05-19
+//
+//  Single source of truth for auto-routing at upload, used by every
+//  campaign's upload processor (GM, TC, AW, EX). Rule per Calvin's spec:
+//
+//   1. Look up Market.programs[campaign.program].mmId. If an active agent
+//      exists at that id, route to the MM.
+//   2. Else look up Market.programs[campaign.program].cmId. If an active
+//      agent exists at that id AND their channels list includes this
+//      campaign, route to the CM. (The campaign-match gate prevents
+//      e.g. routing a non-Lifeline device to a CM who only covers Lifeline.)
+//   3. Else null — device lands unassigned.
+//
+//  Inputs:
+//   - marketName: 'Tulsa OK', 'San Antonio TX', etc.
+//   - campaignKey: registry key like 'TruConnect', 'Gen Mobile', 'Assurance'
+//
+//  Returns: { agent: <agentObj>, source: 'market-mm' | 'market-cm' | null }
+//           or { agent: null, source: null } when nothing matches.
+// ════════════════════════════════════════════════════════════════════════
+function resolveUploadRecipient(marketName, campaignKey){
+  if(!marketName || typeof MARKETS === 'undefined') return {agent:null, source:null};
+  var cfg = (typeof campaignCfg === 'function') ? campaignCfg(campaignKey) : null;
+  if(!cfg) return {agent:null, source:null};
+  var programKey = cfg.program || 'lifeline';
+
+  // Find the active market row
+  var marketRow = MARKETS.find(function(m){
+    if(!m || m.active === false) return false;
+    return (m.name || '').toLowerCase().trim() === marketName.toLowerCase().trim();
+  });
+  if(!marketRow || !marketRow.programs) return {agent:null, source:null};
+
+  var sec = marketRow.programs[programKey];
+  if(!sec) return {agent:null, source:null};
+
+  // Step 1: MM in this market+program
+  if(sec.mmId){
+    var mm = (DB.agents||[]).find(function(a){ return a.id === sec.mmId && a.active; });
+    if(mm) return {agent: mm, source: 'market-mm'};
+  }
+
+  // Step 2: CM of this market+program — but ONLY if they cover this campaign.
+  // The channels[] check is the "Tanita is CM for Lifeline (TC/GM/AW), so a
+  // TC device falls back to her — but only if she covers TC" gate.
+  if(sec.cmId){
+    var cm = (DB.agents||[]).find(function(a){ return a.id === sec.cmId && a.active; });
+    if(cm){
+      var campaignChannel = (cfg.id || '').toLowerCase();          // 'tc','gm','aw','ex'
+      var labelChannel    = (cfg.label || '').toLowerCase();        // 'truconnect','gen mobile', etc
+      var altChannels = {
+        'tc': ['truconnect','tc'],
+        'gm': ['genmobile','gen mobile','gm'],
+        'aw': ['assurance','assurance wireless','aw'],
+        'ex': ['excess','excess telecom','ex']
+      };
+      var coverList = (altChannels[cfg.id]||[campaignChannel]);
+      var chs = (cm.channels || []).map(function(c){ return String(c).toLowerCase().trim(); });
+      var covers = coverList.some(function(c){ return chs.indexOf(c) >= 0; });
+      if(covers) return {agent: cm, source: 'market-cm'};
+      // If the CM doesn't cover this campaign, do NOT route to them.
+      // Falling through to unassigned is the safe choice.
+    }
+  }
+
+  return {agent:null, source:null};
+}
+if(typeof window !== 'undefined'){ window.resolveUploadRecipient = resolveUploadRecipient; }
+
+// ════════════════════════════════════════════════════════════════════════
 //  NEW ROUTING (replaces gmResolveAutoAssignee for fresh uploads)
 //  Returns { agent, source, market } where source is one of:
 //    'csv-name'       — matched the CSV Name column to an active agent
@@ -12392,17 +12466,28 @@ function gmResolveUploadRecipient(csvName, marketName){
   // 1. Try CSV Name first
   var byName = gmResolveByCSVName(csvName, marketName);
   // CM-veto: if the matched agent is a CM (or IBO), don't auto-assign to them
-  // (per Calvin: CM/IBO is never the default end-holder; they're the central
-  // receiver, not the actual operator)
+  // FROM THE NAME COLUMN. (The CM may still be the rightful fallback below
+  // when there's no MM — that's a different decision.)
   if(byName && byName.role !== 'Campaign Manager' && byName.role !== 'IBO'){
     return { agent: byName, source: 'csv-name', market: marketName };
   }
 
-  // 2. Fall back to market's MM
-  var mm = gmResolveMarketMMOnly(marketName);
-  if(mm) return { agent: mm, source: 'market-mm', market: marketName };
+  // 2 + 3. Calvin 2026-05-19: use shared resolveUploadRecipient so GM,
+  // TC, AW, EX all share the same MM-then-CM rule.
+  // Rule: market MM first; if no MM, market CM for the program — but only
+  // if that CM's channels include this campaign. Else unassigned.
+  if(typeof resolveUploadRecipient === 'function'){
+    var resolution = resolveUploadRecipient(marketName, 'Gen Mobile');
+    if(resolution && resolution.agent){
+      return { agent: resolution.agent, source: resolution.source, market: marketName };
+    }
+  } else {
+    // Fallback if shared resolver missing (older code path) — MM only
+    var mm = gmResolveMarketMMOnly(marketName);
+    if(mm) return { agent: mm, source: 'market-mm', market: marketName };
+  }
 
-  // 3. NO CM FALLBACK — leave unassigned in pool
+  // Last resort — unassigned
   return { agent: null, source: 'unassigned', market: marketName };
 }
 
@@ -12817,21 +12902,29 @@ function processTCInventoryUpload(htmlText, batchId){
     var market = tcMarketTranslate(teamDd);
     if(!market) unknownMarkets[teamDd || '(blank)'] = (unknownMarkets[teamDd || '(blank)'] || 0) + 1;
 
-    // ── Calvin 2026-05-19: AUTO-ROUTE TO MARKET MM at upload (mirror GM) ──
-    // If the device's market has an active Market Manager, the device lands
-    // ASSIGNED to that MM (e.g., Tulsa OK → Sheila Love). If no MM, fall
-    // back to unassigned in the pool. This mirrors GM exactly — markets
-    // without an MM still get devices, just unassigned until manually routed.
-    // We use the SAME helper GM uses so any future market/MM changes apply
-    // to both campaigns identically.
-    var autoMM = null;
-    if(typeof gmResolveMarketMMOnly === 'function' && market){
-      autoMM = gmResolveMarketMMOnly(market);
+    // ── Calvin 2026-05-19: AUTO-ROUTE via shared resolver (TC + GM share rule) ──
+    // resolveUploadRecipient consults the market's program section:
+    //   1. MM (if set + active)
+    //   2. CM-of-market (if set + active + covers this campaign)
+    //   3. else null → unassigned
+    var resolution = {agent:null, source:null};
+    if(typeof resolveUploadRecipient === 'function' && market){
+      resolution = resolveUploadRecipient(market, 'TruConnect') || {agent:null, source:null};
     }
-    var devStatus    = autoMM ? 'assigned' : 'unassigned';
-    var devHolderId  = autoMM ? autoMM.id   : null;
-    var devHolderName= autoMM ? autoMM.name : '';
-    var routeKey = market + (autoMM ? (' → ' + autoMM.name + ' (MM)') : ' → UNASSIGNED (no MM)');
+    var autoRecipient = resolution.agent;
+    var routeSource   = resolution.source; // 'market-mm' | 'market-cm' | null
+    var devStatus    = autoRecipient ? 'assigned' : 'unassigned';
+    var devHolderId  = autoRecipient ? autoRecipient.id   : null;
+    var devHolderName= autoRecipient ? autoRecipient.name : '';
+    var routeKey;
+    if(autoRecipient){
+      var roleTag = (routeSource === 'market-mm') ? ' (MM)'
+                  : (routeSource === 'market-cm') ? ' (CM)'
+                  : '';
+      routeKey = market + ' → ' + autoRecipient.name + roleTag;
+    } else {
+      routeKey = market + ' → UNASSIGNED (no MM/CM for this campaign)';
+    }
     if(!routingBreakdown[routeKey]) routingBreakdown[routeKey] = 0;
     routingBreakdown[routeKey]++;
 
@@ -12862,9 +12955,9 @@ function processTCInventoryUpload(htmlText, batchId){
       holderId:       devHolderId,
       holderName:     devHolderName,
       assignedTo:     devHolderId,
-      assignedDate:   autoMM ? nowISO.slice(0,10) : '',
-      mmId:           autoMM ? autoMM.id   : null,
-      mmName:         autoMM ? autoMM.name : '',
+      assignedDate:   autoRecipient ? nowISO.slice(0,10) : '',
+      mmId:           (routeSource === 'market-mm' && autoRecipient) ? autoRecipient.id   : null,
+      mmName:         (routeSource === 'market-mm' && autoRecipient) ? autoRecipient.name : '',
       vendorDueDate:  vendorDueISO,    // office-only — hidden from MMs/agents
       expiryDate:     '',              // Inv Dept sets this before transferring
       uploadedAt:     nowISO,
@@ -12880,16 +12973,18 @@ function processTCInventoryUpload(htmlText, batchId){
       }]
     };
     // If auto-routed, add a "assigned-at-upload" entry to the chain so
-    // the audit log shows the MM took possession at upload time.
-    if(autoMM){
+    // the audit log shows who took possession at upload time.
+    if(autoRecipient){
       dev.chainOfCustody.push({
         type:   'assigned-at-upload',
         at:     nowISO,
-        to:     autoMM.name,
-        toId:   autoMM.id,
-        role:   'Market Manager',
+        to:     autoRecipient.name,
+        toId:   autoRecipient.id,
+        role:   autoRecipient.role,           // 'Market Manager' OR 'Campaign Manager'
         market: market,
-        source: 'auto-route-market-mm'
+        source: routeSource === 'market-mm' ? 'auto-route-market-mm'
+              : routeSource === 'market-cm' ? 'auto-route-market-cm-fallback'
+              : 'auto-route'
       });
     }
     // Track for the batch — we'll bulk-add after the loop so we don't
