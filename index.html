@@ -10842,14 +10842,20 @@ function agentCodedCampaigns(agent){
 //  user clicks Refresh Now. Save Anyway requires a confirm() — explicit.
 // ════════════════════════════════════════════════════════════════════════
 
-// Pools we sync. Each maps to its existing app_settings data key.
+// Pools we sync. Each maps to its app_settings blob key (Path A) AND
+// its real Supabase table name (Path B). Both layers coexist so the app
+// keeps working if Path B tables don't exist yet.
 var INV_SYNC_POOLS = [
-  {key:'gm',     dataSettingKey:'gm_inventory', label:'Gen Mobile'},
-  {key:'tc',     dataSettingKey:'tc_inventory', label:'TruConnect'},
-  {key:'aw',     dataSettingKey:'aw_inventory', label:'Assurance'},
-  {key:'ex',     dataSettingKey:'ex_inventory', label:'Excess'},
-  {key:'legacy', dataSettingKey:'inv_devices',  label:'Legacy'}
+  {key:'gm',     dataSettingKey:'gm_inventory', tableName:'gm_inventory',      label:'Gen Mobile'},
+  {key:'tc',     dataSettingKey:'tc_inventory', tableName:'tc_inventory',      label:'TruConnect'},
+  {key:'aw',     dataSettingKey:'aw_inventory', tableName:'aw_inventory',      label:'Assurance'},
+  {key:'ex',     dataSettingKey:'ex_inventory', tableName:'ex_inventory',      label:'Excess'},
+  {key:'legacy', dataSettingKey:'inv_devices',  tableName:'inventory_devices', label:'Legacy'}
 ];
+function _invPoolTableName(poolKey){
+  var p = INV_SYNC_POOLS.find(function(x){return x.key===poolKey;});
+  return p ? p.tableName : null;
+}
 function _invSyncMetaKey(poolKey){ return _invSyncDataKey(poolKey) + '_meta'; }
 function _invSyncDataKey(poolKey){
   var p = INV_SYNC_POOLS.find(function(x){return x.key===poolKey;});
@@ -11119,6 +11125,304 @@ if(typeof window !== 'undefined'){
   window.inventorySyncDismissConflict   = inventorySyncDismissConflict;
   window.inventorySyncPreSaveCheck      = inventorySyncPreSaveCheck;
   window.renderInventoryConflictBanner  = renderInventoryConflictBanner;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY SYNC — PATH B (Calvin 2026-05-18)
+//
+//  Per-row Supabase writes for inventory. Replaces the JSON-blob approach
+//  with real database rows so:
+//    - Concurrent edits never clobber each other
+//    - Delete = single SQL DELETE; can verify in Supabase dashboard
+//    - Realtime subscriptions (next step) push live updates to all browsers
+//    - No version conflicts; no merge issues
+//
+//  REQUIRES: the 5 tables from path_b_migration.sql to exist in Supabase.
+//  GRACEFUL FALLBACK: if a table doesn't exist or a write fails, Path A
+//  is still in place and Path B silently logs the error. The app never
+//  breaks because Path B is missing.
+//
+//  STATE FLAG: window._invPathBReady tracks whether we've successfully
+//  read from the new tables at least once. Once true, the load path uses
+//  them as the source of truth. Until true, we fall back to Path A blobs.
+// ════════════════════════════════════════════════════════════════════════
+
+// Detection: returns true if we've confirmed the new tables exist.
+window._invPathBReady = false;
+window._invPathBLastError = null;
+
+// Map a JS device object to a Supabase row. Unknown fields go into `raw`
+// JSONB so we never lose data.
+function _invDeviceToRow(device, campaignName){
+  if(!device) return null;
+  var KNOWN = ['id','imei','sim','msisdn','model','status','market','holderId','holderName',
+               'assignedTo','assignedDate','expiryDate','soldAt','soldByAgentId','soldByAgentName',
+               'soldOrderNumber','customerName','activatedAt','deletedAt','deletedBy','deletedByName',
+               'deletedReason','_statusBeforeDelete','_statusBeforeSold','campaign','tribal','portIn'];
+  var raw = {};
+  Object.keys(device).forEach(function(k){
+    if(KNOWN.indexOf(k) < 0) raw[k] = device[k];
+  });
+  return {
+    id:              String(device.id || ''),
+    imei:            device.imei || null,
+    sim:             device.sim || null,
+    msisdn:          device.msisdn || null,
+    model:           device.model || null,
+    status:          device.status || null,
+    market:          device.market || null,
+    holder_id:       (typeof device.holderId === 'number') ? device.holderId : null,
+    holder_name:     device.holderName || null,
+    assigned_to:     (typeof device.assignedTo === 'number') ? device.assignedTo : null,
+    assigned_date:   device.assignedDate || null,
+    expiry_date:     device.expiryDate || null,
+    sold_at:         device.soldAt || null,
+    sold_by_agent_id:   (typeof device.soldByAgentId === 'number') ? device.soldByAgentId : null,
+    sold_by_agent_name: device.soldByAgentName || null,
+    sold_order_number:  device.soldOrderNumber || null,
+    customer_name:      device.customerName || null,
+    activated_at:    device.activatedAt || null,
+    deleted_at:      device.deletedAt || null,
+    deleted_by:      (typeof device.deletedBy === 'number') ? device.deletedBy : null,
+    deleted_by_name: device.deletedByName || null,
+    deleted_reason:  device.deletedReason || null,
+    status_before_delete: device._statusBeforeDelete || null,
+    status_before_sold:   device._statusBeforeSold || null,
+    campaign:        device.campaign || campaignName || null,
+    tribal:          !!device.tribal,
+    port_in:         !!device.portIn,
+    raw:             raw
+  };
+}
+
+// Map a Supabase row back to a JS device object. Restores `raw` fields.
+function _invRowToDevice(row){
+  if(!row) return null;
+  var dev = {
+    id:              row.id,
+    imei:            row.imei || '',
+    sim:             row.sim || '',
+    msisdn:          row.msisdn || '',
+    model:           row.model || '',
+    status:          row.status || '',
+    market:          row.market || '',
+    holderId:        row.holder_id,
+    holderName:      row.holder_name || '',
+    assignedTo:      row.assigned_to,
+    assignedDate:    row.assigned_date || '',
+    expiryDate:      row.expiry_date || '',
+    soldAt:          row.sold_at || '',
+    soldByAgentId:   row.sold_by_agent_id,
+    soldByAgentName: row.sold_by_agent_name || '',
+    soldOrderNumber: row.sold_order_number || '',
+    customerName:    row.customer_name || '',
+    activatedAt:     row.activated_at || '',
+    deletedAt:       row.deleted_at || '',
+    deletedBy:       row.deleted_by,
+    deletedByName:   row.deleted_by_name || '',
+    deletedReason:   row.deleted_reason || '',
+    _statusBeforeDelete: row.status_before_delete || '',
+    _statusBeforeSold:   row.status_before_sold || '',
+    campaign:        row.campaign || '',
+    tribal:          row.tribal === true,
+    portIn:          row.port_in === true
+  };
+  // Restore the raw JSONB extras
+  if(row.raw && typeof row.raw === 'object'){
+    Object.keys(row.raw).forEach(function(k){
+      if(typeof dev[k] === 'undefined') dev[k] = row.raw[k];
+    });
+  }
+  // Clean null-empty strings → empty string for back-compat
+  ['imei','sim','msisdn','model','status','market'].forEach(function(k){
+    if(dev[k] === null || dev[k] === undefined) dev[k] = '';
+  });
+  return dev;
+}
+
+// Upsert one device. Returns a Promise that resolves to {ok, error}.
+async function invDbUpsertDevice(poolKey, device){
+  if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
+  var table = _invPoolTableName(poolKey);
+  if(!table) return {ok:false, error:'unknown-pool'};
+  var row = _invDeviceToRow(device, INV_SYNC_POOLS.find(function(p){return p.key===poolKey;}).label);
+  if(!row || !row.id) return {ok:false, error:'no-id'};
+  try{
+    var res = await supaClient.from(table).upsert(row, {onConflict:'id'});
+    if(res && res.error){
+      window._invPathBLastError = res.error;
+      console.warn('[invDbUpsertDevice] '+table+' upsert failed:', res.error);
+      return {ok:false, error:res.error};
+    }
+    return {ok:true};
+  }catch(e){
+    window._invPathBLastError = e;
+    console.warn('[invDbUpsertDevice] '+table+' threw:', e);
+    return {ok:false, error:e};
+  }
+}
+
+// Delete one device by id. Returns Promise resolving to {ok, error}.
+async function invDbDeleteDevice(poolKey, deviceId){
+  if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
+  var table = _invPoolTableName(poolKey);
+  if(!table) return {ok:false, error:'unknown-pool'};
+  try{
+    var res = await supaClient.from(table).delete().eq('id', String(deviceId));
+    if(res && res.error){
+      window._invPathBLastError = res.error;
+      console.warn('[invDbDeleteDevice] '+table+' delete failed:', res.error);
+      return {ok:false, error:res.error};
+    }
+    return {ok:true};
+  }catch(e){
+    window._invPathBLastError = e;
+    console.warn('[invDbDeleteDevice] '+table+' threw:', e);
+    return {ok:false, error:e};
+  }
+}
+
+// Bulk delete by id list. Returns {ok, deletedCount, error}.
+async function invDbBulkDelete(poolKey, deviceIds){
+  if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
+  if(!Array.isArray(deviceIds) || !deviceIds.length) return {ok:true, deletedCount:0};
+  var table = _invPoolTableName(poolKey);
+  if(!table) return {ok:false, error:'unknown-pool'};
+  try{
+    // Chunk into batches of 100 for safety on large deletes
+    var BATCH = 100, total = 0;
+    for(var i=0;i<deviceIds.length;i+=BATCH){
+      var chunk = deviceIds.slice(i, i+BATCH).map(String);
+      var res = await supaClient.from(table).delete().in('id', chunk);
+      if(res && res.error){
+        window._invPathBLastError = res.error;
+        console.warn('[invDbBulkDelete] '+table+' chunk '+(i/BATCH)+' failed:', res.error);
+        return {ok:false, error:res.error, deletedCount:total};
+      }
+      total += chunk.length;
+    }
+    return {ok:true, deletedCount:total};
+  }catch(e){
+    window._invPathBLastError = e;
+    console.warn('[invDbBulkDelete] '+table+' threw:', e);
+    return {ok:false, error:e};
+  }
+}
+
+// Fetch all rows from a pool's Supabase table. Returns array of device objects.
+async function invDbLoadPool(poolKey){
+  if(typeof supaClient === 'undefined' || !supaClient) return null;
+  var table = _invPoolTableName(poolKey);
+  if(!table) return null;
+  try{
+    // Supabase default row limit is 1000 — paginate if needed
+    var all = [], offset = 0, PAGE = 1000;
+    while(true){
+      var res = await supaClient.from(table).select('*').range(offset, offset + PAGE - 1);
+      if(res && res.error){
+        window._invPathBLastError = res.error;
+        console.warn('[invDbLoadPool] '+table+' select failed:', res.error);
+        return null;
+      }
+      if(!res || !res.data) break;
+      all = all.concat(res.data);
+      if(res.data.length < PAGE) break;
+      offset += PAGE;
+    }
+    return all.map(_invRowToDevice);
+  }catch(e){
+    window._invPathBLastError = e;
+    console.warn('[invDbLoadPool] '+table+' threw:', e);
+    return null;
+  }
+}
+
+// Load all 5 pools from the new tables. Returns {ok, counts:{gm,tc,aw,ex,legacy}}.
+// On success, replaces the in-memory arrays and sets window._invPathBReady = true.
+async function invDbLoadAllFromTables(){
+  if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
+  var counts = {};
+  var failed = false;
+  for(var i=0;i<INV_SYNC_POOLS.length;i++){
+    var p = INV_SYNC_POOLS[i];
+    var devices = await invDbLoadPool(p.key);
+    if(devices === null){
+      failed = true;
+      // Don't replace this pool — keep whatever was loaded by Path A
+      counts[p.key] = '(table missing or error)';
+      continue;
+    }
+    // Replace the in-memory array in place to preserve any closures
+    _invSyncReplacePool(p.key, devices);
+    counts[p.key] = devices.length;
+  }
+  if(!failed) window._invPathBReady = true;
+  console.log('[invDbLoadAllFromTables] loaded:', counts, 'pathB ready:', window._invPathBReady);
+  // Persist to localStorage so panels reading from the local cache get fresh data
+  try{ _invSyncWriteLocalOnly(); }catch(e){}
+  return {ok:!failed, counts:counts};
+}
+
+// One-time migration: push existing in-memory inventory into the new tables.
+// Idempotent — uses upsert(onConflict:id) so re-running is safe. Only runs
+// when the tables exist (detected by a probe select).
+async function invDbMigrateFromBlobs(){
+  if(typeof supaClient === 'undefined' || !supaClient){
+    console.log('[invDbMigrateFromBlobs] Supabase unavailable — skipping');
+    return {ok:false, error:'no-supabase'};
+  }
+  // Probe: try to select 1 row from gm_inventory. If it errors, tables don't
+  // exist yet — user hasn't run the SQL migration.
+  try{
+    var probe = await supaClient.from('gm_inventory').select('id').limit(1);
+    if(probe && probe.error){
+      console.log('[invDbMigrateFromBlobs] gm_inventory not ready — run the SQL migration first');
+      return {ok:false, error:'tables-not-ready', detail:probe.error};
+    }
+  }catch(e){
+    console.log('[invDbMigrateFromBlobs] probe failed — tables likely missing:', e.message);
+    return {ok:false, error:'tables-not-ready', detail:e};
+  }
+  // Tables exist — push every pool
+  console.log('[invDbMigrateFromBlobs] Tables ready — migrating inventory…');
+  var report = {};
+  for(var i=0;i<INV_SYNC_POOLS.length;i++){
+    var p = INV_SYNC_POOLS[i];
+    var pool = _invSyncPoolForKey(p.key);
+    if(!Array.isArray(pool) || !pool.length){ report[p.key] = 0; continue; }
+    var rows = pool.map(function(d){ return _invDeviceToRow(d, p.label); }).filter(Boolean);
+    if(!rows.length){ report[p.key] = 0; continue; }
+    // Bulk upsert in chunks of 100
+    var BATCH = 100, total = 0, failed = false;
+    for(var j=0;j<rows.length;j+=BATCH){
+      var chunk = rows.slice(j, j+BATCH);
+      try{
+        var res = await supaClient.from(p.tableName).upsert(chunk, {onConflict:'id'});
+        if(res && res.error){
+          console.warn('[invDbMigrateFromBlobs] '+p.tableName+' chunk failed:', res.error);
+          failed = true;
+          break;
+        }
+        total += chunk.length;
+      }catch(e){
+        console.warn('[invDbMigrateFromBlobs] '+p.tableName+' threw:', e);
+        failed = true;
+        break;
+      }
+    }
+    report[p.key] = failed ? '(partial: '+total+' of '+rows.length+')' : total;
+  }
+  console.log('[invDbMigrateFromBlobs] Done:', report);
+  return {ok:true, report:report};
+}
+
+if(typeof window !== 'undefined'){
+  window.invDbUpsertDevice      = invDbUpsertDevice;
+  window.invDbDeleteDevice      = invDbDeleteDevice;
+  window.invDbBulkDelete        = invDbBulkDelete;
+  window.invDbLoadPool          = invDbLoadPool;
+  window.invDbLoadAllFromTables = invDbLoadAllFromTables;
+  window.invDbMigrateFromBlobs  = invDbMigrateFromBlobs;
 }
 
 function saveInventory(){
@@ -14759,12 +15063,29 @@ async function wmamInventorySyncProbe(){
   console.log(' INVENTORY SYNC PROBE  ' + new Date().toLocaleString());
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   var pools = [
-    {key:'gm',     arr:GM_INVENTORY,      dataKey:'gm_inventory', lsKey:'wmam_gm_inventory'},
-    {key:'tc',     arr:TC_INVENTORY,      dataKey:'tc_inventory', lsKey:'wmam_tc_inventory'},
-    {key:'aw',     arr:AW_INVENTORY,      dataKey:'aw_inventory', lsKey:'wmam_aw_inventory'},
-    {key:'ex',     arr:EX_INVENTORY,      dataKey:'ex_inventory', lsKey:'wmam_ex_inventory'},
-    {key:'legacy', arr:INVENTORY_DEVICES, dataKey:'inv_devices',  lsKey:'wmam_inv_devices'}
+    {key:'gm',     arr:GM_INVENTORY,      dataKey:'gm_inventory', lsKey:'wmam_gm_inventory', tableName:'gm_inventory'},
+    {key:'tc',     arr:TC_INVENTORY,      dataKey:'tc_inventory', lsKey:'wmam_tc_inventory', tableName:'tc_inventory'},
+    {key:'aw',     arr:AW_INVENTORY,      dataKey:'aw_inventory', lsKey:'wmam_aw_inventory', tableName:'aw_inventory'},
+    {key:'ex',     arr:EX_INVENTORY,      dataKey:'ex_inventory', lsKey:'wmam_ex_inventory', tableName:'ex_inventory'},
+    {key:'legacy', arr:INVENTORY_DEVICES, dataKey:'inv_devices',  lsKey:'wmam_inv_devices',  tableName:'inventory_devices'}
   ];
+  // Path B: fetch row counts from real tables (if they exist)
+  var pathBCounts = {};
+  if(typeof supaClient !== 'undefined' && supaClient){
+    for(var pi=0; pi<pools.length; pi++){
+      var p = pools[pi];
+      try{
+        var res = await supaClient.from(p.tableName).select('id', {count:'exact', head:true});
+        if(res && res.error){
+          pathBCounts[p.key] = '(table missing: ' + (res.error.code||res.error.message||'') + ')';
+        } else {
+          pathBCounts[p.key] = (typeof res.count === 'number') ? res.count : 0;
+        }
+      }catch(e){
+        pathBCounts[p.key] = '(error: '+e.message+')';
+      }
+    }
+  }
   // Fetch all remote keys at once
   var remote = {};
   if(typeof supaClient !== 'undefined' && supaClient){
@@ -14800,6 +15121,8 @@ async function wmamInventorySyncProbe(){
       catch(e){ remoteCount = '(unparseable)'; }
     }
     console.log('  Supabase (cloud):         ' + remoteCount);
+    // Path B real-table count
+    console.log('  Path B table (per-row):   ' + (pathBCounts[p.key] !== undefined ? pathBCounts[p.key] : 'n/a'));
     // Version comparison
     var localV = (typeof INV_SYNC_LOCAL_VERSION !== 'undefined') ? (INV_SYNC_LOCAL_VERSION[p.key]||0) : '?';
     var remoteMeta = remote[p.dataKey + '_meta'];
@@ -21663,6 +21986,13 @@ function ownerInvDevicePool(campaign){
   return cfg.inventory() || [];
 }
 
+// Calvin 2026-05-18 — Path B: map campaign label → poolKey ('gm','tc','aw','ex','legacy')
+function ownerInvPoolKey(campaign){
+  if(campaign === 'Legacy') return 'legacy';
+  var cfg = campaignCfg(campaign);
+  return cfg ? cfg.id : null;
+}
+
 // Get the transfers list for the chosen campaign. Legacy has no transfers.
 function ownerInvTransferPool(campaign){
   if(campaign === 'Legacy') return [];
@@ -21804,7 +22134,7 @@ function ownerInvFindBlockedByTransfer(){
 }
 
 // THE delete action — runs after DELETE typed and confirmed
-function ownerInvDeleteCommit(){
+async function ownerInvDeleteCommit(){
   var u = DB.current;
   // Calvin 2026-05-18: Owner OR Inv Dept (Makenzie has depts.inv=true).
   // Matches the panel-view permission — previously the panel was open to
@@ -21842,17 +22172,40 @@ function ownerInvDeleteCommit(){
   }
 
   // ── Calvin 2026-05-18 — PATH A pre-save conflict check ──
-  // If another user updated inventory since this user loaded the page,
-  // warn before allowing a destructive overwrite. Save Anyway = explicit,
-  // Cancel = bail out so user can click "Refresh Now" on the banner.
+  // (Still useful if Path B tables aren't ready yet — Path A is the fallback.)
   if(typeof inventorySyncPreSaveCheck === 'function' && !inventorySyncPreSaveCheck()){
     OWNER_INV_DELETE.feedback = '⏸ Save canceled — click "Refresh Now" on the banner to pull latest first.';
     gotoPanel('owner-inv-delete');
     return;
   }
 
-  // Final hard-delete
+  // ── Calvin 2026-05-18 — PATH B per-row Supabase delete ──
+  // Hit the real Supabase table FIRST so the deletion is durable in the
+  // cloud before we touch local memory. If the cloud delete succeeds, we
+  // then mirror the change locally. If the cloud delete fails (e.g., the
+  // tables aren't created yet), we fall back to the Path A blob approach
+  // and warn the user.
+  var poolKey = ownerInvPoolKey(OWNER_INV_DELETE.campaign);
   var pool = ownerInvDevicePool(OWNER_INV_DELETE.campaign);
+  var pathBSuccess = false;
+  var pathBError = null;
+  if(poolKey && typeof invDbBulkDelete === 'function'){
+    try{
+      var bulkResult = await invDbBulkDelete(poolKey, ids);
+      if(bulkResult && bulkResult.ok){
+        pathBSuccess = true;
+        console.log('[ownerInvDeleteCommit] PATH B: deleted '+bulkResult.deletedCount+' rows from Supabase '+poolKey+' table');
+      } else {
+        pathBError = (bulkResult && bulkResult.error) ? bulkResult.error : 'unknown';
+        console.warn('[ownerInvDeleteCommit] PATH B failed:', pathBError);
+      }
+    }catch(e){
+      pathBError = e;
+      console.warn('[ownerInvDeleteCommit] PATH B threw:', e);
+    }
+  }
+
+  // Local in-memory removal (always, regardless of Path B outcome)
   var removed = 0;
   ids.forEach(function(idStr){
     var idx = pool.findIndex(function(d){return String(d.id)===String(idStr);});
@@ -21861,18 +22214,28 @@ function ownerInvDeleteCommit(){
       removed++;
     }
   });
-  // Calvin 2026-05-18 — explicit logging so we can verify the persistence
-  // chain succeeded. Without this, a silent Supabase failure would feel
-  // identical to "delete worked locally but didn't sync."
-  console.log('[ownerInvDeleteCommit] Removed '+removed+' from '+OWNER_INV_DELETE.campaign+'; pool now has '+pool.length+' devices');
+  console.log('[ownerInvDeleteCommit] Removed '+removed+' from in-memory '+OWNER_INV_DELETE.campaign+'; pool now has '+pool.length+' devices');
 
-  // Save to localStorage + Supabase via existing inventory save paths
+  // Save to localStorage + Supabase blob (Path A — keeps blob & meta in
+  // sync with the new state, even if Path B is the durable source).
   try { saveInventory(); console.log('[ownerInvDeleteCommit] saveInventory completed'); } catch(e){ console.warn('[ownerInvDeleteCommit] saveInventory failed:', e); }
   try { saveToStorage();  console.log('[ownerInvDeleteCommit] saveToStorage completed'); } catch(e){ console.warn('[ownerInvDeleteCommit] saveToStorage failed:', e); }
 
-  // Reset state and show success
+  // Reset state and show success — message reflects which path persisted
   ownerInvDeleteReset();
-  alert('✅ '+removed+' device(s) hard-deleted from '+ (OWNER_INV_DELETE.campaign||'inventory') +'. \n\nLocally: gone immediately.\nSupabase: write fired (check console for errors).\nOther users: their next page navigation pulls this within 3 seconds.');
+  var pathBMsg;
+  if(pathBSuccess){
+    pathBMsg = '\n\n✓ Supabase (cloud): durable per-row delete completed. Other users see this within 3 seconds.';
+  } else if(pathBError === 'no-supabase'){
+    pathBMsg = '\n\n⚠ Supabase offline — change is local-only until reconnect.';
+  } else if(pathBError && (pathBError.code === '42P01' || (pathBError.message && /relation .* does not exist/i.test(pathBError.message)))){
+    pathBMsg = '\n\n⚠ Path B Supabase tables not created yet — run path_b_migration.sql in Supabase SQL Editor. Falling back to Path A blob save.';
+  } else if(pathBError){
+    pathBMsg = '\n\n⚠ Path B delete failed (see F12 console). Falling back to Path A blob save.';
+  } else {
+    pathBMsg = '';
+  }
+  alert('✅ '+removed+' device(s) hard-deleted from '+ (OWNER_INV_DELETE.campaign||'inventory') + pathBMsg);
   gotoPanel('owner-inv-delete');
 }
 
@@ -56140,6 +56503,41 @@ if(typeof trainingAutoAdvancePending === 'function'){
   // Calvin 2026-05-14: DIRECT-SUPABASE INIT
   // Just load from Supabase and subscribe to realtime. No queue to flush.
   await loadFromSupabase();
+
+  // ── Calvin 2026-05-18 — Path B inventory bootstrap ──
+  // Try to load inventory from the real Supabase tables. If they exist
+  // and are populated, they take precedence over the Path A blobs that
+  // loadFromSupabase loaded above. If they exist but are empty, do a
+  // one-time migration to push current localStorage inventory into them.
+  // If they don't exist (SQL migration not run yet), this is a silent
+  // no-op and Path A keeps working.
+  try{
+    if(typeof invDbLoadAllFromTables === 'function'){
+      var loadResult = await invDbLoadAllFromTables();
+      if(loadResult && loadResult.ok){
+        // Check whether all 5 tables are empty AND we have local data —
+        // if so, this is first boot post-SQL-migration; push local data up.
+        var allEmpty = true;
+        Object.keys(loadResult.counts).forEach(function(k){
+          if(typeof loadResult.counts[k] === 'number' && loadResult.counts[k] > 0) allEmpty = false;
+        });
+        var hasLocal = (typeof GM_INVENTORY !== 'undefined' && GM_INVENTORY.length)
+                    || (typeof TC_INVENTORY !== 'undefined' && TC_INVENTORY.length)
+                    || (typeof AW_INVENTORY !== 'undefined' && AW_INVENTORY.length)
+                    || (typeof EX_INVENTORY !== 'undefined' && EX_INVENTORY.length)
+                    || (typeof INVENTORY_DEVICES !== 'undefined' && INVENTORY_DEVICES.length);
+        if(allEmpty && hasLocal){
+          console.log('[init] Path B tables empty + local has data → migrating once');
+          if(typeof invDbMigrateFromBlobs === 'function'){
+            await invDbMigrateFromBlobs();
+            // Re-load from the now-populated tables so we have canonical IDs
+            await invDbLoadAllFromTables();
+          }
+        }
+      }
+    }
+  }catch(e){ console.warn('[init] Path B bootstrap failed (safe to ignore — Path A still active):', e); }
+
   // ── Subscribe to realtime changes on agents + app_settings ──
   // K-Anna's edits appear on Calvin's screen within ~1 sec (and vice versa)
   // without anyone refreshing. Falls back gracefully if Realtime isn't enabled.
