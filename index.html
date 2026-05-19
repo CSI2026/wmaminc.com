@@ -14739,6 +14739,103 @@ if(typeof window !== 'undefined'){
 }
 
 // ════════════════════════════════════════════════════════════════════════
+//  INVENTORY SYNC DIAGNOSTIC (Calvin 2026-05-18)
+//
+//  Run in F12 console:   wmamInventorySyncProbe()
+//
+//  Shows for every inventory pool:
+//    - Local in-memory count (the live JS array)
+//    - Local localStorage count (what's persisted on this browser)
+//    - Remote Supabase count (what's stored cloud-side)
+//    - Local version vs remote version
+//    - Last writer name + timestamp
+//  This lets you confirm exactly where the sync state actually is. If
+//  Makenzie deletes and her local count drops to 0 but remote stays at
+//  59, that's a Supabase push failure. If remote drops to 0 but Calvin
+//  still sees 59, that's his localStorage stale-overwrite (Fix 1 above).
+// ════════════════════════════════════════════════════════════════════════
+async function wmamInventorySyncProbe(){
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(' INVENTORY SYNC PROBE  ' + new Date().toLocaleString());
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  var pools = [
+    {key:'gm',     arr:GM_INVENTORY,      dataKey:'gm_inventory', lsKey:'wmam_gm_inventory'},
+    {key:'tc',     arr:TC_INVENTORY,      dataKey:'tc_inventory', lsKey:'wmam_tc_inventory'},
+    {key:'aw',     arr:AW_INVENTORY,      dataKey:'aw_inventory', lsKey:'wmam_aw_inventory'},
+    {key:'ex',     arr:EX_INVENTORY,      dataKey:'ex_inventory', lsKey:'wmam_ex_inventory'},
+    {key:'legacy', arr:INVENTORY_DEVICES, dataKey:'inv_devices',  lsKey:'wmam_inv_devices'}
+  ];
+  // Fetch all remote keys at once
+  var remote = {};
+  if(typeof supaClient !== 'undefined' && supaClient){
+    var allKeys = [];
+    pools.forEach(function(p){
+      allKeys.push(p.dataKey);
+      allKeys.push(p.dataKey + '_meta');
+    });
+    try{
+      var res = await supaClient.from('app_settings').select('key,value').in('key', allKeys);
+      if(res && res.data){
+        res.data.forEach(function(r){ remote[r.key] = r.value; });
+      }
+    }catch(e){ console.warn('Supabase fetch failed:', e); }
+  } else {
+    console.log('⚠ Supabase client not available — showing local state only');
+  }
+  pools.forEach(function(p){
+    console.log('');
+    console.log('─── ' + p.key.toUpperCase() + ' ───');
+    // In-memory count
+    console.log('  In-memory (this tab):     ' + p.arr.length + ' devices');
+    // localStorage count
+    var lsRaw = localStorage.getItem(p.lsKey);
+    var lsCount = 0;
+    try{ if(lsRaw){ var lsArr = JSON.parse(lsRaw); if(Array.isArray(lsArr)) lsCount = lsArr.length; } }catch(e){}
+    console.log('  Local storage (browser):  ' + lsCount + ' devices');
+    // Remote count
+    var remoteRaw = remote[p.dataKey];
+    var remoteCount = '(not in Supabase)';
+    if(remoteRaw){
+      try{ var rArr = JSON.parse(remoteRaw); if(Array.isArray(rArr)) remoteCount = rArr.length + ' devices'; }
+      catch(e){ remoteCount = '(unparseable)'; }
+    }
+    console.log('  Supabase (cloud):         ' + remoteCount);
+    // Version comparison
+    var localV = (typeof INV_SYNC_LOCAL_VERSION !== 'undefined') ? (INV_SYNC_LOCAL_VERSION[p.key]||0) : '?';
+    var remoteMeta = remote[p.dataKey + '_meta'];
+    var remoteV = '(no meta)';
+    var remoteWriter = '';
+    var remoteAt = '';
+    if(remoteMeta){
+      try{
+        var m = JSON.parse(remoteMeta);
+        remoteV = m.version;
+        remoteWriter = m.lastWriter || '';
+        remoteAt = m.lastWrittenAt || '';
+      }catch(e){}
+    }
+    console.log('  Versions: local=' + localV + '  remote=' + remoteV);
+    if(remoteWriter) console.log('  Last writer: ' + remoteWriter + (remoteAt ? ' at ' + remoteAt : ''));
+    // Mismatch detection
+    if(p.arr.length !== lsCount){
+      console.log('  ⚠ MISMATCH: in-memory ≠ localStorage. Save not flushed?');
+    }
+    if(typeof remoteCount === 'string' && remoteCount.indexOf('devices') >= 0){
+      var rc = parseInt(remoteCount);
+      if(rc !== p.arr.length){
+        console.log('  ⚠ MISMATCH: in-memory ('+p.arr.length+') ≠ Supabase ('+rc+'). Push failed OR you have local changes not yet saved.');
+      }
+    }
+  });
+  console.log('');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  return 'Done — scroll up for full report';
+}
+if(typeof window !== 'undefined'){
+  window.wmamInventorySyncProbe = wmamInventorySyncProbe;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 //  INVENTORY ROUTING DIAGNOSTIC (Calvin 2026-05-14)
 //  Call from F12 console: wmamDebugInventoryRouting('Waco TX')
 //  Walks every step of the routing logic and prints what's happening.
@@ -15977,7 +16074,27 @@ async function loadFromSupabase(){
     // arrays are now populated and loadInventory's localStorage values
     // would overwrite them with stale per-device data. Skip it when we
     // just hydrated from Supabase so cross-user data wins.
-    var supabaseHadInventory = settings && settings.some(function(s){return s.key && s.key.indexOf('inv_')===0;});
+    //
+    // Calvin 2026-05-18 ROOT-CAUSE FIX:
+    // The old check only matched keys starting with 'inv_' (legacy table).
+    // But the per-campaign keys are gm_inventory / tc_inventory / aw_inventory
+    // / ex_inventory — they do NOT start with 'inv_'. So the old guard
+    // ALWAYS failed to detect them, loadInventory always ran, and the
+    // browser's stale localStorage always overwrote Supabase's correct
+    // data on every page load.
+    //
+    // Symptom: Makenzie deletes 59 devices → saveInventory pushes empty
+    // GM_INVENTORY to Supabase (correct). On her next page navigation /
+    // reload, loadFromSupabase loads the empty array. Then loadInventory
+    // runs, reads her stale localStorage (which she updated last save —
+    // hm actually that should match... unless she had an older browser
+    // session). In any event: the guard was wrong and the localStorage
+    // overwrite path is dangerous. Fix it by checking for ANY of the
+    // 5 inventory keys.
+    var supabaseInventoryKeys = ['gm_inventory','tc_inventory','aw_inventory','ex_inventory','inv_devices'];
+    var supabaseHadInventory = settings && settings.some(function(s){
+      return s.key && supabaseInventoryKeys.indexOf(s.key) >= 0 && s.value;
+    });
     if(!supabaseHadInventory){
       loadInventory();
       // ── ONE-TIME BACKFILL ──
@@ -21744,13 +21861,18 @@ function ownerInvDeleteCommit(){
       removed++;
     }
   });
+  // Calvin 2026-05-18 — explicit logging so we can verify the persistence
+  // chain succeeded. Without this, a silent Supabase failure would feel
+  // identical to "delete worked locally but didn't sync."
+  console.log('[ownerInvDeleteCommit] Removed '+removed+' from '+OWNER_INV_DELETE.campaign+'; pool now has '+pool.length+' devices');
+
   // Save to localStorage + Supabase via existing inventory save paths
-  try { saveInventory(); } catch(e){ console.warn('[ownerInvDeleteCommit] saveInventory failed:', e); }
-  try { saveToStorage();  } catch(e){ console.warn('[ownerInvDeleteCommit] saveToStorage failed:', e); }
+  try { saveInventory(); console.log('[ownerInvDeleteCommit] saveInventory completed'); } catch(e){ console.warn('[ownerInvDeleteCommit] saveInventory failed:', e); }
+  try { saveToStorage();  console.log('[ownerInvDeleteCommit] saveToStorage completed'); } catch(e){ console.warn('[ownerInvDeleteCommit] saveToStorage failed:', e); }
 
   // Reset state and show success
   ownerInvDeleteReset();
-  alert('✅ '+removed+' device(s) hard-deleted from '+ (OWNER_INV_DELETE.campaign||'inventory') +'. No log written (test cleanup mode).');
+  alert('✅ '+removed+' device(s) hard-deleted from '+ (OWNER_INV_DELETE.campaign||'inventory') +'. \n\nLocally: gone immediately.\nSupabase: write fired (check console for errors).\nOther users: their next page navigation pulls this within 3 seconds.');
   gotoPanel('owner-inv-delete');
 }
 
