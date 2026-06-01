@@ -4049,7 +4049,14 @@ function notifVisibleTo(notif, u){
 }
 
 function getMyNotifications(u){
-  return WMAM_NOTIFICATIONS.filter(function(n){ return notifVisibleTo(n,u); });
+  if(!u) return [];
+  return WMAM_NOTIFICATIONS.filter(function(n){
+    if(!notifVisibleTo(n,u)) return false;
+    // Calvin 2026-06-01: Clear button removes notification from MY personal view.
+    // Other recipients still see it.
+    if(Array.isArray(n.clearedBy) && n.clearedBy.indexOf(u.id) >= 0) return false;
+    return true;
+  });
 }
 
 function getUnreadCount(u){
@@ -4057,6 +4064,55 @@ function getUnreadCount(u){
   return getMyNotifications(u).filter(function(n){
     return !(n.read||[]).some(function(rid){ return rid===u.id; });
   }).length;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  CLEAR / KEEP notifications — Calvin 2026-06-01
+//
+//  Each notification gets two actions: Keep (mark read but stay in list)
+//  and Clear (mark read AND remove from MY view). Per-user, others still
+//  see it. Clear-all bulk option for cleaning up read notifications.
+// ════════════════════════════════════════════════════════════════════════
+function clearNotification(notifId, u){
+  if(!u) return;
+  var n = WMAM_NOTIFICATIONS.find(function(x){return x.id===notifId;});
+  if(!n) return;
+  // Also mark read since clearing implies you saw it
+  if(!Array.isArray(n.read)) n.read = [];
+  if(n.read.indexOf(u.id) < 0) n.read.push(u.id);
+  // Add to cleared list (per-user)
+  if(!Array.isArray(n.clearedBy)) n.clearedBy = [];
+  if(n.clearedBy.indexOf(u.id) < 0) n.clearedBy.push(u.id);
+  saveNotifications();
+  renderNotifBell();
+  // Sync read+cleared state to Supabase
+  _notifPushReadState(n);
+}
+
+function clearAllRead(u){
+  if(!u) return;
+  var n_cleared = 0;
+  WMAM_NOTIFICATIONS.forEach(function(n){
+    if(!notifVisibleTo(n,u)) return;
+    var isRead = (n.read||[]).indexOf(u.id) >= 0;
+    if(!isRead) return; // only clear already-read
+    if(!Array.isArray(n.clearedBy)) n.clearedBy = [];
+    if(n.clearedBy.indexOf(u.id) < 0){
+      n.clearedBy.push(u.id);
+      _notifPushReadState(n);
+      n_cleared++;
+    }
+  });
+  if(n_cleared > 0){
+    saveNotifications();
+    renderNotifBell();
+  }
+  return n_cleared;
+}
+
+if(typeof window !== 'undefined'){
+  window.clearNotification = clearNotification;
+  window.clearAllRead = clearAllRead;
 }
 
 function markNotifRead(notifId, u){
@@ -17980,6 +18036,327 @@ async function wmamTestEmail(toEmail){
 if(typeof window !== 'undefined'){ window.wmamTestEmail = wmamTestEmail; }
 
 // ════════════════════════════════════════════════════════════════════════
+//  APPLICANT EMAIL + REMINDER SYSTEM — Calvin Williams · 2026-06-01
+//
+//  When someone submits the public application form, fire:
+//   1. In-app notification (already done via appNotifyChain — untouched)
+//   2. NEW: Email to selected manager (if any) + office@wmaminc.com (ALWAYS)
+//   3. NEW: Track applicant in `applicants` Supabase table
+//   4. NEW: Background hourly check fires daily reminder emails until
+//      applicant status flips to 'scheduled' or 'removed'
+//
+//  Escalation per Calvin 2026-06-01:
+//   - Day 0-3: Reminder to selected manager (TL/MM) + office@wmaminc.com
+//   - Day 3+:  ESCALATED. Reminder to upper management (MM/CM/IBO/Owner)
+//              chain ABOVE the assigned TL + office@wmaminc.com.
+//              Original TL drops off the reminder list.
+//
+//  Auto-stop triggers (no new HR panel today, per Calvin):
+//   - Applicant flagged scheduled via existing training-scheduled flow
+//   - Applicant flagged removed via bg-fail or manual removal
+//   - Both detected by polling status field; flip stops reminders.
+// ════════════════════════════════════════════════════════════════════════
+
+var OFFICE_NOTIFY_EMAIL = 'office@wmaminc.com'; // hardcoded fallback per Calvin
+
+// In-memory cache of applicants from Supabase. Re-loaded on boot + after writes.
+var APPLICANTS = [];
+
+async function loadApplicants(){
+  if(typeof supaClient === 'undefined' || !supaClient) return;
+  try{
+    var res = await supaClient.from('applicants').select('*').order('submitted_at', {ascending:false}).limit(500);
+    if(res && !res.error && Array.isArray(res.data)){
+      APPLICANTS = res.data;
+      if(typeof window !== 'undefined') window.APPLICANTS = APPLICANTS;
+    }
+  }catch(e){ console.warn('[loadApplicants] error:', e); }
+}
+
+// Save a brand-new applicant record after the form is submitted.
+async function saveApplicant(applicantData){
+  if(typeof supaClient === 'undefined' || !supaClient){
+    console.warn('[saveApplicant] no supabase — applicant will not persist');
+    return null;
+  }
+  var row = {
+    first_name:        applicantData.fn || '',
+    last_name:         applicantData.ln || '',
+    legal_name:        applicantData.legalName || '',
+    dob:               applicantData.dob || '',
+    phone:             applicantData.phone || '',
+    email:             applicantData.email || '',
+    position:          applicantData.position || '',
+    signature:         applicantData.signature || '',
+    programs:          applicantData.programs || [],
+    market_id:         applicantData.marketId || null,
+    market_name:       applicantData.marketName || '',
+    selected_tl_id:    applicantData.tlId || null,
+    selected_tl_name:  applicantData.tlName || '',
+    status:            'applied',
+    raw:               applicantData
+  };
+  try{
+    var res = await supaClient.from('applicants').insert(row).select().single();
+    if(res && res.error){
+      console.warn('[saveApplicant] insert failed:', res.error);
+      return null;
+    }
+    // Push into local cache so the reminder timer sees it
+    if(res && res.data){
+      APPLICANTS.unshift(res.data);
+      return res.data;
+    }
+    return null;
+  }catch(e){
+    console.warn('[saveApplicant] threw:', e);
+    return null;
+  }
+}
+
+// Look up the agent matching a TL id — used to find email
+function _agentById(id){
+  if(!id || typeof DB === 'undefined' || !Array.isArray(DB.agents)) return null;
+  return DB.agents.find(function(a){ return a && a.id === id && a.active; }) || null;
+}
+
+// Build the recipient list for the INITIAL submission email.
+// Per Calvin: selected manager (if any) + office@wmaminc.com (ALWAYS).
+// If no manager selected → office only.
+function _buildApplicationRecipients_initial(applicantRow){
+  var recipients = [];
+  // Office email always
+  recipients.push({email: OFFICE_NOTIFY_EMAIL, name:'WMAMinc Office', kind:'office'});
+  // Selected manager (TL/MM)
+  if(applicantRow.selected_tl_id || applicantRow.selectedTlId){
+    var tlId = applicantRow.selected_tl_id || applicantRow.selectedTlId;
+    var tl = _agentById(tlId);
+    if(tl && tl.email){
+      recipients.push({email: tl.email, name: tl.name, kind:'manager', agentId: tl.id});
+    }
+  }
+  return recipients;
+}
+
+// Build the ESCALATED recipient list (day 3+).
+// Per Calvin: upper management ABOVE the original TL + office. Original TL drops off.
+// Walk-up chain: TL → MM → CM → IBO → Owner.
+function _buildApplicationRecipients_escalated(applicantRow){
+  var recipients = [{email: OFFICE_NOTIFY_EMAIL, name:'WMAMinc Office', kind:'office'}];
+  // Try to resolve management chain via market
+  var marketId = applicantRow.market_id || applicantRow.marketId;
+  var market = (typeof MARKETS !== 'undefined' && marketId)
+    ? MARKETS.find(function(m){ return m && m.id === marketId; })
+    : null;
+  if(market && market.programs){
+    // Iterate program sections (lifeline most common)
+    var sections = ['lifeline','internet','aca'];
+    var seenIds = {};
+    sections.forEach(function(s){
+      var sec = market.programs[s];
+      if(!sec) return;
+      // Add MM, CM, IBO if set (skip the original TL id)
+      ['mmId','cmId','iboId'].forEach(function(roleKey){
+        var aid = sec[roleKey];
+        if(!aid || seenIds[aid]) return;
+        seenIds[aid] = true;
+        var agent = _agentById(aid);
+        if(agent && agent.email){
+          recipients.push({email: agent.email, name: agent.name, kind:'escalation', agentId: agent.id});
+        }
+      });
+    });
+  }
+  // Always add Owner(s) at top of chain — they're the highest escalation
+  if(typeof DB !== 'undefined' && Array.isArray(DB.agents)){
+    DB.agents.forEach(function(a){
+      if(!a || !a.active) return;
+      if(typeof isOwner === 'function' && isOwner(a) && a.email){
+        var alreadyIn = recipients.some(function(r){ return r.agentId === a.id; });
+        if(!alreadyIn){
+          recipients.push({email: a.email, name: a.name, kind:'owner', agentId: a.id});
+        }
+      }
+    });
+  }
+  return recipients;
+}
+
+// Fire the initial application email to all recipients (manager + office).
+async function fireApplicationSubmittedEmail(applicantRow){
+  if(typeof notifyByEmail !== 'function'){
+    console.warn('[fireApplicationSubmittedEmail] notifyByEmail not available');
+    return;
+  }
+  var recipients = _buildApplicationRecipients_initial(applicantRow);
+  var payload = {
+    firstName:  applicantRow.first_name || applicantRow.fn,
+    lastName:   applicantRow.last_name  || applicantRow.ln,
+    phone:      applicantRow.phone,
+    email:      applicantRow.email,
+    position:   applicantRow.position,
+    marketName: applicantRow.market_name || applicantRow.marketName,
+    tlName:     applicantRow.selected_tl_name || applicantRow.tlName,
+    programs:   applicantRow.programs || []
+  };
+  recipients.forEach(function(r){
+    notifyByEmail({
+      toAgent: {id: r.agentId||null, name: r.name, email: r.email},
+      eventType: 'application.submitted',
+      payload: payload
+    }).catch(function(e){ console.warn('[fireApplicationSubmittedEmail] recipient '+r.email+':', e); });
+  });
+  console.log('[fireApplicationSubmittedEmail] fired to '+recipients.length+' recipient(s)');
+}
+
+// Fire a reminder email (day 1-3 or day 3+ escalation) for one applicant.
+async function fireApplicationReminderEmail(applicantRow, daysSince){
+  if(typeof notifyByEmail !== 'function') return;
+  var eventType = daysSince >= 3 ? 'application.reminder.day3plus' : 'application.reminder.day1';
+  var recipients = daysSince >= 3
+    ? _buildApplicationRecipients_escalated(applicantRow)
+    : _buildApplicationRecipients_initial(applicantRow);
+  var payload = {
+    firstName:      applicantRow.first_name,
+    lastName:       applicantRow.last_name,
+    phone:          applicantRow.phone,
+    email:          applicantRow.email,
+    position:       applicantRow.position,
+    marketName:     applicantRow.market_name,
+    daysSince:      daysSince,
+    originalTlName: applicantRow.selected_tl_name
+  };
+  recipients.forEach(function(r){
+    notifyByEmail({
+      toAgent: {id: r.agentId||null, name: r.name, email: r.email},
+      eventType: eventType,
+      payload: payload
+    }).catch(function(e){ console.warn('[fireApplicationReminderEmail] recipient '+r.email+':', e); });
+  });
+  console.log('[fireApplicationReminderEmail] day '+daysSince+' → '+recipients.length+' recipient(s) for '+applicantRow.first_name+' '+applicantRow.last_name);
+
+  // Bookkeeping — update last_reminded_at + reminder_count
+  if(typeof supaClient !== 'undefined' && supaClient && applicantRow.id){
+    try{
+      await supaClient.from('applicants').update({
+        last_reminded_at: new Date().toISOString(),
+        reminder_count:   (applicantRow.reminder_count || 0) + 1
+      }).eq('id', applicantRow.id);
+      applicantRow.last_reminded_at = new Date().toISOString();
+      applicantRow.reminder_count = (applicantRow.reminder_count || 0) + 1;
+    }catch(e){ console.warn('[fireApplicationReminderEmail] update bookkeeping:', e); }
+  }
+}
+
+// Determine if an applicant is due for a reminder.
+// Conditions: status === 'applied' AND submitted >= 24h ago AND
+//             (last_reminded_at is null OR >= 24h ago).
+function _isReminderDue(applicantRow){
+  if(!applicantRow || applicantRow.status !== 'applied') return false;
+  var now = Date.now();
+  var submittedMs = applicantRow.submitted_at ? new Date(applicantRow.submitted_at).getTime() : 0;
+  if(!submittedMs || (now - submittedMs) < 24*60*60*1000) return false;
+  var lastReminderMs = applicantRow.last_reminded_at ? new Date(applicantRow.last_reminded_at).getTime() : 0;
+  if(lastReminderMs && (now - lastReminderMs) < 24*60*60*1000) return false;
+  return true;
+}
+
+// Days since submission (integer)
+function _daysSinceSubmission(applicantRow){
+  if(!applicantRow || !applicantRow.submitted_at) return 0;
+  var ms = Date.now() - new Date(applicantRow.submitted_at).getTime();
+  return Math.floor(ms / (24*60*60*1000));
+}
+
+// Background timer — checks every hour. Re-loads applicants from Supabase to
+// pick up status changes from other browsers, then fires any due reminders.
+var WMAM_APPLICANT_REMINDER_TIMER = null;
+function startApplicantReminderTimer(){
+  if(WMAM_APPLICANT_REMINDER_TIMER) return;
+  // Initial load on boot
+  loadApplicants().then(checkAndFireApplicantReminders).catch(function(){});
+  // Recurring check every hour
+  WMAM_APPLICANT_REMINDER_TIMER = setInterval(function(){
+    loadApplicants().then(checkAndFireApplicantReminders).catch(function(){});
+  }, 60*60*1000); // 1 hour
+}
+
+async function checkAndFireApplicantReminders(){
+  if(!Array.isArray(APPLICANTS)) return;
+  var due = APPLICANTS.filter(_isReminderDue);
+  if(!due.length) return;
+  console.log('[applicant-reminders] '+due.length+' applicant(s) due for reminder');
+  for(var i=0; i<due.length; i++){
+    var days = _daysSinceSubmission(due[i]);
+    await fireApplicationReminderEmail(due[i], days);
+  }
+}
+
+// Hook for existing flows to mark an applicant as scheduled or removed.
+// Called by the training-scheduled handler and the BG-fail handler.
+// Matches by email (primary) and by name (fallback).
+async function markApplicantStatus(matchEmail, matchName, newStatus, opts){
+  opts = opts || {};
+  if(['scheduled','removed'].indexOf(newStatus) < 0) return;
+  if(typeof supaClient === 'undefined' || !supaClient) return;
+  // Re-load to be sure we have current data
+  await loadApplicants();
+  var u = DB.current || {};
+  // Find matching applicant — prefer email, fall back to name+ phone
+  var match = null;
+  if(matchEmail){
+    match = APPLICANTS.find(function(a){
+      return a && a.status === 'applied'
+          && a.email && String(a.email).toLowerCase().trim() === String(matchEmail).toLowerCase().trim();
+    });
+  }
+  if(!match && matchName){
+    var n = String(matchName).toLowerCase().trim();
+    match = APPLICANTS.find(function(a){
+      if(!a || a.status !== 'applied') return false;
+      var full = ((a.first_name||'')+' '+(a.last_name||'')).toLowerCase().trim();
+      return full === n;
+    });
+  }
+  if(!match) return;
+  try{
+    await supaClient.from('applicants').update({
+      status:                  newStatus,
+      status_changed_at:       new Date().toISOString(),
+      status_changed_by_id:    u.id || null,
+      status_changed_by_name:  u.name || '',
+      status_reason:           opts.reason || null,
+      status_note:             opts.note || null
+    }).eq('id', match.id);
+    match.status = newStatus;
+    console.log('[markApplicantStatus] '+match.first_name+' '+match.last_name+' → '+newStatus);
+  }catch(e){ console.warn('[markApplicantStatus] update failed:', e); }
+}
+
+if(typeof window !== 'undefined'){
+  window.OFFICE_NOTIFY_EMAIL = OFFICE_NOTIFY_EMAIL;
+  window.APPLICANTS = APPLICANTS;
+  window.loadApplicants = loadApplicants;
+  window.saveApplicant = saveApplicant;
+  window.fireApplicationSubmittedEmail = fireApplicationSubmittedEmail;
+  window.fireApplicationReminderEmail = fireApplicationReminderEmail;
+  window.checkAndFireApplicantReminders = checkAndFireApplicantReminders;
+  window.markApplicantStatus = markApplicantStatus;
+  window.startApplicantReminderTimer = startApplicantReminderTimer;
+  // Diagnostic helper
+  window.wmamTestApplicantEmail = async function(){
+    var sample = {
+      first_name:'Test', last_name:'Applicant', phone:'(555) 123-4567',
+      email:'test@example.com', position:'Field Agent', market_name:'Tulsa OK',
+      selected_tl_name:'Najee Burns', programs:['Lifeline','Internet'],
+      submitted_at:new Date().toISOString()
+    };
+    await fireApplicationSubmittedEmail(sample);
+    alert('✓ Test application email fired. Check ' + OFFICE_NOTIFY_EMAIL + ' inbox.');
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════
 //  END realtime + conflict + notify block
 // ════════════════════════════════════════════════════════════════════════
 
@@ -21679,13 +22056,23 @@ function panelNotifications(){
 
   // Unread banner
   if(unread.length){
-    h += '<div style="background:linear-gradient(135deg,#CC0000,#8b0000);border-radius:10px;padding:20px 24px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between">'
+    h += '<div style="background:linear-gradient(135deg,#CC0000,#8b0000);border-radius:10px;padding:20px 24px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">'
       +'<div>'
       +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.6rem;color:white;letter-spacing:3px">'+unread.length+' UNREAD NOTIFICATION'+(unread.length!==1?'S':'')+'</div>'
       +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:rgba(255,255,255,.75);letter-spacing:1px;margin-top:2px">Review and acknowledge below</div>'
       +'</div>'
-      +'<button onclick="markAllRead(DB.current);gotoPanel(this.dataset.p)" data-p="notifications" style="background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.4);color:white;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:9px 18px;border-radius:6px;cursor:pointer">Mark All Read ✓</button>'
+      +'<div style="display:flex;gap:8px">'
+      +'<button onclick="markAllRead(DB.current);gotoPanel(\'notifications\')" style="background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.4);color:white;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:9px 18px;border-radius:6px;cursor:pointer">Mark All Read ✓</button>'
+      +'</div>'
       +'</div>';
+  }
+
+  // Calvin 2026-06-01: Clear All Read button — clears every notification I've already read
+  var readCount = all.filter(function(n){ return (n.read||[]).indexOf(u.id)>=0; }).length;
+  if(readCount > 0){
+    h += '<div style="display:flex;justify-content:flex-end;margin-bottom:10px">'
+      + '<button onclick="if(confirm(\'Clear '+readCount+' read notification(s) from your list?\')){ clearAllRead(DB.current); gotoPanel(\'notifications\'); }" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;padding:6px 14px;border-radius:6px;cursor:pointer">🗑 Clear '+readCount+' Read</button>'
+      + '</div>';
   }
 
   // Type filter tabs
@@ -21797,9 +22184,16 @@ function panelNotifications(){
         +'</div>';
     }
 
-    h += '<div style="display:flex;align-items:center;justify-content:space-between">'
+    h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">'
       +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);letter-spacing:1px">'+ts+' &nbsp;·&nbsp; From: '+n.fromName+'</div>'
-      +(isUnread?'<button onclick="markNotifRead('+n.id+',DB.current);gotoPanel(this.dataset.p)" data-p="notifications" style="background:none;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;padding:4px 12px;border-radius:100px;cursor:pointer">Mark Read</button>':'<span style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:#22c55e">✓ Read</span>')
+      // ── Calvin 2026-06-01: Keep / Clear buttons replace lingering Mark Read ──
+      // Keep = mark read but stay visible; Clear = mark read AND remove from MY list.
+      +'<div style="display:flex;gap:6px;align-items:center">'
+        +(isUnread
+          ? '<button onclick="markNotifRead('+n.id+',DB.current);gotoPanel(\'notifications\')" style="background:none;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;padding:4px 12px;border-radius:100px;cursor:pointer">Keep</button>'
+          : '<span style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:#22c55e">✓ Kept</span>'
+        )
+        +'<button onclick="clearNotification('+n.id+',DB.current);gotoPanel(\'notifications\')" style="background:white;border:1px solid #CC0000;color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;padding:4px 12px;border-radius:100px;cursor:pointer">Clear</button>'
       +'</div>'
       +'</div>'
       +'</div></div>';
@@ -46579,6 +46973,18 @@ function tsSchedule(){
       }
     } catch(uplineErr){ console.warn('[tsSchedule] upline notification failed:', uplineErr); }
 
+    // ── Calvin 2026-06-01: stop applicant reminder loop ──
+    // If this scheduled agent is in our applicants table as 'applied',
+    // flip status to 'scheduled'. Matches by email primarily.
+    try{
+      if(typeof markApplicantStatus === 'function' && agent){
+        markApplicantStatus(agent.email || '', agent.name || '', 'scheduled', {
+          reason: 'training-scheduled',
+          note:   'Auto-flipped by training-scheduled flow'
+        }).catch(function(e){ console.warn('[tsSchedule] markApplicantStatus:', e); });
+      }
+    } catch(stopErr){ console.warn('[tsSchedule] applicant status flip failed:', stopErr); }
+
     alert('✓ Training scheduled with '+agent.name+'.\n\n'
       + numDays + '-day session starting '+date+(numDays>1?' through '+endDate:'')+'.\n\n'
       + 'After the session, come back and click "Mark Complete" to log outcomes.');
@@ -58931,6 +59337,64 @@ function submitApplication(){
     saveToStorage();
   }
 
+  // ── Calvin 2026-06-01: Persist applicant + fire email ──
+  // The in-app notification was already fired by appNotifyChain above.
+  // Now we also: (1) save to Supabase 'applicants' table for the reminder
+  // loop, and (2) fire the application.submitted email to the selected
+  // manager + office@wmaminc.com (always).
+  var tlAgent = tlId ? (DB.agents||[]).find(function(a){return a && a.id === tlId;}) : null;
+  // Collect program selections
+  var programs = [];
+  ['lifeline','internet','aca','energy'].forEach(function(p){
+    var el = document.getElementById('app-prog-'+p);
+    if(el && el.checked) programs.push(p.charAt(0).toUpperCase() + p.slice(1));
+  });
+  var applicantPayload = {
+    fn:        fn,
+    ln:        ln,
+    legalName: (document.getElementById('app-legal')||{value:''}).value.trim(),
+    dob:       (document.getElementById('app-dob')||{value:''}).value.trim(),
+    phone:     ph,
+    email:     em,
+    position:  pos,
+    signature: (document.getElementById('app-signature')||{value:''}).value.trim(),
+    programs:  programs,
+    marketId:  marketId,
+    marketName:marketName,
+    tlId:      tlId,
+    tlName:    tlAgent ? tlAgent.name : ''
+  };
+  // Save to Supabase (fire-and-forget; we don't block the user's submission UX)
+  if(typeof saveApplicant === 'function'){
+    saveApplicant(applicantPayload).then(function(savedRow){
+      if(savedRow){
+        // Fire the initial application email to manager + office
+        if(typeof fireApplicationSubmittedEmail === 'function'){
+          fireApplicationSubmittedEmail(savedRow);
+        }
+      } else {
+        // Save failed but we still want to send email so office is alerted
+        if(typeof fireApplicationSubmittedEmail === 'function'){
+          fireApplicationSubmittedEmail({
+            first_name: fn, last_name: ln, phone: ph, email: em, position: pos,
+            market_name: marketName, selected_tl_name: tlAgent ? tlAgent.name : '',
+            selected_tl_id: tlId, programs: programs
+          });
+        }
+      }
+    }).catch(function(e){
+      console.warn('[submitApplication] saveApplicant error:', e);
+      // Still fire the email even if save failed
+      if(typeof fireApplicationSubmittedEmail === 'function'){
+        fireApplicationSubmittedEmail({
+          first_name: fn, last_name: ln, phone: ph, email: em, position: pos,
+          market_name: marketName, selected_tl_name: tlAgent ? tlAgent.name : '',
+          selected_tl_id: tlId, programs: programs
+        });
+      }
+    });
+  }
+
   alert('\u2713 Application submitted! We will review your application and reach out within 1\u20132 business days.\n\nThank you for your interest in Williams Marketing and Management Inc.!');
   closeModal('applicationModal');
 }
@@ -59156,6 +59620,10 @@ if(typeof trainingAutoAdvancePending === 'function'){
   // Calvin 2026-05-19: inventory realtime + conflict queue + notify framework
   if(typeof subscribeInventoryRealtime === 'function'){
     try{ subscribeInventoryRealtime(); }catch(e){ console.warn('[init] inventory realtime subscribe failed:', e); }
+  }
+  // Calvin 2026-06-01: applicant reminder timer (hourly check; daily emails)
+  if(typeof startApplicantReminderTimer === 'function'){
+    try{ startApplicantReminderTimer(); }catch(e){ console.warn('[init] applicant reminder timer failed:', e); }
   }
   // Calvin 2026-05-14: auto-refresh for tables not on realtime (notifications,
   // sales, transfers). Polls every 15s. This is what makes notifications
