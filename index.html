@@ -12005,10 +12005,10 @@ var CAMPAIGN_REGISTRY = {
     // parseInventoryCSV here is a misnomer kept for consistency with the
     // registry shape — the parser handles HTML tables, not CSV.
     parseInventoryCSV:  function(text){ return parseTCInventoryHTML(text); },
-    parseActivationCSV: null,
+    parseActivationCSV: function(text){ return parseTCInventoryHTML(text); },
     processInventoryUpload:  function(text, batchId){ return processTCInventoryUpload(text, batchId); },
-    processActivationUpload: null,
-    applyActivations:        null
+    processActivationUpload: function(text, batchId){ return processTCActivationUpload(text, batchId); },
+    applyActivations:        function(parseResult){ return applyTCActivations(parseResult); }
   },
   'Excess': {
     id:          'ex',
@@ -26585,7 +26585,7 @@ function gotoPanel(id, params){
     'gm-pricelist':'GM Pricelist',
     'inv-hub':'Inventory Hub',
     'aw-inventory':'Assurance Wireless Inventory','aw-upload':'Assurance Upload','aw-transfers':'Assurance Transfers',
-    'tc-inventory':'TruConnect Inventory','tc-upload':'TruConnect Upload','tc-transfers':'TruConnect Transfers',
+    'tc-inventory':'TruConnect Inventory','tc-upload':'TruConnect Upload','tc-transfers':'TruConnect Transfers','tc-activations':'TruConnect Activations',
     'pending-conflicts':'Pending Inventory Conflicts',
     'ex-inventory':'Excess Telecom Inventory','ex-upload':'Excess Upload','ex-transfers':'Excess Transfers',
     'inv-export':'Export to Excel','inv-my-inventory':'My Inventory',
@@ -26638,6 +26638,7 @@ function gotoPanel(id, params){
     'tc-upload':   function(){ return panelCampaignUpload('TruConnect'); },
     'tc-transfers':function(){ return panelCampaignTransfers('TruConnect'); },
     'tc-set-expiry':function(){ return panelTCSetExpiry(); },
+    'tc-activations':function(){ return panelTCActivations(); },
     'pending-conflicts':function(){ return panelPendingConflicts(); },
     'ex-inventory':function(){ return panelCampaignInventory('Excess'); },
     'ex-upload':   function(){ return panelCampaignUpload('Excess'); },
@@ -39914,6 +39915,336 @@ function tcProcessInventoryUpload(){
 if(typeof window !== 'undefined'){ window.tcProcessInventoryUpload = tcProcessInventoryUpload; }
 
 // ════════════════════════════════════════════════════════════════════════
+//  TRUCONNECT ACTIVATION UPLOAD — Calvin 2026-06-01
+//
+//  Source: TruConnect "Sold by Agent" report — HTML-as-.xls (same as the
+//  inventory upload format). 17 columns. Uploaded daily/weekly.
+//
+//  Locked spec (per Calvin):
+//   - Daily/weekly upload = scoreboard + leaderboard + sale tracking
+//   - Wednesday pay file (existing payroll system) = source of truth for $
+//   - Tribal column (col 5) drives commission rate (Tribal $25 / NLAD per tcModel)
+//   - Status: Approved → credit + commission preview; Pending → record only;
+//     Canceled → record, mirror GM behavior (don't credit, no clawback here)
+//   - Plan Type: Handset/SIM/Tablet all count, same rate. SIMs won't match
+//     TC_INVENTORY (expected, not flagged as problem)
+//   - Agent matching: first+last case-insensitive (col 15). Unmatched flags
+//     for review on preview screen.
+//   - Dedup: IMEI + Order Number (re-upload safe)
+//   - Port-in: NOT handled here. Wednesday pay file's existing pipeline.
+//
+//  Column map (locked 2026-06-01 against report1780073599837.xls):
+//    0  ISO Name
+//    1  Team Name              → market via tcMarketTranslate
+//    2  Order DD: Order Number → dedup key
+//    3  Date                   → sale date
+//    4  State
+//    5  Tribal (YES/NO)        → commission rate driver
+//    6  Status (Approved/Pending/Canceled)
+//    7  First Call Date
+//    8  CA Approval Date
+//    9  CA Disconnect Date
+//   10  CA Invoice Date
+//   11  Fed Approval Date
+//   12  Fed Disconnect Date
+//   13  Fed Invoice Date
+//   14  IMEI (15 digits)
+//   15  Agent                  → credited agent (first+last name match)
+//   16  Plan Type              → Handset / SIM / Tablet
+// ════════════════════════════════════════════════════════════════════════
+
+// Match an agent by their full display name (first+last, case-insensitive).
+// Returns the agent object or null. Inactive agents are excluded.
+function _tcMatchAgentByName(name){
+  if(!name || typeof DB === 'undefined' || !Array.isArray(DB.agents)) return null;
+  var target = String(name).toLowerCase().replace(/\s+/g,' ').trim();
+  if(!target) return null;
+  return DB.agents.find(function(a){
+    if(!a || a.active === false) return false;
+    var an = String(a.name||'').toLowerCase().replace(/\s+/g,' ').trim();
+    return an === target;
+  }) || null;
+}
+
+// Parse "M/D/YYYY" → "YYYY-MM-DD". Returns '' on junk.
+function _tcParseDate(s){
+  if(!s) return '';
+  var m = String(s).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if(!m) return '';
+  var mm = String(parseInt(m[1],10)).padStart(2,'0');
+  var dd = String(parseInt(m[2],10)).padStart(2,'0');
+  return m[3] + '-' + mm + '-' + dd;
+}
+
+// Pick the right rate for an agent based on their tcModel + Tribal flag.
+// Returns commission in DOLLARS. Reads locked rate tables from memory.
+// If unknown model, returns 0 (will show as 'rate unknown' in preview).
+function _tcCommissionFor(agent, tribal){
+  if(!agent) return 0;
+  var model = (agent.tcModel || 'tc-standard').toLowerCase();
+  // Locked spec recap (Calvin):
+  //  - tc-standard (most agents): Tribal $18/$23 sliding (slides at 30/wk), NLAD $8 sliding
+  //  - tc-cm-difference (Brandon-style CMs): Tribal $25 flat, NLAD $10 flat (their personal rate)
+  //  - tc-cm-consolidated (Juan-style IBOs): Tribal $25 flat, NLAD $10 flat (all to the IBO)
+  //  - tc-cm-oklahoma (Tanita): Tribal $28 cap, agent gets $18/$23 + diff to Tanita
+  //
+  // For the SCOREBOARD/leaderboard preview, we show the agent's PERSONAL
+  // commission for the deal. Sliding rates default to the lower tier
+  // (Tribal $18, NLAD $8) since we can't know weekly totals at upload time;
+  // the Wednesday pay file is authoritative for the actual paid amount.
+  if(tribal){
+    if(model === 'tc-cm-difference' || model === 'tc-cm-consolidated' || model === 'tc-cm-oklahoma'){
+      return 25; // CMs get flat $25 Tribal personal
+    }
+    return 18; // standard agent default (lower tier; pay file fills in tier diff)
+  }
+  // NLAD
+  if(model === 'tc-cm-difference' || model === 'tc-cm-consolidated'){
+    return 10;
+  }
+  if(model === 'tc-cm-oklahoma'){
+    return 10; // Tanita NLAD personal — Calvin 2026-06-01 correction (was $8, should be $10)
+  }
+  return 8; // standard agent NLAD lower-tier
+}
+
+// Parse + classify the TC activation file. Returns a preview object so
+// Inv Dept can review before committing.
+function processTCActivationUpload(htmlText, batchId){
+  var parsed = parseTCInventoryHTML(htmlText); // re-use the HTML parser
+  if(!parsed.rows.length){
+    return {ok:false, error:'No rows found in file', approved:[], pending:[], canceled:[], unmatchedAgents:[], duplicates:[], batchId:batchId};
+  }
+  // Header validation — must have IMEI and Tribal columns
+  var headers = parsed.headers.map(function(h){return String(h||'').trim().toLowerCase();});
+  if(headers.indexOf('imei') < 0 || headers.indexOf('tribal') < 0 || headers.indexOf('agent') < 0){
+    return {ok:false, error:'File missing required columns (IMEI, Tribal, Agent). Got: '+parsed.headers.join(', '), approved:[], pending:[], canceled:[], unmatchedAgents:[], duplicates:[], batchId:batchId};
+  }
+
+  // Build dedup index of existing TC_ACTIVATIONS by IMEI + Order Number.
+  // Per Calvin's spec: same IMEI + order = same sale (don't double-credit on re-upload).
+  var existingKeys = {};
+  if(typeof TC_ACTIVATIONS !== 'undefined' && Array.isArray(TC_ACTIVATIONS)){
+    TC_ACTIVATIONS.forEach(function(a){
+      var k = (a.imei||'') + '|' + (a.orderNumber||'');
+      existingKeys[k] = true;
+    });
+  }
+
+  var approved=[], pending=[], canceled=[], duplicates=[], unmatchedAgents={};
+  var nowISO = new Date().toISOString();
+
+  parsed.rows.forEach(function(cells){
+    // Map to canonical fields (col positions locked above)
+    var teamName    = cells[1] || '';
+    var orderNumber = (cells[2] || '').trim();
+    var saleDate    = _tcParseDate(cells[3] || '');
+    var state       = cells[4] || '';
+    var tribalRaw   = (cells[5] || '').trim().toUpperCase();
+    var status      = (cells[6] || '').trim();
+    var imei        = (cells[14] || '').replace(/\D/g,'');
+    var agentName   = (cells[15] || '').trim();
+    var planType    = (cells[16] || '').trim();
+
+    if(!imei || !orderNumber){ return; } // skip junk rows
+
+    var dedupKey = imei + '|' + orderNumber;
+    if(existingKeys[dedupKey]){
+      duplicates.push({imei:imei, orderNumber:orderNumber, agentName:agentName});
+      return;
+    }
+    existingKeys[dedupKey] = true;
+
+    var tribal = (tribalRaw === 'YES' || tribalRaw === 'Y' || tribalRaw === 'TRUE');
+    var market = (typeof tcMarketTranslate === 'function') ? tcMarketTranslate(teamName) : teamName;
+    var matchedAgent = _tcMatchAgentByName(agentName);
+    if(!matchedAgent && agentName){
+      unmatchedAgents[agentName] = (unmatchedAgents[agentName]||0) + 1;
+    }
+
+    var commissionAmount = matchedAgent ? _tcCommissionFor(matchedAgent, tribal) : 0;
+    var planLower = planType.toLowerCase();
+    var isSim = (planLower === 'sim');
+
+    var record = {
+      // dedup
+      imei:          imei,
+      orderNumber:   orderNumber,
+      // sale
+      saleDate:      saleDate,
+      market:        market,
+      teamName:      teamName,
+      state:         state,
+      // classification
+      tribal:        tribal,
+      status:        status,
+      planType:      planType,
+      isSim:         isSim,
+      // attribution
+      agentName:     agentName,
+      agentId:       matchedAgent ? matchedAgent.id : null,
+      agentMatched:  !!matchedAgent,
+      // commission (PREVIEW only — Wednesday pay file is authoritative)
+      commission:    commissionAmount,
+      commissionNote: matchedAgent ? null : 'agent-not-matched',
+      // approval chain dates (for audit, not used in math)
+      firstCallDate:    _tcParseDate(cells[7] || ''),
+      caApprovalDate:   _tcParseDate(cells[8] || ''),
+      caDisconnectDate: _tcParseDate(cells[9] || ''),
+      caInvoiceDate:    _tcParseDate(cells[10] || ''),
+      fedApprovalDate:  _tcParseDate(cells[11] || ''),
+      fedDisconnectDate:_tcParseDate(cells[12] || ''),
+      fedInvoiceDate:   _tcParseDate(cells[13] || ''),
+      // meta
+      uploadBatchId: batchId,
+      uploadedAt:    nowISO,
+      source:        'tc-sold-by-agent-report'
+    };
+
+    var sLower = status.toLowerCase();
+    if(sLower === 'approved') approved.push(record);
+    else if(sLower === 'pending') pending.push(record);
+    else if(sLower === 'canceled' || sLower === 'cancelled') canceled.push(record);
+    else {
+      // Unknown status — treat as pending and flag
+      record.unknownStatus = status;
+      pending.push(record);
+    }
+  });
+
+  return {
+    ok: true,
+    total: parsed.rows.length,
+    approved: approved,
+    pending:  pending,
+    canceled: canceled,
+    duplicates: duplicates,
+    unmatchedAgents: Object.keys(unmatchedAgents).map(function(name){
+      return {name:name, count:unmatchedAgents[name]};
+    }),
+    batchId: batchId
+  };
+}
+
+// Commit the parsed activation upload to scoreboard + leaderboard + Path B.
+// Only Approved sales credit the agent (mirrors GM behavior).
+// Canceled and Pending are recorded but don't bump counts.
+async function applyTCActivations(parseResult){
+  if(!parseResult || !parseResult.ok) return {ok:false, error:'invalid-parse-result'};
+  if(typeof TC_ACTIVATIONS === 'undefined' || !Array.isArray(TC_ACTIVATIONS)){
+    window.TC_ACTIVATIONS = [];
+  }
+
+  var creditedSales=0, deviceUpdates=0, simSalesRecorded=0;
+  var nowISO = new Date().toISOString();
+
+  // ── Approved sales: credit the agent + bump scoreboard ──
+  parseResult.approved.forEach(function(act){
+    TC_ACTIVATIONS.push(act);
+
+    // Update the matching device record in TC_INVENTORY (skip SIM rows
+    // since SIMs don't pull from inventory; the IMEI is the customer's
+    // own phone, not ours).
+    if(!act.isSim && typeof TC_INVENTORY !== 'undefined'){
+      var dev = TC_INVENTORY.find(function(d){return d && d.imei===act.imei;});
+      if(dev){
+        dev.status         = 'activated';
+        dev.activatedAt    = act.saleDate || nowISO;
+        dev.activatedById  = act.agentId;
+        dev.activatedByName= act.agentName;
+        dev.tribal         = !!act.tribal;
+        dev.soldOrderNumber= act.orderNumber;
+        if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody = [];
+        dev.chainOfCustody.push({
+          type:    'activated',
+          at:      nowISO,
+          orderNumber: act.orderNumber,
+          agentId:    act.agentId,
+          agentName:  act.agentName,
+          tribal:     !!act.tribal,
+          source:     'tc-sold-by-agent-upload'
+        });
+        deviceUpdates++;
+        // Path B per-row sync (fire and forget)
+        if(typeof invDbUpsertDevice === 'function'){
+          invDbUpsertDevice('tc', dev).catch(function(e){
+            console.warn('[applyTCActivations] Path B failed for '+dev.imei+':', e);
+          });
+        }
+      }
+    } else if(act.isSim){
+      simSalesRecorded++;
+    }
+
+    // Bump agent stats (matched agents only). Mirrors applyGMActivations.
+    if(act.agentId){
+      var agent = DB.agents.find(function(a){return a.id===act.agentId;});
+      if(agent){
+        var month   = (act.saleDate||nowISO).slice(0,7);
+        var weekKey = (typeof getWeekKey === 'function')
+                    ? getWeekKey(new Date(act.saleDate || Date.now()), '')
+                    : (act.saleDate || nowISO.slice(0,10));
+        var dateStr = act.saleDate || nowISO.slice(0,10);
+        if(!agent.monthlySales) agent.monthlySales = [];
+        var entry = agent.monthlySales.find(function(m){return m.month===month && m.program==='Lifeline';});
+        if(!entry){
+          entry = {month:month, program:'Lifeline', sales:0, weekSales:{}, entries:[]};
+          agent.monthlySales.push(entry);
+        }
+        entry.sales = (entry.sales||0) + 1;
+        if(!entry.weekSales) entry.weekSales = {};
+        entry.weekSales[weekKey] = (entry.weekSales[weekKey]||0) + 1;
+        if(!entry.entries) entry.entries = [];
+        entry.entries.push({
+          date:    dateStr,
+          count:   1,
+          imei:    act.imei,
+          tribal:  !!act.tribal,
+          order:   act.orderNumber,
+          planType:act.planType,
+          source:  'tc-activation-upload'
+        });
+        agent.sales = (agent.sales||0) + 1;
+        creditedSales++;
+      }
+    }
+  });
+
+  // ── Pending sales: record only, no agent credit ──
+  parseResult.pending.forEach(function(act){
+    TC_ACTIVATIONS.push(act);
+  });
+
+  // ── Canceled sales: record only, no agent credit, no clawback (Wednesday pay file handles $) ──
+  parseResult.canceled.forEach(function(act){
+    TC_ACTIVATIONS.push(act);
+    // If we'd previously activated this device, leave the device record
+    // alone — the daily file's purpose is tracking, not undoing past credits.
+    // Wednesday pay file is the truth for what actually gets paid.
+  });
+
+  // Persist
+  try{ saveInventory(); }catch(e){ console.warn('[applyTCActivations] saveInventory:', e); }
+  try{ if(typeof saveToStorage === 'function') saveToStorage(); }catch(e){}
+
+  return {
+    ok: true,
+    creditedSales: creditedSales,
+    deviceUpdates: deviceUpdates,
+    simSalesRecorded: simSalesRecorded,
+    pendingRecorded: parseResult.pending.length,
+    canceledRecorded: parseResult.canceled.length
+  };
+}
+
+if(typeof window !== 'undefined'){
+  window.processTCActivationUpload = processTCActivationUpload;
+  window.applyTCActivations        = applyTCActivations;
+  window._tcMatchAgentByName       = _tcMatchAgentByName;
+  window._tcCommissionFor          = _tcCommissionFor;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 //  INV-DEPT "SET DOWNSTREAM EXPIRY" — Calvin 2026-05-19
 //
 //  Inv Dept (Makenzie) stamps the date that MMs/TLs/Agents will see and
@@ -40370,6 +40701,195 @@ if(typeof window !== 'undefined'){
   window.tcSetExpiryOne              = tcSetExpiryOne;
   window.tcSetExpiryRefreshList      = tcSetExpiryRefreshList;
   window.panelTCSetExpiry            = panelTCSetExpiry;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  TC ACTIVATIONS UPLOAD PANEL — Calvin 2026-06-01
+//
+//  Owner / Inv Dept upload the TruConnect "Sold by Agent" report. The
+//  panel parses, shows a preview broken out by Approved/Pending/Canceled,
+//  flags unmatched agents and duplicates, and only commits when user
+//  clicks the green button.
+// ════════════════════════════════════════════════════════════════════════
+var TC_ACT_UPLOAD_PREVIEW = null;
+
+function panelTCActivations(){
+  var u = DB.current;
+  var canUpload = (typeof isOwner === 'function' && isOwner(u))
+               || (typeof isInventory === 'function' && isInventory(u))
+               || (u && u.depts && u.depts.inv);
+  if(!canUpload){
+    return panelHeader('🛑 Access Denied') + '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Owner or Inventory Department only.</div>';
+  }
+
+  var h = panelHeader('📊 TruConnect — Activations Upload');
+
+  h += '<div class="bo-card">';
+  h += '<div class="bo-card-head"><div class="bo-card-title">Daily / Weekly Sold-by-Agent Report</div></div>';
+  h += '<div style="padding:18px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.55">';
+  h += '<p>Upload the TruConnect "Sold by Agent" report. The system credits Approved sales to the agent\'s scoreboard + leaderboard. Pending sales record without credit. Canceled sales record without credit.</p>';
+  h += '<p style="margin-top:8px;padding:10px;background:rgba(0,53,148,.06);border-left:3px solid var(--blue);border-radius:4px"><strong>Note on commissions:</strong> The preview shows a commission estimate based on each agent\'s tcModel. The <strong>Wednesday pay file</strong> from TruConnect is the authoritative source for actual $ paid (including any clawbacks). This upload is for tracking + scoreboard only.</p>';
+  h += '<p style="margin-top:6px"><strong>Dedup:</strong> Same IMEI + Order Number is treated as one sale. Re-uploading the same file is safe — already-imported sales are flagged as duplicates and skipped.</p>';
+  h += '</div>';
+
+  h += '<div style="padding:18px;border-top:1px solid var(--border)">';
+  h += '<input type="file" id="tc-act-file" accept=".xls,.html,.htm" style="margin-bottom:12px;font-family:Barlow Condensed,sans-serif;font-size:.85rem">';
+  h += '<button onclick="tcParseActivations()" class="btn-fire" style="padding:11px 22px;font-size:.74rem">📊 Parse & Preview →</button>';
+  h += '</div>';
+
+  // Preview area
+  h += '<div id="tc-act-preview" style="padding:18px;border-top:1px solid var(--border)">';
+  if(TC_ACT_UPLOAD_PREVIEW) h += tcActivationsPreviewHTML(TC_ACT_UPLOAD_PREVIEW);
+  h += '</div>';
+
+  h += '</div>';
+  return h;
+}
+
+function tcParseActivations(){
+  var fileEl = document.getElementById('tc-act-file');
+  if(!fileEl || !fileEl.files || !fileEl.files[0]){ alert('Please select a TruConnect sold-by-agent .xls file.'); return; }
+  var file = fileEl.files[0];
+  var reader = new FileReader();
+  reader.onload = function(e){
+    try{
+      var text = e.target.result;
+      if(!text || typeof text !== 'string'){
+        document.getElementById('tc-act-preview').innerHTML = '<div style="color:#CC0000;font-family:Barlow Condensed,sans-serif">Could not read file.</div>';
+        return;
+      }
+      if(text.indexOf('<th') < 0 || text.toLowerCase().indexOf('imei') < 0){
+        document.getElementById('tc-act-preview').innerHTML = '<div style="background:rgba(204,0,0,.06);border:2px solid #CC0000;border-radius:8px;padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown)"><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:#CC0000;letter-spacing:2px;margin-bottom:8px">🛑 FORMAT NOT RECOGNIZED</div>This file doesn\'t look like the TC sold-by-agent report. Expected an HTML-table with IMEI and Tribal columns.</div>';
+        return;
+      }
+      var batchId = 'tca-'+Date.now();
+      var result = processTCActivationUpload(text, batchId);
+      TC_ACT_UPLOAD_PREVIEW = result;
+      document.getElementById('tc-act-preview').innerHTML = tcActivationsPreviewHTML(result);
+    }catch(err){
+      console.error('[tcParseActivations]', err);
+      document.getElementById('tc-act-preview').innerHTML = '<div style="color:#CC0000;font-family:Barlow Condensed,sans-serif">Parse error: '+ (err && err.message ? err.message : String(err)) +'</div>';
+    }
+  };
+  reader.readAsText(file);
+}
+
+function tcActivationsPreviewHTML(result){
+  if(!result || !result.ok){
+    return '<div style="color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.85rem">'+(result && result.error || 'Parse failed.')+'</div>';
+  }
+  var h = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.6">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--blue);letter-spacing:1.5px;margin-bottom:10px">📊 Parsed '+result.total+' row(s)</div>';
+
+  // Summary cards
+  h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">';
+  h += '<div style="flex:1;min-width:140px;background:rgba(5,150,105,.08);border:1px solid #059669;padding:10px;border-radius:6px"><div style="font-size:.7rem;letter-spacing:1.5px;color:#047857;text-transform:uppercase">Approved</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:#059669">'+result.approved.length+'</div></div>';
+  h += '<div style="flex:1;min-width:140px;background:rgba(217,119,6,.08);border:1px solid #d97706;padding:10px;border-radius:6px"><div style="font-size:.7rem;letter-spacing:1.5px;color:#92400e;text-transform:uppercase">Pending</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:#d97706">'+result.pending.length+'</div></div>';
+  h += '<div style="flex:1;min-width:140px;background:rgba(204,0,0,.06);border:1px solid #CC0000;padding:10px;border-radius:6px"><div style="font-size:.7rem;letter-spacing:1.5px;color:#CC0000;text-transform:uppercase">Canceled</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:#CC0000">'+result.canceled.length+'</div></div>';
+  if(result.duplicates && result.duplicates.length){
+    h += '<div style="flex:1;min-width:140px;background:rgba(100,100,100,.06);border:1px solid var(--border);padding:10px;border-radius:6px"><div style="font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Duplicates (skipped)</div><div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:var(--muted)">'+result.duplicates.length+'</div></div>';
+  }
+  h += '</div>';
+
+  // Unmatched agents warning
+  if(result.unmatchedAgents && result.unmatchedAgents.length){
+    h += '<div style="margin-bottom:14px;padding:12px;background:rgba(204,0,0,.06);border-left:3px solid #CC0000;border-radius:4px">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;color:#CC0000;letter-spacing:1.5px;margin-bottom:6px">🛑 UNMATCHED AGENTS — '+result.unmatchedAgents.length+' name(s)</div>';
+    h += '<div style="font-size:.78rem;color:var(--brown)">These names in the file don\'t match any active agent. Sales for these names will NOT be credited. Fix the names in the file OR re-upload after the agents are added/reactivated:</div>';
+    h += '<ul style="margin:6px 0 0 20px;font-size:.78rem">';
+    result.unmatchedAgents.forEach(function(u){
+      h += '<li><strong>'+_escapeHtml(u.name)+'</strong> — '+u.count+' sale(s)</li>';
+    });
+    h += '</ul>';
+    h += '</div>';
+  }
+
+  // Approved sales table (preview by agent)
+  if(result.approved.length){
+    // Group by agent
+    var byAgent = {};
+    result.approved.forEach(function(a){
+      var k = a.agentMatched ? (a.agentName+' [✓]') : (a.agentName+' [unmatched]');
+      if(!byAgent[k]) byAgent[k] = {count:0, tribal:0, nlad:0, sims:0, commission:0, matched:a.agentMatched};
+      byAgent[k].count++;
+      byAgent[k].tribal += a.tribal ? 1 : 0;
+      byAgent[k].nlad   += a.tribal ? 0 : 1;
+      byAgent[k].sims   += a.isSim ? 1 : 0;
+      byAgent[k].commission += a.commission || 0;
+    });
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:#059669;margin:10px 0">Approved Sales (will credit on commit)</div>';
+    h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.82rem">';
+    h += '<thead><tr style="background:var(--offwhite);border-bottom:1px solid var(--border)"><th style="text-align:left;padding:7px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">AGENT</th><th style="text-align:right;padding:7px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">SALES</th><th style="text-align:right;padding:7px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">TRIBAL</th><th style="text-align:right;padding:7px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">NLAD</th><th style="text-align:right;padding:7px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">SIM</th><th style="text-align:right;padding:7px 10px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted)">EST. $</th></tr></thead><tbody>';
+    Object.keys(byAgent).sort().forEach(function(k){
+      var a = byAgent[k];
+      var rowBg = a.matched ? '' : 'background:rgba(204,0,0,.04)';
+      h += '<tr style="border-bottom:1px solid var(--border);'+rowBg+'">';
+      h += '<td style="padding:7px 10px;font-weight:600">'+_escapeHtml(k)+'</td>';
+      h += '<td style="padding:7px 10px;text-align:right;font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--blue)">'+a.count+'</td>';
+      h += '<td style="padding:7px 10px;text-align:right">'+a.tribal+'</td>';
+      h += '<td style="padding:7px 10px;text-align:right">'+a.nlad+'</td>';
+      h += '<td style="padding:7px 10px;text-align:right">'+a.sims+'</td>';
+      h += '<td style="padding:7px 10px;text-align:right;color:#059669">$'+a.commission.toFixed(2)+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table>';
+  }
+
+  // Pending + Canceled summary
+  if(result.pending.length){
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:#d97706;margin:14px 0 6px">Pending (no credit yet)</div>';
+    h += '<div style="font-size:.78rem;color:var(--brown)">'+result.pending.length+' sale(s) awaiting approval. Recorded but no agent credit until status flips to Approved on a later upload.</div>';
+  }
+  if(result.canceled.length){
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:#CC0000;margin:14px 0 6px">Canceled (recorded, no credit)</div>';
+    h += '<div style="font-size:.78rem;color:var(--brown)">'+result.canceled.length+' sale(s) canceled. Recorded for audit but no credit. The Wednesday pay file handles any clawback/payment adjustments.</div>';
+  }
+
+  // Commit / Cancel buttons
+  h += '<div style="display:flex;gap:10px;margin-top:18px;padding-top:14px;border-top:1px solid var(--border)">';
+  h += '<button onclick="tcCommitActivations()" class="btn-fire" style="background:#059669;padding:11px 24px;font-size:.78rem">✓ Commit '+result.approved.length+' Approved Sale(s) →</button>';
+  h += '<button onclick="tcCancelActivationPreview()" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 24px;border-radius:6px;cursor:pointer">Cancel</button>';
+  h += '</div>';
+
+  h += '</div>';
+  return h;
+}
+
+async function tcCommitActivations(){
+  if(!TC_ACT_UPLOAD_PREVIEW || !TC_ACT_UPLOAD_PREVIEW.ok){
+    alert('No preview to commit.');
+    return;
+  }
+  var r = TC_ACT_UPLOAD_PREVIEW;
+  var ok = confirm('Commit this upload?\n\n'+r.approved.length+' approved sales will credit agents.\n'+r.pending.length+' pending sales recorded (no credit yet).\n'+r.canceled.length+' canceled sales recorded.\n\nWednesday pay file remains the authoritative source for $ paid.');
+  if(!ok) return;
+
+  try{
+    var result = await applyTCActivations(r);
+    if(result.ok){
+      alert('✅ Committed.\n\nCredited '+result.creditedSales+' sale(s) to '+r.approved.length+' approval row(s).\nDevice records updated: '+result.deviceUpdates+'\nSIM sales (no device update): '+result.simSalesRecorded+'\nPending recorded: '+result.pendingRecorded+'\nCanceled recorded: '+result.canceledRecorded);
+      TC_ACT_UPLOAD_PREVIEW = null;
+      gotoPanel('tc-activations');
+    } else {
+      alert('⚠ Commit failed: '+(result.error||'unknown'));
+    }
+  }catch(err){
+    console.error('[tcCommitActivations]', err);
+    alert('⚠ Commit threw:\n\n'+(err && err.message || String(err)));
+  }
+}
+
+function tcCancelActivationPreview(){
+  TC_ACT_UPLOAD_PREVIEW = null;
+  gotoPanel('tc-activations');
+}
+
+if(typeof window !== 'undefined'){
+  window.panelTCActivations          = panelTCActivations;
+  window.tcParseActivations          = tcParseActivations;
+  window.tcCommitActivations         = tcCommitActivations;
+  window.tcCancelActivationPreview   = tcCancelActivationPreview;
+  window.tcActivationsPreviewHTML    = tcActivationsPreviewHTML;
 }
 
 // ════════════════════════════════════════════════════════════════════════
