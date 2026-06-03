@@ -12988,67 +12988,131 @@ if(typeof window !== 'undefined'){
 }
 
 // Parse the extracted text into pricelist row candidates.
-// Returns: array of {model, price, network?, screen?, specs?, caTribalCredit?, nonCACredit?, sourceLine}
-// The parser is INTENTIONALLY conservative: any line that doesn't look like
-// a price row is skipped. We'd rather miss a row and have the user notice
-// than silently insert garbage into the pricelist.
+// Returns: { rows: [...], skippedLines: [...] }
+//
+// Calvin 2026-06-03 v2 (STRICT): Locked to Gen Mobile's exact PDF format.
+// A valid device row MUST contain BOTH:
+//   1. A network token: "Sky", "Orange", or "Sky/Orange"
+//   2. A specs token:   "NGB/NGB" (e.g., 3GB/32GB) OR a bare GB capacity (e.g., "64GB")
+// If either is missing, the line is SKIPPED and added to skippedLines.
+//
+// Once we confirm a device row, we use the structural columns to extract:
+//   [model name] [network] [screen=decimal] [specs] [JunePrice $] [CACredit $] [NonCACredit $]
+// The June Price is the FIRST $-prefixed number AFTER the specs token.
+// Credits are the SECOND and THIRD $-prefixed numbers (each may be $0).
+//
+// Anti-misread guard: if the parser can find network + specs but cannot find
+// 1+ $-prefixed number AFTER the specs, the row is skipped (we don't guess).
 function gmPdfParseRows(allText){
-  if(!allText || !allText.length) return [];
+  var result = {rows: [], skippedLines: []};
+  if(!allText || !allText.length) return result;
   var lines = allText.split(/\r?\n/).map(function(l){ return l.trim(); }).filter(Boolean);
-  var rows = [];
 
-  // Strategy: walk each line. A pricelist row generally has:
-  //   - Letters (a model name, possibly with hyphens/digits)
-  //   - At least one $-prefixed or unprefixed number that looks like a phone price ($35-$500)
-  // We extract the FIRST plausible price as "price", and optionally find
-  // CA tribal credit and non-CA credit if there are 2-3 numbers on the line.
-  // Word boundary on the digit run so "9999999" doesn't yield a stray "9999".
-  var priceRegex = /\$?\s?\b(\d{2,4})(?:\.\d{1,2})?\b/g;
-  var skipKeywords = /^(price|model|device|network|screen|spec|credit|gen\s*mobile|lifeline|tribal|non-?ca|page|monthly|effective|copyright|confidential)/i;
+  // Network token finder. Matches "Sky", "Orange", or "Sky/Orange" as a whole word.
+  // Captures the FULL token so we can split on its position.
+  var networkRegex = /\b(Sky\/Orange|Orange\/Sky|Sky|Orange)\b/i;
+
+  // Specs token finder. Matches "3GB/32GB", "4GB/128GB", or bare "64GB", "128GB".
+  // We require GB explicitly so we don't catch random pairs of numbers.
+  var specsRegex = /\b(\d+\s*GB\s*\/\s*\d+\s*GB|\d+\s*GB)\b/i;
+
+  // $-prefixed number — REQUIRED for prices, so we don't accidentally
+  // grab the screen size (5.5, 6.6) or specs digits as the price.
+  // Allow $0 (some credits are $0).
+  var dollarRegex = /\$\s?(\d{1,4})\b/g;
+
+  // Header / preamble keywords we definitely want to skip even if they
+  // somehow contain a network/specs hint (defensive)
+  var preambleKeywords = /(distribution credit|june price|may activations|distributor|gen mobile network|seventy five|carrier|copyright|confidential|tribal lifeline|non-?ca\* distribution)/i;
 
   lines.forEach(function(line){
     if(line.length < 5) return;
-    if(skipKeywords.test(line)) return;
 
-    // Find all numbers in the line that look like prices ($20-$2000)
-    var nums = [];
-    var m;
-    priceRegex.lastIndex = 0;
-    while((m = priceRegex.exec(line)) !== null){
-      var n = parseInt(m[1], 10);
-      if(n >= 20 && n <= 2000) nums.push({val: n, idx: m.index});
+    var netMatch = line.match(networkRegex);
+    var specMatch = line.match(specsRegex);
+
+    if(!netMatch || !specMatch){
+      // Not a device row. Only log lines that LOOK like they might have
+      // pricing data so the skip log isn't cluttered with legal text.
+      if(/\$\s?\d/.test(line) && line.length < 200){
+        result.skippedLines.push({line: line, reason: 'No Network + Specs anchor (need Sky/Orange + NGB/NGB)'});
+      }
+      return;
     }
-    if(!nums.length) return;
 
-    // Extract the model name = everything from the start of the line up to
-    // the first number. Strip trailing punctuation.
-    var modelEnd = nums[0].idx;
-    var modelRaw = line.substring(0, modelEnd).trim();
-    // Strip trailing $, comma, parens, hyphens
-    modelRaw = modelRaw.replace(/[\s\$,\-:]+$/, '').trim();
-    if(modelRaw.length < 3) return;  // too short to be a real model name
+    // Defensive: skip if line still looks like a header/preamble
+    if(preambleKeywords.test(line)){
+      result.skippedLines.push({line: line, reason: 'Looks like header/preamble (matched preamble keyword)'});
+      return;
+    }
 
-    // A model name should contain at least one letter
-    if(!/[a-zA-Z]/.test(modelRaw)) return;
+    // Find all $-prefixed numbers (these are the price columns)
+    var dollarNums = [];
+    var m;
+    dollarRegex.lastIndex = 0;
+    while((m = dollarRegex.exec(line)) !== null){
+      dollarNums.push({val: parseInt(m[1], 10), idx: m.index});
+    }
+    if(!dollarNums.length){
+      result.skippedLines.push({line: line, reason: 'Has Network+Specs but no $-prefixed price (parser refuses to guess)'});
+      return;
+    }
 
-    // Guess columns: most GM pricelist rows have the structure
-    //   [model] [network?] [screen?] [specs?] [PRICE] [CA TRIBAL CREDIT] [NON-CA CREDIT]
-    // Most reliable signal: the PRICE is the FIRST number, credits are subsequent
-    // (and usually 40-100 range)
-    var price = nums[0].val;
-    var caCredit = nums.length >= 2 ? nums[1].val : null;
-    var nonCaCredit = nums.length >= 3 ? nums[2].val : null;
+    // The June Price is the FIRST $-number that appears AFTER the specs token.
+    // This is the structural anchor — credits come after the price.
+    var specsEndIdx = specMatch.index + specMatch[0].length;
+    var dollarsAfterSpecs = dollarNums.filter(function(d){ return d.idx >= specsEndIdx; });
+    if(!dollarsAfterSpecs.length){
+      // All $-numbers were BEFORE the specs — unusual layout, refuse to guess
+      result.skippedLines.push({line: line, reason: 'No $-price found after specs column'});
+      return;
+    }
 
-    rows.push({
+    var price = dollarsAfterSpecs[0].val;
+    // Sanity check: phone prices should be $20-$2000
+    if(price < 20 || price > 2000){
+      result.skippedLines.push({line: line, reason: 'Detected price $'+price+' out of expected range ($20-$2000)'});
+      return;
+    }
+
+    // Credits: next two $-numbers after the price (each may legitimately be $0)
+    var caCredit    = dollarsAfterSpecs.length >= 2 ? dollarsAfterSpecs[1].val : null;
+    var nonCaCredit = dollarsAfterSpecs.length >= 3 ? dollarsAfterSpecs[2].val : null;
+
+    // The model name = everything BEFORE the network token. Clean it up.
+    var modelRaw = line.substring(0, netMatch.index).trim();
+    // Strip trailing punctuation
+    modelRaw = modelRaw.replace(/[\s\$,\-:.]+$/, '').trim();
+    if(modelRaw.length < 3 || !/[a-zA-Z]/.test(modelRaw)){
+      result.skippedLines.push({line: line, reason: 'Model name too short or no letters'});
+      return;
+    }
+
+    // Normalize the network value to the canonical token from the match
+    var network = netMatch[1].replace(/\s+/g,'');
+    if(/orange\/sky/i.test(network)) network = 'Sky/Orange';
+
+    // Screen size: a decimal number between the network and the specs (e.g., 5.5, 6.6)
+    var screenSection = line.substring(netMatch.index + netMatch[0].length, specMatch.index);
+    var screenMatch = screenSection.match(/(\d+\.\d)/);
+    var screen = screenMatch ? screenMatch[1] : '';
+
+    // Specs: as-found, normalized whitespace
+    var specs = specMatch[1].replace(/\s+/g,'');
+
+    result.rows.push({
       model: modelRaw,
+      network: network,
+      screen: screen,
+      specs: specs,
       price: price,
-      caTribalCredit: (caCredit !== null && caCredit >= 30 && caCredit <= 200) ? caCredit : null,
-      nonCACredit:    (nonCaCredit !== null && nonCaCredit >= 30 && nonCaCredit <= 200) ? nonCaCredit : null,
+      caTribalCredit: (caCredit !== null && caCredit >= 0 && caCredit <= 500) ? caCredit : null,
+      nonCACredit:    (nonCaCredit !== null && nonCaCredit >= 0 && nonCaCredit <= 500) ? nonCaCredit : null,
       sourceLine: line
     });
   });
 
-  return rows;
+  return result;
 }
 
 // Diff parsed rows against the live pricelist. Returns:
@@ -42988,6 +43052,28 @@ function _gmPdfRenderPreviewStep(st){
   }
   h += renderRow('⚪ Unchanged (will skip)',  d.unchanged, '#6b7280', false);
 
+  // ── Calvin 2026-06-03 v2: skipped lines disclosure ──
+  // Show every line that LOOKED like it might have pricing data but didn't
+  // pass the strict device-row test. Lets the user verify the parser didn't
+  // miss a real device row by being too strict.
+  if(st.skippedLines && st.skippedLines.length){
+    h += '<div style="margin-top:24px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:14px 18px">';
+    h += '<details><summary style="cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#6b7280;letter-spacing:1px;text-transform:uppercase;font-weight:700">🔍 '+st.skippedLines.length+' lines were skipped (click to review) — verify nothing important was missed</summary>';
+    h += '<div style="margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:#6b7280;line-height:1.5">Lines below were SKIPPED because they didn\'t pass the strict device-row test (needed Network + Specs + $Price). This list lets you confirm the parser didn\'t accidentally skip a real device row.</div>';
+    h += '<table style="width:100%;border-collapse:collapse;margin-top:10px;font-family:Barlow Condensed,sans-serif;font-size:.74rem">';
+    h += '<thead><tr style="background:white;border-bottom:1px solid #e5e7eb">';
+    h += '<th style="text-align:left;padding:6px 10px;font-size:.62rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">Skipped Line</th>';
+    h += '<th style="text-align:left;padding:6px 10px;font-size:.62rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">Reason</th>';
+    h += '</tr></thead><tbody>';
+    st.skippedLines.forEach(function(sl){
+      h += '<tr style="border-bottom:1px solid #f3f4f6">';
+      h += '<td style="padding:6px 10px;color:#0B1E3F;font-family:monospace;font-size:.72rem;max-width:380px;word-break:break-word">'+escHtml(sl.line)+'</td>';
+      h += '<td style="padding:6px 10px;color:#6b7280;font-size:.72rem">'+escHtml(sl.reason)+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></details></div>';
+  }
+
   // Action buttons
   h += '<div style="margin-top:24px;padding-top:18px;border-top:1px solid #e5e7eb;display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">';
   h += '<button onclick="_gmPdfCloseModal()" style="background:white;border:1px solid #d1d5db;color:#6b7280;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 22px;border-radius:6px;cursor:pointer">Cancel</button>';
@@ -43073,15 +43159,17 @@ async function _gmPdfHandleFilePicked(evt){
       return;
     }
     var parsed = gmPdfParseRows(text);
-    if(!parsed.length){
+    var rows = parsed.rows || [];
+    st.skippedLines = parsed.skippedLines || [];
+    if(!rows.length){
       st.error = 'No pricelist rows could be detected.';
-      st.errorDetail = 'Read '+text.length+' characters of text via '+(ex.sourceMethod||'?')+' but found 0 model+price rows matching the expected pattern (model name followed by a number $20-$2000). The pricelist format may be different from expected, or the OCR may have misread numbers. You can try a clearer photo, a different file, or add devices manually using "+ Add Device".';
+      st.errorDetail = 'Read '+text.length+' characters of text via '+(ex.sourceMethod||'?')+' but found 0 valid device rows (need Network + Specs + $Price on the same line). The pricelist format may be different from expected, or the OCR may have misread the structure. You can try a clearer photo, a different file, or add devices manually using "+ Add Device".';
       st.processing = false;
       _gmPdfRenderModal();
       return;
     }
-    st.parsed = parsed;
-    st.diff = gmPdfDiff(parsed, st.effectiveDate);
+    st.parsed = rows;
+    st.diff = gmPdfDiff(rows, st.effectiveDate);
     st.step = 'preview';
     st.processing = false;
     _gmPdfRenderModal();
@@ -43102,6 +43190,7 @@ function _gmPdfBackToPick(){
   st.extracted = null;
   st.parsed = null;
   st.diff = null;
+  st.skippedLines = [];
   st.tombstoneSet = {};
   _gmPdfRenderModal();
 }
