@@ -11100,6 +11100,8 @@ function canAccess(u, area){
     case 'form-builder':     return (typeof canEditForms === 'function') ? canEditForms(u) : false;
     // Calvin 2026-06-03: Document Assignments dashboard — same gate as form-builder
     case 'doc-assignments':  return (typeof canEditForms === 'function') ? canEditForms(u) : false;
+    // Calvin 2026-06-03: Background Check Queue — office staff (Onboarding, HR, admin, Owner)
+    case 'bg-check-queue':   return isOfficeRole(u);
     case 'meeting-hosts':    return false;
 
     // ── AGENT MANAGEMENT ── Onboarding Dept is the designated gatekeeper.
@@ -19171,6 +19173,263 @@ if(typeof window !== 'undefined'){
 }
 
 // ════════════════════════════════════════════════════════════════════════
+//  BACKGROUND CHECK SYSTEM — Calvin Williams 2026-06-03
+//
+//  Each agent has a `bgChecks` object on their record:
+//    agent.bgChecks = {
+//      'Gen Mobile':  {status:'pending'|'passed'|'failed', decidedAt:ISO,
+//                      decidedById:n, decidedByName:s, reason:string,
+//                      notes:string, history:[ {ts, byId, byName, from, to, reason} ]},
+//      'TruConnect':  {...},
+//      ...
+//    }
+//
+//  Flow:
+//   1. Office adds the agent to the BG check queue per campaign (status:'pending')
+//   2. Office reviews actual BG result and clicks Pass or Fail on the queue
+//   3. On PASS: agent gets bgcheck.passed email listing approved campaigns;
+//      a flag is set so next login auto-shows the celebration modal
+//   4. On FAIL: agent gets bgcheck.failed email (only when ALL pending
+//      checks at the time of decision come back failed for this flip).
+//      Per Calvin spec, a partial-fail still sends a fail email scoped to
+//      ONLY the failed campaigns (multiple emails may go out if mixed).
+//   5. Reversing a decision is allowed with confirmation + audit log entry
+//      AND fires a bgcheck.status_changed email to the agent.
+// ════════════════════════════════════════════════════════════════════════
+
+// Ensure the bgChecks object exists for an agent. Returns the object.
+function bgEnsure(agent){
+  if(!agent) return null;
+  if(!agent.bgChecks || typeof agent.bgChecks !== 'object') agent.bgChecks = {};
+  return agent.bgChecks;
+}
+
+// Get every campaign+agent combination currently pending review.
+// Used by the queue panel. Returns: [{agent, campaign, since}, ...]
+function bgListPending(){
+  var out = [];
+  (DB.agents || []).forEach(function(a){
+    if(!a || !a.active) return;
+    var bc = a.bgChecks || {};
+    Object.keys(bc).forEach(function(camp){
+      if(bc[camp] && bc[camp].status === 'pending'){
+        out.push({agent:a, campaign:camp, since:bc[camp].submittedAt || bc[camp].createdAt || null});
+      }
+    });
+  });
+  // Sort: oldest pending first
+  out.sort(function(x, y){
+    return String(x.since||'').localeCompare(String(y.since||''));
+  });
+  return out;
+}
+
+// Get every agent who has ANY bgCheck record (any status) — used by profile view + queue archive
+function bgListAll(){
+  var out = [];
+  (DB.agents || []).forEach(function(a){
+    if(!a || !a.active) return;
+    if(a.bgChecks && Object.keys(a.bgChecks).length){
+      out.push(a);
+    }
+  });
+  return out;
+}
+
+// Submit an agent for BG check for a given campaign. Idempotent — if already
+// pending for that campaign, no-op. If previously decided, requires confirm.
+function bgSubmit(agentId, campaign){
+  var u = DB.current || {};
+  var agent = (DB.agents || []).find(function(a){ return a && a.id === agentId; });
+  if(!agent){ console.warn('[bgSubmit] no agent'); return false; }
+  var bc = bgEnsure(agent);
+  if(bc[campaign] && bc[campaign].status === 'pending') return false; // already pending
+  bc[campaign] = {
+    status:        'pending',
+    submittedAt:   new Date().toISOString(),
+    submittedById: u.id || null,
+    submittedByName: u.name || '',
+    decidedAt:     null,
+    decidedById:   null,
+    decidedByName: '',
+    reason:        '',
+    notes:         '',
+    history:       (bc[campaign] && bc[campaign].history) || []
+  };
+  bc[campaign].history.push({
+    ts:     new Date().toISOString(),
+    byId:   u.id || null,
+    byName: u.name || '',
+    from:   'none',
+    to:     'pending',
+    reason: 'submitted for review'
+  });
+  // Persist
+  try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
+  try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
+  return true;
+}
+
+// Decide a BG check (passed or failed). reason/notes optional. Returns the
+// updated entry. Fires the appropriate email.
+// allowFlip: if false, refuses to flip an already-decided check unless
+// transitioning from 'pending' to a decision. Defaults true (with audit).
+function bgDecide(agentId, campaign, newStatus, opts){
+  opts = opts || {};
+  if(['passed','failed'].indexOf(newStatus) < 0){ console.warn('[bgDecide] bad status'); return null; }
+  var u = DB.current || {};
+  var agent = (DB.agents || []).find(function(a){ return a && a.id === agentId; });
+  if(!agent){ return null; }
+  var bc = bgEnsure(agent);
+  // Initialize if missing — treat as if it was just-pending
+  if(!bc[campaign]) bgSubmit(agentId, campaign);
+  var entry = bc[campaign];
+  var oldStatus = entry.status;
+  // Record history
+  if(!Array.isArray(entry.history)) entry.history = [];
+  entry.history.push({
+    ts:     new Date().toISOString(),
+    byId:   u.id || null,
+    byName: u.name || '',
+    from:   oldStatus,
+    to:     newStatus,
+    reason: opts.reason || ''
+  });
+  entry.status        = newStatus;
+  entry.decidedAt     = new Date().toISOString();
+  entry.decidedById   = u.id || null;
+  entry.decidedByName = u.name || '';
+  if(opts.reason) entry.reason = opts.reason;
+  if(opts.notes)  entry.notes  = opts.notes;
+
+  // If this is a REVERSAL (was decided, now flipping to different decision),
+  // fire a status_changed email. Otherwise fire the appropriate primary email.
+  var isReversal = (oldStatus === 'passed' || oldStatus === 'failed') && oldStatus !== newStatus;
+
+  if(isReversal){
+    // The reversal email lets the agent know things changed (avoids being blindsided)
+    if(typeof notifyByEmail === 'function' && agent.email){
+      notifyByEmail({
+        toAgent: {id: agent.id, name: agent.name, email: agent.email},
+        eventType: 'bgcheck.status_changed',
+        payload: {
+          firstName:    (agent.name||'').split(' ')[0],
+          fullName:     agent.name,
+          campaignName: campaign,
+          oldStatus:    oldStatus,
+          newStatus:    newStatus,
+          reason:       opts.reason || '',
+          appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        }
+      }).catch(function(){});
+    }
+  } else if(newStatus === 'passed'){
+    bgFirePassedEmail(agent, [campaign]);
+    // Flag so next login shows the celebration modal
+    agent.bgPassedModalPending = true;
+  } else if(newStatus === 'failed'){
+    bgFireFailedEmail(agent, [campaign], opts.reason);
+  }
+
+  // Persist
+  try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
+  try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
+
+  return entry;
+}
+
+// Mark-all helper: apply the same decision (pass or fail) to multiple
+// campaigns at once. Sends ONE email per decision-type listing all affected
+// campaigns, so the agent gets the cleanest possible message.
+function bgDecideMany(agentId, campaigns, newStatus, opts){
+  opts = opts || {};
+  if(['passed','failed'].indexOf(newStatus) < 0) return 0;
+  if(!Array.isArray(campaigns) || !campaigns.length) return 0;
+  var u = DB.current || {};
+  var agent = (DB.agents || []).find(function(a){ return a && a.id === agentId; });
+  if(!agent) return 0;
+  var bc = bgEnsure(agent);
+  var changedCamps = [];
+  campaigns.forEach(function(camp){
+    if(!bc[camp]) bgSubmit(agentId, camp);
+    var entry = bc[camp];
+    var oldStatus = entry.status;
+    if(!Array.isArray(entry.history)) entry.history = [];
+    entry.history.push({
+      ts:     new Date().toISOString(),
+      byId:   u.id || null,
+      byName: u.name || '',
+      from:   oldStatus,
+      to:     newStatus,
+      reason: opts.reason || ''
+    });
+    entry.status        = newStatus;
+    entry.decidedAt     = new Date().toISOString();
+    entry.decidedById   = u.id || null;
+    entry.decidedByName = u.name || '';
+    if(opts.reason) entry.reason = opts.reason;
+    changedCamps.push(camp);
+  });
+  if(!changedCamps.length) return 0;
+  // Fire ONE consolidated email
+  if(newStatus === 'passed'){
+    bgFirePassedEmail(agent, changedCamps);
+    agent.bgPassedModalPending = true;
+  } else {
+    bgFireFailedEmail(agent, changedCamps, opts.reason);
+  }
+  try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
+  try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
+  return changedCamps.length;
+}
+
+// Send the 'passed' email listing the approved campaigns
+function bgFirePassedEmail(agent, campaigns){
+  if(!agent || !agent.email) return;
+  if(typeof notifyByEmail !== 'function') return;
+  notifyByEmail({
+    toAgent: {id: agent.id, name: agent.name, email: agent.email},
+    eventType: 'bgcheck.passed',
+    payload: {
+      firstName: (agent.name||'').split(' ')[0],
+      fullName:  agent.name,
+      campaigns: campaigns,
+      campaignsList: campaigns.join(', '),
+      appUrl:    (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+    }
+  }).catch(function(e){ console.warn('[bgFirePassedEmail] failed:', e); });
+}
+
+// Send the 'failed' email — professional, mentions other opportunities
+function bgFireFailedEmail(agent, campaigns, reason){
+  if(!agent || !agent.email) return;
+  if(typeof notifyByEmail !== 'function') return;
+  notifyByEmail({
+    toAgent: {id: agent.id, name: agent.name, email: agent.email},
+    eventType: 'bgcheck.failed',
+    payload: {
+      firstName: (agent.name||'').split(' ')[0],
+      fullName:  agent.name,
+      campaigns: campaigns,
+      campaignsList: campaigns.join(', '),
+      reason:    reason || '',
+      appUrl:    (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+    }
+  }).catch(function(e){ console.warn('[bgFireFailedEmail] failed:', e); });
+}
+
+if(typeof window !== 'undefined'){
+  window.bgEnsure = bgEnsure;
+  window.bgListPending = bgListPending;
+  window.bgListAll = bgListAll;
+  window.bgSubmit = bgSubmit;
+  window.bgDecide = bgDecide;
+  window.bgDecideMany = bgDecideMany;
+  window.bgFirePassedEmail = bgFirePassedEmail;
+  window.bgFireFailedEmail = bgFireFailedEmail;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 //  END realtime + conflict + notify block
 // ════════════════════════════════════════════════════════════════════════
 
@@ -26252,6 +26511,14 @@ function doLogin(){
     sendFirstLoginNotification(found);
   }
   launchBO(found);
+  // ── Calvin 2026-06-03: BG-check passed welcome modal ──
+  // If this agent passed a background check and hasn't been onboarded yet for
+  // that campaign, show a celebration modal on login + auto-navigate to
+  // My Documents so they're nudged to start the packet. The flag is cleared
+  // once shown (one-shot per pass event).
+  if(found && found.bgPassedModalPending && !isOfficeRole(found) && !isOwner(found)){
+    setTimeout(function(){ try { bgShowPassedWelcomeModal(found); } catch(e){ console.warn('[doLogin] bg passed modal failed:', e); } }, 1200);
+  }
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   loadNotifications(); setTimeout(renderNotifBell, 100); setTimeout(function(){ if(typeof renderSyncBell==='function') renderSyncBell(); }, 100); setTimeout(showLoginSplash, 950);
   loadNotifications(); loadCallRoomHosts(); loadImpersonationGrants(); loadPayrollAccess(); loadPayrollUploadAccess(); loadPayrollWeeks(); loadPayrollDebtLedger(); loadCompPlans(); loadOnboardData(); loadStore(); gmPricelistLoad(); makenzieBonusLoad(); _payrollViewLoad(); setTimeout(renderNotifBell,100); setTimeout(function(){ if(typeof renderSyncBell==='function') renderSyncBell(); },100); setTimeout(showLoginSplash,950); setTimeout(startCallAlertPolling, 2000);
@@ -26806,6 +27073,10 @@ function buildNav(u){
     // Calvin 2026-06-03: Document Assignments dashboard — office staff who can edit forms
     if(canAccess(u,'doc-assignments')){
       obItems += boDropBtn('doc-assignments','📌 Document Assignments');
+    }
+    // Calvin 2026-06-03: Background Check Queue — office staff
+    if(canAccess(u,'bg-check-queue')){
+      obItems += boDropBtn('bg-check-queue','🔍 Background Check Queue');
     }
     // Onboarding Packages — visible to managers (Owner/Admin/Onboarding)
     if(typeof canManageOnboarding === 'function' && canManageOnboarding(u)){
@@ -28247,7 +28518,7 @@ function gotoPanel(id, params){
     'supply-mgmt':panelSupplyMgmt,'pending-transfers':panelPendingTransfers,
     'agent-codes':panelAgentCodes,'goal-settings':panelGoalSettings,
     'form-builder':panelFormBuilder,announce:panelAnnounce,
-    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,
+    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,'bg-check-queue':panelBgCheckQueue,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
     agents:panelAgents,'ll-teams':panelMarketsAdmin,
@@ -38580,9 +38851,12 @@ function panelOnboarding(){
   var h=panelHeader('📋 Onboarding Department');
   // Calvin 2026-06-03: Edit Start Dates entry point — office-only, drives anniversaries
   if(isOfficeRole(u)){
-    h += '<div style="margin-bottom:14px;display:flex;gap:10px;flex-wrap:wrap">';
+    h += '<div style="margin-bottom:14px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">';
     h += '<button onclick="gotoPanel(\'edit-start-dates\')" style="background:#0ea5e9;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">📅 Edit Start Dates →</button>';
-    h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);align-self:center">Set official start dates so the anniversary recognition system works for everyone.</span>';
+    // Calvin 2026-06-03: BG Check Queue quick-action — shows pending count
+    var bgPendingCount = (typeof bgListPending === 'function') ? bgListPending().length : 0;
+    h += '<button onclick="gotoPanel(\'bg-check-queue\')" style="background:'+(bgPendingCount?'#dc2626':'#6b7280')+';color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">🔍 Background Checks'+(bgPendingCount?' <span style="background:white;color:#dc2626;padding:1px 8px;border-radius:100px;font-size:.7rem;margin-left:4px">'+bgPendingCount+'</span>':'')+'</button>';
+    h += '<button onclick="gotoPanel(\'doc-assignments\')" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">📌 Doc Assignments →</button>';
     h += '</div>';
   }
   var allSales=DB.agents.filter(function(a){return a.active&&isSalesRole(a);});
@@ -38675,6 +38949,43 @@ function panelOnboarding(){
             h+='<span style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;font-weight:700;color:#0891b2">📝 '+sd+'/3 Steps</span>';
           }
           h+='</div>';
+
+          // ── Calvin 2026-06-03: Background Check status row (office-visible) ──
+          // Shows current BG status for this campaign with Pass/Fail/Reset buttons.
+          // Same logic as the BG Queue panel but available inline on the agent
+          // profile. Office-only — agent never sees this row.
+          if(isOfficeRole(u)){
+            var bgEntry = (a.bgChecks && a.bgChecks[camp]) || null;
+            var bgStatus = bgEntry ? bgEntry.status : null;
+            var bgChip = '';
+            var bgChipBg = '';
+            var bgChipCol = '';
+            if(bgStatus === 'passed'){ bgChip = '✓ BG Passed'; bgChipBg = 'rgba(22,163,74,.1)'; bgChipCol = '#16a34a'; }
+            else if(bgStatus === 'failed'){ bgChip = '✗ BG Failed'; bgChipBg = 'rgba(220,38,38,.1)'; bgChipCol = '#dc2626'; }
+            else if(bgStatus === 'pending'){ bgChip = '⏳ BG Pending Review'; bgChipBg = 'rgba(217,119,6,.1)'; bgChipCol = '#d97706'; }
+            else { bgChip = '— BG Not Submitted'; bgChipBg = 'rgba(0,0,0,.04)'; bgChipCol = 'var(--muted)'; }
+
+            h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;padding:8px 10px;background:'+bgChipBg+';border:1px solid '+bgChipCol+';border-radius:5px;flex-wrap:wrap">';
+            h+='<span style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;font-weight:700;color:'+bgChipCol+';letter-spacing:1px">🔍 '+bgChip+'</span>';
+            if(bgEntry && bgEntry.decidedByName){
+              h+='<span style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted)">by '+escHtml(bgEntry.decidedByName)+' '+(bgEntry.decidedAt?new Date(bgEntry.decidedAt).toLocaleDateString():'')+'</span>';
+            }
+            h+='<div style="margin-left:auto;display:flex;gap:5px">';
+            if(!bgStatus){
+              h+='<button onclick="bgInlineSubmit('+a.id+',\''+escHtml(camp).replace(/\\\'/g,"\\'")+'\')" style="background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer">Submit for BG Check</button>';
+            } else {
+              if(bgStatus !== 'passed'){
+                h+='<button onclick="bgDecideClick('+a.id+',\''+escHtml(camp).replace(/\\\'/g,"\\'")+'\',\'passed\')" style="background:#16a34a;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer">✓ Pass</button>';
+              }
+              if(bgStatus !== 'failed'){
+                h+='<button onclick="bgDecideClick('+a.id+',\''+escHtml(camp).replace(/\\\'/g,"\\'")+'\',\'failed\')" style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer">✗ Fail</button>';
+              }
+              if(bgEntry && Array.isArray(bgEntry.history) && bgEntry.history.length){
+                h+='<button onclick="bgOpenAgentDetail('+a.id+')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;padding:5px 10px;border-radius:4px;cursor:pointer">History</button>';
+              }
+            }
+            h+='</div></div>';
+          }
 
           if(cs.packetSentAt){
             var sLabels={1:'1099 Contractor Agreement',2:'Company Policy & Compliance',3:'Banking Information'};
@@ -38910,6 +39221,356 @@ if(typeof window !== 'undefined'){
   window.esdRender = esdRender;
   window.esdSave = esdSave;
   window.esdShowAudit = esdShowAudit;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  BACKGROUND CHECK QUEUE PANEL — Calvin Williams 2026-06-03
+//
+//  Office-staff dashboard listing every agent with at least one pending
+//  background check, grouped by agent. Each campaign row gets Pass/Fail
+//  buttons; agents with >1 pending get a "Mark All" toggle.
+//
+//  Includes a "Submit New" picker so office can add an agent+campaign to
+//  the queue if it's not already there (e.g., onboarded an agent and
+//  realized they need a BG check for an additional campaign).
+//
+//  Below the pending queue: "Decided" archive with optional filter, so
+//  history is visible without leaving the panel.
+// ════════════════════════════════════════════════════════════════════════
+function panelBgCheckQueue(){
+  var u = DB.current;
+  if(!isOfficeRole(u)){
+    return panelHeader('🔒 Background Check Queue') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Office staff only (Owner, admin, HR, Onboarding, Payroll, Inventory).</div></div>';
+  }
+  var h = panelHeader('🔍 Background Check Queue');
+  h += '<div style="background:rgba(220,38,38,.06);border:1px solid rgba(220,38,38,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>Review and decide background checks per campaign.</strong> ';
+  h += 'A Pass auto-emails the agent + auto-prompts them at next login to begin onboarding. A Fail sends a professional turn-down email mentioning future BG-free opportunities. ';
+  h += 'Decisions can be reversed (with confirmation + audit log).';
+  h += '</div>';
+
+  // ── Submit New BG Check (add agent + campaign) ──
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">➕ Submit Agent for Background Check</div></div>';
+  h += '<div style="padding:14px 18px;display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end">';
+  h += '<div><label class="f-label">Agent</label><select id="bgSubmitAgent" class="f-select">';
+  var agents = (DB.agents||[]).filter(function(a){ return a && a.active; }).sort(function(x,y){ return String(x.name||'').localeCompare(String(y.name||'')); });
+  h += '<option value="">-- Select agent --</option>';
+  agents.forEach(function(a){
+    h += '<option value="'+a.id+'">'+escHtml(a.name)+' &middot; '+escHtml(a.role||'')+'</option>';
+  });
+  h += '</select></div>';
+  h += '<div><label class="f-label">Campaign</label><select id="bgSubmitCamp" class="f-select">';
+  var allCamps = ['Gen Mobile','TruConnect','Assurance','Excess','Astound','Chuzo','ACA'];
+  if(typeof WMAM_CAMPAIGNS !== 'undefined' && Array.isArray(WMAM_CAMPAIGNS)){
+    WMAM_CAMPAIGNS.forEach(function(c){
+      if(c && c.active && c.name && allCamps.indexOf(c.name) < 0) allCamps.push(c.name);
+    });
+  }
+  h += '<option value="">-- Select campaign --</option>';
+  allCamps.forEach(function(c){
+    h += '<option value="'+escHtml(c)+'">'+escHtml(c)+'</option>';
+  });
+  h += '</select></div>';
+  h += '<button onclick="bgQueueSubmit()" class="btn-fire" style="padding:10px 22px;font-size:.78rem">Submit →</button>';
+  h += '</div></div>';
+
+  // ── Pending queue ──
+  var pending = bgListPending();
+  // Group by agent for clean display
+  var byAgent = {};
+  pending.forEach(function(p){
+    if(!byAgent[p.agent.id]) byAgent[p.agent.id] = {agent:p.agent, items:[]};
+    byAgent[p.agent.id].items.push(p);
+  });
+  var groups = Object.keys(byAgent).map(function(k){ return byAgent[k]; });
+
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:2px;color:var(--brown);margin:18px 0 10px">⏳ Pending Review ('+pending.length+')</div>';
+  if(!pending.length){
+    h += '<div class="bo-card"><div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No pending background checks. Submit one above when needed.</div></div>';
+  } else {
+    groups.forEach(function(grp){
+      var a = grp.agent;
+      var multi = grp.items.length > 1;
+      h += '<div class="bo-card" style="margin-bottom:12px;border-left:4px solid #d97706">';
+      h += '<div class="bo-card-head"><div>'
+        + '<div class="bo-card-title">'+escHtml(a.name)+' <span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);font-weight:400;margin-left:6px">'+escHtml(a.role||'')+'</span></div>'
+        + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);margin-top:2px">'+escHtml(a.email||'(no email on file)')+' &middot; '+escHtml(a.phone||'')+'</div>'
+        + '</div></div>';
+      h += '<div style="padding:14px 18px">';
+      // Per-campaign rows
+      grp.items.forEach(function(item){
+        var sinceLabel = item.since ? new Date(item.since).toLocaleDateString() : '';
+        h += '<div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--border);font-family:Barlow Condensed,sans-serif" '+(multi?'class="bg-row-multi" data-aid="'+a.id+'" data-camp="'+escHtml(item.campaign)+'"':'')+'>';
+        if(multi){
+          h += '<input type="checkbox" class="bg-row-cb" checked data-aid="'+a.id+'" data-camp="'+escHtml(item.campaign)+'" style="width:16px;height:16px;cursor:pointer">';
+        }
+        h += '<div style="flex:1;font-weight:700;color:var(--brown);font-size:.92rem">'+escHtml(item.campaign)+'</div>';
+        h += '<div style="font-size:.7rem;color:var(--muted);margin-right:8px">Submitted '+escHtml(sinceLabel)+'</div>';
+        h += '<button onclick="bgDecideClick('+a.id+',\''+escHtml(item.campaign).replace(/'/g,"\\'")+'\',\'passed\')" style="background:#16a34a;color:white;border:none;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700">✓ Pass</button>';
+        h += '<button onclick="bgDecideClick('+a.id+',\''+escHtml(item.campaign).replace(/'/g,"\\'")+'\',\'failed\')" style="background:#dc2626;color:white;border:none;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700">✗ Fail</button>';
+        h += '</div>';
+      });
+      if(multi){
+        h += '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
+        h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:1.5px">Mark All Checked:</span>';
+        h += '<button onclick="bgDecideManyClick('+a.id+',\'passed\')" style="background:#16a34a;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700">✓ Pass All</button>';
+        h += '<button onclick="bgDecideManyClick('+a.id+',\'failed\')" style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700">✗ Fail All</button>';
+        h += '</div>';
+      }
+      h += '</div></div>';
+    });
+  }
+
+  // ── Decided archive ──
+  var decidedAgents = bgListAll().filter(function(a){
+    var bc = a.bgChecks || {};
+    return Object.keys(bc).some(function(c){ return bc[c].status === 'passed' || bc[c].status === 'failed'; });
+  });
+  if(decidedAgents.length){
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:2px;color:var(--muted);margin:24px 0 10px">📋 Decided Archive ('+decidedAgents.length+' agent(s))</div>';
+    h += '<div class="bo-card"><div style="padding:0">';
+    h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif"><thead><tr style="background:var(--offwhite);border-bottom:2px solid var(--border)">';
+    h += '<th style="text-align:left;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Agent</th>';
+    h += '<th style="text-align:left;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Campaigns</th>';
+    h += '<th style="text-align:right;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Actions</th>';
+    h += '</tr></thead><tbody>';
+    decidedAgents.forEach(function(a){
+      var bc = a.bgChecks || {};
+      var chips = Object.keys(bc).map(function(c){
+        var st = bc[c].status;
+        var color = st==='passed' ? '#16a34a' : st==='failed' ? '#dc2626' : '#d97706';
+        var bg = st==='passed' ? 'rgba(22,163,74,.1)' : st==='failed' ? 'rgba(220,38,38,.1)' : 'rgba(217,119,6,.1)';
+        var icon = st==='passed' ? '✓' : st==='failed' ? '✗' : '⏳';
+        return '<span style="display:inline-block;margin:2px 4px 2px 0;background:'+bg+';color:'+color+';font-size:.66rem;font-weight:700;padding:3px 9px;border-radius:100px;letter-spacing:1px;text-transform:uppercase">'+icon+' '+escHtml(c)+'</span>';
+      }).join('');
+      h += '<tr style="border-bottom:1px solid var(--border)">';
+      h += '<td style="padding:10px 14px;font-weight:700;color:var(--brown)">'+escHtml(a.name)+'</td>';
+      h += '<td style="padding:10px 14px">'+chips+'</td>';
+      h += '<td style="padding:10px 14px;text-align:right"><button onclick="bgOpenAgentDetail('+a.id+')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:5px;cursor:pointer">📋 Details</button></td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  return h;
+}
+
+// ── Click handlers ──
+
+function bgQueueSubmit(){
+  var aid = parseInt((document.getElementById('bgSubmitAgent')||{value:''}).value, 10);
+  var camp = (document.getElementById('bgSubmitCamp')||{value:''}).value;
+  if(!aid || !camp){ alert('Pick both an agent and a campaign.'); return; }
+  var ok = bgSubmit(aid, camp);
+  if(!ok){
+    var agent = (DB.agents||[]).find(function(a){ return a && a.id === aid; });
+    var existing = agent && agent.bgChecks && agent.bgChecks[camp];
+    if(existing && existing.status === 'pending'){
+      alert('Already pending for that agent/campaign.');
+    } else {
+      alert('Could not submit. Check agent/campaign selection.');
+    }
+    return;
+  }
+  alert('✓ Submitted for BG check.');
+  gotoPanel('bg-check-queue');
+}
+
+function bgDecideClick(agentId, campaign, newStatus){
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  if(!agent) return;
+  var bc = agent.bgChecks && agent.bgChecks[campaign];
+  var oldStatus = bc ? bc.status : 'pending';
+  // Reversal needs explicit confirm
+  if((oldStatus === 'passed' || oldStatus === 'failed') && oldStatus !== newStatus){
+    var msg = 'REVERSE the existing decision?\n\n' + agent.name + ' / ' + campaign + '\n' +
+              oldStatus.toUpperCase() + ' → ' + newStatus.toUpperCase() + '\n\n' +
+              'A status-changed email will be sent to the agent and the change will be recorded in the audit log.';
+    if(!confirm(msg)) return;
+  } else {
+    // First decision still confirms
+    var emailWord = newStatus === 'passed' ? 'PASS' : 'FAIL';
+    var emailNote = newStatus === 'passed'
+      ? 'They will receive a congratulations email + be auto-prompted at next login to begin onboarding.'
+      : 'They will receive a professional turn-down email mentioning future BG-free opportunities.';
+    if(!confirm(emailWord + ' background check?\n\n' + agent.name + ' / ' + campaign + '\n\n' + emailNote)) return;
+  }
+  var reason = '';
+  if(newStatus === 'failed'){
+    reason = prompt('Internal reason / notes (optional, not shown to agent):', '') || '';
+  }
+  bgDecide(agentId, campaign, newStatus, {reason: reason});
+  gotoPanel('bg-check-queue');
+}
+
+function bgDecideManyClick(agentId, newStatus){
+  var rows = Array.prototype.slice.call(document.querySelectorAll('.bg-row-cb'));
+  var camps = [];
+  rows.forEach(function(cb){
+    if(cb.checked && parseInt(cb.getAttribute('data-aid'), 10) === agentId){
+      camps.push(cb.getAttribute('data-camp'));
+    }
+  });
+  if(!camps.length){ alert('Check at least one campaign first.'); return; }
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  if(!agent) return;
+  var emailWord = newStatus === 'passed' ? 'PASS' : 'FAIL';
+  var msg = emailWord + ' background check for ALL '+camps.length+' selected campaign(s)?\n\n' +
+            agent.name + '\n' + camps.join(', ') + '\n\n' +
+            'ONE consolidated email will be sent listing the affected campaigns.';
+  if(!confirm(msg)) return;
+  var reason = '';
+  if(newStatus === 'failed'){
+    reason = prompt('Internal reason / notes (optional, not shown to agent):', '') || '';
+  }
+  bgDecideMany(agentId, camps, newStatus, {reason: reason});
+  gotoPanel('bg-check-queue');
+}
+
+function bgOpenAgentDetail(agentId){
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  if(!agent) return;
+  var bc = agent.bgChecks || {};
+  var msg = 'BACKGROUND CHECK STATUS — ' + agent.name + '\n\n';
+  Object.keys(bc).forEach(function(c){
+    var e = bc[c];
+    msg += c + ': ' + (e.status||'pending').toUpperCase() + '\n';
+    if(e.decidedAt) msg += '  Decided ' + new Date(e.decidedAt).toLocaleString() + ' by ' + (e.decidedByName||'?') + '\n';
+    if(e.reason) msg += '  Reason: ' + e.reason + '\n';
+    if(Array.isArray(e.history) && e.history.length){
+      msg += '  History (' + e.history.length + ' entry):\n';
+      e.history.slice().reverse().forEach(function(h){
+        msg += '    ' + new Date(h.ts).toLocaleString() + ' — ' + (h.from||'?') + '→' + h.to + ' by ' + (h.byName||'?') + (h.reason?' ('+h.reason+')':'') + '\n';
+      });
+    }
+    msg += '\n';
+  });
+  alert(msg);
+}
+
+if(typeof window !== 'undefined'){
+  window.panelBgCheckQueue = panelBgCheckQueue;
+  window.bgQueueSubmit = bgQueueSubmit;
+  window.bgDecideClick = bgDecideClick;
+  window.bgDecideManyClick = bgDecideManyClick;
+  window.bgOpenAgentDetail = bgOpenAgentDetail;
+  window.bgInlineSubmit = bgInlineSubmit;
+  window.bgShowPassedWelcomeModal = bgShowPassedWelcomeModal;
+  window.bgBeginOnboardingFromModal = bgBeginOnboardingFromModal;
+}
+
+// ── Calvin 2026-06-03: BG-passed welcome modal ──
+// Shown once after the agent logs in if they have agent.bgPassedModalPending
+// set true (which bgDecide sets when status flips to 'passed'). Lists which
+// campaigns they were approved for, has a "Begin Onboarding →" button that
+// clears the flag + auto-navigates to my-documents.
+function bgShowPassedWelcomeModal(agent){
+  if(!agent) return;
+  // Find which campaigns are passed
+  var passedCamps = [];
+  if(agent.bgChecks && typeof agent.bgChecks === 'object'){
+    Object.keys(agent.bgChecks).forEach(function(c){
+      if(agent.bgChecks[c] && agent.bgChecks[c].status === 'passed') passedCamps.push(c);
+    });
+  }
+  if(!passedCamps.length){
+    // Nothing passed (shouldn't happen, but defensive) — just clear the flag
+    agent.bgPassedModalPending = false;
+    try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
+    return;
+  }
+
+  // Build the modal
+  var bg = document.createElement('div');
+  bg.id = 'bg-passed-modal-bg';
+  bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
+
+  var box = document.createElement('div');
+  box.style.cssText = 'background:white;border-radius:14px;max-width:540px;width:100%;box-shadow:0 14px 48px rgba(0,0,0,.4);overflow:hidden;animation:bgPassFadeIn .4s ease-out';
+
+  var html = '<div style="background:linear-gradient(135deg,#16a34a 0%,#22c55e 100%);color:white;padding:30px 28px;text-align:center">';
+  html += '<div style="font-size:54px;line-height:1;margin-bottom:8px">🎉</div>';
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;letter-spacing:2px;margin-bottom:4px">Congratulations!</div>';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;opacity:.95;letter-spacing:1px">Your background check passed</div>';
+  html += '</div>';
+
+  html += '<div style="padding:26px 28px">';
+  html += '<p style="font-family:Barlow Condensed,sans-serif;font-size:1rem;color:var(--brown);margin:0 0 14px;line-height:1.6">Hi '+escHtml((agent.name||'').split(' ')[0])+',</p>';
+  html += '<p style="font-family:Barlow Condensed,sans-serif;font-size:.9rem;color:var(--brown);margin:0 0 16px;line-height:1.65">Great news — you\'ve been approved for the following '+(passedCamps.length===1?'campaign':'campaigns')+':</p>';
+
+  html += '<ul style="list-style:none;margin:0 0 18px;padding:0">';
+  passedCamps.forEach(function(c){
+    html += '<li style="display:flex;align-items:center;gap:10px;padding:10px 14px;margin-bottom:6px;background:rgba(22,163,74,.08);border:1px solid rgba(22,163,74,.25);border-radius:6px;font-family:Barlow Condensed,sans-serif">'
+      + '<span style="font-size:1.1rem">✓</span>'
+      + '<span style="font-weight:700;color:#16a34a;font-size:.95rem">'+escHtml(c)+'</span>'
+      + '</li>';
+  });
+  html += '</ul>';
+
+  html += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.25);border-radius:8px;padding:14px 16px;margin-bottom:18px">';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6"><strong>Next step:</strong> Complete your onboarding documents (1099 Contractor Agreement, Company Policy & Compliance, and Banking Information). It only takes a few minutes.</div>';
+  html += '</div>';
+
+  html += '<div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">';
+  html += '<button onclick="bgCloseModalLater()" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 20px;border-radius:6px;cursor:pointer">I\'ll do it later</button>';
+  html += '<button onclick="bgBeginOnboardingFromModal('+agent.id+')" style="background:#16a34a;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 22px;border-radius:6px;cursor:pointer;font-weight:700">Begin Onboarding →</button>';
+  html += '</div>';
+  html += '</div>';
+
+  box.innerHTML = html;
+  bg.appendChild(box);
+  // Inject minimal animation CSS once
+  if(!document.getElementById('bg-passed-modal-css')){
+    var style = document.createElement('style');
+    style.id = 'bg-passed-modal-css';
+    style.textContent = '@keyframes bgPassFadeIn{from{opacity:0;transform:scale(.96) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}';
+    document.head.appendChild(style);
+  }
+  document.body.appendChild(bg);
+}
+
+function bgCloseModalLater(){
+  // "Later" still clears the flag (we don't want to nag them every login)
+  // but leaves them on their dashboard rather than auto-routing.
+  var u = DB.current;
+  if(u){
+    u.bgPassedModalPending = false;
+    try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(u); } catch(e){}
+    try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
+  }
+  var el = document.getElementById('bg-passed-modal-bg');
+  if(el) el.remove();
+}
+
+// Inline submit from the agent profile detail row — wraps bgSubmit with a
+// confirm + refresh of the onboarding panel.
+function bgInlineSubmit(agentId, campaign){
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  if(!agent) return;
+  if(!confirm('Submit '+agent.name+' for background check for '+campaign+'?\n\nThis adds them to the BG Check Queue for office review.')) return;
+  if(bgSubmit(agentId, campaign)){
+    alert('✓ Submitted. Visit the BG Check Queue to pass or fail.');
+    gotoPanel('onboarding');
+  } else {
+    alert('Already pending for that agent/campaign.');
+  }
+}
+
+function bgBeginOnboardingFromModal(agentId){
+  var u = DB.current;
+  if(u && u.id === agentId){
+    u.bgPassedModalPending = false;
+    try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(u); } catch(e){}
+    try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
+  }
+  var el = document.getElementById('bg-passed-modal-bg');
+  if(el) el.remove();
+  if(typeof gotoPanel === 'function') gotoPanel('my-documents');
+}
+
+if(typeof window !== 'undefined'){
+  window.bgCloseModalLater = bgCloseModalLater;
 }
 
 // ════════════════════════════════════════════════════════════════════════
