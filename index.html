@@ -12,6 +12,8 @@
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <!-- Calvin 2026-06-03: pdf.js for the Gen Mobile pricelist PDF upload parser -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <!-- Calvin 2026-06-03: Tesseract.js (free open-source OCR) for photo/scanned PDF pricelist upload -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js"></script>
   <script>
     // Set pdf.js worker source (required for the library to function).
     // Done in a try/catch so the page still works if CDN is briefly down.
@@ -12873,6 +12875,116 @@ async function gmPdfExtractText(file){
     pageCount: pdf.numPages,
     isScan: allText.length < 50  // virtually no text → almost certainly a scan
   };
+}
+
+// ── OCR for images + scanned PDFs (Calvin 2026-06-03) ──
+// Uses Tesseract.js, an open-source OCR engine that runs entirely in the
+// browser. No external API, no fees, no data leaves the device. Slower
+// than text extraction (10-30 sec per page) but the only way to read
+// photos and scanned PDFs without a paid vision API.
+//
+// progressCb: function(percent, statusLabel) — called periodically during OCR
+async function gmOcrImage(file, progressCb){
+  if(typeof Tesseract === 'undefined'){
+    throw new Error('OCR library (Tesseract.js) failed to load. Refresh the page and try again.');
+  }
+  if(typeof progressCb !== 'function') progressCb = function(){};
+  progressCb(0, 'Loading OCR engine...');
+  // Tesseract.recognize handles file objects + data URLs + canvases
+  var result = await Tesseract.recognize(file, 'eng', {
+    logger: function(m){
+      // m.status: 'loading tesseract core', 'initializing api', 'recognizing text', etc.
+      // m.progress: 0..1 (per-status). We map to a UI percent.
+      var pct = 0;
+      var label = m.status || 'Processing...';
+      if(m.status === 'loading tesseract core')      pct = 5  + (m.progress||0) * 10;
+      else if(m.status === 'initializing tesseract') pct = 15 + (m.progress||0) * 10;
+      else if(m.status === 'loading language traineddata') pct = 25 + (m.progress||0) * 15;
+      else if(m.status === 'initializing api')        pct = 40 + (m.progress||0) * 10;
+      else if(m.status === 'recognizing text')        pct = 50 + (m.progress||0) * 50;
+      else                                            pct = Math.min(95, Math.round((m.progress||0) * 100));
+      progressCb(Math.round(pct), label.charAt(0).toUpperCase() + label.slice(1));
+    }
+  });
+  progressCb(100, 'OCR complete');
+  return result.data.text || '';
+}
+
+// Render a scanned PDF page-by-page to canvas, then OCR each canvas.
+// This is how we handle scanned/image-based PDFs — they're not directly
+// readable as text, but each page IS an image, so we render then OCR.
+async function gmOcrScannedPdf(file, progressCb){
+  if(typeof pdfjsLib === 'undefined'){
+    throw new Error('pdf.js failed to load.');
+  }
+  if(typeof Tesseract === 'undefined'){
+    throw new Error('Tesseract.js failed to load.');
+  }
+  if(typeof progressCb !== 'function') progressCb = function(){};
+  var arrayBuf = await file.arrayBuffer();
+  var pdf = await pdfjsLib.getDocument({data: arrayBuf}).promise;
+  var allText = '';
+  for(var i = 1; i <= pdf.numPages; i++){
+    progressCb(0, 'Page '+i+' of '+pdf.numPages+': rendering...');
+    var page = await pdf.getPage(i);
+    // Render at 2x scale for better OCR accuracy
+    var viewport = page.getViewport({scale: 2.0});
+    var canvas = document.createElement('canvas');
+    canvas.width  = viewport.width;
+    canvas.height = viewport.height;
+    var ctx = canvas.getContext('2d');
+    await page.render({canvasContext: ctx, viewport: viewport}).promise;
+    // OCR the canvas
+    var pageStart = ((i-1) / pdf.numPages) * 100;
+    var pageShare = (1 / pdf.numPages) * 100;
+    var pageText = await gmOcrImage(canvas, function(pct, label){
+      // Scale per-page progress into the overall progress range
+      var overall = Math.round(pageStart + (pct / 100) * pageShare);
+      progressCb(overall, 'Page '+i+' of '+pdf.numPages+': '+label);
+    });
+    allText += pageText + '\n\n';
+  }
+  return allText.trim();
+}
+
+// Smart router: picks the right extraction path based on file type.
+// Returns: {text, sourceMethod, pageCount}
+// sourceMethod: 'pdf-text' | 'pdf-ocr' | 'image-ocr'
+async function gmExtractAnyFile(file, progressCb){
+  if(typeof progressCb !== 'function') progressCb = function(){};
+  var name = (file.name || '').toLowerCase();
+  var isImage = (file.type || '').indexOf('image/') === 0
+             || /\.(jpe?g|png|heic|heif|webp|gif|bmp)$/i.test(name);
+  var isPdf   = (file.type || '').indexOf('pdf') >= 0
+             || /\.pdf$/i.test(name);
+
+  if(isImage){
+    progressCb(0, 'Reading photo with AI vision...');
+    var text = await gmOcrImage(file, progressCb);
+    return {text: text, sourceMethod: 'image-ocr', pageCount: 1};
+  }
+
+  if(isPdf){
+    // Try text extraction first (fast, accurate when it works)
+    progressCb(5, 'Trying fast text extraction...');
+    var ex = await gmPdfExtractText(file);
+    if(!ex.isScan && ex.allText.length >= 50){
+      progressCb(100, 'Text extracted from PDF');
+      return {text: ex.allText, sourceMethod: 'pdf-text', pageCount: ex.pageCount};
+    }
+    // Scanned PDF — fall back to OCR
+    progressCb(10, 'Scanned PDF detected — switching to AI vision...');
+    var ocrText = await gmOcrScannedPdf(file, progressCb);
+    return {text: ocrText, sourceMethod: 'pdf-ocr', pageCount: ex.pageCount};
+  }
+
+  throw new Error('Unsupported file type. Please upload a PDF, JPG, PNG, or HEIC.');
+}
+
+if(typeof window !== 'undefined'){
+  window.gmOcrImage = gmOcrImage;
+  window.gmOcrScannedPdf = gmOcrScannedPdf;
+  window.gmExtractAnyFile = gmExtractAnyFile;
 }
 
 // Parse the extracted text into pricelist row candidates.
@@ -42743,9 +42855,9 @@ function _gmPdfRenderPickStep(st){
   h += '</div>';
 
   // File picker
-  h += '<div style="margin-bottom:14px"><label class="f-label" style="font-weight:700;color:#0B1E3F">Pricelist PDF</label>';
-  h += '<input type="file" id="gm-pdf-file-input" accept=".pdf,application/pdf" style="display:block;width:100%;padding:14px;border:2px dashed #d1d5db;border-radius:8px;background:#f9fafb;cursor:pointer;font-family:Barlow Condensed,sans-serif">';
-  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:4px">PDF only. Must be a text PDF (text selectable when opened) — scanned PDFs cannot be parsed automatically.</div>';
+  h += '<div style="margin-bottom:14px"><label class="f-label" style="font-weight:700;color:#0B1E3F">Pricelist (PDF, photo, or screenshot)</label>';
+  h += '<input type="file" id="gm-pdf-file-input" accept=".pdf,application/pdf,image/*,.jpg,.jpeg,.png,.heic,.heif,.webp" style="display:block;width:100%;padding:14px;border:2px dashed #d1d5db;border-radius:8px;background:#f9fafb;cursor:pointer;font-family:Barlow Condensed,sans-serif">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:4px">Accepts: text PDFs (instant), scanned PDFs (~15-30 sec OCR), or photos taken with your phone camera. AI vision is free and runs locally in your browser — no data leaves your device.</div>';
   h += '</div>';
 
   if(st.error){
@@ -42757,7 +42869,19 @@ function _gmPdfRenderPickStep(st){
     h += '</div>';
   }
   if(st.processing){
-    h += '<div style="text-align:center;margin-top:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">⏳ Reading PDF...</div>';
+    var pct = st.progressPct || 0;
+    var label = st.progressLabel || 'Reading file...';
+    h += '<div style="margin-top:20px;padding:18px 20px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;font-family:Barlow Condensed,sans-serif">';
+    h += '<span id="gm-pdf-progress-label" style="font-size:.86rem;color:#0B1E3F;font-weight:700">'+escHtml(label)+'</span>';
+    h += '<span id="gm-pdf-progress-pct" style="font-size:.86rem;color:#dc2626;font-weight:700">'+pct+'%</span>';
+    h += '</div>';
+    h += '<div style="background:#e5e7eb;border-radius:100px;height:8px;overflow:hidden">';
+    h += '<div id="gm-pdf-progress-bar" style="background:linear-gradient(90deg,#dc2626,#dc2626);height:100%;width:'+pct+'%;transition:width .3s ease"></div>';
+    h += '</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:8px;line-height:1.5">';
+    h += '💡 Photos and scanned PDFs use OCR (~15-30 seconds). Text PDFs are instant. All processing happens locally in your browser — no data leaves your device.';
+    h += '</div></div>';
   }
   return h;
 }
@@ -42765,6 +42889,36 @@ function _gmPdfRenderPickStep(st){
 function _gmPdfRenderPreviewStep(st){
   var d = st.diff;
   var h = '';
+  // Source-method banner — tells the user HOW we read the file
+  // (so they can adjust their level of careful review)
+  if(st.sourceMethod){
+    var smLabel, smColor, smBg, smIcon, smNote;
+    if(st.sourceMethod === 'pdf-text'){
+      smLabel = 'Text PDF — instant, high confidence';
+      smIcon = '✓';
+      smColor = '#059669';
+      smBg = '#dcfce7';
+      smNote = 'Text was extracted directly from the PDF. Numbers and model names should be exact.';
+    } else if(st.sourceMethod === 'pdf-ocr'){
+      smLabel = 'Scanned PDF — read with OCR';
+      smIcon = '👁️';
+      smColor = '#d97706';
+      smBg = '#fef3c7';
+      smNote = 'OCR was used because the PDF was scanned. Please double-check prices and model names before committing — OCR can occasionally misread similar characters (5↔6, 0↔O, 1↔I).';
+    } else if(st.sourceMethod === 'image-ocr'){
+      smLabel = 'Photo / image — read with OCR';
+      smIcon = '📸';
+      smColor = '#d97706';
+      smBg = '#fef3c7';
+      smNote = 'OCR was used to read the image. Please double-check prices and model names before committing — OCR can occasionally misread similar characters (5↔6, 0↔O, 1↔I).';
+    }
+    if(smLabel){
+      h += '<div style="background:'+smBg+';border:1px solid '+smColor+';border-radius:8px;padding:12px 16px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif">';
+      h += '<div style="display:flex;align-items:center;gap:8px;font-weight:700;color:'+smColor+';font-size:.85rem">'+smIcon+' '+smLabel+'</div>';
+      h += '<div style="font-size:.74rem;color:'+smColor+';margin-top:4px;opacity:.9;line-height:1.5">'+smNote+'</div>';
+      h += '</div>';
+    }
+  }
   // Summary chips
   h += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px">';
   var stat = function(label, n, color){
@@ -42889,22 +43043,39 @@ async function _gmPdfHandleFilePicked(evt){
   st.error = null;
   st.errorDetail = null;
   st.processing = true;
+  st.progressPct = 0;
+  st.progressLabel = 'Starting...';
+  st.sourceMethod = null;
   _gmPdfRenderModal();
 
+  // Progress callback — updates the in-modal progress UI without re-rendering
+  // the entire modal (which would lose the file input state)
+  var progressCb = function(pct, label){
+    st.progressPct = pct;
+    st.progressLabel = label;
+    var bar = document.getElementById('gm-pdf-progress-bar');
+    var lbl = document.getElementById('gm-pdf-progress-label');
+    var pctEl = document.getElementById('gm-pdf-progress-pct');
+    if(bar) bar.style.width = pct + '%';
+    if(lbl) lbl.textContent = label;
+    if(pctEl) pctEl.textContent = pct + '%';
+  };
+
   try {
-    var ex = await gmPdfExtractText(file);
-    st.extracted = ex;
-    if(ex.isScan){
-      st.error = 'This appears to be a SCANNED PDF.';
-      st.errorDetail = 'pdf.js could only extract '+ex.allText.length+' characters of text across '+ex.pageCount+' page(s). The PDF likely contains images of text rather than selectable text. Options: (1) Ask Gen Mobile to send a text version, (2) Open the PDF in Preview/Adobe and use File → Export As → Text, then re-upload that, or (3) Add devices manually using "+ Add Device".';
+    var ex = await gmExtractAnyFile(file, progressCb);
+    st.sourceMethod = ex.sourceMethod;
+    var text = ex.text || '';
+    if(!text.length){
+      st.error = 'Could not read any text from the file.';
+      st.errorDetail = 'Source method: '+(ex.sourceMethod||'?')+'. The file may be blank, corrupted, or contain text that\'s too small/blurry to read. Try a clearer photo, or add devices manually using "+ Add Device".';
       st.processing = false;
       _gmPdfRenderModal();
       return;
     }
-    var parsed = gmPdfParseRows(ex.allText);
+    var parsed = gmPdfParseRows(text);
     if(!parsed.length){
-      st.error = 'No pricelist rows could be detected in the PDF.';
-      st.errorDetail = 'Extracted '+ex.allText.length+' characters of text but found 0 model+price rows. The PDF format may be different from expected. You can try a different file, or add devices manually using "+ Add Device".';
+      st.error = 'No pricelist rows could be detected.';
+      st.errorDetail = 'Read '+text.length+' characters of text via '+(ex.sourceMethod||'?')+' but found 0 model+price rows matching the expected pattern (model name followed by a number $20-$2000). The pricelist format may be different from expected, or the OCR may have misread numbers. You can try a clearer photo, a different file, or add devices manually using "+ Add Device".';
       st.processing = false;
       _gmPdfRenderModal();
       return;
@@ -42916,7 +43087,7 @@ async function _gmPdfHandleFilePicked(evt){
     _gmPdfRenderModal();
   } catch(e){
     console.error('[gmPdfHandleFilePicked]', e);
-    st.error = 'Failed to read PDF.';
+    st.error = 'Failed to read file.';
     st.errorDetail = e && e.message ? e.message : 'Unknown error.';
     st.processing = false;
     _gmPdfRenderModal();
