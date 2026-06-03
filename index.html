@@ -10642,7 +10642,18 @@ function isOnboarding(u){
   return false;
 }
 function isHRorInv(u)    { return isHR(u)||isInventory(u); }
-function isOfficeRole(u) { return isHR(u)||isInventory(u)||isPayroll(u)||isOnboarding(u); }
+function isOfficeRole(u) {
+  // Calvin 2026-06-03: extended to include Owner, admin, and explicit
+  // "Office Staff" role for the mass email/text access + the new "Office"
+  // recipient category. This is the canonical "office staff" definition
+  // used by the mass communication tools.
+  if(!u) return false;
+  if(typeof isOwner === 'function' && isOwner(u)) return true;
+  var role = String(u.role || '').toLowerCase();
+  if(role === 'admin' || role === 'office staff' || role === 'office') return true;
+  return isHR(u) || isInventory(u) || isPayroll(u) || isOnboarding(u);
+}
+if(typeof window !== 'undefined') window.isOfficeRole = isOfficeRole;
 
 // ── Calvin 2026-05-19 — Vendor-due-date visibility ──
 // TC inventory has TWO dates: vendorDueDate (the real cap from the carrier,
@@ -18496,6 +18507,271 @@ if(typeof window !== 'undefined'){
     await fireApplicationSubmittedEmail(sample);
     alert('✓ Test application email fired. Check ' + OFFICE_NOTIFY_EMAIL + ' inbox.');
   };
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  BIRTHDAY + WORK ANNIVERSARY AUTO-RECOGNITION
+//  Calvin Williams · 2026-06-03
+//
+//  Daily scanner that runs on app boot + every 6 hours. For each active
+//  agent:
+//
+//   - BIRTHDAY (dob): if today's MM-DD matches their dob's MM-DD AND we
+//     haven't already celebrated this year:
+//       * Pop notification on their dashboard
+//       * Auto-post to National chat + each of their program chats
+//       * Notify office staff + email morning-of ("Today is X's birthday!")
+//
+//   - ANNIVERSARY (start): if today's MM-DD matches their start date's
+//     MM-DD AND the year-diff is in [1, 2, 5, 10] AND we haven't already
+//     celebrated this milestone:
+//       * Pop notification on their dashboard
+//       * Auto-post to National chat + program chats
+//       * Notify office staff + email
+//
+//  Dedup: each celebration sets a `lastBirthdayCelebratedYear` /
+//  `lastAnniversaryCelebratedYear` field on the agent record so re-running
+//  the scanner the same day is idempotent.
+//
+//  Respects agent.celebrateBirthday flag (default true). No equivalent
+//  opt-out for anniversaries — they're professional milestones.
+// ════════════════════════════════════════════════════════════════════════
+var WMAM_CELEBRATION_TIMER = null;
+
+function startCelebrationScanner(){
+  if(WMAM_CELEBRATION_TIMER) return;
+  // Initial scan on boot (delayed slightly so app fully loads first)
+  setTimeout(function(){ try{ scanForCelebrations(); }catch(e){ console.warn('[celebration] initial scan failed:', e); } }, 5000);
+  // Recurring scan every 6 hours
+  WMAM_CELEBRATION_TIMER = setInterval(function(){
+    try{ scanForCelebrations(); }catch(e){ console.warn('[celebration] scan failed:', e); }
+  }, 6 * 60 * 60 * 1000);
+}
+
+// Convenience: extract MM-DD from a date string (YYYY-MM-DD or ISO)
+function _ymdMonthDay(s){
+  if(!s) return null;
+  var m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(!m) return null;
+  return {year:parseInt(m[1],10), month:parseInt(m[2],10), day:parseInt(m[3],10)};
+}
+
+function _todayYMD(){
+  var d = new Date();
+  return {year:d.getFullYear(), month:d.getMonth()+1, day:d.getDate()};
+}
+
+// Years between two YMD dates (anniversary calc — accounts for if today is past their start MM-DD this year)
+function _yearsBetween(start, today){
+  if(!start || !today) return 0;
+  var y = today.year - start.year;
+  if(today.month < start.month || (today.month === start.month && today.day < start.day)) y--;
+  return y;
+}
+
+function scanForCelebrations(){
+  if(!Array.isArray(DB.agents)) return;
+  var today = _todayYMD();
+  var thisYearStr = String(today.year);
+  var birthdayFolks = [];
+  var anniversaryFolks = [];
+
+  DB.agents.forEach(function(a){
+    if(!a || a.active === false) return;
+
+    // ── BIRTHDAY check ──
+    if(a.dob && a.celebrateBirthday !== false){
+      var dob = _ymdMonthDay(a.dob);
+      if(dob && dob.month === today.month && dob.day === today.day){
+        if(String(a.lastBirthdayCelebratedYear || '') !== thisYearStr){
+          birthdayFolks.push(a);
+          a.lastBirthdayCelebratedYear = thisYearStr;
+        }
+      }
+    }
+
+    // ── ANNIVERSARY check ──
+    if(a.start){
+      var start = _ymdMonthDay(a.start);
+      if(start && start.month === today.month && start.day === today.day){
+        var years = _yearsBetween(start, today);
+        var milestones = [1, 2, 5, 10, 15, 20, 25, 30];
+        if(milestones.indexOf(years) >= 0){
+          var lastKey = a.lastAnniversaryCelebratedYear || '';
+          var thisMilestoneKey = thisYearStr + ':' + years;
+          if(String(lastKey) !== thisMilestoneKey){
+            anniversaryFolks.push({agent:a, years:years});
+            a.lastAnniversaryCelebratedYear = thisMilestoneKey;
+          }
+        }
+      }
+    }
+  });
+
+  // Persist agent updates (idempotency markers) — best effort
+  if(birthdayFolks.length || anniversaryFolks.length){
+    try{
+      if(typeof saveToStorage === 'function') saveToStorage();
+    }catch(e){}
+  }
+
+  // Fire celebrations
+  birthdayFolks.forEach(fireBirthdayCelebration);
+  anniversaryFolks.forEach(function(item){
+    fireAnniversaryCelebration(item.agent, item.years);
+  });
+
+  if(birthdayFolks.length || anniversaryFolks.length){
+    console.log('[celebration] fired '+birthdayFolks.length+' birthday(s), '+anniversaryFolks.length+' anniversary milestone(s)');
+  }
+}
+
+// Resolve which chat channels this agent's celebration should post to.
+// Always includes 'national'. Adds program-specific channels they're tied to.
+function _channelsForAgent(a){
+  var channels = ['national'];
+  // Read programs from a.programs[] (or fall back to single .program)
+  var pgms = Array.isArray(a.programs) && a.programs.length
+    ? a.programs
+    : (a.program ? [a.program] : []);
+  pgms.forEach(function(p){
+    var slug = String(p||'').toLowerCase().trim();
+    if(slug && channels.indexOf(slug) < 0) channels.push(slug);
+  });
+  return channels;
+}
+
+// Post a system message to a chat channel. Best-effort; logs on failure.
+function _systemPostToChannel(channelId, message){
+  if(!channelId || !message) return;
+  // Append directly to the channel's messages array, marking source as 'system'
+  try{
+    if(typeof CHATS !== 'undefined' && CHATS && Array.isArray(CHATS[channelId] && CHATS[channelId].messages)){
+      CHATS[channelId].messages.push({
+        id: 'sys-'+Date.now()+'-'+Math.random().toString(36).slice(2,7),
+        senderId: 0,
+        senderName: '🎉 WMAMinc',
+        text: message,
+        ts: new Date().toISOString(),
+        system: true
+      });
+    }
+    // Also try to call postToChannel if it exists for cloud sync
+    if(typeof saveChats === 'function') saveChats();
+  }catch(e){ console.warn('[_systemPostToChannel] failed for '+channelId+':', e); }
+}
+
+function fireBirthdayCelebration(a){
+  if(!a) return;
+  var firstName = (a.name || '').split(' ')[0] || 'friend';
+  var bodyChat = '🎂 Happy Birthday to '+a.name+'! Wishing you an amazing day from all of us at WMAMinc!';
+
+  // 1. Post to chat channels (national + program chats)
+  _channelsForAgent(a).forEach(function(ch){ _systemPostToChannel(ch, bodyChat); });
+
+  // 2. Pop notification on THE PERSON'S dashboard
+  if(typeof pushNotification === 'function'){
+    pushNotification({
+      toIds: [a.id],
+      toRoles: [],
+      type: 'info',
+      icon: '🎂',
+      title: 'Happy Birthday, ' + firstName + '!',
+      body:  'The whole WMAMinc family is celebrating you today. Have an amazing day!',
+      priority: 'high'
+    });
+
+    // 3. Notify office staff with their own toast/notification
+    var officeIds = (DB.agents||[]).filter(function(x){ return isOfficeRole(x) && x.id !== a.id; }).map(function(x){ return x.id; });
+    if(officeIds.length){
+      pushNotification({
+        toIds: officeIds,
+        toRoles: [],
+        type: 'info',
+        icon: '🎂',
+        title: 'Today is ' + a.name + "'s birthday",
+        body:  'Reach out and wish ' + firstName + ' a happy birthday today!'
+      });
+    }
+  }
+
+  // 4. Email office staff
+  if(typeof notifyByEmail === 'function'){
+    (DB.agents||[]).forEach(function(staff){
+      if(!isOfficeRole(staff) || !staff.email || staff.id === a.id) return;
+      notifyByEmail({
+        toAgent: {id: staff.id, name: staff.name, email: staff.email},
+        eventType: 'celebration.birthday',
+        payload: {
+          firstName: firstName,
+          fullName:  a.name,
+          role:      a.role,
+          dob:       a.dob,
+          channels:  _channelsForAgent(a)
+        }
+      }).catch(function(){});
+    });
+  }
+}
+
+function fireAnniversaryCelebration(a, years){
+  if(!a || !years) return;
+  var firstName = (a.name || '').split(' ')[0] || 'team member';
+  var yearStr = years + (years === 1 ? ' year' : ' years');
+  var bodyChat = '🎉 Today marks '+yearStr+' since '+a.name+' joined WMAMinc! Thank you for everything you do for the team.';
+
+  _channelsForAgent(a).forEach(function(ch){ _systemPostToChannel(ch, bodyChat); });
+
+  if(typeof pushNotification === 'function'){
+    pushNotification({
+      toIds: [a.id],
+      toRoles: [],
+      type: 'info',
+      icon: '🎉',
+      title: yearStr + ' with WMAMinc!',
+      body:  'Congrats on your '+yearStr+' anniversary, '+firstName+'! We are grateful for your work.',
+      priority: 'high'
+    });
+
+    var officeIds = (DB.agents||[]).filter(function(x){ return isOfficeRole(x) && x.id !== a.id; }).map(function(x){ return x.id; });
+    if(officeIds.length){
+      pushNotification({
+        toIds: officeIds,
+        toRoles: [],
+        type: 'info',
+        icon: '🎉',
+        title: a.name + ' — ' + yearStr + ' Anniversary',
+        body:  firstName + ' joined the team '+yearStr+' ago today. Take a moment to recognize them!'
+      });
+    }
+  }
+
+  if(typeof notifyByEmail === 'function'){
+    (DB.agents||[]).forEach(function(staff){
+      if(!isOfficeRole(staff) || !staff.email || staff.id === a.id) return;
+      notifyByEmail({
+        toAgent: {id: staff.id, name: staff.name, email: staff.email},
+        eventType: 'celebration.anniversary',
+        payload: {
+          firstName: firstName,
+          fullName:  a.name,
+          role:      a.role,
+          years:     years,
+          startDate: a.start,
+          channels:  _channelsForAgent(a)
+        }
+      }).catch(function(){});
+    });
+  }
+}
+
+if(typeof window !== 'undefined'){
+  window.startCelebrationScanner = startCelebrationScanner;
+  window.scanForCelebrations = scanForCelebrations;
+  window.fireBirthdayCelebration = fireBirthdayCelebration;
+  window.fireAnniversaryCelebration = fireAnniversaryCelebration;
+  window._yearsBetween = _yearsBetween;
+  window._ymdMonthDay = _ymdMonthDay;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -27206,7 +27482,7 @@ function gotoPanel(id, params){
     'supply-mgmt':panelSupplyMgmt,'pending-transfers':panelPendingTransfers,
     'agent-codes':panelAgentCodes,'goal-settings':panelGoalSettings,
     'form-builder':panelFormBuilder,announce:panelAnnounce,
-    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,
+    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'edit-start-dates':panelEditStartDates,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
     agents:panelAgents,'ll-teams':panelMarketsAdmin,
@@ -37537,6 +37813,13 @@ function panelOnboarding(){
     return '<div style="padding:40px;text-align:center;color:var(--muted)">Onboarding Department access required.</div>';
 
   var h=panelHeader('📋 Onboarding Department');
+  // Calvin 2026-06-03: Edit Start Dates entry point — office-only, drives anniversaries
+  if(isOfficeRole(u)){
+    h += '<div style="margin-bottom:14px;display:flex;gap:10px;flex-wrap:wrap">';
+    h += '<button onclick="gotoPanel(\'edit-start-dates\')" style="background:#0ea5e9;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">📅 Edit Start Dates →</button>';
+    h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);align-self:center">Set official start dates so the anniversary recognition system works for everyone.</span>';
+    h += '</div>';
+  }
   var allSales=DB.agents.filter(function(a){return a.active&&isSalesRole(a);});
   var pendingTasks=ONBOARDING_TASKS.filter(function(t){return t.status==='pending';});
 
@@ -37694,6 +37977,174 @@ function panelOnboarding(){
   }
   h+='</div>';
   return h;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  EDIT START DATES — Office-only. Calvin Williams 2026-06-03
+//
+//  Many WMAMinc agents have been with the company for years but their
+//  agent.start field is missing or wrong. This panel lets office staff
+//  (Owner / admin / HR / Onboarding / Payroll / Inventory) view every
+//  active agent and edit their start date.
+//
+//  Audit trail: every change writes an entry to a.startDateAudit[] with
+//  who changed it, when, and old→new values. This survives forever
+//  alongside the agent record (no separate table needed).
+//
+//  Agents themselves can NOT edit (or even see) their own start date.
+//  The route is registered to 'edit-start-dates' and is the only entry
+//  point — it does not appear on My Profile.
+// ════════════════════════════════════════════════════════════════════════
+function panelEditStartDates(){
+  var u = DB.current;
+  if(!isOfficeRole(u)){
+    return panelHeader('🔒 Edit Start Dates') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Office staff only (Owner, admin, HR, Onboarding, Payroll, Inventory).</div></div>';
+  }
+  var h = panelHeader('📅 Edit Start Dates');
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>Set the official start date for any team member.</strong> This date powers the work-anniversary recognition system (1yr, 2yr, 5yr, 10yr, 15yr, 20yr, 25yr, 30yr milestones). Many agents have been here for years — make sure their start date is correct. Every change is logged.';
+  h += '</div>';
+
+  // Search/filter
+  h += '<div class="bo-card" style="margin-bottom:14px"><div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
+  h += '<input id="esdSearch" type="text" placeholder="🔍 Filter by name…" oninput="esdRender()" class="f-input" style="max-width:340px">';
+  h += '</div></div>';
+
+  h += '<div id="esdList"></div>';
+
+  // Initial render
+  setTimeout(function(){ try{ esdRender(); }catch(e){ console.warn(e); } }, 50);
+  return h;
+}
+
+function esdRender(){
+  var box = document.getElementById('esdList');
+  if(!box) return;
+  var q = ((document.getElementById('esdSearch')||{value:''}).value || '').toLowerCase().trim();
+  var agents = (DB.agents||[]).filter(function(a){ return a && a.active; });
+  if(q) agents = agents.filter(function(a){ return String(a.name||'').toLowerCase().indexOf(q) >= 0; });
+  // Sort: missing start first, then by name
+  agents.sort(function(x, y){
+    var xMissing = !x.start ? 1 : 0;
+    var yMissing = !y.start ? 1 : 0;
+    if(xMissing !== yMissing) return yMissing - xMissing;
+    return String(x.name||'').localeCompare(String(y.name||''));
+  });
+
+  if(!agents.length){
+    box.innerHTML = '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No agents match.</div></div>';
+    return;
+  }
+
+  var html = '<div class="bo-card"><div style="padding:0">';
+  html += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+  html += '<thead><tr style="background:var(--offwhite);border-bottom:2px solid var(--border)">'
+       +'<th style="text-align:left;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Name</th>'
+       +'<th style="text-align:left;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Role</th>'
+       +'<th style="text-align:left;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Start Date</th>'
+       +'<th style="text-align:left;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">DOB</th>'
+       +'<th style="text-align:left;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Tenure</th>'
+       +'<th style="text-align:right;padding:10px 14px;font-size:.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase">Actions</th>'
+       +'</tr></thead><tbody>';
+
+  agents.forEach(function(a){
+    var startVal = a.start || '';
+    var dobVal = a.dob || '';
+    var tenure = '';
+    if(startVal){
+      var s = _ymdMonthDay(startVal);
+      var t = _todayYMD();
+      if(s && t){
+        var y = _yearsBetween(s, t);
+        tenure = y + (y === 1 ? ' year' : ' years');
+      }
+    }
+    var isMissingStart = !startVal;
+    var auditCount = Array.isArray(a.startDateAudit) ? a.startDateAudit.length : 0;
+    html += '<tr style="border-bottom:1px solid var(--border)'+(isMissingStart?';background:rgba(220,38,38,.04)':'')+'">';
+    html += '<td style="padding:10px 14px;font-weight:700;color:var(--brown)">'+_escapeHtml(a.name)+(isMissingStart?'<span style="color:#dc2626;font-size:.7rem;margin-left:6px">(missing)</span>':'')+'</td>';
+    html += '<td style="padding:10px 14px;color:var(--muted);font-size:.85rem">'+_escapeHtml(a.role || '')+'</td>';
+    html += '<td style="padding:10px 14px"><input type="date" id="esdStart-'+a.id+'" value="'+_escapeAttr(startVal)+'" class="f-input" style="padding:6px 8px;font-size:.85rem;max-width:160px"></td>';
+    html += '<td style="padding:10px 14px"><input type="date" id="esdDob-'+a.id+'" value="'+_escapeAttr(dobVal)+'" class="f-input" style="padding:6px 8px;font-size:.85rem;max-width:160px"></td>';
+    html += '<td style="padding:10px 14px;color:var(--muted);font-size:.85rem">'+_escapeHtml(tenure)+'</td>';
+    html += '<td style="padding:10px 14px;text-align:right">';
+    html += '<button onclick="esdSave('+a.id+')" style="background:#16a34a;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:5px;cursor:pointer;font-weight:700">💾 Save</button>';
+    if(auditCount){
+      html += ' <button onclick="esdShowAudit('+a.id+')" style="background:white;color:var(--brown);border:1px solid var(--border);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 10px;border-radius:5px;cursor:pointer">📜 '+auditCount+'</button>';
+    }
+    html += '</td>';
+    html += '</tr>';
+  });
+  html += '</tbody></table></div></div>';
+  box.innerHTML = html;
+}
+
+function esdSave(agentId){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  if(!agent){ alert('Agent not found.'); return; }
+  var newStart = (document.getElementById('esdStart-'+agentId)||{value:''}).value;
+  var newDob   = (document.getElementById('esdDob-'+agentId)  ||{value:''}).value;
+  var oldStart = agent.start || '';
+  var oldDob   = agent.dob   || '';
+  var changes = [];
+  if(newStart !== oldStart) changes.push('start: '+(oldStart||'(empty)')+' → '+(newStart||'(empty)'));
+  if(newDob   !== oldDob)   changes.push('dob: '+(oldDob||'(empty)')+' → '+(newDob||'(empty)'));
+  if(!changes.length){ alert('No changes.'); return; }
+  if(!confirm('Save change?\n\n'+changes.join('\n')+'\n\nThis will be logged in the audit trail.')) return;
+
+  // Audit log entry
+  if(!Array.isArray(agent.startDateAudit)) agent.startDateAudit = [];
+  agent.startDateAudit.push({
+    ts:        new Date().toISOString(),
+    byId:      u.id,
+    byName:    u.name,
+    oldStart:  oldStart,
+    newStart:  newStart,
+    oldDob:    oldDob,
+    newDob:    newDob
+  });
+
+  agent.start = newStart;
+  agent.dob   = newDob;
+  // If the agent's celebrateBirthday flag has never been set, default to true
+  if(typeof agent.celebrateBirthday === 'undefined') agent.celebrateBirthday = true;
+
+  // Persist
+  try{
+    if(typeof saveToStorage === 'function') saveToStorage();
+    // Push the updated agent to Supabase if a syncPushAgent helper exists
+    if(typeof syncPushAgent === 'function') syncPushAgent(agent);
+    else if(typeof saveAgent === 'function') saveAgent(agent);
+  }catch(e){ console.warn('[esdSave] persistence:', e); }
+
+  alert('✓ Saved.\n\n'+changes.join('\n'));
+  esdRender();
+}
+
+function esdShowAudit(agentId){
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  if(!agent) return;
+  var log = Array.isArray(agent.startDateAudit) ? agent.startDateAudit.slice().reverse() : [];
+  if(!log.length){ alert('No audit entries.'); return; }
+  var msg = 'AUDIT TRAIL — '+agent.name+'\n\n';
+  log.forEach(function(e){
+    var d = new Date(e.ts);
+    msg += d.toLocaleString() + '  ·  by ' + e.byName + '\n';
+    if(e.oldStart !== e.newStart) msg += '  start: '+(e.oldStart||'(empty)')+' → '+(e.newStart||'(empty)')+'\n';
+    if(e.oldDob   !== e.newDob)   msg += '  dob:   '+(e.oldDob||'(empty)')+' → '+(e.newDob||'(empty)')+'\n';
+    msg += '\n';
+  });
+  alert(msg);
+}
+
+if(typeof window !== 'undefined'){
+  window.panelEditStartDates = panelEditStartDates;
+  window.esdRender = esdRender;
+  window.esdSave = esdSave;
+  window.esdShowAudit = esdShowAudit;
 }
 
 function obShowTab(tab){
@@ -55775,6 +56226,7 @@ function _meAllCampaigns(){
 
 // Roles available in the picker. Order matters — leadership first.
 var ME_ROLES = [
+  {key:'Office',          label:'Office Staff',    icon:'🏢'}, // Calvin 2026-06-03: new category
   {key:'IBO',             label:'IBO',             icon:'💼'},
   {key:'Campaign Manager',label:'Campaign Manager',icon:'📊'},
   {key:'Market Manager',  label:'Market Manager',  icon:'🗺️'},
@@ -55784,11 +56236,13 @@ var ME_ROLES = [
 
 function panelMassEmail(){
   var u = DB.current;
-  if(!isOwner(u)){
-    return panelHeader('🔒 Mass Email') +
-      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner only.</div></div>';
+  // Calvin 2026-06-03: opened from Owner-only to all office staff
+  // (Owner, admin, HR, Payroll, Onboarding, Inventory, Office Staff).
+  if(!isOfficeRole(u)){
+    return panelHeader('🔒 Mass Email / Text') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Office staff only (Owner, admin, HR, Payroll, Onboarding, Inventory).</div></div>';
   }
-  var h = panelHeader('📧 Mass Email — Send to Team');
+  var h = panelHeader('📧 Mass Email / Text — Send to Team');
   h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
   h += '<strong>Send to a hierarchy: Program → Campaign → Role.</strong> Pick one or more programs (or "All Programs"), then pick campaigns within them (or "All Campaigns"), then pick which roles. Recipient count updates live. Click <strong>Show recipient list</strong> before sending to verify.';
   h += '</div>';
@@ -55843,10 +56297,20 @@ function panelMassEmail(){
   h += '<div style="font-size:.66rem;color:var(--muted);margin-top:4px">Use blank lines for paragraph breaks. URLs auto-link. <code>{{name}}</code> gets replaced with each recipient\'s first name.</div></div>';
   h += '</div></div>';
 
+  // ── DELIVERY MODE (Calvin 2026-06-03) ──
+  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">Delivery method</div></div>';
+  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;display:flex;gap:18px;flex-wrap:wrap">';
+  h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown);font-weight:700"><input type="radio" name="meMode" value="email"  checked style="width:16px;height:16px"> 📧 Email only</label>';
+  h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown);font-weight:700"><input type="radio" name="meMode" value="text"           style="width:16px;height:16px"> 📱 Text only</label>';
+  h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown);font-weight:700"><input type="radio" name="meMode" value="both"           style="width:16px;height:16px"> 📧📱 Both</label>';
+  h += '</div>';
+  h += '<div style="padding:0 18px 14px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">Text uses Brevo SMS. Recipients without a valid US phone number are silently skipped for text. Same for missing email.</div>';
+  h += '</div>';
+
   // ── SEND ──
   h += '<div class="bo-card"><div style="padding:14px 18px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">';
-  h += '<button onclick="meSendNow()" class="btn-fire" style="padding:11px 22px;background:#16a34a;border-color:#16a34a">📤 SEND EMAIL</button>';
-  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">Brevo handles delivery. Batched 50 at a time, ~80ms between messages. Agents without an email are silently skipped.</div>';
+  h += '<button onclick="meSendNow()" class="btn-fire" style="padding:11px 22px;background:#16a34a;border-color:#16a34a">📤 SEND</button>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">Brevo handles delivery. Batched 50 at a time, ~80ms between messages. Agents without an email or phone are silently skipped.</div>';
   h += '</div></div>';
 
   // Initial render of campaigns + count (deferred so the DOM is ready)
@@ -55928,6 +56392,12 @@ function meUpdateCount(){
 //   - Agent must have an active code in AT LEAST ONE selected campaign
 //   - Agent's role must match AT LEAST ONE selected role
 //   - Agent must be active and have an email
+//
+// Calvin 2026-06-03: special handling for the new "Office" role bucket —
+// office staff usually don't have agentCodes for sales campaigns, so the
+// campaign filter would exclude them entirely. When "Office" is in the
+// selected roles, we ALSO include any agent that passes isOfficeRole(),
+// regardless of campaign match.
 function _meResolveRecipients(){
   var agents = (DB.agents||[]).filter(function(a){ return a.active && a.email && /@/.test(a.email); });
   // Read selected campaigns
@@ -55936,18 +56406,35 @@ function _meResolveRecipients(){
   // Read selected roles
   var selectedRoles = [];
   document.querySelectorAll('input[name="meRole"]:checked').forEach(function(cb){ selectedRoles.push(cb.value); });
-  // If no campaigns selected, no one matches
-  if(!selectedCamps.length || !selectedRoles.length) return [];
-  return agents.filter(function(a){
-    // Role match
-    if(selectedRoles.indexOf(a.role) < 0) return false;
-    // Campaign match — agent must have a code in at least one selected campaign
+  if(!selectedRoles.length) return [];
+  var officeSelected = selectedRoles.indexOf('Office') >= 0;
+  // If only Office is selected and no campaigns, that's fine — return all office staff
+  if(officeSelected && !selectedCamps.length){
+    return agents.filter(function(a){ return isOfficeRole(a); })
+      .map(function(a){ return {agent:a, email:a.email, name:a.name}; });
+  }
+  if(!selectedCamps.length) return [];
+  // Build matched set
+  var matched = {};
+  agents.forEach(function(a){
+    // Office bypass — any office staff is in when Office role is checked
+    if(officeSelected && isOfficeRole(a)){
+      matched[a.id] = a; return;
+    }
+    // Role match (skip 'Office' meta-role for normal agents)
+    var roleMatches = selectedRoles.some(function(r){ return r !== 'Office' && r === a.role; });
+    if(!roleMatches) return;
+    // Campaign match
     var ac = a.agentCodes || {};
-    var hasMatch = selectedCamps.some(function(c){
+    var hasCamp = selectedCamps.some(function(c){
       return Object.prototype.hasOwnProperty.call(ac, c) && ac[c];
     });
-    return hasMatch;
-  }).map(function(a){ return {agent:a, email:a.email, name:a.name}; });
+    if(hasCamp) matched[a.id] = a;
+  });
+  return Object.keys(matched).map(function(k){
+    var a = matched[k];
+    return {agent:a, email:a.email, name:a.name};
+  });
 }
 
 function meRefreshPreview(){
@@ -55986,25 +56473,44 @@ function _meBuildHtmlBody(plainText, recipientName){
     +'</div>';
 }
 
-// SEND THE EMAIL — batched 50 at a time, sequential to avoid throttling.
+// SEND THE EMAIL/TEXT — batched 50 at a time, sequential to avoid throttling.
+// Calvin 2026-06-03: honors the new email/text/both delivery mode toggle.
 function meSendNow(){
   var u = DB.current;
-  if(!isOwner(u)){ alert('Owner only.'); return; }
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  // Read mode toggle
+  var mode = 'email';
+  document.querySelectorAll('input[name="meMode"]:checked').forEach(function(r){ mode = r.value; });
+  var sendEmail = (mode === 'email' || mode === 'both');
+  var sendText  = (mode === 'text'  || mode === 'both');
   var subject = (document.getElementById('meSubject')||{value:''}).value.trim();
   var body = (document.getElementById('meBody')||{value:''}).value.trim();
-  if(!subject){ alert('Subject is required.'); return; }
+  if(sendEmail && !subject){ alert('Subject is required when sending email.'); return; }
   if(!body){ alert('Message body is required.'); return; }
   var recipients = _meResolveRecipients();
   if(!recipients.length){ alert('No valid recipients.'); return; }
-  if(!confirm('SEND TO '+recipients.length+' recipient(s)?\n\nSubject: '+subject+'\n\nThis CANNOT be undone.')) return;
+
+  // Pre-filter recipients for SMS — needs valid phone, not just email
+  var smsRecipients = sendText ? recipients.filter(function(r){
+    var phone = r.agent && r.agent.phone;
+    return phone && _phoneIsLikelyValid(phone);
+  }) : [];
+  var emailRecipients = sendEmail ? recipients : [];
+
+  var modeStr = sendEmail && sendText
+    ? 'EMAIL + TEXT'
+    : (sendEmail ? 'EMAIL' : 'TEXT');
+  var confirmMsg = 'SEND VIA '+modeStr+'?\n\n';
+  if(sendEmail) confirmMsg += '📧 '+emailRecipients.length+' email recipient(s)\n';
+  if(sendText)  confirmMsg += '📱 '+smsRecipients.length+' text recipient(s)\n';
+  if(sendEmail) confirmMsg += '\nSubject: '+subject+'\n';
+  confirmMsg += '\nThis CANNOT be undone.';
+  if(!confirm(confirmMsg)) return;
 
   var BATCH_SIZE = 50;
-  var DELAY_BETWEEN_BATCHES = 1500; // ms
-  var sent = 0, failed = 0;
-  var batches = [];
-  for(var i=0; i<recipients.length; i+=BATCH_SIZE){
-    batches.push(recipients.slice(i, i+BATCH_SIZE));
-  }
+  var DELAY_BETWEEN_BATCHES = 1500;
+  var emailSent = 0, emailFailed = 0, smsSent = 0, smsFailed = 0;
+
   // Show progress modal
   var prog = document.createElement('div');
   prog.id = 'meSendProgress';
@@ -56013,44 +56519,92 @@ function meSendNow(){
   var bd = document.createElement('div');
   bd.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999';
   document.body.appendChild(bd); document.body.appendChild(prog);
-
   function updateProg(text){ var el = document.getElementById('meProgText'); if(el) el.textContent = text; }
 
-  function sendBatch(idx){
-    if(idx >= batches.length){
-      prog.remove(); bd.remove();
-      alert('✓ Send complete!\n\n'+sent+' sent, '+failed+' failed.\n\nFailures (if any) are logged in the browser console — check for [brevoSend] entries.');
-      return;
+  // ─── Email send loop ───
+  function runEmailLoop(then){
+    if(!sendEmail || !emailRecipients.length){ then(); return; }
+    var batches = [];
+    for(var i=0; i<emailRecipients.length; i+=BATCH_SIZE){
+      batches.push(emailRecipients.slice(i, i+BATCH_SIZE));
     }
-    var batch = batches[idx];
-    updateProg('Batch '+(idx+1)+' of '+batches.length+' — sending to '+batch.length+' recipient(s)...');
-    // Brevo lets us send to multiple "to" addresses in one call but each
-    // recipient sees the others' addresses if we do that. To preserve
-    // privacy + personalize per-recipient, we send one-at-a-time within
-    // the batch, with a small inter-message delay.
-    var batchSent = 0, batchFailed = 0;
-    function nextInBatch(j){
-      if(j >= batch.length){
-        sent += batchSent; failed += batchFailed;
-        // Move to next batch with a delay
-        setTimeout(function(){ sendBatch(idx+1); }, DELAY_BETWEEN_BATCHES);
-        return;
+    function sendBatch(idx){
+      if(idx >= batches.length){ then(); return; }
+      var batch = batches[idx];
+      updateProg('📧 Email batch '+(idx+1)+' of '+batches.length+' — '+batch.length+' recipient(s)...');
+      function nextInBatch(j){
+        if(j >= batch.length){
+          setTimeout(function(){ sendBatch(idx+1); }, DELAY_BETWEEN_BATCHES);
+          return;
+        }
+        var r = batch[j];
+        var html = _meBuildHtmlBody(body, r.name);
+        brevoSend({
+          to: [{email: r.email, name: r.name}],
+          subject: subject,
+          htmlContent: html,
+          replyTo: { email: BREVO_SENDER_EMAIL, name: BREVO_SENDER_NAME }
+        }).then(function(res){
+          if(res && res.ok) emailSent++; else emailFailed++;
+          setTimeout(function(){ nextInBatch(j+1); }, 80);
+        }).catch(function(){ emailFailed++; setTimeout(function(){ nextInBatch(j+1); }, 80); });
       }
-      var r = batch[j];
-      var html = _meBuildHtmlBody(body, r.name);
-      brevoSend({
-        to: [{email: r.email, name: r.name}],
-        subject: subject,
-        htmlContent: html,
-        replyTo: { email: BREVO_SENDER_EMAIL, name: BREVO_SENDER_NAME }
-      }).then(function(res){
-        if(res.ok) batchSent++; else batchFailed++;
-        setTimeout(function(){ nextInBatch(j+1); }, 80);  // Small per-message delay
-      });
+      nextInBatch(0);
     }
-    nextInBatch(0);
+    sendBatch(0);
   }
-  sendBatch(0);
+
+  // ─── SMS send loop ───
+  function runSmsLoop(then){
+    if(!sendText || !smsRecipients.length){ then(); return; }
+    var batches = [];
+    for(var i=0; i<smsRecipients.length; i+=BATCH_SIZE){
+      batches.push(smsRecipients.slice(i, i+BATCH_SIZE));
+    }
+    function sendBatch(idx){
+      if(idx >= batches.length){ then(); return; }
+      var batch = batches[idx];
+      updateProg('📱 SMS batch '+(idx+1)+' of '+batches.length+' — '+batch.length+' recipient(s)...');
+      function nextInBatch(j){
+        if(j >= batch.length){
+          setTimeout(function(){ sendBatch(idx+1); }, DELAY_BETWEEN_BATCHES);
+          return;
+        }
+        var r = batch[j];
+        // Personalize SMS body with {{name}}
+        var smsBody = body.replace(/\{\{\s*name\s*\}\}/g, (r.name||'').split(' ')[0] || 'team');
+        brevoSendSms({
+          to: r.agent.phone,
+          message: smsBody,
+          name: r.name
+        }).then(function(res){
+          if(res && res.ok) smsSent++; else smsFailed++;
+          setTimeout(function(){ nextInBatch(j+1); }, 80);
+        }).catch(function(){ smsFailed++; setTimeout(function(){ nextInBatch(j+1); }, 80); });
+      }
+      nextInBatch(0);
+    }
+    sendBatch(0);
+  }
+
+  // Run email first, then SMS, then done
+  runEmailLoop(function(){
+    runSmsLoop(function(){
+      prog.remove(); bd.remove();
+      var summary = '✓ Send complete!\n\n';
+      if(sendEmail) summary += '📧 Email: '+emailSent+' sent, '+emailFailed+' failed\n';
+      if(sendText)  summary += '📱 Text:  '+smsSent+' sent, '+smsFailed+' failed\n';
+      summary += '\nFailures (if any) are logged in the browser console — check for [brevoSend] / [brevoSendSms] entries.';
+      alert(summary);
+    });
+  });
+}
+
+// Helper: quick phone validator. Looks for 10+ digits.
+function _phoneIsLikelyValid(p){
+  if(!p) return false;
+  var digits = String(p).replace(/\D/g,'');
+  return digits.length >= 10;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -59789,6 +60343,10 @@ if(typeof trainingAutoAdvancePending === 'function'){
   // Calvin 2026-06-01: applicant reminder timer (hourly check; daily emails)
   if(typeof startApplicantReminderTimer === 'function'){
     try{ startApplicantReminderTimer(); }catch(e){ console.warn('[init] applicant reminder timer failed:', e); }
+  }
+  // Calvin 2026-06-03: birthday + work anniversary scanner (boots once + every 6h)
+  if(typeof startCelebrationScanner === 'function'){
+    try{ startCelebrationScanner(); }catch(e){ console.warn('[init] celebration scanner failed:', e); }
   }
   // Calvin 2026-05-14: auto-refresh for tables not on realtime (notifications,
   // sales, transfers). Polls every 15s. This is what makes notifications
