@@ -10,6 +10,17 @@
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- Calvin 2026-06-03: pdf.js for the Gen Mobile pricelist PDF upload parser -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>
+    // Set pdf.js worker source (required for the library to function).
+    // Done in a try/catch so the page still works if CDN is briefly down.
+    try {
+      if (typeof pdfjsLib !== 'undefined') {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      }
+    } catch(e){ console.warn('[pdf.js] worker setup failed:', e); }
+  </script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WMAM Inc. — Williams Marketing & Management</title>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Barlow+Condensed:ital,wght@0,300;0,400;0,600;0,700;0,900;1,700&family=Barlow:wght@300;400;500;600&family=Caveat:wght@400;700&display=swap" rel="stylesheet">
@@ -12794,6 +12805,236 @@ function canManageGMPricelist(user){
   if(user.depts && (user.depts.inventory === true || user.depts.inv === true)) return true;
   return false;
 }
+
+// ══════════════════════════════════════════════════════════
+//  GM PRICELIST PDF UPLOAD — Calvin Williams 2026-06-03
+//
+//  Workflow:
+//   1. Office uploads Gen Mobile's monthly pricelist PDF
+//   2. pdf.js extracts text from each page (free, browser-side, no API)
+//   3. The smart parser scans the extracted text for rows matching the
+//      pricelist schema: model name + price + (optional) network, screen,
+//      specs, CA tribal credit, non-CA credit
+//   4. We diff against the live GM_PRICELIST and present a preview:
+//        - NEW rows (model not in list)
+//        - PRICE CHANGES (model exists, price different)
+//        - UNCHANGED (model exists, same price)
+//        - MISSING (model in list but absent from PDF — flagged for tombstone)
+//   5. Office reviews and clicks Commit
+//   6. We call gmPricelistAddOrSupersede() for each non-unchanged row
+//      (this is the existing engine — it handles supersede, effective date,
+//      audit, and Supabase sync; chargebacks remain correct because old
+//      inventory locked devCost at upload time)
+//
+//  Scan detection: if pdf.js returns < 50 characters of text across all
+//  pages, we treat the PDF as a scan and show a clear "this is a scanned
+//  PDF, can't parse — please type prices in manually" message rather than
+//  silently inserting wrong data.
+// ══════════════════════════════════════════════════════════
+
+// Extract raw text from every page of a PDF File object.
+// Returns: Promise<{pages: [string,...], allText: string, isScan: bool}>
+async function gmPdfExtractText(file){
+  if(typeof pdfjsLib === 'undefined'){
+    throw new Error('pdf.js library failed to load. Refresh the page and try again.');
+  }
+  var arrayBuf = await file.arrayBuffer();
+  var pdf = await pdfjsLib.getDocument({data: arrayBuf}).promise;
+  var pages = [];
+  for(var i = 1; i <= pdf.numPages; i++){
+    var page = await pdf.getPage(i);
+    var content = await page.getTextContent();
+    // Group text items by approximate Y coordinate so we reconstruct rows
+    var items = content.items.map(function(it){
+      return {str: it.str, x: it.transform[4], y: Math.round(it.transform[5])};
+    });
+    // Sort by Y descending (top→bottom), then by X ascending (left→right)
+    items.sort(function(a,b){ return (b.y - a.y) || (a.x - b.x); });
+    // Group items that are on the same line (within 3px Y tolerance)
+    var lines = [];
+    var currentLine = [], currentY = null;
+    items.forEach(function(it){
+      if(currentY === null || Math.abs(it.y - currentY) <= 3){
+        currentLine.push(it.str);
+        if(currentY === null) currentY = it.y;
+      } else {
+        if(currentLine.length) lines.push(currentLine.join(' '));
+        currentLine = [it.str];
+        currentY = it.y;
+      }
+    });
+    if(currentLine.length) lines.push(currentLine.join(' '));
+    pages.push(lines.join('\n'));
+  }
+  var allText = pages.join('\n\n').trim();
+  return {
+    pages: pages,
+    allText: allText,
+    pageCount: pdf.numPages,
+    isScan: allText.length < 50  // virtually no text → almost certainly a scan
+  };
+}
+
+// Parse the extracted text into pricelist row candidates.
+// Returns: array of {model, price, network?, screen?, specs?, caTribalCredit?, nonCACredit?, sourceLine}
+// The parser is INTENTIONALLY conservative: any line that doesn't look like
+// a price row is skipped. We'd rather miss a row and have the user notice
+// than silently insert garbage into the pricelist.
+function gmPdfParseRows(allText){
+  if(!allText || !allText.length) return [];
+  var lines = allText.split(/\r?\n/).map(function(l){ return l.trim(); }).filter(Boolean);
+  var rows = [];
+
+  // Strategy: walk each line. A pricelist row generally has:
+  //   - Letters (a model name, possibly with hyphens/digits)
+  //   - At least one $-prefixed or unprefixed number that looks like a phone price ($35-$500)
+  // We extract the FIRST plausible price as "price", and optionally find
+  // CA tribal credit and non-CA credit if there are 2-3 numbers on the line.
+  // Word boundary on the digit run so "9999999" doesn't yield a stray "9999".
+  var priceRegex = /\$?\s?\b(\d{2,4})(?:\.\d{1,2})?\b/g;
+  var skipKeywords = /^(price|model|device|network|screen|spec|credit|gen\s*mobile|lifeline|tribal|non-?ca|page|monthly|effective|copyright|confidential)/i;
+
+  lines.forEach(function(line){
+    if(line.length < 5) return;
+    if(skipKeywords.test(line)) return;
+
+    // Find all numbers in the line that look like prices ($20-$2000)
+    var nums = [];
+    var m;
+    priceRegex.lastIndex = 0;
+    while((m = priceRegex.exec(line)) !== null){
+      var n = parseInt(m[1], 10);
+      if(n >= 20 && n <= 2000) nums.push({val: n, idx: m.index});
+    }
+    if(!nums.length) return;
+
+    // Extract the model name = everything from the start of the line up to
+    // the first number. Strip trailing punctuation.
+    var modelEnd = nums[0].idx;
+    var modelRaw = line.substring(0, modelEnd).trim();
+    // Strip trailing $, comma, parens, hyphens
+    modelRaw = modelRaw.replace(/[\s\$,\-:]+$/, '').trim();
+    if(modelRaw.length < 3) return;  // too short to be a real model name
+
+    // A model name should contain at least one letter
+    if(!/[a-zA-Z]/.test(modelRaw)) return;
+
+    // Guess columns: most GM pricelist rows have the structure
+    //   [model] [network?] [screen?] [specs?] [PRICE] [CA TRIBAL CREDIT] [NON-CA CREDIT]
+    // Most reliable signal: the PRICE is the FIRST number, credits are subsequent
+    // (and usually 40-100 range)
+    var price = nums[0].val;
+    var caCredit = nums.length >= 2 ? nums[1].val : null;
+    var nonCaCredit = nums.length >= 3 ? nums[2].val : null;
+
+    rows.push({
+      model: modelRaw,
+      price: price,
+      caTribalCredit: (caCredit !== null && caCredit >= 30 && caCredit <= 200) ? caCredit : null,
+      nonCACredit:    (nonCaCredit !== null && nonCaCredit >= 30 && nonCaCredit <= 200) ? nonCaCredit : null,
+      sourceLine: line
+    });
+  });
+
+  return rows;
+}
+
+// Diff parsed rows against the live pricelist. Returns:
+//   { new: [], changed: [], unchanged: [], missing: [] }
+function gmPdfDiff(parsedRows, asOfDate){
+  asOfDate = asOfDate || new Date().toISOString().slice(0,10);
+  var result = {new: [], changed: [], unchanged: [], missing: []};
+  var seenInPdf = {};
+
+  parsedRows.forEach(function(pr){
+    var existing = gmPricelistLookup(pr.model, asOfDate);
+    var normKey = gmPricelistNormalize(pr.model);
+    seenInPdf[normKey] = true;
+    if(!existing || existing.isTombstone){
+      result.new.push({parsed: pr, existing: null});
+    } else if(existing.price !== pr.price
+              || (pr.caTribalCredit !== null && existing.caTribalCredit !== pr.caTribalCredit)
+              || (pr.nonCACredit    !== null && existing.nonCACredit    !== pr.nonCACredit)){
+      result.changed.push({parsed: pr, existing: existing});
+    } else {
+      result.unchanged.push({parsed: pr, existing: existing});
+    }
+  });
+
+  // Models on the live pricelist (active, not tombstoned, current on asOfDate)
+  // that weren't seen in the PDF
+  var byModel = {};
+  GM_PRICELIST.forEach(function(row){
+    if(row.isTombstone) return;
+    if((row.effectiveDate||'').slice(0,10) > asOfDate) return;
+    if(row.supersededAt && row.supersededAt.slice(0,10) <= asOfDate) return;
+    var key = gmPricelistNormalize(row.model);
+    if(!byModel[key] || row.effectiveDate > byModel[key].effectiveDate){
+      byModel[key] = row;
+    }
+  });
+  Object.keys(byModel).forEach(function(key){
+    if(!seenInPdf[key]) result.missing.push(byModel[key]);
+  });
+
+  return result;
+}
+
+// Commit the diff to the pricelist. tombstoneMissing: if true, missing models
+// are tombstoned; otherwise they're left alone.
+function gmPdfCommit(diff, effectiveDate, tombstoneMissingModelNames, currentUserId){
+  var stats = {created: 0, updated: 0, tombstoned: 0, errors: []};
+  var notes = 'Imported from PDF on ' + new Date().toISOString().slice(0,10);
+
+  // Apply NEW and CHANGED rows
+  diff.new.forEach(function(item){
+    var p = item.parsed;
+    var res = gmPricelistAddOrSupersede({
+      model: p.model,
+      price: p.price,
+      caTribalCredit: p.caTribalCredit !== null ? p.caTribalCredit : 55,
+      nonCACredit:    p.nonCACredit    !== null ? p.nonCACredit    : 40,
+      effectiveDate: effectiveDate,
+      notes: notes
+    }, currentUserId);
+    if(res.ok) stats.created++;
+    else stats.errors.push('NEW '+p.model+': '+res.error);
+  });
+  diff.changed.forEach(function(item){
+    var p = item.parsed;
+    var ex = item.existing;
+    var res = gmPricelistAddOrSupersede({
+      model: p.model,
+      network: ex.network, screen: ex.screen, specs: ex.specs,
+      price: p.price,
+      caTribalCredit: p.caTribalCredit !== null ? p.caTribalCredit : ex.caTribalCredit,
+      nonCACredit:    p.nonCACredit    !== null ? p.nonCACredit    : ex.nonCACredit,
+      effectiveDate: effectiveDate,
+      notes: notes
+    }, currentUserId);
+    if(res.ok) stats.updated++;
+    else stats.errors.push('UPDATE '+p.model+': '+res.error);
+  });
+
+  // Tombstone selected missing models
+  if(Array.isArray(tombstoneMissingModelNames) && tombstoneMissingModelNames.length){
+    tombstoneMissingModelNames.forEach(function(modelName){
+      var res = gmPricelistRemoveModel(modelName, currentUserId);
+      if(res.ok) stats.tombstoned++;
+      else stats.errors.push('TOMBSTONE '+modelName+': '+res.error);
+    });
+  }
+
+  return stats;
+}
+
+if(typeof window !== 'undefined'){
+  window.gmPdfExtractText = gmPdfExtractText;
+  window.gmPdfParseRows = gmPdfParseRows;
+  window.gmPdfDiff = gmPdfDiff;
+  window.gmPdfCommit = gmPdfCommit;
+}
+
 // ══════════════════════════════════════════════════════════
 //  END GM PRICELIST
 // ══════════════════════════════════════════════════════════
@@ -42335,6 +42576,8 @@ function panelGMPricelist(){
   // Action strip
   h += '<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap;align-items:center">';
   h += '<button onclick="gmPricelistShowAddForm()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">+ Add Device</button>';
+  // Calvin 2026-06-03: PDF upload — drops in monthly Gen Mobile pricelist PDF
+  h += '<button onclick="gmPdfShowUploadModal()" style="padding:10px 24px;background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer;font-weight:700">📤 Upload Price Sheet (PDF)</button>';
   h += '<button onclick="gmPricelistShowImportSheet()" style="padding:10px 18px;background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.3);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">📋 View Source Sheet</button>';
   h += '<div style="flex:1"></div>';
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">'+Object.keys(byModel).filter(function(k){return byModel[k].current && !byModel[k].current.isTombstone;}).length+' active models · '+GM_PRICELIST.length+' total rows (incl. history)</div>';
@@ -42401,6 +42644,326 @@ function panelGMPricelist(){
 }
 
 // Helpers for the panel
+
+// ════════════════════════════════════════════════════════════════════════
+//  PDF UPLOAD MODAL & WORKFLOW — Calvin 2026-06-03
+//
+//  Three-step UI: Pick file → Preview diff → Commit
+//  All state held in window._gmPdfState so the modal can re-render between
+//  steps without losing the parsed rows.
+// ════════════════════════════════════════════════════════════════════════
+window._gmPdfState = null;  // {file, extracted, parsed, diff, effectiveDate, step, tombstoneSet}
+
+function gmPdfShowUploadModal(){
+  var u = DB.current;
+  if(!canManageGMPricelist(u)){
+    alert('Only the Owner or Inventory dept can update the pricelist.');
+    return;
+  }
+  // Initialize state
+  window._gmPdfState = {
+    file: null, extracted: null, parsed: null, diff: null,
+    effectiveDate: (new Date().toISOString().slice(0,8) + '01'),  // 1st of current month
+    step: 'pick',
+    tombstoneSet: {}  // {modelName: true} for missing models user wants to tombstone
+  };
+  _gmPdfRenderModal();
+}
+
+function _gmPdfCloseModal(){
+  var bg = document.getElementById('gm-pdf-modal-bg');
+  if(bg) bg.remove();
+  window._gmPdfState = null;
+}
+
+function _gmPdfRenderModal(){
+  var st = window._gmPdfState;
+  if(!st) return;
+  var bg = document.getElementById('gm-pdf-modal-bg');
+  if(!bg){
+    bg = document.createElement('div');
+    bg.id = 'gm-pdf-modal-bg';
+    bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding:30px 20px;overflow-y:auto';
+    document.body.appendChild(bg);
+  }
+
+  var box = document.createElement('div');
+  box.style.cssText = 'background:white;border-radius:12px;max-width:900px;width:100%;box-shadow:0 14px 48px rgba(0,0,0,.35);overflow:hidden';
+
+  var html = '';
+  // Header
+  html += '<div style="background:linear-gradient(135deg,#0B1E3F 0%,#1e3a8a 100%);color:white;padding:22px 28px;display:flex;justify-content:space-between;align-items:center">';
+  html += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;letter-spacing:2px">📤 Upload Gen Mobile Price Sheet</div>';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.85;margin-top:2px">Auto-update pricelist from monthly PDF · chargebacks & expirations stay correct</div></div>';
+  html += '<button onclick="_gmPdfCloseModal()" style="background:none;border:none;color:white;font-size:1.6rem;cursor:pointer;opacity:.8">×</button>';
+  html += '</div>';
+
+  // Step indicator
+  html += '<div style="background:#f9fafb;padding:14px 28px;border-bottom:1px solid #e5e7eb;display:flex;gap:24px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase">';
+  ['pick','preview','commit'].forEach(function(s, i){
+    var label = s === 'pick' ? '1. Pick File' : s === 'preview' ? '2. Preview' : '3. Commit';
+    var active = st.step === s;
+    var done = ['pick','preview','commit'].indexOf(st.step) > i;
+    var color = active ? '#dc2626' : done ? '#059669' : '#9ca3af';
+    html += '<div style="color:'+color+';font-weight:'+(active?'700':'500')+'">'+label+(done?' ✓':'')+'</div>';
+  });
+  html += '</div>';
+
+  // Body content per step
+  html += '<div style="padding:24px 28px;max-height:60vh;overflow-y:auto">';
+  if(st.step === 'pick'){
+    html += _gmPdfRenderPickStep(st);
+  } else if(st.step === 'preview'){
+    html += _gmPdfRenderPreviewStep(st);
+  } else if(st.step === 'done'){
+    html += _gmPdfRenderDoneStep(st);
+  }
+  html += '</div>';
+
+  bg.innerHTML = '';
+  bg.appendChild(box);
+  box.innerHTML = html;
+  // Wire file input change handler (since onchange in innerHTML doesn't always survive re-render)
+  var fileInput = document.getElementById('gm-pdf-file-input');
+  if(fileInput){
+    fileInput.onchange = function(e){ _gmPdfHandleFilePicked(e); };
+  }
+}
+
+function _gmPdfRenderPickStep(st){
+  var h = '';
+  h += '<div style="background:rgba(220,38,38,.05);border:1px solid rgba(220,38,38,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#7f1d1d;line-height:1.6">';
+  h += '<strong>How this works:</strong> Drop in the monthly Gen Mobile pricelist PDF. We extract the text, match each row against your live pricelist, and show you exactly what will change — new devices, price changes, and discontinued models — before anything is saved.';
+  h += '</div>';
+
+  // Effective date picker
+  h += '<div style="margin-bottom:18px"><label class="f-label" style="font-weight:700;color:#0B1E3F">Effective Date</label>';
+  h += '<input type="date" id="gm-pdf-effective-date" value="'+escHtml(st.effectiveDate)+'" class="f-input" style="max-width:240px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:4px">All new prices will take effect on this date. Inventory already in stock keeps its locked cost (chargebacks remain correct).</div>';
+  h += '</div>';
+
+  // File picker
+  h += '<div style="margin-bottom:14px"><label class="f-label" style="font-weight:700;color:#0B1E3F">Pricelist PDF</label>';
+  h += '<input type="file" id="gm-pdf-file-input" accept=".pdf,application/pdf" style="display:block;width:100%;padding:14px;border:2px dashed #d1d5db;border-radius:8px;background:#f9fafb;cursor:pointer;font-family:Barlow Condensed,sans-serif">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:4px">PDF only. Must be a text PDF (text selectable when opened) — scanned PDFs cannot be parsed automatically.</div>';
+  h += '</div>';
+
+  if(st.error){
+    h += '<div style="background:rgba(220,38,38,.08);border:1px solid #dc2626;border-radius:6px;padding:12px 16px;margin-top:14px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:#7f1d1d">';
+    h += '<strong>⚠️ '+escHtml(st.error)+'</strong>';
+    if(st.errorDetail){
+      h += '<div style="margin-top:6px;font-size:.78rem;opacity:.85">'+escHtml(st.errorDetail)+'</div>';
+    }
+    h += '</div>';
+  }
+  if(st.processing){
+    h += '<div style="text-align:center;margin-top:20px;font-family:Barlow Condensed,sans-serif;color:var(--muted)">⏳ Reading PDF...</div>';
+  }
+  return h;
+}
+
+function _gmPdfRenderPreviewStep(st){
+  var d = st.diff;
+  var h = '';
+  // Summary chips
+  h += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px">';
+  var stat = function(label, n, color){
+    return '<div style="background:'+color+';border-radius:8px;padding:14px 16px;text-align:center">'
+      +'<div style="font-family:Bebas Neue,sans-serif;font-size:2rem;line-height:1;color:white">'+n+'</div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:white;opacity:.95;margin-top:4px">'+label+'</div></div>';
+  };
+  h += stat('New', d.new.length, '#059669');
+  h += stat('Price Change', d.changed.length, '#d97706');
+  h += stat('Unchanged', d.unchanged.length, '#6b7280');
+  h += stat('Missing from PDF', d.missing.length, '#dc2626');
+  h += '</div>';
+
+  var renderRow = function(label, items, color, isMissing){
+    if(!items.length) return '';
+    var rh = '<div style="margin-bottom:18px"><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:'+color+';margin-bottom:8px">'+label+' ('+items.length+')</div>';
+    rh += '<div style="border:1px solid #e5e7eb;border-radius:6px;overflow:hidden">';
+    rh += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.82rem">';
+    rh += '<thead><tr style="background:#f9fafb;border-bottom:1px solid #e5e7eb">';
+    if(isMissing){
+      rh += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">Tombstone?</th>';
+      rh += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">Model</th>';
+      rh += '<th style="padding:8px 12px;text-align:right;font-size:.66rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">Last Price</th>';
+    } else {
+      rh += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">Model</th>';
+      rh += '<th style="padding:8px 12px;text-align:right;font-size:.66rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">Price</th>';
+      rh += '<th style="padding:8px 12px;text-align:right;font-size:.66rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">CA Tribal</th>';
+      rh += '<th style="padding:8px 12px;text-align:right;font-size:.66rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase">Non-CA</th>';
+    }
+    rh += '</tr></thead><tbody>';
+    items.forEach(function(item){
+      if(isMissing){
+        var checked = st.tombstoneSet[item.model] ? 'checked' : '';
+        rh += '<tr style="border-bottom:1px solid #f3f4f6">';
+        rh += '<td style="padding:8px 12px"><input type="checkbox" '+checked+' onchange="_gmPdfToggleTombstone(\''+escHtml(item.model).replace(/\\\'/g,"\\'")+'\', this.checked)" style="cursor:pointer"></td>';
+        rh += '<td style="padding:8px 12px;font-weight:700;color:#0B1E3F">'+escHtml(item.model)+'</td>';
+        rh += '<td style="padding:8px 12px;text-align:right;color:#6b7280">$'+escHtml(String(item.price))+'</td>';
+        rh += '</tr>';
+      } else {
+        var p = item.parsed;
+        var ex = item.existing;
+        rh += '<tr style="border-bottom:1px solid #f3f4f6">';
+        rh += '<td style="padding:8px 12px;font-weight:700;color:#0B1E3F">'+escHtml(p.model)+'</td>';
+        if(ex && ex.price !== p.price){
+          rh += '<td style="padding:8px 12px;text-align:right"><span style="color:#9ca3af;text-decoration:line-through">$'+escHtml(String(ex.price))+'</span> → <span style="color:'+color+';font-weight:700">$'+escHtml(String(p.price))+'</span></td>';
+        } else {
+          rh += '<td style="padding:8px 12px;text-align:right;color:'+color+';font-weight:700">$'+escHtml(String(p.price))+'</td>';
+        }
+        var caVal = p.caTribalCredit !== null ? '$'+p.caTribalCredit : (ex ? '$'+ex.caTribalCredit+' (kept)' : '—');
+        var ncVal = p.nonCACredit    !== null ? '$'+p.nonCACredit    : (ex ? '$'+ex.nonCACredit+' (kept)'    : '—');
+        rh += '<td style="padding:8px 12px;text-align:right;color:#6b7280">'+escHtml(caVal)+'</td>';
+        rh += '<td style="padding:8px 12px;text-align:right;color:#6b7280">'+escHtml(ncVal)+'</td>';
+        rh += '</tr>';
+      }
+    });
+    rh += '</tbody></table></div></div>';
+    return rh;
+  };
+
+  h += renderRow('🟢 New Devices',        d.new,       '#059669', false);
+  h += renderRow('🟡 Price Changes',      d.changed,   '#d97706', false);
+  if(d.missing.length){
+    h += '<div style="background:rgba(220,38,38,.05);border:1px solid rgba(220,38,38,.2);border-radius:8px;padding:12px 16px;margin-bottom:8px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#7f1d1d;line-height:1.5">';
+    h += '<strong>⚠️ Missing from PDF:</strong> These models are on your live pricelist but didn\'t appear in this PDF. Check the box next to any you want to discontinue (tombstone). Existing inventory keeps its locked cost — chargebacks remain correct.';
+    h += '</div>';
+    h += renderRow('🔴 Missing — Discontinue?', d.missing, '#dc2626', true);
+  }
+  h += renderRow('⚪ Unchanged (will skip)',  d.unchanged, '#6b7280', false);
+
+  // Action buttons
+  h += '<div style="margin-top:24px;padding-top:18px;border-top:1px solid #e5e7eb;display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">';
+  h += '<button onclick="_gmPdfCloseModal()" style="background:white;border:1px solid #d1d5db;color:#6b7280;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 22px;border-radius:6px;cursor:pointer">Cancel</button>';
+  h += '<button onclick="_gmPdfBackToPick()" style="background:white;border:1px solid #d1d5db;color:#0B1E3F;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 22px;border-radius:6px;cursor:pointer">← Pick Different File</button>';
+  var hasChanges = d.new.length + d.changed.length + Object.keys(st.tombstoneSet).length;
+  if(hasChanges){
+    h += '<button onclick="_gmPdfCommit()" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:12px 28px;border-radius:6px;cursor:pointer;font-weight:700">✓ Commit '+hasChanges+' Change'+(hasChanges===1?'':'s')+'</button>';
+  } else {
+    h += '<button disabled style="background:#e5e7eb;color:#9ca3af;border:none;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:12px 28px;border-radius:6px;cursor:not-allowed">Nothing to Commit</button>';
+  }
+  h += '</div>';
+  return h;
+}
+
+function _gmPdfRenderDoneStep(st){
+  var s = st.commitStats || {};
+  var h = '';
+  h += '<div style="text-align:center;padding:30px 20px">';
+  h += '<div style="font-size:54px;line-height:1;margin-bottom:8px">✓</div>';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;letter-spacing:2px;color:#059669">Pricelist Updated</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.92rem;color:var(--muted);margin-top:8px">Effective date: '+escHtml(st.effectiveDate)+'</div>';
+  h += '</div>';
+  h += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:20px 0">';
+  h += '<div style="background:#dcfce7;border-radius:8px;padding:14px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#059669">'+(s.created||0)+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:#065f46">Created</div></div>';
+  h += '<div style="background:#fef3c7;border-radius:8px;padding:14px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#d97706">'+(s.updated||0)+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:#92400e">Updated</div></div>';
+  h += '<div style="background:#fee2e2;border-radius:8px;padding:14px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#dc2626">'+(s.tombstoned||0)+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:#991b1b">Tombstoned</div></div>';
+  h += '</div>';
+  if(s.errors && s.errors.length){
+    h += '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:12px 16px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#7f1d1d">';
+    h += '<strong>'+s.errors.length+' error(s):</strong><ul style="margin:6px 0 0 18px;padding:0">';
+    s.errors.forEach(function(e){ h += '<li>'+escHtml(e)+'</li>'; });
+    h += '</ul></div>';
+  }
+  h += '<div style="text-align:center;margin-top:18px">';
+  h += '<button onclick="_gmPdfCloseModal(); gotoPanel(\'gm-pricelist\')" class="btn-fire" style="padding:11px 24px">View Updated Pricelist →</button>';
+  h += '</div>';
+  return h;
+}
+
+// ── Handlers ──
+
+async function _gmPdfHandleFilePicked(evt){
+  var file = evt.target.files && evt.target.files[0];
+  if(!file) return;
+  var st = window._gmPdfState;
+  if(!st) return;
+
+  // Capture effective date from input now
+  var ed = document.getElementById('gm-pdf-effective-date');
+  if(ed && ed.value) st.effectiveDate = ed.value;
+
+  st.file = file;
+  st.error = null;
+  st.errorDetail = null;
+  st.processing = true;
+  _gmPdfRenderModal();
+
+  try {
+    var ex = await gmPdfExtractText(file);
+    st.extracted = ex;
+    if(ex.isScan){
+      st.error = 'This appears to be a SCANNED PDF.';
+      st.errorDetail = 'pdf.js could only extract '+ex.allText.length+' characters of text across '+ex.pageCount+' page(s). The PDF likely contains images of text rather than selectable text. Options: (1) Ask Gen Mobile to send a text version, (2) Open the PDF in Preview/Adobe and use File → Export As → Text, then re-upload that, or (3) Add devices manually using "+ Add Device".';
+      st.processing = false;
+      _gmPdfRenderModal();
+      return;
+    }
+    var parsed = gmPdfParseRows(ex.allText);
+    if(!parsed.length){
+      st.error = 'No pricelist rows could be detected in the PDF.';
+      st.errorDetail = 'Extracted '+ex.allText.length+' characters of text but found 0 model+price rows. The PDF format may be different from expected. You can try a different file, or add devices manually using "+ Add Device".';
+      st.processing = false;
+      _gmPdfRenderModal();
+      return;
+    }
+    st.parsed = parsed;
+    st.diff = gmPdfDiff(parsed, st.effectiveDate);
+    st.step = 'preview';
+    st.processing = false;
+    _gmPdfRenderModal();
+  } catch(e){
+    console.error('[gmPdfHandleFilePicked]', e);
+    st.error = 'Failed to read PDF.';
+    st.errorDetail = e && e.message ? e.message : 'Unknown error.';
+    st.processing = false;
+    _gmPdfRenderModal();
+  }
+}
+
+function _gmPdfBackToPick(){
+  var st = window._gmPdfState;
+  if(!st) return;
+  st.step = 'pick';
+  st.file = null;
+  st.extracted = null;
+  st.parsed = null;
+  st.diff = null;
+  st.tombstoneSet = {};
+  _gmPdfRenderModal();
+}
+
+function _gmPdfToggleTombstone(modelName, checked){
+  var st = window._gmPdfState;
+  if(!st) return;
+  if(checked) st.tombstoneSet[modelName] = true;
+  else delete st.tombstoneSet[modelName];
+}
+
+function _gmPdfCommit(){
+  var st = window._gmPdfState;
+  if(!st || !st.diff) return;
+  var tombstones = Object.keys(st.tombstoneSet);
+  var changes = st.diff.new.length + st.diff.changed.length + tombstones.length;
+  if(!changes){ alert('Nothing to commit.'); return; }
+  if(!confirm('Commit '+changes+' change(s) to the live pricelist?\n\nThis is irreversible (though all changes are versioned with effective dates, so chargebacks on existing inventory remain correct).')) return;
+  var u = DB.current;
+  var stats = gmPdfCommit(st.diff, st.effectiveDate, tombstones, u ? u.id : null);
+  st.commitStats = stats;
+  st.step = 'done';
+  _gmPdfRenderModal();
+}
+
+if(typeof window !== 'undefined'){
+  window.gmPdfShowUploadModal = gmPdfShowUploadModal;
+  window._gmPdfCloseModal = _gmPdfCloseModal;
+  window._gmPdfHandleFilePicked = _gmPdfHandleFilePicked;
+  window._gmPdfBackToPick = _gmPdfBackToPick;
+  window._gmPdfToggleTombstone = _gmPdfToggleTombstone;
+  window._gmPdfCommit = _gmPdfCommit;
+}
 
 function gmPricelistShowAddForm(){
   var holder = document.getElementById('gmpl-add-form');
