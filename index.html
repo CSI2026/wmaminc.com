@@ -4456,6 +4456,7 @@ function pushNotification(opts){
     // n.data && n.data.kind === 'audit'). Preserve the field through to
     // the saved notification + Supabase row + localStorage.
     data: opts.data || null,
+    priority: opts.priority || 'normal',
     ts: new Date().toISOString(),
     read: []
   };
@@ -4471,12 +4472,53 @@ function pushNotification(opts){
   saveNotifications();
   renderNotifBell();
   // ── Ship A12.4: push to Supabase so other devices receive it ──
-  // Fire-and-forget — local copy already saved above, so a Supabase failure
-  // doesn't block the user. The next page load will sync from Supabase
-  // truth.  Realtime subscribers see the insert within ~50ms.
   _notifPushToSupabase(n);
+
+  // ── Calvin 2026-06-03: AUTO EMAIL MIRROR for priority:'high' notifications ──
+  // Any pushNotification call with priority:'high' ALSO sends an email to
+  // each recipient who has an email on file. Routine pings (normal priority)
+  // stay in-app only to avoid email spam (sales credits, chat mentions, etc.).
+  // Use opts.skipEmail:true to suppress for a specific call site if needed.
+  // Use opts.eventType to choose a specific email template; falls back to
+  // a generic 'in_app_notification' template that uses the title + body.
+  if(opts.priority === 'high' && !opts.skipEmail){
+    try { _mirrorHighPriorityToEmail(n, opts); }
+    catch(e){ console.warn('[pushNotification] email mirror failed:', e); }
+  }
   return n;
 }
+
+// ── Calvin 2026-06-03: email-mirror helper ──
+// Walks n.toIds and fires notifyByEmail for each recipient with an email.
+// Fire-and-forget; failures are logged but never block the in-app notification.
+function _mirrorHighPriorityToEmail(n, opts){
+  if(typeof notifyByEmail !== 'function') return;
+  if(typeof DB === 'undefined' || !DB.agents) return;
+  var eventType = opts.eventType || 'in_app_notification';
+  var seen = {};
+  (n.toIds || []).forEach(function(aid){
+    if(seen[aid]) return;
+    seen[aid] = true;
+    var agent = DB.agents.find(function(a){ return a && a.id === aid; });
+    if(!agent || !agent.active) return;
+    if(!agent.email || !/@/.test(agent.email)) return;
+    notifyByEmail({
+      toAgent:   {id: agent.id, name: agent.name, email: agent.email},
+      eventType: eventType,
+      payload:   {
+        title:    n.title,
+        body:     n.body,
+        icon:     n.icon,
+        fromName: n.fromName,
+        formType: n.formType,
+        appUrl:   (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com',
+        // Pass through any custom payload data the caller specified
+        custom:   opts.emailPayload || null
+      }
+    }).catch(function(e){ console.warn('[_mirrorHighPriorityToEmail] failed for '+agent.email+':', e); });
+  });
+}
+if(typeof window !== 'undefined') window._mirrorHighPriorityToEmail = _mirrorHighPriorityToEmail;
 
 // Push a single notification to the Supabase 'notifications' table.
 // Best-effort; failures are logged but never block.
@@ -10060,7 +10102,41 @@ function sendOnboardingPacket(agentId,campaignName,contractType,customTiers){
     }
   } catch(e){ console.warn('[sendOnboardingPacket] doc assignment seed failed:', e); }
 
-  pushNotification({toIds:[agentId],toRoles:[],icon:'📄',title:'Action Required — Sign Your Onboarding Documents',body:'Your onboarding packet for '+campaignName+' is ready. You have 3 documents to complete. Tap to begin.',panel:'my-documents',priority:'high'});
+  // ── Calvin 2026-06-03: onboarding lifecycle email to AGENT (no office cc) ──
+  // Office staff get the existing in-app/notification routing via
+  // notifyOnboardingProgress below. The AGENT gets a dedicated email here.
+  pushNotification({
+    toIds: [agentId], toRoles: [], icon: '📄',
+    title: 'Action Required — Sign Your Onboarding Documents',
+    body: 'Your onboarding packet for '+campaignName+' is ready. You have 3 documents to complete. Tap to begin.',
+    panel: 'my-documents',
+    priority: 'high',
+    eventType: 'onboarding.packet_sent',
+    skipEmail: true  // we explicitly call notifyByEmail right below with the full payload
+  });
+  // Explicit agent email with the rich onboarding-specific template
+  if(typeof notifyByEmail === 'function' && agent.email){
+    notifyByEmail({
+      toAgent: {id: agent.id, name: agent.name, email: agent.email},
+      eventType: 'onboarding.packet_sent',
+      payload: {
+        firstName:   (agent.name||'').split(' ')[0],
+        fullName:    agent.name,
+        campaignName: campaignName,
+        contractType: contractType,
+        stepsTotal:   3,
+        appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+      }
+    }).catch(function(e){ console.warn('[sendOnboardingPacket] agent email failed:', e); });
+  }
+  // Seed the reminder timer state so we know to nag the agent if they stall
+  if(!ASSIGNED_DOC_STATUS[agentId]) ASSIGNED_DOC_STATUS[agentId] = {};
+  // Reminder bookkeeping lives on the packet status — checked by the
+  // onboarding reminder scanner. Don't overwrite if already there.
+  var pktState = AGENT_ONBOARDING_STATUS[agentId][campaignName];
+  if(pktState && !pktState.lastReminderAt) pktState.lastReminderAt = null;
+  saveAgentContracts();
+
   notifyOnboardingProgress(agent,campaignName,0,3,false);
   createOBTask(agentId,agent.name,campaignName,'pending-signatures','Onboarding Sent — '+agent.name+' / '+campaignName,'Contract type: '+contractType);
 }
@@ -10091,6 +10167,28 @@ function agentCompleteStep(agentId,campaignName,step,data){
     AGENT_BANKING_INFO[agentId]={routingNumber:data.routingNumber,accountNumber:data.accountNumber,accountHolderName:data.accountHolderName,savedAt:new Date().toISOString(),campaignName:campaignName};
   }
   var done=(status.steps[1].signed?1:0)+(status.steps[2].signed?1:0)+(status.steps[3].submitted?1:0);
+
+  // ── Calvin 2026-06-03: progress-update email to AGENT after each step ──
+  // Reset reminder bookkeeping since they just made progress (don't nag them).
+  status.lastReminderAt = null;
+  status.reminderCount = 0;
+  if(typeof notifyByEmail === 'function' && agent.email && done < 3){
+    notifyByEmail({
+      toAgent: {id: agent.id, name: agent.name, email: agent.email},
+      eventType: 'onboarding.step_signed',
+      payload: {
+        firstName:    (agent.name||'').split(' ')[0],
+        fullName:     agent.name,
+        campaignName: campaignName,
+        stepNumber:   step,
+        stepLabel:    (step===1 ? '1099 Contractor Agreement' : step===2 ? 'Company Policy & Compliance' : 'Banking Information'),
+        stepsComplete: done,
+        stepsTotal:   3,
+        appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+      }
+    }).catch(function(){});
+  }
+
   if(done===3){
     // Calvin 2026-06-03: also gate on required assigned docs. If any required
     // assigned doc is still unsigned, the packet shows as "all 3 packet steps
@@ -10102,12 +10200,50 @@ function agentCompleteStep(agentId,campaignName,step,data){
       : true;
     if(reqDocsOk){
       status.allComplete=true; status.currentStep=4;
-      pushNotification({toIds:[agentId],toRoles:[],icon:'⏳',title:'All Done — Pending Agent Code ('+campaignName+')',body:'All documents complete. Onboarding will assign your agent code shortly.',panel:'my-documents',priority:'high'});
+      pushNotification({
+        toIds:[agentId], toRoles:[], icon:'⏳',
+        title:'All Done — Pending Agent Code ('+campaignName+')',
+        body:'All documents complete. Onboarding will assign your agent code shortly.',
+        panel:'my-documents', priority:'high',
+        eventType:'onboarding.all_complete', skipEmail:true
+      });
+      // Agent email — all packet done, pending code
+      if(typeof notifyByEmail === 'function' && agent.email){
+        notifyByEmail({
+          toAgent: {id: agent.id, name: agent.name, email: agent.email},
+          eventType: 'onboarding.all_complete',
+          payload: {
+            firstName:    (agent.name||'').split(' ')[0],
+            fullName:     agent.name,
+            campaignName: campaignName,
+            appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+          }
+        }).catch(function(){});
+      }
       notifyOnboardingProgress(agent,campaignName,3,3,true);
       createOBTask(agentId,agent.name,campaignName,'enter-code','Enter Agent Code — '+agent.name+' / '+campaignName,agent.name+' completed all onboarding documents for '+campaignName+'. Enter their carrier-issued agent code to activate portal access.');
     } else {
       status.currentStep=4;
-      pushNotification({toIds:[agentId],toRoles:[],icon:'⚠️',title:'Almost Done — Additional Documents Required',body:'Your 3-step packet is complete, but there are additional required documents waiting for your signature in My Documents.',panel:'my-documents',priority:'high'});
+      pushNotification({
+        toIds:[agentId], toRoles:[], icon:'⚠️',
+        title:'Almost Done — Additional Documents Required',
+        body:'Your 3-step packet is complete, but there are additional required documents waiting for your signature in My Documents.',
+        panel:'my-documents', priority:'high',
+        eventType:'onboarding.assigned_doc_waiting', skipEmail:true
+      });
+      // Agent email — extra required docs still pending
+      if(typeof notifyByEmail === 'function' && agent.email){
+        notifyByEmail({
+          toAgent: {id: agent.id, name: agent.name, email: agent.email},
+          eventType: 'onboarding.assigned_doc_waiting',
+          payload: {
+            firstName:    (agent.name||'').split(' ')[0],
+            fullName:     agent.name,
+            campaignName: campaignName,
+            appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+          }
+        }).catch(function(){});
+      }
       notifyOnboardingProgress(agent,campaignName,3,3,false);
     }
   } else {
@@ -10124,7 +10260,16 @@ function onboardingEnterAgentCode(agentId,campaignName,code){
   if(carriers.indexOf(campaignName)<0) carriers.push(campaignName);
   agent.carrier=carriers.join(',');
   saveAgentToSupabase(agent); saveToStorage(); buildNav(DB.current); saveAgentContracts();
-  pushNotification({toIds:[agentId],toRoles:[],icon:'🔑',title:'You\'re Coded — '+campaignName+' Access Unlocked!',body:'Your agent code for '+campaignName+' has been entered. You now have full access to all '+campaignName+' tools and portals.',panel:'bo',priority:'high'});
+  // Calvin 2026-06-03: tagged with eventType for the auto email-mirror.
+  // skipEmail:true because the rich welcome email already fires below
+  // via brevoSend — we don't want a duplicate generic mirror email.
+  pushNotification({
+    toIds:[agentId], toRoles:[], icon:'🔑',
+    title:'You\'re Coded — '+campaignName+' Access Unlocked!',
+    body:'Your agent code for '+campaignName+' has been entered. You now have full access to all '+campaignName+' tools and portals.',
+    panel:'bo', priority:'high',
+    eventType:'onboarding.agent_coded', skipEmail:true
+  });
   var notifyIds=[];
   if(agent.marketManagerId){var mm=DB.agents.find(function(a){return a.id===agent.marketManagerId;});if(mm&&mm.active)notifyIds.push(mm.id);}
   if(agent.teamLeaderId){var tl=DB.agents.find(function(a){return a.id===agent.teamLeaderId;});if(tl&&tl.active&&notifyIds.indexOf(tl.id)<0)notifyIds.push(tl.id);}
@@ -18907,6 +19052,125 @@ if(typeof window !== 'undefined'){
 }
 
 // ════════════════════════════════════════════════════════════════════════
+//  ONBOARDING REMINDER SCANNER — Calvin Williams 2026-06-03
+//
+//  For any agent with an unsigned onboarding packet OR unsigned required
+//  assigned doc, fire a reminder email:
+//   - 24 hours after packet sent (if still unsigned, no progress)
+//   - 72 hours after packet sent
+//   - then every 72h afterwards until they make progress OR an office admin
+//     manually clears them (via the existing onboarding queue UI)
+//
+//  Cadence resets on any signed step (handled by agentCompleteStep clearing
+//  status.lastReminderAt + status.reminderCount).
+//
+//  Reminders go to the AGENT only per spec (no office cc — they have the
+//  HR dashboard for the bigger picture).
+//
+//  Retroactive: applies to existing stalled packets, not just new ones —
+//  the scanner reads AGENT_ONBOARDING_STATUS regardless of when the packet
+//  was sent.
+// ════════════════════════════════════════════════════════════════════════
+var WMAM_ONBOARDING_REMINDER_TIMER = null;
+
+function startOnboardingReminderScanner(){
+  if(WMAM_ONBOARDING_REMINDER_TIMER) return;
+  // Initial scan on boot (delayed so app fully loads)
+  setTimeout(function(){
+    try{ scanForOnboardingReminders(); }
+    catch(e){ console.warn('[onboarding-reminders] initial scan failed:', e); }
+  }, 10000);
+  // Recurring scan every hour. The 24h/72h decision happens inside the scanner.
+  WMAM_ONBOARDING_REMINDER_TIMER = setInterval(function(){
+    try{ scanForOnboardingReminders(); }
+    catch(e){ console.warn('[onboarding-reminders] scan failed:', e); }
+  }, 60 * 60 * 1000);
+}
+
+function _hoursSince(iso){
+  if(!iso) return 0;
+  var ms = Date.now() - new Date(iso).getTime();
+  if(!isFinite(ms) || ms < 0) return 0;
+  return ms / (1000 * 60 * 60);
+}
+
+// Decide whether this packet is due for a reminder right now.
+// Returns null if not due, or a string label of the reminder being fired.
+function _isOnboardingReminderDue(status){
+  if(!status || status.allComplete) return null;
+  // Compute hours since packet sent + hours since last reminder
+  var hoursSinceSent     = _hoursSince(status.packetSentAt);
+  var hoursSinceReminder = status.lastReminderAt ? _hoursSince(status.lastReminderAt) : null;
+  // Have they made ANY signing progress? Step 1+2 signed or 3 submitted means they've engaged.
+  var anyProgress = (status.steps && (
+    (status.steps[1] && status.steps[1].signed) ||
+    (status.steps[2] && status.steps[2].signed) ||
+    (status.steps[3] && status.steps[3].submitted)
+  ));
+  if(anyProgress) return null;  // they've engaged; reminders pause until they stall again
+  // No progress AND packet sent 24h+ ago AND (never reminded OR last reminder 72h+ ago for follow-ups; 24h for first)
+  if(hoursSinceSent >= 24){
+    if(!status.lastReminderAt){
+      return '24h-no-progress';
+    }
+    if(hoursSinceReminder >= 72){
+      return '72h-follow-up';
+    }
+  }
+  return null;
+}
+
+function scanForOnboardingReminders(){
+  if(typeof AGENT_ONBOARDING_STATUS === 'undefined') return;
+  var agentIds = Object.keys(AGENT_ONBOARDING_STATUS);
+  if(!agentIds.length) return;
+  var fired = 0;
+  agentIds.forEach(function(aidStr){
+    var aid = parseInt(aidStr, 10);
+    if(isNaN(aid)) return;
+    var agent = (DB.agents||[]).find(function(a){ return a && a.id === aid; });
+    if(!agent || !agent.active || !agent.email) return;
+    var campMap = AGENT_ONBOARDING_STATUS[aidStr];
+    if(!campMap) return;
+    Object.keys(campMap).forEach(function(camp){
+      var status = campMap[camp];
+      var due = _isOnboardingReminderDue(status);
+      if(!due) return;
+      // Fire reminder email to agent
+      if(typeof notifyByEmail === 'function'){
+        notifyByEmail({
+          toAgent: {id: agent.id, name: agent.name, email: agent.email},
+          eventType: 'onboarding.reminder',
+          payload: {
+            firstName:    (agent.name||'').split(' ')[0],
+            fullName:     agent.name,
+            campaignName: camp,
+            hoursSinceSent: Math.floor(_hoursSince(status.packetSentAt)),
+            cadence:      due,
+            reminderNumber: (status.reminderCount || 0) + 1,
+            appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+          }
+        }).catch(function(){});
+      }
+      // Update bookkeeping
+      status.lastReminderAt = new Date().toISOString();
+      status.reminderCount  = (status.reminderCount || 0) + 1;
+      fired++;
+    });
+  });
+  if(fired){
+    try{ saveAgentContracts(); }catch(e){}
+    console.log('[onboarding-reminders] fired '+fired+' reminder(s)');
+  }
+}
+
+if(typeof window !== 'undefined'){
+  window.startOnboardingReminderScanner = startOnboardingReminderScanner;
+  window.scanForOnboardingReminders = scanForOnboardingReminders;
+  window._isOnboardingReminderDue = _isOnboardingReminderDue;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 //  END realtime + conflict + notify block
 // ════════════════════════════════════════════════════════════════════════
 
@@ -22663,6 +22927,25 @@ function saveAgentForm(){
       na.campaign = campElNew ? campElNew.value : '';
     }
     DB.agents.push(na);
+    // ── Calvin 2026-06-03: account-created email to the AGENT ──
+    // Welcome email so they know they've been added to the system. Fires for
+    // every new agent who has an email on file. Office staff get the existing
+    // in-app routing — no email cc per spec.
+    if(typeof notifyByEmail === 'function' && na.email){
+      try {
+        notifyByEmail({
+          toAgent: {id: na.id, name: na.name, email: na.email},
+          eventType: 'onboarding.account_created',
+          payload: {
+            firstName: (na.name||'').split(' ')[0],
+            fullName:  na.name,
+            role:      na.role,
+            username:  na.username,
+            appUrl:    (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+          }
+        }).catch(function(){});
+      } catch(e){ console.warn('[addAgent] account_created email failed:', e); }
+    }
     if(teamId){var t2=LIFELINE_TEAMS.find(function(t){return t.id===teamId;});if(t2&&t2.members.indexOf(na.id)<0)t2.members.push(na.id);}
     // Save agent codes for new agents — all programs
     na.agentCodes={};
@@ -61218,6 +61501,12 @@ if(typeof trainingAutoAdvancePending === 'function'){
   // Calvin 2026-06-03: birthday + work anniversary scanner (boots once + every 6h)
   if(typeof startCelebrationScanner === 'function'){
     try{ startCelebrationScanner(); }catch(e){ console.warn('[init] celebration scanner failed:', e); }
+  }
+  // Calvin 2026-06-03: onboarding reminder scanner — 24h then every 72h
+  // until agent signs OR admin clears. Retroactive: scans all existing
+  // packets, not just new ones.
+  if(typeof startOnboardingReminderScanner === 'function'){
+    try{ startOnboardingReminderScanner(); }catch(e){ console.warn('[init] onboarding reminder scanner failed:', e); }
   }
   // Calvin 2026-05-14: auto-refresh for tables not on realtime (notifications,
   // sales, transfers). Polls every 15s. This is what makes notifications
