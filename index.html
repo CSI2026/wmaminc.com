@@ -4561,8 +4561,14 @@ function renderNotifBell(){
 function canEditForms(u){
   if(!u) return false;
   if(isOwner(u)) return true;
-  // Admin no longer implies form-builder access. Only the Owner plus users
-  // explicitly listed in FORM_BUILDER_ACCESS (maintained by the Owner) qualify.
+  // Calvin 2026-06-03: extended to include office staff (Owner, admin, HR,
+  // Onboarding) per the document-assignment spec. Also keeps the existing
+  // FORM_BUILDER_ACCESS whitelist for backward compatibility — Owner can
+  // still add specific non-office users via that list.
+  var role = String(u.role || '').toLowerCase();
+  if(role === 'admin' || role === 'hr' || role === 'onboarding' || role === 'office staff') return true;
+  if(typeof isHR === 'function' && isHR(u)) return true;
+  if(typeof isOnboarding === 'function' && isOnboarding(u)) return true;
   return FORM_BUILDER_ACCESS.indexOf(u.username) >= 0;
 }
 var IMPERSONATING   = null; // stores original owner while impersonating
@@ -9919,6 +9925,52 @@ var AGENT_BANKING_INFO      = {};
 var ONBOARDING_TASKS        = [];
 var OB_TASK_NEXT_ID         = 1;
 
+// ════════════════════════════════════════════════════════════════════════
+//  ASSIGNED DOCUMENTS — Calvin Williams 2026-06-03
+//
+//  Documents/forms built in Form Builder can be ASSIGNED to:
+//   - Specific individuals (agentIds)
+//   - Specific campaigns
+//   - Entire company (including office staff)
+//
+//  When assigned to a campaign or company, ALL existing matching agents
+//  get notified immediately, AND all future agents onboarded to that
+//  campaign get it in their initial packet (see sendOnboardingPacket).
+//
+//  Required docs BLOCK onboarding completion (no agent code issued until
+//  signed). Optional docs nag but don't block.
+//
+//  Data shape:
+//    ASSIGNED_DOC_STATUS[agentId] = {
+//      [formId]: {
+//        assignedAt: ISO,
+//        assignedBy: {id, name},
+//        scope: 'individual' | 'campaign:GenMobile' | 'company',
+//        required: bool,
+//        signed: bool,
+//        signedAt: ISO|null,
+//        signature: string,
+//        responses: {fieldId: value}   // for full-form mode
+//      }
+//    }
+// ════════════════════════════════════════════════════════════════════════
+var ASSIGNED_DOC_STATUS = {};
+
+function saveAssignedDocs(){
+  try{ localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); }catch(e){}
+  if(typeof supaClient !== 'undefined' && supaClient){
+    (async function(){
+      try{ await supaClient.from('app_settings').upsert({key:'assigned_doc_status', value:JSON.stringify(ASSIGNED_DOC_STATUS)},{onConflict:'key'}); }catch(e){}
+    })();
+  }
+}
+function loadAssignedDocs(){
+  try{
+    var s = localStorage.getItem('wmam_assigned_docs');
+    if(s) ASSIGNED_DOC_STATUS = JSON.parse(s);
+  }catch(e){}
+}
+
 function saveAgentContracts(){
   var data = {status:AGENT_ONBOARDING_STATUS,signed:AGENT_SIGNED_DOCS,banking:AGENT_BANKING_INFO,tasks:ONBOARDING_TASKS,taskNextId:OB_TASK_NEXT_ID};
   try{ localStorage.setItem('wmam_contracts',JSON.stringify(data)); }catch(e){}
@@ -9976,6 +10028,38 @@ function sendOnboardingPacket(agentId,campaignName,contractType,customTiers){
     packetSentAt:new Date().toISOString()
   };
   saveAgentContracts();
+
+  // ── Calvin 2026-06-03: also seed any campaign-assigned or company-wide docs ──
+  // Any docs assigned to this campaign (or to the whole company) should appear
+  // in the agent's My Documents alongside the built-in 3-step packet.
+  try{
+    if(typeof getFBRegistry === 'function'){
+      var registry = getFBRegistry();
+      if(!ASSIGNED_DOC_STATUS[agentId]) ASSIGNED_DOC_STATUS[agentId] = {};
+      registry.forEach(function(f){
+        if(f.active === false) return;
+        if(!f.assignedTo || f.assignedTo.mode === 'none') return;
+        var applies = false;
+        if(f.assignedTo.mode === 'company') applies = true;
+        else if(f.assignedTo.mode === 'campaigns' && (f.assignedTo.campaigns||[]).indexOf(campaignName) >= 0) applies = true;
+        else if(f.assignedTo.mode === 'individuals' && (f.assignedTo.agentIds||[]).indexOf(agentId) >= 0) applies = true;
+        if(applies && !ASSIGNED_DOC_STATUS[agentId][f.id]){
+          ASSIGNED_DOC_STATUS[agentId][f.id] = {
+            assignedAt: new Date().toISOString(),
+            assignedBy: null,
+            scope: 'onboarding-packet',
+            required: !!f.requiredForOnboarding,
+            signed: false,
+            signedAt: null,
+            signature: '',
+            responses: {}
+          };
+        }
+      });
+      saveAssignedDocs();
+    }
+  } catch(e){ console.warn('[sendOnboardingPacket] doc assignment seed failed:', e); }
+
   pushNotification({toIds:[agentId],toRoles:[],icon:'📄',title:'Action Required — Sign Your Onboarding Documents',body:'Your onboarding packet for '+campaignName+' is ready. You have 3 documents to complete. Tap to begin.',panel:'my-documents',priority:'high'});
   notifyOnboardingProgress(agent,campaignName,0,3,false);
   createOBTask(agentId,agent.name,campaignName,'pending-signatures','Onboarding Sent — '+agent.name+' / '+campaignName,'Contract type: '+contractType);
@@ -10008,10 +10092,24 @@ function agentCompleteStep(agentId,campaignName,step,data){
   }
   var done=(status.steps[1].signed?1:0)+(status.steps[2].signed?1:0)+(status.steps[3].submitted?1:0);
   if(done===3){
-    status.allComplete=true; status.currentStep=4;
-    pushNotification({toIds:[agentId],toRoles:[],icon:'⏳',title:'All Done — Pending Agent Code ('+campaignName+')',body:'All documents complete. Onboarding will assign your agent code shortly.',panel:'my-documents',priority:'high'});
-    notifyOnboardingProgress(agent,campaignName,3,3,true);
-    createOBTask(agentId,agent.name,campaignName,'enter-code','Enter Agent Code — '+agent.name+' / '+campaignName,agent.name+' completed all onboarding documents for '+campaignName+'. Enter their carrier-issued agent code to activate portal access.');
+    // Calvin 2026-06-03: also gate on required assigned docs. If any required
+    // assigned doc is still unsigned, the packet shows as "all 3 packet steps
+    // done" but allComplete stays false until those docs are signed too.
+    // checkAndFireOnboardingCompletion() will flip allComplete when the
+    // agent eventually signs the last required doc.
+    var reqDocsOk = (typeof allRequiredAssignedDocsSigned === 'function')
+      ? allRequiredAssignedDocsSigned(agentId)
+      : true;
+    if(reqDocsOk){
+      status.allComplete=true; status.currentStep=4;
+      pushNotification({toIds:[agentId],toRoles:[],icon:'⏳',title:'All Done — Pending Agent Code ('+campaignName+')',body:'All documents complete. Onboarding will assign your agent code shortly.',panel:'my-documents',priority:'high'});
+      notifyOnboardingProgress(agent,campaignName,3,3,true);
+      createOBTask(agentId,agent.name,campaignName,'enter-code','Enter Agent Code — '+agent.name+' / '+campaignName,agent.name+' completed all onboarding documents for '+campaignName+'. Enter their carrier-issued agent code to activate portal access.');
+    } else {
+      status.currentStep=4;
+      pushNotification({toIds:[agentId],toRoles:[],icon:'⚠️',title:'Almost Done — Additional Documents Required',body:'Your 3-step packet is complete, but there are additional required documents waiting for your signature in My Documents.',panel:'my-documents',priority:'high'});
+      notifyOnboardingProgress(agent,campaignName,3,3,false);
+    }
   } else {
     notifyOnboardingProgress(agent,campaignName,done,3,false);
   }
@@ -10850,7 +10948,13 @@ function canAccess(u, area){
     case 'alerts':           return false;
     case 'goal-settings':    return false;
     case 'agent-codes':      return false;
-    case 'form-builder':     return false;
+    // Calvin 2026-06-03: form-builder is no longer owner-only. Office staff
+    // (admin, HR, Onboarding) can create + assign docs per the document
+    // assignment build. Gate it through canEditForms which has the canonical
+    // permission logic.
+    case 'form-builder':     return (typeof canEditForms === 'function') ? canEditForms(u) : false;
+    // Calvin 2026-06-03: Document Assignments dashboard — same gate as form-builder
+    case 'doc-assignments':  return (typeof canEditForms === 'function') ? canEditForms(u) : false;
     case 'meeting-hosts':    return false;
 
     // ── AGENT MANAGEMENT ── Onboarding Dept is the designated gatekeeper.
@@ -10986,7 +11090,20 @@ function canAccess(u, area){
     case 'leaderboard':      return isSales;
     case 'submissions':      return isSales;
     case 'links':            return isSales || isIBOCategory(u);
-    case 'my-documents':     return isSales || isIBOCategory(u);
+    case 'my-documents': {
+      // Sales agents + IBOs always have access. Calvin 2026-06-03: also
+      // grant access to anyone who has been assigned at least one document
+      // via Form Builder assignment (company-wide, campaign-wide, or
+      // individual), so office staff who get assigned docs can complete them.
+      if(isSales || isIBOCategory(u)) return true;
+      try {
+        if(typeof getAssignedFormsForAgent === 'function'){
+          var assigned = getAssignedFormsForAgent(u);
+          if(assigned && assigned.length) return true;
+        }
+      } catch(e){}
+      return false;
+    }
     case 'daily-audit':      return isSales || isIBOCategory(u);
     case 'inv-request':      return isSales || isIBOCategory(u);
 
@@ -17347,6 +17464,7 @@ async function loadFromSupabase(){
     loadPayrollData();
     loadCampaignDocs();
     loadAgentContracts();
+    loadAssignedDocs();  // Calvin 2026-06-03 — assignable docs framework
     // Restore any link URL overrides saved by owner
     try{
       var lo = localStorage.getItem('wmam_links_overrides');
@@ -21230,11 +21348,140 @@ function panelFormBuilder(){
   h += '<div style="margin-top:8px"><label class="f-label">Success Message</label>'
     +'<textarea id="fb-form-success-msg" class="f-textarea" style="min-height:60px" placeholder="Thank you! We will be in touch shortly.">'+escHtml(form.successMsg||'')+'</textarea></div>';
   h += '</div>';
+
+  // ════════════════════════════════════════════════════════════════════
+  //  ASSIGNMENT SECTION — Calvin 2026-06-03
+  //  Where does this doc go? Who has to fill it out?
+  // ════════════════════════════════════════════════════════════════════
+  var aTo = form.assignedTo || {mode:'none', agentIds:[], campaigns:[]};
+  h += '<div class="bo-card" style="margin-top:12px;padding:16px;border:2px solid rgba(124,58,237,.3)">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:3px;text-transform:uppercase;color:#7c3aed;margin-bottom:10px;font-weight:700">📌 Assignment</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);line-height:1.5;margin-bottom:12px">Who needs to fill this out? Assignments push immediately to all matching agents AND to all future agents onboarded to the matching campaign.</div>';
+
+  // Doc Mode toggle (form vs signature)
+  h += '<div style="margin-bottom:14px"><label class="f-label">Document Mode</label>';
+  h += '<select id="fb-doc-mode" class="f-select" onchange="fbToggleDocMode(this.value)">';
+  h += '<option value="form"'+(form.docMode==='form'?' selected':'')+'>Full Form (fields like Application form above)</option>';
+  h += '<option value="signature"'+(form.docMode==='signature'?' selected':'')+'>Signature Only (agent reads + types name)</option>';
+  h += '</select></div>';
+
+  // Document body (only shown for signature mode — but always rendered, hidden via display)
+  h += '<div id="fb-doc-body-wrap" style="margin-bottom:14px;display:'+(form.docMode==='signature'?'block':'none')+'">';
+  h += '<label class="f-label">Document Body (markdown / plain text)</label>';
+  h += '<textarea id="fb-doc-body" class="f-textarea" style="min-height:120px;font-family:monospace;font-size:.78rem" placeholder="The contract / agreement text the agent will read before signing.">'+escHtml(form.documentBody||'')+'</textarea>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted);margin-top:4px">Shown above the signature field. Use blank lines for paragraphs.</div>';
+  h += '</div>';
+
+  // Required toggle
+  h += '<label style="display:flex;align-items:center;gap:8px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);margin-bottom:12px;cursor:pointer;padding:8px 10px;background:rgba(220,38,38,.05);border:1px solid rgba(220,38,38,.2);border-radius:6px">'
+    +'<input type="checkbox" id="fb-doc-required" '+(form.requiredForOnboarding?'checked':'')+' style="accent-color:var(--red);width:14px;height:14px"> <strong style="color:var(--red)">Required for Onboarding Completion</strong> — blocks agent code issuance + payroll until signed</label>';
+
+  // Assignment scope
+  h += '<div style="margin-bottom:12px"><label class="f-label">Assign To</label>';
+  h += '<select id="fb-assign-mode" class="f-select" onchange="fbToggleAssignMode(this.value)">';
+  h += '<option value="none"'+(aTo.mode==='none'?' selected':'')+'>— Not Assigned (Form Builder only) —</option>';
+  h += '<option value="individuals"'+(aTo.mode==='individuals'?' selected':'')+'>👤 Specific Individuals</option>';
+  h += '<option value="campaigns"'+(aTo.mode==='campaigns'?' selected':'')+'>📋 Specific Campaigns</option>';
+  h += '<option value="company"'+(aTo.mode==='company'?' selected':'')+'>🏢 Entire Company (everyone, including office)</option>';
+  h += '</select></div>';
+
+  // Individuals picker — shown when mode='individuals'
+  h += '<div id="fb-assign-individuals" style="margin-bottom:12px;display:'+(aTo.mode==='individuals'?'block':'none')+'">';
+  h += '<label class="f-label">Select Agents (check all that apply)</label>';
+  h += '<div style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--offwhite)">';
+  var activeAgents = (DB.agents || []).filter(function(a){ return a && a.active; }).sort(function(x,y){ return String(x.name||'').localeCompare(String(y.name||'')); });
+  if(!activeAgents.length){
+    h += '<div style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem;padding:8px">No active agents.</div>';
+  } else {
+    activeAgents.forEach(function(a){
+      var isChecked = (aTo.agentIds||[]).indexOf(a.id) >= 0;
+      h += '<label style="display:flex;align-items:center;gap:6px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);padding:4px 6px;cursor:pointer;border-radius:3px" onmouseover="this.style.background=\'rgba(0,53,148,.05)\'" onmouseout="this.style.background=\'\'">'
+        +'<input type="checkbox" class="fb-assign-agent-cb" data-agent-id="'+a.id+'" '+(isChecked?'checked':'')+' style="accent-color:var(--blue)"> '
+        +escHtml(a.name)+' <span style="color:var(--muted);font-size:.66rem;margin-left:auto">'+escHtml(a.role||'')+'</span></label>';
+    });
+  }
+  h += '</div></div>';
+
+  // Campaigns picker — shown when mode='campaigns'
+  h += '<div id="fb-assign-campaigns" style="margin-bottom:12px;display:'+(aTo.mode==='campaigns'?'block':'none')+'">';
+  h += '<label class="f-label">Select Campaigns (check all that apply)</label>';
+  h += '<div style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--offwhite)">';
+  var allCampaigns = ['Gen Mobile','TruConnect','Assurance','Excess','Astound','Chuzo','ACA'];
+  // Add any custom campaigns from WMAM_CAMPAIGNS too if available
+  if(typeof WMAM_CAMPAIGNS !== 'undefined' && Array.isArray(WMAM_CAMPAIGNS)){
+    WMAM_CAMPAIGNS.forEach(function(c){
+      if(c && c.active && c.name && allCampaigns.indexOf(c.name) < 0) allCampaigns.push(c.name);
+    });
+  }
+  allCampaigns.forEach(function(c){
+    var isChecked = (aTo.campaigns||[]).indexOf(c) >= 0;
+    h += '<label style="display:flex;align-items:center;gap:6px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);padding:4px 6px;cursor:pointer;border-radius:3px" onmouseover="this.style.background=\'rgba(0,53,148,.05)\'" onmouseout="this.style.background=\'\'">'
+      +'<input type="checkbox" class="fb-assign-camp-cb" data-camp="'+escHtml(c)+'" '+(isChecked?'checked':'')+' style="accent-color:var(--blue)"> '
+      +escHtml(c)+'</label>';
+  });
+  h += '</div></div>';
+
+  // Live count preview
+  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:6px;padding:10px 12px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">';
+  h += '<span style="font-weight:700">Will be assigned to:</span> <span id="fb-assign-count">…</span> agent(s). ';
+  h += 'Saving with active assignment will <strong>notify all matching agents immediately</strong>.';
+  h += '</div>';
+  h += '</div>'; // end assignment card
   h += '</div>'; // right col
 
   h += '</div>'; // grid
   h += '<div id="fb-saved-msg" style="display:none;text-align:center;margin-top:12px;font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:#059669;letter-spacing:1px">✓ Form saved successfully.</div>';
+  // Trigger initial count update after render
+  setTimeout(function(){ try{ if(typeof fbUpdateAssignCount==='function') fbUpdateAssignCount(); }catch(e){} }, 30);
   return h;
+}
+
+// Calvin 2026-06-03: Form Builder assignment helpers
+function fbToggleDocMode(mode){
+  var wrap = document.getElementById('fb-doc-body-wrap');
+  if(wrap) wrap.style.display = (mode === 'signature') ? 'block' : 'none';
+}
+function fbToggleAssignMode(mode){
+  var ind  = document.getElementById('fb-assign-individuals');
+  var camp = document.getElementById('fb-assign-campaigns');
+  if(ind)  ind.style.display  = (mode === 'individuals') ? 'block' : 'none';
+  if(camp) camp.style.display = (mode === 'campaigns')   ? 'block' : 'none';
+  fbUpdateAssignCount();
+}
+function fbUpdateAssignCount(){
+  var el = document.getElementById('fb-assign-count');
+  if(!el) return;
+  var modeEl = document.getElementById('fb-assign-mode');
+  if(!modeEl){ el.textContent = '0'; return; }
+  var mode = modeEl.value;
+  var count = 0;
+  if(mode === 'company'){
+    count = (DB.agents || []).filter(function(a){ return a && a.active; }).length;
+  } else if(mode === 'individuals'){
+    count = document.querySelectorAll('.fb-assign-agent-cb:checked').length;
+  } else if(mode === 'campaigns'){
+    var camps = [];
+    document.querySelectorAll('.fb-assign-camp-cb:checked').forEach(function(cb){ camps.push(cb.getAttribute('data-camp')); });
+    if(camps.length){
+      count = (DB.agents || []).filter(function(a){
+        if(!a || !a.active) return false;
+        var ac = Object.keys(a.agentCodes || {});
+        return camps.some(function(c){ return ac.indexOf(c) >= 0; });
+      }).length;
+    }
+  }
+  el.textContent = count;
+}
+// Wire change listeners on the checkboxes so the count updates live
+document.addEventListener('change', function(e){
+  if(e.target && (e.target.classList.contains('fb-assign-agent-cb') || e.target.classList.contains('fb-assign-camp-cb'))){
+    fbUpdateAssignCount();
+  }
+});
+if(typeof window !== 'undefined'){
+  window.fbToggleDocMode = fbToggleDocMode;
+  window.fbToggleAssignMode = fbToggleAssignMode;
+  window.fbUpdateAssignCount = fbUpdateAssignCount;
 }
 
 // ── Escape HTML helper ──
@@ -21587,7 +21834,54 @@ function fbSave(){
   if(submitEl) form.submitLabel = submitEl.value.trim()||'Submit →';
   if(successEl) form.successMsg = successEl.value.trim();
 
+  // ── Calvin 2026-06-03: persist assignment fields ──
+  var docModeEl   = document.getElementById('fb-doc-mode');
+  var docBodyEl   = document.getElementById('fb-doc-body');
+  var docReqEl    = document.getElementById('fb-doc-required');
+  var assignModeEl = document.getElementById('fb-assign-mode');
+
+  // Snapshot old assignment to detect changes
+  var prevAssignedTo = JSON.parse(JSON.stringify(form.assignedTo || {mode:'none'}));
+  var prevRequired = !!form.requiredForOnboarding;
+
+  if(docModeEl) form.docMode = docModeEl.value;
+  if(docBodyEl) form.documentBody = docBodyEl.value;
+  if(docReqEl)  form.requiredForOnboarding = docReqEl.checked;
+
+  if(!form.assignedTo) form.assignedTo = {mode:'none', agentIds:[], campaigns:[]};
+  if(assignModeEl){
+    form.assignedTo.mode = assignModeEl.value;
+    // Always collect from checkboxes (so we preserve them even if switching modes)
+    var agentIds = [];
+    document.querySelectorAll('.fb-assign-agent-cb:checked').forEach(function(cb){
+      var id = parseInt(cb.getAttribute('data-agent-id'), 10);
+      if(!isNaN(id)) agentIds.push(id);
+    });
+    form.assignedTo.agentIds = agentIds;
+    var camps = [];
+    document.querySelectorAll('.fb-assign-camp-cb:checked').forEach(function(cb){
+      camps.push(cb.getAttribute('data-camp'));
+    });
+    form.assignedTo.campaigns = camps;
+  }
+
   saveFBRegistry(registry);
+
+  // Detect assignment-change and notify newly-targeted agents
+  var assignmentChanged = (
+    prevAssignedTo.mode !== form.assignedTo.mode
+    || JSON.stringify(prevAssignedTo.agentIds||[]) !== JSON.stringify(form.assignedTo.agentIds||[])
+    || JSON.stringify(prevAssignedTo.campaigns||[]) !== JSON.stringify(form.assignedTo.campaigns||[])
+    || prevRequired !== form.requiredForOnboarding
+  );
+  if(assignmentChanged && form.assignedTo.mode !== 'none' && typeof notifyAssignmentTargets === 'function'){
+    try{
+      var n = notifyAssignmentTargets(form, DB.current);
+      if(n > 0){
+        console.log('[fbSave] assignment changed — notified '+n+' agent(s)');
+      }
+    } catch(e){ console.warn('[fbSave] notifyAssignmentTargets failed:', e); }
+  }
 
   // Also update wmam_form_config for the Application form (backward compat)
   var appForm = registry.find(function(f){return f.id==='builtin-application';});
@@ -21606,18 +21900,163 @@ function fbSave(){
 
 // ── Registry storage ──
 function getFBRegistry(){
+  var registry;
   try{
     var s = localStorage.getItem('wmam_fb_registry');
-    if(s) return JSON.parse(s);
+    if(s) registry = JSON.parse(s);
   }catch(e){}
-  var defaults = fbDefaultForms();
-  saveFBRegistry(defaults);
-  return defaults;
+  if(!registry){
+    registry = fbDefaultForms();
+    saveFBRegistry(registry);
+  }
+  // Calvin 2026-06-03: default-fill new assignment fields on existing
+  // forms so we don't break the registry. Forms built before this update
+  // have no assignedTo/docMode/etc — they're treated as "not assigned anywhere"
+  // which is correct (they're standalone forms in Form Builder until
+  // someone explicitly assigns them).
+  registry.forEach(function(f){
+    if(typeof f.docMode === 'undefined') f.docMode = 'form';            // 'form' | 'signature'
+    if(typeof f.documentBody === 'undefined') f.documentBody = '';      // shown above signature in signature mode
+    if(typeof f.requiredForOnboarding === 'undefined') f.requiredForOnboarding = false;
+    if(typeof f.assignedTo === 'undefined') f.assignedTo = {            // who gets this doc
+      mode: 'none',              // 'none' | 'individuals' | 'campaigns' | 'company'
+      agentIds: [],              // when mode = 'individuals'
+      campaigns: []              // when mode = 'campaigns' (e.g. ['Gen Mobile','TruConnect'])
+    };
+  });
+  return registry;
 }
 
 function saveFBRegistry(registry){
   try{ localStorage.setItem('wmam_fb_registry', JSON.stringify(registry)); }catch(e){}
+  // Calvin 2026-06-03: cloud-sync the registry so doc assignments survive
+  // device switches (was previously localStorage-only, which lost assignments
+  // when an admin assigned from one machine but agent opened on another).
+  if(typeof supaClient !== 'undefined' && supaClient){
+    (async function(){
+      try{ await supaClient.from('app_settings').upsert({key:'fb_registry', value:JSON.stringify(registry)},{onConflict:'key'}); }catch(e){}
+    })();
+  }
 }
+
+// ── Assignment helpers (Calvin 2026-06-03) ──
+
+// Get all forms currently assigned to a specific agent. Considers:
+//   - Form's assignedTo.mode='individuals' AND agent.id in agentIds
+//   - Form's assignedTo.mode='campaigns' AND agent has agentCodes for any of those campaigns
+//   - Form's assignedTo.mode='company' (everyone, including office staff)
+// Returns: array of form records.
+function getAssignedFormsForAgent(agent){
+  if(!agent || !agent.id) return [];
+  var registry = getFBRegistry();
+  var agentCampaigns = Object.keys(agent.agentCodes || {});
+  return registry.filter(function(f){
+    if(!f.assignedTo || f.assignedTo.mode === 'none') return false;
+    if(f.active === false) return false;
+    if(f.assignedTo.mode === 'company') return true;
+    if(f.assignedTo.mode === 'individuals'){
+      return (f.assignedTo.agentIds || []).indexOf(agent.id) >= 0;
+    }
+    if(f.assignedTo.mode === 'campaigns'){
+      return (f.assignedTo.campaigns || []).some(function(c){ return agentCampaigns.indexOf(c) >= 0; });
+    }
+    return false;
+  });
+}
+
+// Check whether all REQUIRED assigned docs are signed for an agent.
+// Used by onboarding completion gate.
+function allRequiredAssignedDocsSigned(agentId){
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  if(!agent) return true; // Unknown agent = don't block
+  var assigned = getAssignedFormsForAgent(agent).filter(function(f){ return f.requiredForOnboarding; });
+  if(!assigned.length) return true;
+  var status = ASSIGNED_DOC_STATUS[agentId] || {};
+  return assigned.every(function(f){
+    var st = status[f.id];
+    return st && st.signed;
+  });
+}
+
+// Mark a doc as signed (or save form responses) for an agent.
+function markAssignedDocSigned(agentId, formId, signature, responses){
+  if(!ASSIGNED_DOC_STATUS[agentId]) ASSIGNED_DOC_STATUS[agentId] = {};
+  var existing = ASSIGNED_DOC_STATUS[agentId][formId] || {};
+  ASSIGNED_DOC_STATUS[agentId][formId] = {
+    assignedAt:  existing.assignedAt || new Date().toISOString(),
+    assignedBy:  existing.assignedBy || null,
+    scope:       existing.scope || 'unknown',
+    required:    !!existing.required,
+    signed:      true,
+    signedAt:    new Date().toISOString(),
+    signature:   signature || '',
+    responses:   responses || existing.responses || {}
+  };
+  saveAssignedDocs();
+}
+
+// Notify all currently-affected agents that a new doc is assigned to them.
+// Called when an admin saves an assignment change.
+function notifyAssignmentTargets(form, assignedBy){
+  var agents = (DB.agents||[]).filter(function(a){ return a && a.active; });
+  var targets = agents.filter(function(a){
+    if(!form.assignedTo || form.assignedTo.mode === 'none') return false;
+    if(form.assignedTo.mode === 'company') return true;
+    if(form.assignedTo.mode === 'individuals'){
+      return (form.assignedTo.agentIds || []).indexOf(a.id) >= 0;
+    }
+    if(form.assignedTo.mode === 'campaigns'){
+      var ac = Object.keys(a.agentCodes || {});
+      return (form.assignedTo.campaigns || []).some(function(c){ return ac.indexOf(c) >= 0; });
+    }
+    return false;
+  });
+
+  targets.forEach(function(a){
+    // Initialize the status entry if missing
+    if(!ASSIGNED_DOC_STATUS[a.id]) ASSIGNED_DOC_STATUS[a.id] = {};
+    if(!ASSIGNED_DOC_STATUS[a.id][form.id]){
+      ASSIGNED_DOC_STATUS[a.id][form.id] = {
+        assignedAt: new Date().toISOString(),
+        assignedBy: assignedBy ? {id: assignedBy.id, name: assignedBy.name} : null,
+        scope:      form.assignedTo.mode,
+        required:   !!form.requiredForOnboarding,
+        signed:     false,
+        signedAt:   null,
+        signature:  '',
+        responses:  {}
+      };
+    } else {
+      // Update the required flag in case it changed (assignment edit)
+      ASSIGNED_DOC_STATUS[a.id][form.id].required = !!form.requiredForOnboarding;
+    }
+    // Notify each agent
+    if(typeof pushNotification === 'function'){
+      pushNotification({
+        toIds:    [a.id],
+        toRoles:  [],
+        icon:     form.requiredForOnboarding ? '📄' : '📋',
+        title:    (form.requiredForOnboarding ? 'Action Required — ' : 'New Document — ') + form.name,
+        body:     form.requiredForOnboarding
+          ? 'You have a new required document to complete. Tap to begin.'
+          : 'A new document is available for you to review and sign.',
+        panel:    'my-documents',
+        priority: form.requiredForOnboarding ? 'high' : 'normal'
+      });
+    }
+  });
+  saveAssignedDocs();
+  return targets.length;
+}
+
+if(typeof window !== 'undefined'){
+  window.getAssignedFormsForAgent = getAssignedFormsForAgent;
+  window.allRequiredAssignedDocsSigned = allRequiredAssignedDocsSigned;
+  window.markAssignedDocSigned = markAssignedDocSigned;
+  window.notifyAssignmentTargets = notifyAssignmentTargets;
+}
+
+function saveFBRegistryOld_DEPRECATED(){}  // kept as placeholder so any external ref doesn't crash
 
 function getFBActiveId(){
   return localStorage.getItem('wmam_fb_active') || 'builtin-application';
@@ -26081,6 +26520,10 @@ function buildNav(u){
     var obItems = boDropBtn('onboarding','📋 Agent Checklists')
       +boDropBtn('onboarding-queue','📝 Onboarding Queue')
       +boDropBtn('campaign-docs','📄 Campaign Documents');
+    // Calvin 2026-06-03: Document Assignments dashboard — office staff who can edit forms
+    if(canAccess(u,'doc-assignments')){
+      obItems += boDropBtn('doc-assignments','📌 Document Assignments');
+    }
     // Onboarding Packages — visible to managers (Owner/Admin/Onboarding)
     if(typeof canManageOnboarding === 'function' && canManageOnboarding(u)){
       obItems += boDropBtn('onboard-packages','📦 Onboarding Packages');
@@ -27521,7 +27964,7 @@ function gotoPanel(id, params){
     'supply-mgmt':panelSupplyMgmt,'pending-transfers':panelPendingTransfers,
     'agent-codes':panelAgentCodes,'goal-settings':panelGoalSettings,
     'form-builder':panelFormBuilder,announce:panelAnnounce,
-    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'edit-start-dates':panelEditStartDates,
+    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
     agents:panelAgents,'ll-teams':panelMarketsAdmin,
@@ -38186,6 +38629,132 @@ if(typeof window !== 'undefined'){
   window.esdShowAudit = esdShowAudit;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  DOCUMENT ASSIGNMENTS DASHBOARD — Calvin Williams 2026-06-03
+//
+//  A dedicated dashboard view showing every form/doc in Form Builder along
+//  with: who it's assigned to, how many agents have signed, how many are
+//  pending. Quick-links to edit the assignment back in Form Builder.
+//
+//  Same gate as Form Builder (office staff). Designed as a visual roster so
+//  office can see the state of all assigned docs without clicking through
+//  Form Builder for each one.
+// ════════════════════════════════════════════════════════════════════════
+function panelDocAssignments(){
+  var u = DB.current;
+  if(!canEditForms(u)){
+    return panelHeader('🔒 Document Assignments') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Office staff only (Owner, admin, HR, Onboarding).</div></div>';
+  }
+  var h = panelHeader('📌 Document Assignments');
+  h += '<div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
+  h += '<strong>One place to see every assignable doc and where it\'s assigned.</strong> ';
+  h += 'Build new docs in <a href="#" onclick="gotoPanel(\'form-builder\');return false" style="color:#7c3aed;font-weight:700">📝 Form Builder</a> — assignments are configured per-doc in that builder. This dashboard shows the current state and lets you jump back to edit.';
+  h += '</div>';
+
+  // Quick-action: New Doc
+  h += '<div style="margin-bottom:14px;display:flex;gap:10px;flex-wrap:wrap">';
+  h += '<button onclick="gotoPanel(\'form-builder\')" class="btn-fire" style="padding:10px 22px;font-size:.78rem">+ New Document (Form Builder)</button>';
+  h += '</div>';
+
+  var registry = (typeof getFBRegistry === 'function') ? getFBRegistry() : [];
+  if(!registry.length){
+    h += '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No documents in Form Builder yet.</div></div>';
+    return h;
+  }
+
+  // Split assigned vs unassigned for clearer presentation
+  var assigned   = registry.filter(function(f){ return f.assignedTo && f.assignedTo.mode && f.assignedTo.mode !== 'none'; });
+  var unassigned = registry.filter(function(f){ return !f.assignedTo || !f.assignedTo.mode || f.assignedTo.mode === 'none'; });
+
+  // ── Assigned docs ──
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:2px;color:var(--brown);margin:18px 0 10px">📌 Assigned ('+assigned.length+')</div>';
+  if(!assigned.length){
+    h += '<div class="bo-card"><div style="padding:24px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No documents are currently assigned anywhere. Open Form Builder, edit any form, set its assignment, and save.</div></div>';
+  } else {
+    assigned.forEach(function(f){
+      h += _daCard(f, true);
+    });
+  }
+
+  // ── Unassigned docs (still useful — they exist in Form Builder but no scope set yet) ──
+  if(unassigned.length){
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:2px;color:var(--muted);margin:24px 0 10px">📋 Available (not assigned)</div>';
+    unassigned.forEach(function(f){
+      h += _daCard(f, false);
+    });
+  }
+
+  return h;
+}
+
+function _daCard(f, isAssigned){
+  var assignedTo = f.assignedTo || {mode:'none'};
+  var assignedToLabel = '—';
+  var targetCount = 0;
+  if(assignedTo.mode === 'company'){
+    assignedToLabel = '🏢 Entire Company';
+    targetCount = (DB.agents||[]).filter(function(a){ return a && a.active; }).length;
+  } else if(assignedTo.mode === 'individuals'){
+    targetCount = (assignedTo.agentIds || []).length;
+    assignedToLabel = '👤 '+targetCount+' individual(s)';
+  } else if(assignedTo.mode === 'campaigns'){
+    var camps = assignedTo.campaigns || [];
+    assignedToLabel = '📋 '+(camps.length ? camps.join(', ') : '—');
+    targetCount = (DB.agents||[]).filter(function(a){
+      if(!a || !a.active) return false;
+      var ac = Object.keys(a.agentCodes || {});
+      return camps.some(function(c){ return ac.indexOf(c) >= 0; });
+    }).length;
+  }
+
+  // Completion stats
+  var signedCount = 0, pendingCount = 0;
+  if(isAssigned){
+    Object.keys(ASSIGNED_DOC_STATUS).forEach(function(aid){
+      var st = ASSIGNED_DOC_STATUS[aid] && ASSIGNED_DOC_STATUS[aid][f.id];
+      if(st){
+        if(st.signed) signedCount++; else pendingCount++;
+      }
+    });
+  }
+
+  var borderColor = isAssigned ? (f.requiredForOnboarding ? 'var(--red)' : '#7c3aed') : 'var(--border)';
+  var html = '<div class="bo-card" style="margin-bottom:12px;border-left:4px solid '+borderColor+'">';
+  html += '<div class="bo-card-head"><div>';
+  html += '<div class="bo-card-title" style="color:'+(isAssigned ? (f.requiredForOnboarding?'var(--red)':'#7c3aed') : 'var(--brown)')+'">'+escHtml(f.name)+'</div>';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted);margin-top:2px">'
+       + 'Mode: '+(f.docMode === 'signature' ? 'Signature acknowledgment' : 'Full form')
+       + (f.requiredForOnboarding ? ' &middot; <span style="color:var(--red);font-weight:700">REQUIRED</span>' : ' &middot; Optional')
+       + (f.active === false ? ' &middot; <span style="color:var(--muted)">Inactive</span>' : '')
+       + '</div>';
+  html += '</div></div>';
+  html += '<div style="padding:14px 20px">';
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:10px">';
+  html += '<div style="background:var(--offwhite);border-radius:6px;padding:8px 12px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:2px">Assigned To</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;font-weight:700;color:var(--brown)">'+assignedToLabel+'</div></div>';
+  if(isAssigned){
+    html += '<div style="background:var(--offwhite);border-radius:6px;padding:8px 12px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:2px">Target Agents</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;font-weight:700;color:var(--brown)">'+targetCount+'</div></div>';
+    html += '<div style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.25);border-radius:6px;padding:8px 12px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase;color:#059669;margin-bottom:2px">Signed</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;font-weight:700;color:#059669">'+signedCount+'</div></div>';
+    html += '<div style="background:'+(pendingCount?'rgba(217,119,6,.08)':'var(--offwhite)')+';border:1px solid '+(pendingCount?'rgba(217,119,6,.25)':'var(--border)')+';border-radius:6px;padding:8px 12px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase;color:'+(pendingCount?'#d97706':'var(--muted)')+';margin-bottom:2px">Pending</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;font-weight:700;color:'+(pendingCount?'#d97706':'var(--muted)')+'">'+pendingCount+'</div></div>';
+  }
+  html += '</div>';
+  html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">';
+  html += '<button onclick="daEditForm(\''+f.id+'\')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer">✏️ Edit & Assign</button>';
+  html += '</div>';
+  html += '</div></div>';
+  return html;
+}
+
+function daEditForm(formId){
+  try{ localStorage.setItem('wmam_fb_active', formId); }catch(e){}
+  gotoPanel('form-builder');
+}
+
+if(typeof window !== 'undefined'){
+  window.panelDocAssignments = panelDocAssignments;
+  window.daEditForm = daEditForm;
+}
+
 function obShowTab(tab){
   ['agents','tasks'].forEach(function(t){
     var pane=document.getElementById('ob-pane-'+t);
@@ -38522,7 +39091,18 @@ function panelMyDocuments(){
   var signed=AGENT_SIGNED_DOCS[u.id]||[];
   var activeCamps=Object.keys(pkt);
 
-  if(!activeCamps.length){
+  // ── Calvin 2026-06-03: assigned docs (campaign-wide / company-wide / individual) ──
+  // Compute first so we can render them whether or not there's an onboarding packet.
+  var assignedForMe = (typeof getAssignedFormsForAgent === 'function')
+    ? getAssignedFormsForAgent(u)
+    : [];
+  var assignedStatus = ASSIGNED_DOC_STATUS[u.id] || {};
+  var unsignedAssigned = assignedForMe.filter(function(f){
+    var st = assignedStatus[f.id] || {};
+    return !st.signed;
+  });
+
+  if(!activeCamps.length && !unsignedAssigned.length){
     h+='<div class="bo-card"><div style="padding:40px;text-align:center">'
       +'<div style="font-size:2.5rem;margin-bottom:12px">📭</div>'
       +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--muted);letter-spacing:2px">No Documents Pending</div>'
@@ -38530,6 +39110,34 @@ function panelMyDocuments(){
       +'</div></div>';
     return h;
   }
+
+  // ── Render assigned docs banner + cards FIRST when present ──
+  if(unsignedAssigned.length){
+    var reqCount = unsignedAssigned.filter(function(f){ return f.requiredForOnboarding; }).length;
+    h += '<div style="background:'+(reqCount?'rgba(204,0,0,.07)':'rgba(124,58,237,.07)')+';border:2px solid '+(reqCount?'rgba(204,0,0,.3)':'rgba(124,58,237,.3)')+';border-radius:10px;padding:14px 20px;margin-bottom:18px;display:flex;align-items:center;gap:14px">'
+      +'<span style="font-size:1.5rem;flex-shrink:0">'+(reqCount?'⚠️':'📋')+'</span>'
+      +'<div style="flex:1"><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:'+(reqCount?'var(--red)':'#7c3aed')+';letter-spacing:2px">'+unsignedAssigned.length+' Assigned Document'+(unsignedAssigned.length===1?'':'s')+' Pending</div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted);margin-top:2px">'+(reqCount?reqCount+' marked required — must be completed for full onboarding.':'Please review and complete when you have a moment.')+'</div>'
+      +'</div></div>';
+
+    unsignedAssigned.forEach(function(f){
+      h += '<div class="bo-card" style="margin-bottom:14px;border-left:4px solid '+(f.requiredForOnboarding?'var(--red)':'#7c3aed')+'">';
+      h += '<div class="bo-card-head"><div>'
+        +'<div class="bo-card-title" style="color:'+(f.requiredForOnboarding?'var(--red)':'#7c3aed')+'">'+escHtml(f.name)+'</div>'
+        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted)">'
+        +(f.requiredForOnboarding ? 'REQUIRED — Blocks onboarding completion' : 'Optional')
+        +' &middot; Mode: '+(f.docMode==='signature'?'Signature acknowledgment':'Full form')
+        +(f.subtitle ? ' &middot; '+escHtml(f.subtitle) : '')
+        +'</div></div></div>';
+      h += '<div style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.5">Click below to open and complete this document.</div>';
+      h += '<button onclick="openAssignedDocModal(\''+f.id+'\')" class="btn-fire" style="padding:10px 22px;font-size:.78rem">📝 Open & Complete →</button>';
+      h += '</div></div>';
+    });
+  }
+
+  // If no onboarding packet, we're done after rendering assigned docs
+  if(!activeCamps.length) return h;
 
   var pendingCamps=activeCamps.filter(function(c){return !pkt[c].allComplete;});
   var doneCamps=activeCamps.filter(function(c){return pkt[c].allComplete;});
@@ -38626,6 +39234,228 @@ function panelMyDocuments(){
     h+='</tbody></table></div></div>';
   }
   return h;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  ASSIGNED DOC MODAL — Calvin 2026-06-03
+//
+//  Modal where an agent opens an assigned doc (signature or full form),
+//  reads/fills it out, and submits. On submit:
+//   - markAssignedDocSigned() persists their signature + form responses
+//   - The agent gets a confirmation
+//   - If the doc was 'required for onboarding' AND all required docs are
+//     now signed AND their onboarding packet is also done, fire the
+//     completion notification.
+// ════════════════════════════════════════════════════════════════════════
+function openAssignedDocModal(formId){
+  var u = DB.current; if(!u) return;
+  var registry = (typeof getFBRegistry === 'function') ? getFBRegistry() : [];
+  var form = registry.find(function(f){ return f.id === formId; });
+  if(!form){ alert('Document not found.'); return; }
+
+  // Build the modal
+  var bg = document.createElement('div');
+  bg.id = 'assigned-doc-modal-bg';
+  bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto';
+
+  var box = document.createElement('div');
+  box.style.cssText = 'background:white;border-radius:12px;max-width:680px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 12px 48px rgba(0,0,0,.3)';
+
+  var html = '<div style="padding:24px 28px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-start;gap:14px;position:sticky;top:0;background:white;z-index:1">';
+  html += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:var(--brown)">'+escHtml(form.name)+'</div>';
+  if(form.subtitle) html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--muted);margin-top:2px">'+escHtml(form.subtitle)+'</div>';
+  html += '</div><button onclick="closeAssignedDocModal()" style="background:none;border:none;color:var(--muted);font-size:1.6rem;cursor:pointer;line-height:1">×</button>';
+  html += '</div>';
+
+  html += '<div style="padding:24px 28px">';
+
+  if(form.docMode === 'signature'){
+    // Signature mode — show the document body, then a signature field
+    var body = form.documentBody || '(No document body — contact office staff.)';
+    html += '<div style="background:var(--offwhite);border:1px solid var(--border);border-radius:8px;padding:18px 22px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.65;white-space:pre-wrap;max-height:380px;overflow-y:auto">'+escHtml(body)+'</div>';
+    html += '<div style="margin-bottom:14px"><label class="f-label">Type your full legal name to sign:</label>';
+    html += '<input type="text" id="assigned-doc-sig" class="f-input" placeholder="Full Legal Name" style="font-family:cursive;font-size:1.1rem"></div>';
+  } else {
+    // Full form mode — render fields just like the application form
+    if(!form.fields || !form.fields.length){
+      html += '<div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">(This form has no fields configured.)</div>';
+    } else {
+      form.fields.forEach(function(fld){
+        html += _adRenderField(fld);
+      });
+    }
+  }
+
+  html += '<div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">';
+  html += '<button onclick="closeAssignedDocModal()" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:2px;text-transform:uppercase;padding:9px 18px;border-radius:5px;cursor:pointer">Cancel</button>';
+  html += '<button onclick="submitAssignedDoc(\''+form.id+'\')" class="btn-fire" style="padding:10px 24px;font-size:.78rem">✓ Submit & Sign</button>';
+  html += '</div>';
+  html += '</div>';
+
+  box.innerHTML = html;
+  bg.appendChild(box);
+  document.body.appendChild(bg);
+}
+
+function _adRenderField(fld){
+  // Minimal renderer for the most-used field types from Form Builder.
+  var label = '<label class="f-label">'+escHtml(fld.label||'')+(fld.required?' <span style="color:var(--red)">*</span>':'')+'</label>';
+  var id = 'ad-field-'+fld.id;
+  var widthStyle = (fld.width === 'half') ? 'display:inline-block;width:49%;margin-right:1%;vertical-align:top' : '';
+  var wrap = '<div style="margin-bottom:14px;'+widthStyle+'">';
+  switch(fld.type){
+    case 'heading':
+      return '<div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:1.5px;color:var(--brown);margin:18px 0 8px;border-bottom:1px solid var(--border);padding-bottom:4px">'+escHtml(fld.label||'')+'</div>';
+    case 'paragraph':
+      return '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--muted);line-height:1.6;margin-bottom:12px">'+escHtml(fld.content||fld.label||'')+'</div>';
+    case 'divider':
+      return '<hr style="border:none;border-top:1px solid var(--border);margin:12px 0">';
+    case 'text': case 'email': case 'phone': case 'number':
+      return wrap+label+'<input type="'+(fld.type==='phone'?'tel':fld.type)+'" id="'+id+'" class="f-input" placeholder="'+escHtml(fld.placeholder||'')+'"></div>';
+    case 'date':
+      return wrap+label+'<input type="date" id="'+id+'" class="f-input"></div>';
+    case 'time':
+      return wrap+label+'<input type="time" id="'+id+'" class="f-input"></div>';
+    case 'textarea':
+      return wrap+label+'<textarea id="'+id+'" class="f-textarea" style="min-height:80px" placeholder="'+escHtml(fld.placeholder||'')+'"></textarea></div>';
+    case 'dropdown':
+      var opts = (fld.options||[]).map(function(o){ return '<option value="'+escHtml(o)+'">'+escHtml(o)+'</option>'; }).join('');
+      return wrap+label+'<select id="'+id+'" class="f-select"><option value="">'+escHtml(fld.placeholder||'-- Select --')+'</option>'+opts+'</select></div>';
+    case 'radio':
+      var radios = (fld.options||[]).map(function(o,i){
+        return '<label style="display:inline-flex;align-items:center;gap:6px;margin-right:14px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);cursor:pointer"><input type="radio" name="'+id+'" value="'+escHtml(o)+'"> '+escHtml(o)+'</label>';
+      }).join('');
+      return wrap+label+'<div>'+radios+'</div></div>';
+    case 'checkbox':
+      var cbs = (fld.options||[]).map(function(o){
+        return '<label style="display:inline-flex;align-items:center;gap:6px;margin-right:14px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);cursor:pointer"><input type="checkbox" class="'+id+'-cb" value="'+escHtml(o)+'"> '+escHtml(o)+'</label>';
+      }).join('');
+      return wrap+label+'<div>'+cbs+'</div></div>';
+    case 'signature':
+      return wrap+label+'<input type="text" id="'+id+'" class="f-input" placeholder="Type your full legal name" style="font-family:cursive;font-size:1.05rem"></div>';
+    default:
+      return wrap+label+'<input type="text" id="'+id+'" class="f-input"></div>';
+  }
+}
+
+function _adCollectFieldValues(form){
+  var responses = {};
+  (form.fields||[]).forEach(function(fld){
+    if(['heading','paragraph','divider'].indexOf(fld.type) >= 0) return;
+    var id = 'ad-field-'+fld.id;
+    if(fld.type === 'radio'){
+      var picked = document.querySelector('input[name="'+id+'"]:checked');
+      responses[fld.id] = picked ? picked.value : '';
+    } else if(fld.type === 'checkbox'){
+      var vals = [];
+      document.querySelectorAll('.'+id+'-cb:checked').forEach(function(cb){ vals.push(cb.value); });
+      responses[fld.id] = vals;
+    } else {
+      var el = document.getElementById(id);
+      responses[fld.id] = el ? el.value : '';
+    }
+  });
+  return responses;
+}
+
+function _adValidate(form, responses, signatureFallback){
+  var missing = [];
+  (form.fields||[]).forEach(function(fld){
+    if(!fld.required) return;
+    if(['heading','paragraph','divider'].indexOf(fld.type) >= 0) return;
+    var v = responses[fld.id];
+    if(fld.type === 'checkbox'){
+      if(!Array.isArray(v) || !v.length) missing.push(fld.label || fld.id);
+    } else {
+      if(!v || !String(v).trim()) missing.push(fld.label || fld.id);
+    }
+  });
+  if(form.docMode === 'signature' && !signatureFallback) missing.push('Signature');
+  return missing;
+}
+
+function submitAssignedDoc(formId){
+  var u = DB.current; if(!u) return;
+  var registry = (typeof getFBRegistry === 'function') ? getFBRegistry() : [];
+  var form = registry.find(function(f){ return f.id === formId; });
+  if(!form){ alert('Document not found.'); return; }
+
+  var signature = '';
+  var responses = {};
+  if(form.docMode === 'signature'){
+    signature = (document.getElementById('assigned-doc-sig') || {value:''}).value.trim();
+  } else {
+    responses = _adCollectFieldValues(form);
+    // For form mode, also look for any signature-type field as the sig
+    (form.fields || []).forEach(function(fld){
+      if(fld.type === 'signature' && responses[fld.id]) signature = responses[fld.id];
+    });
+  }
+
+  var missing = _adValidate(form, responses, signature);
+  if(missing.length){
+    alert('Please complete: \n- '+missing.join('\n- '));
+    return;
+  }
+
+  if(typeof markAssignedDocSigned === 'function'){
+    markAssignedDocSigned(u.id, formId, signature, responses);
+  }
+  closeAssignedDocModal();
+
+  // After completion, check if their full onboarding (built-in + required assigned) is now done
+  try {
+    if(typeof checkAndFireOnboardingCompletion === 'function'){
+      checkAndFireOnboardingCompletion(u.id);
+    }
+  } catch(e){}
+
+  alert('✓ Document submitted. Thank you!');
+  // Refresh the panel so the doc disappears from the pending list
+  if(typeof gotoPanel === 'function') gotoPanel('my-documents');
+}
+
+function closeAssignedDocModal(){
+  var bg = document.getElementById('assigned-doc-modal-bg');
+  if(bg) bg.remove();
+}
+
+// Called after a required assigned doc is signed — checks whether agent
+// onboarding (built-in 3 steps for any campaign + ALL required assigned docs)
+// is now complete, and fires any pending completion notifications.
+function checkAndFireOnboardingCompletion(agentId){
+  if(typeof allRequiredAssignedDocsSigned !== 'function') return;
+  if(!allRequiredAssignedDocsSigned(agentId)) return;
+  var agentStatus = AGENT_ONBOARDING_STATUS[agentId] || {};
+  Object.keys(agentStatus).forEach(function(camp){
+    var cs = agentStatus[camp];
+    if(cs && !cs.allComplete){
+      // Built-in 3-step packet completion lives in existing code paths
+      // (saveStepX functions). We only mark allComplete when both built-in
+      // AND required assigned docs are done. The built-in checks happen in
+      // their respective save handlers; here we just re-check.
+      var s = cs.steps || {};
+      var step1ok = s[1] && s[1].signed;
+      var step2ok = s[2] && s[2].signed;
+      var step3ok = s[3] && s[3].submitted;
+      if(step1ok && step2ok && step3ok){
+        cs.allComplete = true;
+        cs.completedAt = new Date().toISOString();
+        saveAgentContracts();
+        var agent = DB.agents.find(function(a){ return a && a.id === agentId; });
+        if(agent && typeof notifyOnboardingProgress === 'function'){
+          notifyOnboardingProgress(agent, camp, 3, 3, true);
+        }
+      }
+    }
+  });
+}
+
+if(typeof window !== 'undefined'){
+  window.openAssignedDocModal = openAssignedDocModal;
+  window.submitAssignedDoc = submitAssignedDoc;
+  window.closeAssignedDocModal = closeAssignedDocModal;
+  window.checkAndFireOnboardingCompletion = checkAndFireOnboardingCompletion;
 }
 
 // ── Step Sign Modal (Steps 1 + 2) ──
