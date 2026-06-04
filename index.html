@@ -18564,6 +18564,16 @@ async function loadFromSupabase(){
     if(typeof migrateLifelineTeamsToMarkets === 'function'){
       migrateLifelineTeamsToMarkets();
     }
+    // ── Calvin 2026-06-04: BG Authorization backfill for existing agents ──
+    // Agents created BEFORE the auto-assign build (2026-06-04) never got
+    // the BG Authorization form assigned to them, so isOnboardingLocked
+    // returns false and they get full access. This one-time idempotent
+    // migration assigns the BG form to every existing non-grandfathered
+    // agent. Safe to run on every load — won't double-assign.
+    if(typeof backfillBgAuthorizationAssignments === 'function'){
+      try { backfillBgAuthorizationAssignments(); }
+      catch(e){ console.warn('[loadFromSupabase] BG backfill failed:', e); }
+    }
   } catch(e){
     console.warn('Supabase load failed, using local:', e);
     loadFromStorage();
@@ -40692,6 +40702,124 @@ function isOnboardingLocked(agent){
   return false;
 }
 if(typeof window !== 'undefined') window.isOnboardingLocked = isOnboardingLocked;
+
+// ════════════════════════════════════════════════════════════════════════
+//  BG AUTHORIZATION BACKFILL — Calvin 2026-06-04
+//
+//  Problem: agents created BEFORE the auto-assign build (in apSavePerson)
+//  have no ASSIGNED_DOC_STATUS entry for the BG form. So isOnboardingLocked
+//  returns false for them, they bypass the gate, and the lockout modal
+//  never shows on EITHER desktop or mobile.
+//
+//  Fix: on app load, scan every agent. For any agent who:
+//   • is NOT grandfathered (not Owner, not in whitelist, not bypassed)
+//   • is active
+//   • doesn't already have ASSIGNED_DOC_STATUS[id]['builtin-bg-authorization']
+//   • has not yet signed a BG form (no record at all means: not signed)
+//  …assign the BG form by:
+//   1. Adding their id to the form's assignedTo.agentIds (idempotent)
+//   2. Creating an ASSIGNED_DOC_STATUS entry marking it required+unsigned
+//
+//  This is IDEMPOTENT — safe to run on every load. If an agent already
+//  has an entry (signed or unsigned), we skip them.
+//
+//  Why this is safe per Calvin's preservation rule: this ADDS a row to
+//  ASSIGNED_DOC_STATUS for agents who didn't have one. It NEVER overwrites
+//  an existing entry. If an agent already signed the BG form, their
+//  signed:true record is preserved.
+// ════════════════════════════════════════════════════════════════════════
+function backfillBgAuthorizationAssignments(){
+  if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return;
+  if(typeof ASSIGNED_DOC_STATUS === 'undefined') return;
+  if(typeof getFBRegistry !== 'function') return;
+
+  var registry = getFBRegistry();
+  var bgForm = registry.find(function(f){ return f.id === 'builtin-bg-authorization'; });
+  if(!bgForm){
+    console.warn('[bg-backfill] builtin-bg-authorization not in registry — nothing to backfill');
+    return;
+  }
+
+  // Ensure the form's assignedTo structure is sane
+  if(!bgForm.assignedTo) bgForm.assignedTo = {mode:'individuals',agentIds:[],campaigns:[]};
+  if(bgForm.assignedTo.mode === 'none') bgForm.assignedTo.mode = 'individuals';
+  if(!Array.isArray(bgForm.assignedTo.agentIds)) bgForm.assignedTo.agentIds = [];
+
+  var bypassList = (typeof ONBOARDING_GATE_BYPASS !== 'undefined') ? ONBOARDING_GATE_BYPASS : [];
+  var assignedCount = 0;
+  var skippedAlreadyHas = 0;
+  var skippedGrandfathered = 0;
+  var skippedInactive = 0;
+  var registryDirty = false;
+  var statusDirty = false;
+
+  DB.agents.forEach(function(agent){
+    if(!agent || !agent.id) return;
+
+    if(!agent.active){
+      skippedInactive++;
+      return;
+    }
+
+    // Grandfather: Owner
+    if(typeof isOwner === 'function' && isOwner(agent)){
+      skippedGrandfathered++;
+      return;
+    }
+    // Grandfather: explicit flag
+    if(agent.bypassOnboardingGate === true){
+      skippedGrandfathered++;
+      return;
+    }
+    // Grandfather: whitelist
+    var uname = String(agent.username || '').toLowerCase();
+    if(bypassList.indexOf(uname) >= 0){
+      skippedGrandfathered++;
+      return;
+    }
+
+    // Already has a status record (signed or unsigned) — leave alone
+    if(ASSIGNED_DOC_STATUS[agent.id] && ASSIGNED_DOC_STATUS[agent.id]['builtin-bg-authorization']){
+      skippedAlreadyHas++;
+      return;
+    }
+
+    // ASSIGN: add to form's agentIds list (idempotent)
+    if(bgForm.assignedTo.agentIds.indexOf(agent.id) < 0){
+      bgForm.assignedTo.agentIds.push(agent.id);
+      registryDirty = true;
+    }
+    // Create the status record
+    if(!ASSIGNED_DOC_STATUS[agent.id]) ASSIGNED_DOC_STATUS[agent.id] = {};
+    ASSIGNED_DOC_STATUS[agent.id]['builtin-bg-authorization'] = {
+      assignedAt: new Date().toISOString(),
+      assignedBy: null,                  // null = system backfill, not a user action
+      scope:      'pre-onboarding-bg',
+      required:   true,
+      signed:     false,
+      signedAt:   null,
+      signature:  '',
+      responses:  {},
+      backfilled: true                    // flag so we can audit later who got auto-assigned
+    };
+    statusDirty = true;
+    assignedCount++;
+  });
+
+  if(registryDirty){
+    try { saveFBRegistry(registry); } catch(e){ console.warn('[bg-backfill] saveFBRegistry failed:', e); }
+  }
+  if(statusDirty){
+    try { saveAssignedDocs(); } catch(e){ console.warn('[bg-backfill] saveAssignedDocs failed:', e); }
+  }
+
+  console.log('[bg-backfill] complete: assigned='+assignedCount+
+    ', already-had='+skippedAlreadyHas+
+    ', grandfathered='+skippedGrandfathered+
+    ', inactive='+skippedInactive+
+    ' (total active agents='+DB.agents.filter(function(a){return a.active;}).length+')');
+}
+if(typeof window !== 'undefined') window.backfillBgAuthorizationAssignments = backfillBgAuthorizationAssignments;
 
 // ════════════════════════════════════════════════════════════════════════
 //  LOCKOUT_DIAG — Calvin 2026-06-04 mobile debug overlay
