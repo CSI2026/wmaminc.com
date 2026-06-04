@@ -15225,6 +15225,25 @@ function gmAgentSignTransfer(transferId, confirmed){
   req.agentConfirmedPossession = true;
   req.status = 'completed';
 
+  // Calvin 2026-06-04: clear the acceptance-pending flag on the devices.
+  // For upload-source transfers (source==='upload'), devices already live
+  // in the recipient's inventory; the signature just confirms responsibility.
+  // For regular transfers, the move-to-holder code below does the real
+  // ownership change.
+  if(req.source === 'upload'){
+    (req.imeis || []).forEach(function(imei){
+      var dev = GM_INVENTORY.find(function(d){return d.imei===imei;});
+      if(dev){
+        delete dev.acceptancePending;
+        delete dev.acceptanceTransfer;
+      }
+    });
+    saveInventory();
+    alert('✓ Signed. You have accepted responsibility for '+(req.imeis||[]).length+' device(s).');
+    if(typeof renderBO === 'function') renderBO();
+    return;
+  }
+
   // Move devices to new holder
   var cfg = gmEnsureMarket(req.devices[0]?GM_INVENTORY.find(function(d){return d.imei===req.devices[0].imei;})||{}:{});
   var toAgent = DB.agents.find(function(a){return a.id===req.toId;});
@@ -28942,6 +28961,51 @@ function panelAgentMasterProfile(agentId){
   }
   h += '</div></div>';
 
+  // ── Calvin 2026-06-04: TESTING UNLOCK / RE-LOCK CONTROLS ──
+  //
+  // Office staff (Owner, admin, HR, Onboarding) needs a way to bypass the
+  // onboarding lockout for a specific agent so they can log in as that
+  // agent (or instruct them to) and test the full system without being
+  // gated by unsigned documents. This sets agent.bypassOnboardingGate,
+  // which isOnboardingLocked() already honors as a universal grandfather.
+  //
+  // Persists to Supabase via saveAgentToSupabase so the bypass survives
+  // page reloads and propagates to the agent's own login on any device.
+  //
+  // Per Calvin's preservation rule: this does NOT touch any of the
+  // agent's signed documents, ASSIGNED_DOC_STATUS records, onboarding
+  // packets, or any other data. It ONLY flips the bypass flag. Once
+  // testing is done, "Re-Lock" flips it back.
+  if(typeof isOwner === 'function' && (isOwner(viewer) || viewer.role==='admin' || (typeof isHR === 'function' && isHR(viewer)) || (typeof isOnboarding === 'function' && isOnboarding(viewer)))){
+    var isCurrentlyBypassed = (a.bypassOnboardingGate === true);
+    var isCurrentlyLocked   = false;
+    try { isCurrentlyLocked = (typeof isOnboardingLocked === 'function') && isOnboardingLocked(a); } catch(e){}
+    var lockColor = isCurrentlyBypassed ? '#059669' : (isCurrentlyLocked ? '#dc2626' : 'var(--muted)');
+    var lockLabel = isCurrentlyBypassed ? '🔓 Profile UNLOCKED for testing' : (isCurrentlyLocked ? '🔒 Profile is LOCKED (unsigned required docs)' : '⚪ Profile is unlocked (all docs signed or no docs required)');
+    h += '<div class="bo-card" style="margin-bottom:20px;border-left:4px solid '+lockColor+'">';
+    h += '<div style="padding:16px 22px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">';
+    h += '<div style="flex:1;min-width:240px">';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:'+lockColor+';margin-bottom:2px">Onboarding Lockout — Office Override</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.55">'+lockLabel+'</div>';
+    if(isCurrentlyBypassed){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px;line-height:1.5">Bypass is active. When testing is done, re-lock so the agent must complete their required documents like everyone else.</div>';
+    } else if(isCurrentlyLocked){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px;line-height:1.5">Click <strong>Unlock Profile for Testing</strong> to bypass the gate. The agent\'s unsigned documents are preserved — they\'ll still be there in My Documents.</div>';
+    } else {
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:4px;line-height:1.5">This agent has no unsigned required documents. The unlock toggle is still available if you want to flip the explicit bypass flag.</div>';
+    }
+    h += '</div>';
+    h += '<div style="flex-shrink:0">';
+    if(isCurrentlyBypassed){
+      h += '<button onclick="_toggleOnboardingBypass('+a.id+',false)" style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:11px 22px;border-radius:6px;cursor:pointer;font-weight:700">🔒 Re-Lock Profile</button>';
+    } else {
+      h += '<button onclick="_toggleOnboardingBypass('+a.id+',true)" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:11px 22px;border-radius:6px;cursor:pointer;font-weight:700">🔓 Unlock Profile for Testing</button>';
+    }
+    h += '</div>';
+    h += '</div>';
+    h += '</div>';
+  }
+
   // ── Tabs ──
   h += '<div style="display:flex;gap:8px;margin-bottom:18px;flex-wrap:wrap">'
      +'<button onclick="ampShowTab(\'programs\')" id="amp-tab-programs" style="background:var(--blue);color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 18px;border-radius:6px;cursor:pointer">🎯 Programs & Codes</button>'
@@ -40962,6 +41026,77 @@ if(typeof window !== 'undefined') window.isOnboardingLocked = isOnboardingLocked
 //  an existing entry. If an agent already signed the BG form, their
 //  signed:true record is preserved.
 // ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════
+//  TOGGLE ONBOARDING BYPASS — Calvin 2026-06-04
+//
+//  Office override that flips agent.bypassOnboardingGate on the target
+//  agent. The lockout function isOnboardingLocked() honors this flag
+//  as a universal grandfather (it returns false when set), so any agent
+//  with this flag has full access regardless of unsigned documents.
+//
+//  Usage: testing flow. Office staff hits Unlock on an agent's profile,
+//  logs in as that agent, walks through inventory / contract / etc.
+//  flows, then Re-Locks when done. The agent's actual signed-doc records
+//  are NEVER modified — only the bypass flag.
+//
+//  Cloud-persistence: writes to Supabase via saveAgentToSupabase so the
+//  bypass survives reload + propagates to the agent's own browser.
+// ════════════════════════════════════════════════════════════════════════
+function _toggleOnboardingBypass(agentId, newValue){
+  var viewer = DB.current;
+  if(!viewer){ alert('You must be logged in.'); return; }
+  // Permission gate — office staff only
+  var canToggle = (typeof isOwner === 'function' && isOwner(viewer)) ||
+                  viewer.role === 'admin' ||
+                  (typeof isHR === 'function' && isHR(viewer)) ||
+                  (typeof isOnboarding === 'function' && isOnboarding(viewer));
+  if(!canToggle){ alert('Only office staff (Owner, admin, HR, Onboarding) can toggle the onboarding bypass.'); return; }
+
+  var agent = DB.agents.find(function(a){ return a && a.id === agentId; });
+  if(!agent){ alert('Agent not found.'); return; }
+
+  // Confirm before applying — both directions
+  var confirmMsg = newValue
+    ? 'Unlock '+agent.name+' for testing?\n\n• They will be able to access the back office without signing their required documents.\n• Their unsigned documents are PRESERVED — they will still be in My Documents.\n• Re-lock when testing is done so the agent has to complete their docs like everyone else.'
+    : 'Re-lock '+agent.name+'?\n\n• The bypass flag will be removed.\n• If they still have unsigned required documents, they will be locked out again on their next login.';
+  if(!confirm(confirmMsg)) return;
+
+  // Flip the flag
+  agent.bypassOnboardingGate = !!newValue;
+  // Audit trail — who flipped it and when
+  agent.bypassOnboardingGateBy = viewer.id;
+  agent.bypassOnboardingGateAt = new Date().toISOString();
+
+  // Persist locally + to cloud
+  try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
+  try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
+
+  // Notify the agent that their access was changed (if they're connected
+  // they'll see it next refresh; this is just a courtesy notification).
+  try {
+    if(typeof pushNotification === 'function'){
+      pushNotification({
+        toIds:[agent.id], toRoles:[],
+        icon: newValue ? '🔓' : '🔒',
+        title: newValue ? 'Office: Profile Unlocked' : 'Office: Profile Re-locked',
+        body:  newValue
+          ? viewer.name+' temporarily unlocked your profile for system testing. Your documents are still on file in My Documents.'
+          : viewer.name+' re-locked your profile. Please complete any required documents in My Documents.',
+        panel: 'my-documents',
+        priority: 'normal',
+        fromName: viewer.name
+      });
+    }
+  } catch(e){}
+
+  alert('✓ '+agent.name+' is now '+(newValue?'UNLOCKED for testing':'RE-LOCKED')+'.');
+
+  // Re-render the panel so the section reflects the new state
+  if(typeof renderBO === 'function') renderBO();
+  else if(typeof gotoPanel === 'function') gotoPanel('agent-master-profile', agentId);
+}
+if(typeof window !== 'undefined') window._toggleOnboardingBypass = _toggleOnboardingBypass;
+
 function backfillBgAuthorizationAssignments(){
   if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return;
   if(typeof ASSIGNED_DOC_STATUS === 'undefined') return;
@@ -43525,7 +43660,7 @@ function gmConfirmInventoryUpload(batchId){
   // double-assign. If the parser couldn't resolve a recipient (no MM, no
   // CM), the device lands as 'unassigned' and shows on the dashboard for
   // manual placement.
-  var autoAssignSummary = {}; // {recipientName: {count, markets:[]}}
+  var autoAssignSummary = {}; // {recipientName: {count, markets:[], recipientId, imeis:[]}}
   var unassignedCount = 0;
   pending.devices.forEach(function(d){
     if(!d.assignedToName){
@@ -43533,21 +43668,89 @@ function gmConfirmInventoryUpload(batchId){
       return;
     }
     var key = d.assignedToName;
-    if(!autoAssignSummary[key]) autoAssignSummary[key] = {count:0, markets:[], recipientId:d.assignedTo};
+    if(!autoAssignSummary[key]) autoAssignSummary[key] = {count:0, markets:[], recipientId:d.assignedTo, imeis:[]};
     autoAssignSummary[key].count++;
     if(autoAssignSummary[key].markets.indexOf(d.market) < 0){
       autoAssignSummary[key].markets.push(d.market);
     }
+    if(d.imei) autoAssignSummary[key].imeis.push(d.imei);
   });
 
-  // Notify each recipient
+  // ── Calvin 2026-06-04: CREATE TRANSFER-ACCEPTANCE RECORDS PER RECIPIENT ──
+  //
+  // Previously: GM_INVENTORY.push(d) made devices "owned" by Makenzie (or
+  // whoever the auto-assignee was) the instant the upload landed — no
+  // acceptance signature, no contract, no record of responsibility transfer.
+  // Calvin saw zero contracts for Makenzie to sign after she uploaded.
+  //
+  // Fix: for each recipient who got devices in this batch, create a
+  // GM_TRANSFERS record with status 'pending-agent-signature'. That's the
+  // exact status that the Pending Transfers panel watches for. The
+  // recipient will see "Sign to accept N devices" in their queue. Until
+  // they sign, devices are flagged as not-yet-accepted (devUnaccepted=true).
+  //
+  // The 'fromId' is the uploader (e.g. Makenzie if she did the upload, or
+  // Inv Dept user). For self-assignment (recipient === uploader), we still
+  // create the record but mark the source as the upload itself — the
+  // recipient signs to confirm they take responsibility for the devices.
+  var uploader = DB.current;
+  var uploaderId = uploader && uploader.id || null;
+  var uploaderName = uploader && uploader.name || 'Inventory System';
+  var uploaderRole = uploader && uploader.role || 'system';
+  var newTransfers = [];
+  Object.keys(autoAssignSummary).forEach(function(recipientName){
+    var s = autoAssignSummary[recipientName];
+    if(!s.recipientId || !s.imeis.length) return;
+    // Build device cost list from the just-uploaded entries
+    var deviceDetails = s.imeis.map(function(imei){
+      var d = pending.devices.find(function(x){return x.imei===imei;}) || {};
+      return {imei:imei, sim:d.sim||'', model:d.model||'', devType:d.devType||'', devCost:d.devCost||0, market:d.market||''};
+    });
+    var transferReq = {
+      id:                       'gmt-upload-'+(new Date().getTime())+'-'+s.recipientId,
+      fromId:                   uploaderId,
+      fromName:                 uploaderName,
+      fromRole:                 uploaderRole,
+      toId:                     s.recipientId,
+      toName:                   recipientName,
+      toRole:                   (DB.agents.find(function(a){return a.id===s.recipientId;})||{}).role || '',
+      imeis:                    s.imeis.slice(),
+      // 'pending-agent-signature' is the canonical status the Pending
+      // Transfers panel queries for at panelPendingTransfers (line 62953).
+      status:                   'pending-agent-signature',
+      // No upstream approval needed — the upload IS the approval (Inv Dept
+      // member is the one running the upload). Recipient just signs to
+      // accept responsibility.
+      createdAt:                new Date().toISOString(),
+      source:                   'upload',
+      approvedBy:               uploaderName,
+      approvedAt:               new Date().toISOString(),
+      agentSigned:              false,
+      agentSignedAt:            null,
+      agentConfirmedPossession: false,
+      devices:                  deviceDetails
+    };
+    GM_TRANSFERS.push(transferReq);
+    newTransfers.push(transferReq);
+    // Flag each device as not-yet-accepted so we know it's pending sig
+    deviceDetails.forEach(function(dd){
+      var devRec = GM_INVENTORY.find(function(d){return d.imei===dd.imei;});
+      if(devRec){
+        devRec.acceptancePending  = true;
+        devRec.acceptanceTransfer = transferReq.id;
+      }
+    });
+  });
+
+  // Notify each recipient — both for the new-inventory arrival AND that
+  // there's a transfer-acceptance signature waiting in their queue.
   Object.keys(autoAssignSummary).forEach(function(name){
     var s = autoAssignSummary[name];
     pushNotification({
       toIds:[s.recipientId], toRoles:[], icon:'📦',
-      title:'New Inventory Assigned — '+s.markets.join(', '),
-      body:s.count+' device(s) just arrived for '+s.markets.join(', ')+'. Open My Inventory to review or distribute.',
-      panel:'inv-my-inventory', priority:'high'
+      title:'Inventory Assigned — Signature Required',
+      body:s.count+' device(s) just landed in your inventory for '+s.markets.join(', ')+'. Open Pending Transfers to sign for these devices and accept responsibility. Devices are flagged as pending until signed.',
+      panel:'pending-transfers', priority:'high'
     });
   });
 
