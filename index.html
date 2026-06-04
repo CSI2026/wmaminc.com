@@ -55559,6 +55559,62 @@ async function apSavePerson(){
       }
     }
 
+    // ── Calvin 2026-06-04: Auto-assign Universal BG Check Authorization ──
+    //
+    // The previous build added this hook to saveAgentForm() (the legacy
+    // "addAgentModal" save function), which is no longer called — Ship 2
+    // replaced it with addPersonModal + apSavePerson. So the BG form
+    // never got assigned and new agents had no documents to sign on
+    // login. This block lives in apSavePerson so it actually fires for
+    // every new agent.
+    //
+    // What this does:
+    //  1. Look up the built-in "Background Check Authorization & Consent"
+    //     form in FB_REGISTRY (auto-seeded by getFBRegistry on first load).
+    //  2. Append the new agent's id to that form's assignedTo.agentIds.
+    //  3. Create an ASSIGNED_DOC_STATUS entry marking the doc required+unsigned.
+    //
+    // The existing lockout gate (isOnboardingLocked) reads
+    // ASSIGNED_DOC_STATUS[agentId] and sees required && !signed → returns
+    // true → doLogin and gotoPanel both redirect the agent to my-documents
+    // until they sign it.
+    if(isNew){
+      try {
+        if(typeof getFBRegistry === 'function' && typeof ASSIGNED_DOC_STATUS !== 'undefined'){
+          var bgRegistry = getFBRegistry();
+          var bgForm = bgRegistry.find(function(f){ return f.id === 'builtin-bg-authorization'; });
+          if(bgForm){
+            if(!bgForm.assignedTo) bgForm.assignedTo = {mode:'individuals',agentIds:[],campaigns:[]};
+            if(bgForm.assignedTo.mode === 'none') bgForm.assignedTo.mode = 'individuals';
+            if(!Array.isArray(bgForm.assignedTo.agentIds)) bgForm.assignedTo.agentIds = [];
+            if(bgForm.assignedTo.agentIds.indexOf(agent.id) < 0){
+              bgForm.assignedTo.agentIds.push(agent.id);
+              saveFBRegistry(bgRegistry);
+            }
+            if(!ASSIGNED_DOC_STATUS[agent.id]) ASSIGNED_DOC_STATUS[agent.id] = {};
+            if(!ASSIGNED_DOC_STATUS[agent.id][bgForm.id]){
+              ASSIGNED_DOC_STATUS[agent.id][bgForm.id] = {
+                assignedAt: new Date().toISOString(),
+                assignedBy: (DB.current && DB.current.id) || null,
+                scope:      'pre-onboarding-bg',
+                required:   true,
+                signed:     false,
+                signedAt:   null,
+                signature:  '',
+                responses:  {}
+              };
+              if(typeof saveAssignedDocs === 'function') saveAssignedDocs();
+            }
+            console.log('[apSavePerson] ✓ Auto-assigned BG authorization to new agent #'+agent.id);
+          } else {
+            console.warn('[apSavePerson] builtin-bg-authorization form not found in registry');
+          }
+        }
+      } catch(bgErr){
+        console.warn('[apSavePerson] BG auto-assign failed (save still succeeded):', bgErr);
+      }
+    }
+
     // Refresh whatever panel they're on
     if(typeof renderCurrentPanel === 'function') renderCurrentPanel();
     else if(typeof gotoPanel === 'function') gotoPanel(window._currentPanelId || 'manage-agents');
@@ -55597,7 +55653,12 @@ async function apSavePerson(){
 // welcome email at line ~8748 is separate and fires later.
 function apSendNewAgentWelcomeEmail(agent){
   if(!agent || !agent.email) return;
-  var loginUrl = 'https://wmaminc.com';
+  // Calvin 2026-06-04 BUGFIX: was hardcoded 'https://wmaminc.com' which
+  // dropped agents on the marketing homepage instead of the login screen.
+  // Use the current origin + #login so they land directly on the back-office
+  // login page. Falls back to wmaminc.com/#login if location is unavailable.
+  var base = (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com';
+  var loginUrl = base + '/#login';
   var html = '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:white">'
     +'<div style="background:#003594;padding:24px;text-align:center"><h1 style="color:white;margin:0;letter-spacing:2px;font-size:22px">👋 WELCOME TO WMAMINC</h1><p style="color:rgba(255,255,255,.85);margin:6px 0 0;font-size:14px;letter-spacing:1px">YOUR ACCOUNT IS READY</p></div>'
     +'<div style="padding:28px;background:#f8f9fa">'
@@ -63711,6 +63772,26 @@ if(typeof invHandleMagicLink === 'function'){
   setTimeout(function(){ try{ invHandleMagicLink(); }catch(e){ console.warn('[invHandleMagicLink]', e); } }, 1500);
   window.addEventListener('hashchange', function(){ try{ invHandleMagicLink(); }catch(e){} });
 }
+// ── Calvin 2026-06-04: #login hash handler ──
+// Welcome email button links to https://wmaminc.com/#login. Without this
+// handler, that hash does nothing and the agent lands on the marketing
+// homepage. We detect the hash both at boot (link-click from email) and
+// on hashchange (rare, but defensive). showPage('login') already exists.
+function _handleLoginHash(){
+  try {
+    var h = (window.location.hash || '').toLowerCase();
+    if(h === '#login' && typeof showPage === 'function'){
+      // Only switch to login if no one is currently logged in (don't kick
+      // an already-logged-in user back to login).
+      if(!DB || !DB.current){
+        showPage('login');
+      }
+    }
+  } catch(e){ console.warn('[_handleLoginHash]', e); }
+}
+// Run at boot (after the inline scripts finish initializing showPage)
+setTimeout(_handleLoginHash, 600);
+window.addEventListener('hashchange', _handleLoginHash);
 // ── Calvin 2026-05-08: training-flow auto-advance ──
 // Every 30 seconds, scan pending-bg-check completions and float them up
 // to pending-code-approval if BG check + agreements are now done.
