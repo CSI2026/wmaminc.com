@@ -20273,6 +20273,8 @@ function bgDecide(agentId, campaign, newStatus, opts){
     bgFirePassedEmail(agent, [campaign]);
     // Flag so next login shows the celebration modal
     agent.bgPassedModalPending = true;
+    // Auto-fire 3-step packet for this campaign (Calvin 2026-06-04)
+    _autoFirePacketAfterBgPass(agent, campaign);
   } else if(newStatus === 'failed'){
     bgFireFailedEmail(agent, [campaign], opts.reason);
   }
@@ -20321,6 +20323,8 @@ function bgDecideMany(agentId, campaigns, newStatus, opts){
   if(newStatus === 'passed'){
     bgFirePassedEmail(agent, changedCamps);
     agent.bgPassedModalPending = true;
+    // Auto-fire 3-step packets for each campaign that passed (Calvin 2026-06-04)
+    changedCamps.forEach(function(camp){ _autoFirePacketAfterBgPass(agent, camp); });
   } else {
     bgFireFailedEmail(agent, changedCamps, opts.reason);
   }
@@ -20328,6 +20332,83 @@ function bgDecideMany(agentId, campaigns, newStatus, opts){
   try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
   return changedCamps.length;
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  AUTO-FIRE 3-STEP PACKET AFTER BG PASS — Calvin 2026-06-04
+//
+//  Called by bgDecide() and bgDecideMany() when a BG check flips to
+//  'passed'. Per Calvin's spec:
+//   • Auto-fire ONLY for the campaign that passed (not all the agent's
+//     other campaigns — those still need their own BG pass or manual send)
+//   • Contract type: 'tribal' if campaign supports tribal AND agent is
+//     in an Oklahoma market, else 'standard'
+//   • Skip if packet already exists (was sent manually earlier)
+//   • Notify Onboarding + HR + Owner staff that the auto-send happened
+// ════════════════════════════════════════════════════════════════════════
+function _autoFirePacketAfterBgPass(agent, campaign){
+  if(!agent || !campaign) return;
+  try {
+    // Don't double-send if a packet already exists for this campaign
+    var existingPacket = (typeof AGENT_ONBOARDING_STATUS !== 'undefined' &&
+                          AGENT_ONBOARDING_STATUS[agent.id] &&
+                          AGENT_ONBOARDING_STATUS[agent.id][campaign]);
+    if(existingPacket){
+      console.log('[bg auto-fire] packet already exists for '+campaign+' — skip');
+      return;
+    }
+    if(typeof sendOnboardingPacket !== 'function'){
+      console.warn('[bg auto-fire] sendOnboardingPacket missing — cannot auto-fire');
+      return;
+    }
+    // Pick contract type per spec
+    var contractType = 'standard';
+    var campRec = (typeof WMAM_CAMPAIGNS !== 'undefined') &&
+                  WMAM_CAMPAIGNS.find(function(c){ return c.name === campaign; });
+    var supportsTribal = !!(campRec && campRec.settings && campRec.settings.hasTribal === true);
+    var inOklahoma = (typeof agentIsOklahoma === 'function') && agentIsOklahoma(agent);
+    if(supportsTribal && inOklahoma){
+      contractType = 'tribal';
+    }
+    // Fire the packet
+    try {
+      sendOnboardingPacket(agent.id, campaign, contractType);
+      console.log('[bg auto-fire] ✓ '+campaign+' packet ('+contractType+') sent to '+agent.name);
+    } catch(packetErr){
+      console.warn('[bg auto-fire] sendOnboardingPacket threw for '+campaign+':', packetErr);
+      return;
+    }
+    // Notify Onboarding/HR/Owner staff
+    try {
+      var officeIds = [];
+      (DB.agents || []).filter(function(a){
+        return a && a.active && (
+          (typeof isOnboarding === 'function' && isOnboarding(a)) ||
+          (typeof isHR === 'function' && isHR(a)) ||
+          (typeof isOwner === 'function' && isOwner(a))
+        );
+      }).forEach(function(a){
+        if(officeIds.indexOf(a.id) < 0) officeIds.push(a.id);
+      });
+      officeIds.forEach(function(id){
+        pushNotification({
+          toIds: [id],
+          toRoles: [],
+          icon: '📤',
+          title: 'Onboarding Packet Auto-Sent — ' + agent.name,
+          body:  campaign + ' background check passed. The 3-step contract packet (' + contractType + ') was sent automatically. No action needed.',
+          panel: 'onboarding',
+          priority: 'normal',
+          fromName: 'System'
+        });
+      });
+    } catch(notifyErr){
+      console.warn('[bg auto-fire] notification failed:', notifyErr);
+    }
+  } catch(outerErr){
+    console.warn('[bg auto-fire] outer block failed:', outerErr);
+  }
+}
+if(typeof window !== 'undefined') window._autoFirePacketAfterBgPass = _autoFirePacketAfterBgPass;
 
 // Send the 'passed' email listing the approved campaigns
 function bgFirePassedEmail(agent, campaigns){
