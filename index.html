@@ -29950,7 +29950,7 @@ function scheduleNationalCallReminders(){
 // ── Universal panel header — renders at top of every panel ──
 function panelHeader(title, backLabel){
   var bl = backLabel || '← Back';
-  return '<div style="display:flex;align-items:center;gap:12px;padding:14px 20px 10px;'
+  var header = '<div style="display:flex;align-items:center;gap:12px;padding:14px 20px 10px;'
     +'border-bottom:2px solid var(--blue);margin-bottom:18px;background:var(--white);'
     +'position:sticky;top:0;z-index:10">'
     +'<button onclick="goBack()" style="background:rgba(0,53,148,.07);border:1px solid rgba(0,53,148,.2);'
@@ -29960,7 +29960,47 @@ function panelHeader(title, backLabel){
     +'<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:var(--blue)">'
     +title+'</div>'
     +'</div>';
+  // Calvin 2026-06-04: render any unack'd denial banners for current user
+  // at the top of every panel. These persist across reloads and panel
+  // navigations until the agent clicks Acknowledge.
+  try {
+    if(typeof _renderDenialBannersForCurrentUser === 'function'){
+      header += _renderDenialBannersForCurrentUser();
+    }
+  } catch(e){}
+  return header;
 }
+
+// Render persistent denial banners for DB.current (the logged-in user).
+// Each banner is dismissible by clicking Acknowledge — that removes it
+// from the banner store. Until acknowledged, it follows them across
+// every panel they navigate to. Calvin 2026-06-04.
+function _renderDenialBannersForCurrentUser(){
+  if(typeof DB === 'undefined' || !DB.current) return '';
+  if(typeof _denialBannersForUser !== 'function') return '';
+  var banners = _denialBannersForUser(DB.current.id);
+  if(!banners || !banners.length) return '';
+  var html = '';
+  banners.forEach(function(b){
+    html += '<div style="background:linear-gradient(135deg,#fef2f2,#fee2e2);border:2px solid #dc2626;border-radius:8px;padding:14px 18px;margin:0 20px 14px;display:flex;align-items:flex-start;gap:12px">';
+    html += '<div style="font-size:1.4rem;line-height:1;flex-shrink:0">🛑</div>';
+    html += '<div style="flex:1;min-width:0">';
+    html += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;color:#dc2626">'+escHtml(b.label||'Request')+' Denied</div>';
+    if(b.summary){
+      html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">'+escHtml(b.summary)+'</div>';
+    }
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);margin-top:8px;line-height:1.5">';
+    html += '<strong>Reason from '+escHtml(b.denierName||'Inventory')+':</strong><br>';
+    html += '<em>"'+escHtml(b.reason||'')+'"</em>';
+    html += '</div>';
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:var(--muted);margin-top:6px">'+new Date(b.createdAt).toLocaleString()+'</div>';
+    html += '</div>';
+    html += '<button onclick="_denialBannerAck(\''+b.id+'\')" style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0;align-self:center">Acknowledge</button>';
+    html += '</div>';
+  });
+  return html;
+}
+if(typeof window !== 'undefined') window._renderDenialBannersForCurrentUser = _renderDenialBannersForCurrentUser;
 function gotoPanel(id, params){
   // Calvin 2026-05-14: track current panel so realtime/polling can re-render it
   window._currentPanelId = id;
@@ -37341,6 +37381,277 @@ function _invDeptResolveNotifications(transferId){
   }catch(e){ console.warn('[_invDeptResolveNotifications]', e); }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  UNIVERSAL DENIAL-REASON SYSTEM — Calvin 2026-06-04
+//
+//  When Inv Dept / Makenzie denies ANY pending approval (transfer, supply
+//  order, deletion request, etc.), three things must happen:
+//
+//   1. Required reason captured via a proper modal (not browser prompt())
+//      — minimum 10 chars so they can't just type "no"
+//   2. Reason persisted on the request record (denyReason field)
+//   3. Communicated to the requester AND every manager in their upline
+//      via: (a) in-app notification, (b) email, (c) persistent banner
+//      that stays until acknowledged
+//
+//  Public helpers:
+//    invShowDenyReasonModal({title, summary, onConfirm})
+//    _resolveUplineForAgent(agentId)  — returns [{id,name,role}, …]
+//    _sendDenialNotification({request, reason, label, panel, requesterId})
+//    _denialBannerStore — persistent banner list (per-agent)
+//    _denialBannerAck(bannerId) — agent acks a banner, removes it
+//    _renderDenialBanners() — call from agent dashboard / pending panel
+//
+//  This system is uniform across every deny action (inv-dept transfer,
+//  supply order, deletion request, GM legacy direct deny, etc.).
+// ════════════════════════════════════════════════════════════════════════
+
+// ── Persistent denial banner store ──
+// Banners survive page reloads. Each banner is a small record an agent
+// must acknowledge. Stored in localStorage + replicated to Supabase if
+// the table exists (best-effort — never blocks on save errors).
+var _DENIAL_BANNERS = [];
+function _denialBannersLoad(){
+  try {
+    var raw = localStorage.getItem('wmam_denial_banners');
+    if(raw){
+      var parsed = JSON.parse(raw);
+      if(Array.isArray(parsed)) _DENIAL_BANNERS = parsed;
+    }
+  } catch(e){ console.warn('[denialBanners] load failed:', e); }
+}
+function _denialBannersSave(){
+  try { localStorage.setItem('wmam_denial_banners', JSON.stringify(_DENIAL_BANNERS)); }
+  catch(e){ console.warn('[denialBanners] save failed:', e); }
+}
+_denialBannersLoad();
+
+function _denialBannerAdd(banner){
+  if(!banner || !banner.toId) return;
+  banner.id        = banner.id || ('denial-'+Date.now()+'-'+Math.random().toString(36).slice(2,8));
+  banner.createdAt = banner.createdAt || new Date().toISOString();
+  banner.acked     = false;
+  _DENIAL_BANNERS.push(banner);
+  _denialBannersSave();
+}
+function _denialBannerAck(bannerId){
+  var idx = _DENIAL_BANNERS.findIndex(function(b){ return b.id === bannerId; });
+  if(idx < 0) return;
+  _DENIAL_BANNERS.splice(idx, 1);
+  _denialBannersSave();
+  if(typeof renderBO === 'function') renderBO();
+}
+function _denialBannersForUser(userId){
+  return _DENIAL_BANNERS.filter(function(b){ return b.toId === userId && !b.acked; });
+}
+if(typeof window !== 'undefined'){
+  window._denialBannerAck       = _denialBannerAck;
+  window._denialBannersForUser  = _denialBannersForUser;
+}
+
+// ── Upline resolver ──
+// Returns the chain of managers above an agent: TL → MM → CM → IBO.
+// Stops at the top; if the agent IS a manager with no one above, returns [].
+// Used to broadcast denial notifications up the chain so everyone in the
+// org knows when a request gets blocked.
+function _resolveUplineForAgent(agentId){
+  if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return [];
+  var agent = DB.agents.find(function(a){ return a && a.id === agentId; });
+  if(!agent) return [];
+  var upline = [];
+  var seen = {};
+  function add(id){
+    if(!id || seen[id]) return;
+    if(id === agentId) return;  // never include the agent themselves
+    var u = DB.agents.find(function(a){ return a && a.id === id; });
+    if(!u || !u.active) return;
+    seen[id] = true;
+    upline.push({id:u.id, name:u.name, role:u.role});
+  }
+  // Direct chain via team
+  if(agent.team && Array.isArray(LIFELINE_TEAMS)){
+    var team = LIFELINE_TEAMS.find(function(t){ return t && t.id === agent.team; });
+    if(team){
+      // Team Leader(s) — multi-TL safe per Calvin's spec. Scan all team
+      // members with role 'Team Leader'.
+      (team.members || []).forEach(function(m){
+        var memberId = (typeof m === 'object') ? m.id : m;
+        var member = DB.agents.find(function(a){ return a && a.id === memberId; });
+        if(member && member.role === 'Team Leader') add(member.id);
+      });
+      add(team.leader);
+      add(team.marketManager);
+      add(team.campaignManager);
+    }
+  }
+  // Direct pointers on the agent record
+  add(agent.teamLeaderId);
+  add(agent.mmId);
+  add(agent.cmId);
+  add(agent.iboId);
+  // If still nothing, the agent is a top-level manager — no upline.
+  return upline;
+}
+if(typeof window !== 'undefined') window._resolveUplineForAgent = _resolveUplineForAgent;
+
+// ── Unified denial notifier ──
+// Fires (1) in-app notifications, (2) email best-effort, (3) persistent
+// banner records for the requester + entire upline.
+function _sendDenialNotification(opts){
+  opts = opts || {};
+  var requesterId = opts.requesterId;
+  var denierUser  = opts.denierUser || DB.current || {name:'Inventory System'};
+  var reason      = String(opts.reason || '').trim();
+  var label       = opts.label || 'Request';
+  var summary     = opts.summary || '';
+  var panel       = opts.panel || 'pending-transfers';
+  var requestId   = opts.requestId || '';
+
+  if(!requesterId){ console.warn('[denial-notify] no requesterId, skipping'); return; }
+  if(!reason){     console.warn('[denial-notify] no reason, skipping');     return; }
+
+  // Build recipient list: requester + upline managers
+  var recipients = [requesterId];
+  _resolveUplineForAgent(requesterId).forEach(function(u){
+    if(recipients.indexOf(u.id) < 0) recipients.push(u.id);
+  });
+
+  // (1) In-app notification per recipient
+  if(typeof pushNotification === 'function'){
+    recipients.forEach(function(rid){
+      var isRequester = (rid === requesterId);
+      pushNotification({
+        toIds:    [rid],
+        toRoles:  [],
+        icon:     '🛑',
+        title:    label + ' — DENIED' + (isRequester ? '' : ' (Upline notice)'),
+        body:     (isRequester
+                   ? 'Your ' + label.toLowerCase() + ' was denied by ' + denierUser.name + '.'
+                   : 'A ' + label.toLowerCase() + ' from your downline was denied by ' + denierUser.name + '.')
+                  + (summary ? ' ' + summary : '')
+                  + ' Reason: "' + reason + '"',
+        panel:    panel,
+        priority: 'high'
+      });
+    });
+  }
+
+  // (2) Persistent denial banner ONLY for the requester (upline gets the
+  // notification but doesn't need a blocking banner on their dashboard)
+  _denialBannerAdd({
+    toId:        requesterId,
+    label:       label,
+    reason:      reason,
+    summary:     summary,
+    denierName:  denierUser.name,
+    denierId:    denierUser.id || null,
+    requestId:   requestId,
+    panel:       panel
+  });
+
+  // (3) Email best-effort. The email engine is best-effort; if it fails
+  // the in-app + banner still cover the notification.
+  try {
+    if(typeof sendEmailRaw === 'function'){
+      var requesterAgent = (DB.agents || []).find(function(a){ return a && a.id === requesterId; });
+      if(requesterAgent && requesterAgent.email){
+        sendEmailRaw({
+          to:      requesterAgent.email,
+          subject: '['+label+'] Denied — Action Required',
+          html:    '<div style="font-family:Arial,sans-serif;color:#111;max-width:560px">'
+                  +'<h2 style="color:#dc2626;margin:0 0 12px">'+label+' Denied</h2>'
+                  +'<p>Hi '+(requesterAgent.name || 'there')+',</p>'
+                  +'<p>Your '+label.toLowerCase()+' was reviewed and <strong>denied</strong> by '+denierUser.name+'.</p>'
+                  +(summary ? '<p><em>'+summary+'</em></p>' : '')
+                  +'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:12px 16px;margin:14px 0">'
+                  +'<strong>Reason:</strong><br>'+reason
+                  +'</div>'
+                  +'<p>To follow up, log in to the back office, review the request, and reach out to Inventory Department with any questions.</p>'
+                  +'</div>'
+        });
+      }
+    }
+  } catch(e){ console.warn('[denial-notify] email send failed:', e); }
+}
+if(typeof window !== 'undefined') window._sendDenialNotification = _sendDenialNotification;
+
+// ── Universal denial-reason modal ──
+// Replaces the old prompt() calls. Required reason field, minimum 10
+// chars. Mobile-friendly. Returns via callback so all existing deny
+// functions stay synchronous in their core logic.
+function invShowDenyReasonModal(opts){
+  opts = opts || {};
+  var title    = opts.title    || 'Deny Request';
+  var summary  = opts.summary  || '';
+  var examples = opts.examples || 'Examples: incorrect recipient, exceeds market quota, agent not yet trained, market reorg in progress, insufficient justification.';
+  var minLen   = (typeof opts.minLen === 'number') ? opts.minLen : 10;
+  var onConfirm = opts.onConfirm || function(){};
+  var onCancel  = opts.onCancel  || function(){};
+
+  // Remove any stale instance
+  var existing = document.getElementById('inv-deny-reason-modal');
+  if(existing) existing.remove();
+
+  var bg = document.createElement('div');
+  bg.id = 'inv-deny-reason-modal';
+  bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100000;display:flex;align-items:center;justify-content:center;padding:14px';
+  var box = document.createElement('div');
+  box.style.cssText = 'background:white;border-radius:12px;max-width:520px;width:100%;box-shadow:0 18px 48px rgba(0,0,0,.4);overflow:hidden;display:flex;flex-direction:column;max-height:92vh';
+
+  var html = '';
+  html += '<div style="background:linear-gradient(135deg,#dc2626,#991b1b);color:white;padding:18px 22px">';
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px">⛔ '+escHtml(title)+'</div>';
+  if(summary){
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;opacity:.95;margin-top:4px">'+escHtml(summary)+'</div>';
+  }
+  html += '</div>';
+  html += '<div style="padding:18px 22px;font-family:Barlow Condensed,sans-serif;color:var(--brown);line-height:1.55;overflow-y:auto;flex:1">';
+  html += '<p style="margin:0 0 8px;font-weight:600">Why are you denying this?</p>';
+  html += '<p style="margin:0 0 10px;font-size:.78rem;color:var(--muted)">The requester and their upline (TL/MM/CM/IBO) will see this exact reason in a notification, an email, and a banner on their dashboard until they acknowledge it. Be clear so they know what to do next.</p>';
+  html += '<textarea id="inv-deny-reason-text" class="f-textarea" style="min-height:110px;width:100%;box-sizing:border-box;font-family:Barlow Condensed,sans-serif;font-size:.9rem" placeholder="Type your reason here (minimum '+minLen+' characters)..." maxlength="600"></textarea>';
+  html += '<div id="inv-deny-reason-counter" style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);text-align:right;margin-top:4px">0 / 600</div>';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:10px;line-height:1.55"><em>'+escHtml(examples)+'</em></div>';
+  html += '</div>';
+  html += '<div style="padding:14px 22px;border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;background:white">';
+  html += '<button id="inv-deny-reason-cancel" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 20px;border-radius:6px;cursor:pointer">Cancel</button>';
+  html += '<button id="inv-deny-reason-confirm" disabled style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 22px;border-radius:6px;cursor:pointer;font-weight:700;opacity:.4">Confirm Deny</button>';
+  html += '</div>';
+
+  box.innerHTML = html;
+  bg.appendChild(box);
+  document.body.appendChild(bg);
+
+  // Wire counter + enable/disable logic
+  var ta      = document.getElementById('inv-deny-reason-text');
+  var counter = document.getElementById('inv-deny-reason-counter');
+  var btn     = document.getElementById('inv-deny-reason-confirm');
+  if(ta){
+    ta.addEventListener('input', function(){
+      var len = ta.value.trim().length;
+      counter.textContent = ta.value.length + ' / 600';
+      if(len >= minLen){
+        btn.disabled = false;
+        btn.style.opacity = '1';
+      } else {
+        btn.disabled = true;
+        btn.style.opacity = '.4';
+      }
+    });
+    setTimeout(function(){ ta.focus(); }, 80);
+  }
+  document.getElementById('inv-deny-reason-cancel').addEventListener('click', function(){
+    bg.remove();
+    try { onCancel(); } catch(e){}
+  });
+  document.getElementById('inv-deny-reason-confirm').addEventListener('click', function(){
+    var reason = (ta && ta.value || '').trim();
+    if(reason.length < minLen){ return; }  // guard race
+    bg.remove();
+    try { onConfirm(reason); } catch(e){ console.warn('[denyModal] onConfirm threw:', e); }
+  });
+}
+if(typeof window !== 'undefined') window.invShowDenyReasonModal = invShowDenyReasonModal;
+
 function invDeptDeny(transferId, campaign, reason){
   var cfg = (typeof campaignCfg === 'function') ? campaignCfg(campaign) : null;
   if(!cfg || !cfg.transfers){ alert('Campaign config not found.'); return false; }
@@ -37367,14 +37678,18 @@ function invDeptDeny(transferId, campaign, reason){
   req.invDeptDenialReason = reason.trim();
   if(typeof saveInventory === 'function') saveInventory();
   if(typeof saveToStorage === 'function') saveToStorage();
-  // Notify the sender — their request was denied
-  if(typeof pushNotification === 'function'){
-    pushNotification({
-      toIds: [req.fromId], toRoles: [], icon: '🛑',
-      title: campaign + ' Transfer — DENIED',
-      body: 'Inventory Dept (' + u.name + ') denied your transfer to ' + req.toName + '. Reason: ' + reason.trim() + '. Reach out to Inventory Department for follow-up.',
-      priority: 'high',
-      formType:'inv-transfer-outcome', data:{kind:'inv-transfer-outcome', transferId:req.id, campaign:campaign, outcome:'denied'}
+  // Calvin 2026-06-04: unified denial notification — requester + upline +
+  // persistent banner + email best-effort. Replaces the old single
+  // pushNotification call.
+  if(typeof _sendDenialNotification === 'function'){
+    _sendDenialNotification({
+      requesterId: req.fromId,
+      denierUser:  u,
+      reason:      reason.trim(),
+      label:       campaign + ' Transfer',
+      summary:     'Transfer to ' + (req.toName || 'recipient') + ' for ' + ((req.imeis||[]).length || (req.devices||[]).length) + ' device(s)',
+      panel:       'pending-transfers',
+      requestId:   req.id
     });
   }
   // Calvin 2026-05-14: clear the original approval notifications from all bells
@@ -37477,7 +37792,7 @@ function panelInvDeptApprovals(){
     // Action buttons
     h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
     h += '<button onclick="if(invDeptApprove(\''+t.id+'\',\''+_escapeAttr(camp)+'\')){ gotoPanel(\'inv-dept-approvals\'); }" class="btn-fire" style="flex:1;min-width:140px;justify-content:center;padding:11px;font-size:.78rem;background:linear-gradient(135deg,#059669,#047857);color:white;border:none">✓ APPROVE</button>';
-    h += '<button onclick="(function(){ var r = prompt(\'Reason for denial (the sender will see this):\\\\n\\\\nExamples: wrong recipient, exceeds market quota, agent not yet trained, market reorg in progress\'); if(r && invDeptDeny(\''+t.id+'\',\''+_escapeAttr(camp)+'\', r)){ gotoPanel(\'inv-dept-approvals\'); } })()" style="flex:1;min-width:140px;justify-content:center;padding:11px;font-size:.78rem;background:white;color:#dc2626;border:1.5px solid #dc2626;font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">✗ DENY</button>';
+    h += '<button onclick="invShowDenyReasonModal({title:\'Deny '+_escapeAttr(camp)+' Transfer\', summary:\'Transfer from '+_escapeAttr(t.fromName||'')+' to '+_escapeAttr(t.toName||'')+'\', onConfirm:function(reason){ if(invDeptDeny(\''+t.id+'\',\''+_escapeAttr(camp)+'\', reason)){ gotoPanel(\'inv-dept-approvals\'); } }})" style="flex:1;min-width:140px;justify-content:center;padding:11px;font-size:.78rem;background:white;color:#dc2626;border:1.5px solid #dc2626;font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">✗ DENY</button>';
     h += '</div>';
     h += '</div>';
   });
@@ -38314,27 +38629,55 @@ function invApproveDeletion(reqId){
   gotoPanel('inv-dashboard');
 }
 
-function invDenyDeletion(reqId){
+function invDenyDeletion(reqId, reason){
   var u = DB.current;
   if(!isOwner(u)){ alert('Owner approval only.'); return; }
-  var reason = prompt('Reason for denying this deletion (optional):');
   var req = INV_DELETION_REQUESTS.find(function(r){return r.id===reqId;});
   if(!req) return;
+
+  // Calvin 2026-06-04: reason now REQUIRED.
+  if(!reason || !String(reason).trim() || String(reason).trim().length < 10){
+    if(typeof invShowDenyReasonModal === 'function'){
+      invShowDenyReasonModal({
+        title:   'Deny Deletion Request',
+        summary: req.deviceCount + ' device(s) requested by ' + (req.requestedBy||''),
+        onConfirm: function(r){ invDenyDeletion(reqId, r); }
+      });
+      return;
+    }
+    alert('A denial reason is required.');
+    return;
+  }
+
   req.status = 'denied';
   req.reviewedBy = u.name;
   req.reviewedAt = new Date().toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});
-  req.denyReason = reason||'Denied by owner';
+  req.denyReason = String(reason).trim();
   saveInvDeletionRequests();
   if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
   CHANNEL_MSGS['national'].unshift({
     id:channelMsgNextId++, from:'Owner', role:'owner', init:'CW',
     time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
     type:'announcement',
-    text:'❌ DELETION DENIED — '+req.deviceCount+' device(s) kept in system | Requested by: '+req.requestedBy+(reason?' | Reason: '+reason:''),
+    text:'❌ DELETION DENIED — '+req.deviceCount+' device(s) kept in system | Requested by: '+req.requestedBy+' | Reason: '+req.denyReason,
     photo:null
   });
   saveToStorage();
-  alert('Deletion request denied. Inventory Dept has been notified.');
+
+  // Calvin 2026-06-04: unified notification — requester + upline + banner + email
+  if(typeof _sendDenialNotification === 'function' && req.requestedById){
+    _sendDenialNotification({
+      requesterId: req.requestedById,
+      denierUser:  u,
+      reason:      req.denyReason,
+      label:       'Inventory Deletion Request',
+      summary:     req.deviceCount + ' device(s) requested for deletion',
+      panel:       'inv-dashboard',
+      requestId:   req.id
+    });
+  }
+
+  alert('Deletion request denied. Requester and their upline have been notified.');
   gotoPanel('inv-dashboard');
 }
 
@@ -48111,22 +48454,44 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
   if(typeof gotoPanel === 'function') gotoPanel(cfg.id+'-transfers');
 }
 
-function invRejectTransfer(campaign, transferId){
+function invRejectTransfer(campaign, transferId, reason){
   var cfg = campaignCfg(campaign); if(!cfg) return;
   var req = cfg.transfers().find(function(t){return t.id===transferId;}); if(!req) return;
   var u = DB.current;
   if(req.toId !== u.id){ alert('This transfer is not addressed to you.'); return; }
-  if(!confirm('Reject this transfer? The devices stay with '+req.fromName+'.')) return;
+
+  // Calvin 2026-06-04: reason now REQUIRED. The sender + their upline see it.
+  if(!reason || !String(reason).trim() || String(reason).trim().length < 10){
+    if(typeof invShowDenyReasonModal === 'function'){
+      invShowDenyReasonModal({
+        title:   'Reject ' + cfg.label + ' Transfer',
+        summary: 'Transfer from ' + (req.fromName||'') + ' for ' + (req.imeis||[]).length + ' device(s)',
+        onConfirm: function(r){ invRejectTransfer(campaign, transferId, r); }
+      });
+      return;
+    }
+    alert('A rejection reason is required.');
+    return;
+  }
 
   req.status     = 'rejected';
   req.rejectedAt = new Date().toISOString();
+  req.denyReason = String(reason).trim();
+  req.rejectedBy = u.name;
+  req.rejectedById = u.id;
   saveInventory();
-  pushNotification({
-    toIds:[req.fromId], toRoles:[], icon:'❌',
-    title:'Transfer Rejected — '+req.toName,
-    body:req.toName+' rejected your transfer of '+req.imeis.length+' device(s). Devices remain with you.',
-    panel:cfg.id+'-transfers', priority:'high'
-  });
+
+  if(typeof _sendDenialNotification === 'function'){
+    _sendDenialNotification({
+      requesterId: req.fromId,
+      denierUser:  u,
+      reason:      req.denyReason,
+      label:       cfg.label + ' Transfer (Rejected by Recipient)',
+      summary:     u.name + ' did not accept the ' + (req.imeis||[]).length + ' device(s) you sent',
+      panel:       cfg.id+'-transfers',
+      requestId:   req.id
+    });
+  }
   cdFlash('Transfer rejected');
   gotoPanel(cfg.id+'-transfers');
 }
@@ -48214,13 +48579,41 @@ function gmInitiateTransfer(){
   }
 }
 
-function gmDenyTransfer(transferId){
+function gmDenyTransfer(transferId, reason){
   var req = GM_TRANSFERS.find(function(t){return t.id===transferId;}); if(!req) return;
-  req.status = 'denied';
-  req.deniedBy = DB.current.name;
-  req.deniedAt = new Date().toISOString();
+
+  // Calvin 2026-06-04: reason now REQUIRED. Open modal if not provided.
+  if(!reason || !String(reason).trim() || String(reason).trim().length < 10){
+    if(typeof invShowDenyReasonModal === 'function'){
+      invShowDenyReasonModal({
+        title:   'Deny Gen Mobile Transfer',
+        summary: 'Transfer from ' + (req.fromName||'') + ' to ' + (req.toName||''),
+        onConfirm: function(r){ gmDenyTransfer(transferId, r); }
+      });
+      return;
+    }
+    alert('A denial reason is required.');
+    return;
+  }
+
+  req.status     = 'denied';
+  req.deniedBy   = DB.current.name;
+  req.deniedAt   = new Date().toISOString();
+  req.denyReason = String(reason).trim();
   saveInventory();
-  pushNotification({toIds:[req.fromId],toRoles:[],icon:'❌',title:'Transfer Denied — '+req.toName,body:'Your transfer request for '+req.imeis.length+' device(s) was denied by Inventory Dept.',panel:'gm-transfers',priority:'high'});
+
+  // Unified notification: requester + upline + banner + email
+  if(typeof _sendDenialNotification === 'function'){
+    _sendDenialNotification({
+      requesterId: req.fromId,
+      denierUser:  DB.current,
+      reason:      req.denyReason,
+      label:       'Gen Mobile Transfer',
+      summary:     'Transfer to ' + (req.toName||'') + ' for ' + (req.imeis||[]).length + ' device(s)',
+      panel:       'gm-transfers',
+      requestId:   req.id
+    });
+  }
   cdFlash('Transfer denied');
   gotoPanel('gm-transfers');
 }
@@ -63528,7 +63921,7 @@ function panelPendingTransfers(){
       // Action buttons — Approve / Deny inline
       h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
       h += '<button onclick="if(invDeptApprove(\''+_escapeAttr(t.id)+'\',\''+_escapeAttr(entry.campaign)+'\')) gotoPanel(\'pending-transfers\')" class="btn-fire" style="flex:1;min-width:130px;justify-content:center;padding:11px;font-size:.78rem;background:linear-gradient(135deg,#059669,#047857);color:white;border:none">✓ APPROVE</button>';
-      h += '<button onclick="(function(){ var r = prompt(\'Reason for denial (the sender will see this):\\\\n\\\\nExamples: wrong recipient, exceeds market quota, agent not yet trained\'); if(r && invDeptDeny(\''+_escapeAttr(t.id)+'\',\''+_escapeAttr(entry.campaign)+'\', r)) gotoPanel(\'pending-transfers\'); })()" style="flex:1;min-width:130px;justify-content:center;padding:11px;font-size:.78rem;background:white;color:#dc2626;border:1.5px solid #dc2626;font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">✗ DENY</button>';
+      h += '<button onclick="invShowDenyReasonModal({title:\'Deny '+_escapeAttr(entry.campaign)+' Transfer\', summary:\'Transfer from '+_escapeAttr(t.fromName||'')+' to '+_escapeAttr(t.toName||'')+'\', onConfirm:function(reason){ if(invDeptDeny(\''+_escapeAttr(t.id)+'\',\''+_escapeAttr(entry.campaign)+'\', reason)) gotoPanel(\'pending-transfers\'); }})" style="flex:1;min-width:130px;justify-content:center;padding:11px;font-size:.78rem;background:white;color:#dc2626;border:1.5px solid #dc2626;font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">✗ DENY</button>';
       h += '</div>';
       h += '</div>';
     });
@@ -63737,7 +64130,7 @@ function invApproveTransfer(campaign, transferId){
   gotoPanel('pending-transfers');
 }
 
-function invDenyTransfer(campaign, transferId){
+function invDenyTransfer(campaign, transferId, reason){
   var cfg = (typeof campaignCfg === 'function') ? campaignCfg(campaign) : null;
   if(!cfg) return;
   var req = (cfg.transfers()||[]).find(function(t){return t.id===transferId;});
@@ -63745,20 +64138,40 @@ function invDenyTransfer(campaign, transferId){
   var u = DB.current;
   var imApprover = (Array.isArray(req.approverIds) && req.approverIds.indexOf(u.id) >= 0) || isOwner(u) || isInventory(u) || u.role==='admin';
   if(!imApprover){ alert('You are not authorized to deny this transfer.'); return; }
-  var reason = prompt('Optional reason for denial:');
+
+  // Calvin 2026-06-04: reason is now REQUIRED. If caller invoked without
+  // one (legacy code paths), pop the modal first; on confirm, recurse.
+  if(!reason || !String(reason).trim() || String(reason).trim().length < 10){
+    if(typeof invShowDenyReasonModal === 'function'){
+      invShowDenyReasonModal({
+        title:   'Deny ' + cfg.label + ' Transfer',
+        summary: 'Transfer from ' + (req.fromName||'') + ' to ' + (req.toName||''),
+        onConfirm: function(r){ invDenyTransfer(campaign, transferId, r); }
+      });
+      return;
+    }
+    alert('A denial reason is required.');
+    return;
+  }
+
   req.status     = 'denied';
   req.deniedBy   = u.name;
   req.deniedById = u.id;
   req.deniedAt   = new Date().toISOString();
-  req.denyReason = reason || '';
+  req.denyReason = String(reason).trim();
   saveInventory();
 
-  if(typeof pushNotification === 'function'){
-    pushNotification({
-      toIds:[req.fromId], toRoles:[], icon:'❌',
-      title: cfg.label + ' Transfer Denied',
-      body: u.name + ' denied your transfer to ' + req.toName + '.' + (reason ? ' Reason: '+reason : ''),
-      panel:'pending-transfers', priority:'high'
+  // Calvin 2026-06-04: unified denial notification (requester + upline +
+  // banner + email best-effort). Replaces the single in-app push.
+  if(typeof _sendDenialNotification === 'function'){
+    _sendDenialNotification({
+      requesterId: req.fromId,
+      denierUser:  u,
+      reason:      req.denyReason,
+      label:       cfg.label + ' Transfer',
+      summary:     'Transfer to ' + (req.toName||'') + ' for ' + ((req.imeis||[]).length || (req.devices||[]).length) + ' device(s)',
+      panel:       'pending-transfers',
+      requestId:   req.id
     });
   }
   if(typeof cdFlash === 'function') cdFlash('Transfer denied');
