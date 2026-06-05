@@ -16998,7 +16998,11 @@ async function syncPullFreshAgent(agentId){
       cmModel:       a.cm_model || 'none',
       tcModel:       a.tc_model || 'none',
       awModel:       a.aw_model || 'none',
-      reportsTo:     safeJSON(a.reports_to, {})
+      reportsTo:     safeJSON(a.reports_to, {}),
+      // Calvin 2026-06-04: office-override bypass flag
+      bypassOnboardingGate:    a.bypass_onboarding_gate === true,
+      bypassOnboardingGateBy:  a.bypass_onboarding_gate_by || null,
+      bypassOnboardingGateAt:  a.bypass_onboarding_gate_at || null
     };
     var idx = DB.agents.findIndex(function(x){ return x.id === agentId; });
     if(idx >= 0){
@@ -17055,7 +17059,10 @@ async function syncPullFreshAllAgents(){
         cmModel:       a.cm_model || 'none',
         tcModel:       a.tc_model || 'none',
         awModel:       a.aw_model || 'none',
-        reportsTo:     safeJSON(a.reports_to, {})
+        reportsTo:     safeJSON(a.reports_to, {}),
+        bypassOnboardingGate:    a.bypass_onboarding_gate === true,
+        bypassOnboardingGateBy:  a.bypass_onboarding_gate_by || null,
+        bypassOnboardingGateAt:  a.bypass_onboarding_gate_at || null
       };
     });
     saveToStorage();
@@ -18491,6 +18498,10 @@ async function loadFromSupabase(){
           awModel:       a.aw_model || 'none',
           // Per-campaign reporting chain. Map of {campaignName: parentAgentId | null}.
           reportsTo:     safeJSON(a.reports_to, {}),
+          // Calvin 2026-06-04: office-override bypass flag
+          bypassOnboardingGate:    a.bypass_onboarding_gate === true,
+          bypassOnboardingGateBy:  a.bypass_onboarding_gate_by || null,
+          bypassOnboardingGateAt:  a.bypass_onboarding_gate_at || null,
           _supaUpdatedAt: a.updated_at || null
         };
       });
@@ -18908,7 +18919,12 @@ function _buildAgentRow(agent){
     cm_model:       agent.cmModel || null,
     tc_model:       agent.tcModel || null,
     aw_model:       agent.awModel || null,
-    reports_to:     agent.reportsTo || {}
+    reports_to:     agent.reportsTo || {},
+    // Calvin 2026-06-04: persist the office-override bypass flag so the
+    // Unlock Profile setting survives reload and propagates across devices.
+    bypass_onboarding_gate:    agent.bypassOnboardingGate === true,
+    bypass_onboarding_gate_by: agent.bypassOnboardingGateBy || null,
+    bypass_onboarding_gate_at: agent.bypassOnboardingGateAt || null
   };
 }
 
@@ -18943,6 +18959,12 @@ async function saveAgentToSupabase(agent){
       delete legacy.ibo_markets; delete legacy.cm_model;
       delete legacy.tc_model; delete legacy.aw_model;
       delete legacy.reports_to; delete legacy.address;
+      // Calvin 2026-06-04: bypass fields are new — strip if schema is older.
+      // Local + localStorage still hold the flag so the Owner's session
+      // still works; only cross-device sync would lose it until schema updated.
+      delete legacy.bypass_onboarding_gate;
+      delete legacy.bypass_onboarding_gate_by;
+      delete legacy.bypass_onboarding_gate_at;
       var res2 = await supaClient.from('agents').upsert(legacy, { onConflict: 'id' }).select().single();
       if(res2 && res2.error){
         var failResult = { ok: false, error: (res2.error.message || res2.error || res.error.message || 'Unknown error'), code: res2.error.code || res.error.code };
@@ -19015,7 +19037,12 @@ function _mergeServerAgentIntoLocal(serverRow){
     cmModel:     serverRow.cm_model || 'none',
     tcModel:     serverRow.tc_model || 'none',
     awModel:     serverRow.aw_model || 'none',
-    reportsTo:   safeJSONLocal(serverRow.reports_to, {})
+    reportsTo:   safeJSONLocal(serverRow.reports_to, {}),
+    // Calvin 2026-06-04: hydrate the office-override bypass flag from
+    // the server. Default to false if column missing (older schema).
+    bypassOnboardingGate:    serverRow.bypass_onboarding_gate === true,
+    bypassOnboardingGateBy:  serverRow.bypass_onboarding_gate_by || null,
+    bypassOnboardingGateAt:  serverRow.bypass_onboarding_gate_at || null
   };
   if(!Array.isArray(DB.agents)) DB.agents = [];
   var idx = DB.agents.findIndex(function(a){ return a && a.id === mapped.id; });
@@ -30054,10 +30081,13 @@ function gotoPanel(id, params){
   // them — including the panels behind this gate — without being
   // hard-routed to onboard-sign every navigation. The unsigned packets
   // are preserved; only the FORCING is suppressed.
+  // Calvin 2026-06-04: also exempt ALL office staff roles uniformly.
+  // The onboarding gate is for field agents only.
   try{
     if(typeof obAgentPendingAssignments === 'function' && DB && DB.current
        && !isOwner(DB.current)
-       && DB.current.bypassOnboardingGate !== true){
+       && DB.current.bypassOnboardingGate !== true
+       && !(typeof isOfficeRole === 'function' && isOfficeRole(DB.current))){
       var obPending = obAgentPendingAssignments(DB.current.id);
       var obAllowed = ['onboard-sign','notifications'];
       if(obPending.length && obAllowed.indexOf(id) < 0){
@@ -30091,10 +30121,12 @@ function gotoPanel(id, params){
   // Calvin 2026-06-04: bypassOnboardingGate flag also exempts (same
   // reasoning as the onboarding-signature gate above — office staff
   // need to walk through the agent's profile for testing).
+  // Calvin 2026-06-04: also exempt ALL office staff roles uniformly.
   try{
     if(typeof ppGetMyPendingAssignments === 'function' && DB && DB.current
        && !isOwner(DB.current)
-       && DB.current.bypassOnboardingGate !== true){
+       && DB.current.bypassOnboardingGate !== true
+       && !(typeof isOfficeRole === 'function' && isOfficeRole(DB.current))){
       var pending = ppGetMyPendingAssignments();
       var allowed = ['comp-acknowledge','notifications'];
       if(pending.length && allowed.indexOf(id) < 0){
@@ -42107,7 +42139,21 @@ function isOnboardingLocked(agent){
   if(agent.bypassOnboardingGate === true) return false;
   // Grandfather: Owner
   if(typeof isOwner === 'function' && isOwner(agent)) return false;
-  // Grandfather: username whitelist
+  // ── Calvin 2026-06-04 CRITICAL FIX ──
+  // Grandfather: ALL office staff roles. The onboarding gate exists to
+  // make sure FIELD AGENTS sign their BG forms and contract packets
+  // before they can sell. Office staff (Owner, admin, HR, Inventory Dept,
+  // Onboarding, Payroll, "Office Staff" role) are NOT field agents —
+  // they're the people who ASSIGN and MANAGE these forms. Locking them
+  // out of their own back office for missing signatures they were never
+  // supposed to fill out is the bug Calvin keeps reporting.
+  //
+  // This is the comprehensive fix: any office-role user is exempt from
+  // the onboarding gate, period. They can still sign assigned docs if
+  // any are intentionally assigned to them via Form Builder, but they
+  // will never be FORCED to.
+  if(typeof isOfficeRole === 'function' && isOfficeRole(agent)) return false;
+  // Grandfather: username whitelist (legacy — kept for back-compat)
   var uname = String(agent.username || '').toLowerCase();
   if(ONBOARDING_GATE_BYPASS.indexOf(uname) >= 0) return false;
   // Check 3-step packets
