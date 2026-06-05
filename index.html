@@ -28826,6 +28826,12 @@ function buildNav(u){
     h += boNavBtn('meetings','📞 Meetings');
   }
 
+  // Calvin 2026-06-04: Contact directory — call mgrs/office without
+  // exposing personal numbers. Everyone gets the link; the panel itself
+  // filters which numbers each user can see (agents see up-chain only,
+  // office/mgrs see the full directory).
+  h += boNavBtn('contact','☎️ Contact');
+
   // Store — everyone can browse
   h += boNavBtn('store','🛍️ Store');
 
@@ -29122,12 +29128,24 @@ function panelAgentMasterProfile(agentId){
      +'</div>';
 
   // Action buttons
+  // Calvin 2026-06-04: Call button (if a contact entry is configured for
+  // this agent + viewer has permission to call them). Rendered ahead of
+  // Edit/Deactivate buttons so it's prominent for office staff who
+  // frequently need to reach mgrs while on their profile.
+  var _callBtnHtml = (typeof contactCallButtonForAgent === 'function')
+    ? contactCallButtonForAgent(a.id)
+    : '';
   if(isOwner(viewer)||viewer.role==='admin'){
     h += '<div style="display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0">'
+       +_callBtnHtml
        +'<button onclick="openEditPerson('+a.id+')" style="background:rgba(0,53,148,.1);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 16px;border-radius:6px;cursor:pointer">✏️ Edit Agent</button>'
        +(a.active&&a.id!==1?'<button onclick="deactivateAgent('+a.id+',\''+a.name.replace(/'/g,"\\'")+'\')" style="background:rgba(204,0,0,.08);border:1px solid rgba(204,0,0,.25);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 16px;border-radius:6px;cursor:pointer">Deactivate</button>':'')
        +(!a.active&&a.id!==1?'<button onclick="reactivateAgent('+a.id+',\''+a.name.replace(/'/g,"\\'")+'\')" style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.25);color:#059669;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:8px 16px;border-radius:6px;cursor:pointer">Reactivate</button>':'')
        +'</div>';
+  } else if(_callBtnHtml){
+    // Non-admin viewer who CAN call this agent (e.g. they have them in
+    // their upline): show just the Call button on its own.
+    h += '<div style="display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0">'+_callBtnHtml+'</div>';
   }
   h += '</div></div>';
 
@@ -30277,6 +30295,10 @@ function gotoPanel(id, params){
     'meeting-hosts':panelMeetingHosts,
     'my-documents':panelMyDocuments,
     'campaign-docs':panelCampaignDocs,
+    // Calvin 2026-06-04: Contact directory panels
+    'contact':panelContactDirectory,
+    'contact-admin':panelContactAdmin,
+    'contact-log':panelContactLog,
     'agent-master':function(){ return panelAgentMasterProfile(gotoPanel._masterAgentId||0); }
   };
 
@@ -39991,6 +40013,489 @@ function getMeetingJoinBtn(room, isLive){
   return '<button data-room="'+room.id+'" data-rname="'+room.name+'" onclick="joinCall(this.dataset.room,this.dataset.rname)" '
     +'style="flex:1;background:'+bg+';border:'+bd+';color:'+cl+';font-family:Barlow Condensed,sans-serif;'
     +'font-size:.68rem;letter-spacing:2px;text-transform:uppercase;padding:10px 14px;border-radius:6px;cursor:pointer">'+label+'</button>';
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  CONTACT DIRECTORY — Calvin 2026-06-04
+//
+//  Lets agents/mgrs call configured phone numbers (Office departments and
+//  individual managers) without seeing the raw digits. Numbers are stored
+//  in CONTACT_DIRECTORY and edited by Owner/admin on the admin panel.
+//
+//  Mechanism: tel: links. Clicking a Call button opens the device's
+//  dialer with the configured number. On desktop that triggers
+//  FaceTime/Phone Link/etc. depending on what's installed.
+//
+//  Permissions: agents see up-chain only (their TL, MM, CM, IBO + office
+//  numbers + admins/Inv Dept). Owner, admin, HR, Inv Dept, and all
+//  managers see the full directory.
+//
+//  Every call attempt is logged in CONTACT_CALL_LOG with caller, callee,
+//  timestamp, and a post-call note the caller can fill in afterward.
+// ════════════════════════════════════════════════════════════════════════
+
+// ── Storage: contact entries + call log ──
+// CONTACT_DIRECTORY: [{id, kind:'office'|'agent', label, phone, deptKey?,
+//                       linkedAgentId?, sortOrder, active, createdAt, updatedAt}]
+//  - kind 'office' is a department line (Onboarding, Payroll, Inventory, General)
+//  - kind 'agent'  is a manager's office phone, linked to an agent record
+//
+// CONTACT_CALL_LOG: [{id, callerId, callerName, contactId, contactLabel,
+//                      ts, note, noteAt}]
+var CONTACT_DIRECTORY = [];
+var CONTACT_CALL_LOG  = [];
+
+function _contactLoad(){
+  try {
+    var d = localStorage.getItem('wmam_contact_directory');
+    if(d){
+      var pd = JSON.parse(d);
+      if(Array.isArray(pd)) CONTACT_DIRECTORY = pd;
+    }
+    var l = localStorage.getItem('wmam_contact_call_log');
+    if(l){
+      var pl = JSON.parse(l);
+      if(Array.isArray(pl)) CONTACT_CALL_LOG = pl;
+    }
+  } catch(e){ console.warn('[contact] load failed:', e); }
+}
+function _contactSaveDirectory(){
+  try { localStorage.setItem('wmam_contact_directory', JSON.stringify(CONTACT_DIRECTORY)); }
+  catch(e){ console.warn('[contact] save dir failed:', e); }
+}
+function _contactSaveLog(){
+  try { localStorage.setItem('wmam_contact_call_log', JSON.stringify(CONTACT_CALL_LOG)); }
+  catch(e){ console.warn('[contact] save log failed:', e); }
+}
+_contactLoad();
+
+// Format a phone number for human display from any digit string.
+// Strips non-digits, then formats US 10-digit as (XXX) XXX-XXXX.
+function _contactFormatPhone(raw){
+  var d = String(raw||'').replace(/\D/g, '');
+  if(d.length === 11 && d[0] === '1') d = d.slice(1);
+  if(d.length === 10){
+    return '('+d.slice(0,3)+') '+d.slice(3,6)+'-'+d.slice(6);
+  }
+  return raw || '';
+}
+
+// Build the tel: URL for the dialer. Strips formatting, keeps + prefix
+// if present for international numbers.
+function _contactTelUrl(raw){
+  var s = String(raw||'').trim();
+  var plus = s.charAt(0) === '+';
+  var d = s.replace(/\D/g, '');
+  return 'tel:' + (plus ? '+' : '') + d;
+}
+
+// Permission check: should this viewer see this contact entry?
+// Returns true if:
+//   - viewer is Owner, admin, HR, Inv Dept, or any kind of manager
+//   - the contact is an office department (everyone sees those)
+//   - the contact is linked to an agent who's in viewer's upline (TL/MM/CM/IBO)
+function _contactVisibleTo(viewer, entry){
+  if(!viewer || !entry || entry.active === false) return false;
+  // Office numbers are visible to everyone
+  if(entry.kind === 'office') return true;
+  // Full-directory roles
+  var isFullView = (typeof isOwner === 'function' && isOwner(viewer))
+    || viewer.role === 'admin'
+    || (typeof isHR === 'function' && isHR(viewer))
+    || (typeof isInventory === 'function' && isInventory(viewer))
+    || (typeof isOnboarding === 'function' && isOnboarding(viewer))
+    || viewer.role === 'Owner'
+    || viewer.role === 'Team Leader'
+    || viewer.role === 'Market Manager'
+    || viewer.role === 'Campaign Manager'
+    || viewer.role === 'IBO';
+  if(isFullView) return true;
+  // Agent: only up-chain managers
+  if(entry.kind === 'agent' && entry.linkedAgentId){
+    if(typeof _resolveUplineForAgent === 'function'){
+      var upline = _resolveUplineForAgent(viewer.id);
+      if(upline.some(function(u){ return u.id === entry.linkedAgentId; })) return true;
+    }
+  }
+  return false;
+}
+
+// Filter the visible directory for a given viewer.
+function _contactVisibleDirectory(viewer){
+  return (CONTACT_DIRECTORY || [])
+    .filter(function(e){ return _contactVisibleTo(viewer, e); })
+    .sort(function(a, b){
+      // office entries first, then by sortOrder, then label
+      if(a.kind !== b.kind) return a.kind === 'office' ? -1 : 1;
+      var so = (a.sortOrder || 0) - (b.sortOrder || 0);
+      if(so !== 0) return so;
+      return String(a.label||'').localeCompare(String(b.label||''));
+    });
+}
+
+// ── ACTION: log + dial ──
+// Records a call attempt then opens the dialer via tel: URL. The note
+// is filled in afterward via a prompt-style banner that lets the caller
+// add context. Returns the log entry id so the UI can wire the note input.
+function _contactPlaceCall(contactId){
+  var entry = CONTACT_DIRECTORY.find(function(e){ return e.id === contactId; });
+  if(!entry){ alert('Contact not found.'); return; }
+  if(!entry.phone){ alert('No phone number configured for this contact.'); return; }
+  var u = DB.current;
+  if(!u){ alert('You must be logged in to place a call.'); return; }
+  // Log the attempt
+  var logEntry = {
+    id:           'call-' + Date.now() + '-' + Math.random().toString(36).slice(2,7),
+    callerId:     u.id,
+    callerName:   u.name,
+    contactId:    entry.id,
+    contactLabel: entry.label,
+    ts:           new Date().toISOString(),
+    note:         '',
+    noteAt:       null
+  };
+  CONTACT_CALL_LOG.unshift(logEntry);
+  if(CONTACT_CALL_LOG.length > 1000) CONTACT_CALL_LOG = CONTACT_CALL_LOG.slice(0, 1000);
+  _contactSaveLog();
+  // Open the dialer
+  try {
+    window.location.href = _contactTelUrl(entry.phone);
+  } catch(e){ console.warn('[contact] tel: open failed:', e); }
+  // Show a banner inviting them to leave a note after the call
+  _contactShowNoteBanner(logEntry.id, entry.label);
+}
+if(typeof window !== 'undefined') window._contactPlaceCall = _contactPlaceCall;
+
+function _contactShowNoteBanner(logId, contactLabel){
+  // Remove any existing banner
+  var existing = document.getElementById('contact-note-banner');
+  if(existing) existing.remove();
+  var bg = document.createElement('div');
+  bg.id = 'contact-note-banner';
+  bg.style.cssText = 'position:fixed;bottom:20px;right:20px;background:white;border:2px solid #059669;border-radius:10px;padding:14px 18px;box-shadow:0 10px 30px rgba(0,0,0,.2);z-index:99800;max-width:380px;font-family:Barlow Condensed,sans-serif';
+  bg.innerHTML =
+    '<div style="font-family:Bebas Neue,sans-serif;color:#059669;font-size:.95rem;letter-spacing:1.5px;margin-bottom:8px">📞 Call to ' + escHtml(contactLabel) + '</div>'
+    +'<div style="font-size:.78rem;color:var(--brown);margin-bottom:8px;line-height:1.5">Leave a quick note about what this call was for (optional but helpful for follow-up).</div>'
+    +'<textarea id="contact-note-input-'+logId+'" maxlength="240" placeholder="e.g. asked about TC inventory, called to clarify a transfer" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid var(--border);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;min-height:60px;resize:vertical"></textarea>'
+    +'<div style="display:flex;gap:6px;justify-content:flex-end;margin-top:8px">'
+    +'<button onclick="document.getElementById(\'contact-note-banner\').remove()" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:7px 12px;border-radius:5px;cursor:pointer">Skip</button>'
+    +'<button onclick="_contactSaveNote(\''+logId+'\')" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700">Save Note</button>'
+    +'</div>';
+  document.body.appendChild(bg);
+}
+
+function _contactSaveNote(logId){
+  var ta = document.getElementById('contact-note-input-' + logId);
+  if(!ta) return;
+  var note = (ta.value || '').trim();
+  var entry = CONTACT_CALL_LOG.find(function(e){ return e.id === logId; });
+  if(entry){
+    entry.note   = note;
+    entry.noteAt = new Date().toISOString();
+    _contactSaveLog();
+  }
+  var bg = document.getElementById('contact-note-banner');
+  if(bg) bg.remove();
+}
+if(typeof window !== 'undefined') window._contactSaveNote = _contactSaveNote;
+
+// Render a small Call button suitable for embedding in profile cards.
+// Returns '' if there's no contact entry linked to this agent.
+function contactCallButtonForAgent(agentId){
+  if(!DB.current) return '';
+  var entry = (CONTACT_DIRECTORY || []).find(function(e){
+    return e.kind === 'agent' && e.linkedAgentId === agentId && e.active !== false;
+  });
+  if(!entry) return '';
+  if(!_contactVisibleTo(DB.current, entry)) return '';
+  return '<button onclick="_contactPlaceCall(\''+entry.id+'\')" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700;display:inline-flex;align-items:center;gap:6px"><span style="font-size:.9rem">📞</span> Call</button>';
+}
+if(typeof window !== 'undefined') window.contactCallButtonForAgent = contactCallButtonForAgent;
+
+// ════════════════════════════════════════════════════════════════════════
+//  PANEL: Contact Directory — what every user sees on the Contact tab
+// ════════════════════════════════════════════════════════════════════════
+function panelContactDirectory(){
+  var u = DB.current;
+  var h = panelHeader('☎️ Contact Directory');
+  if(!u){
+    h += '<div class="bo-card" style="padding:30px;text-align:center;color:var(--muted)">Please sign in to view contacts.</div>';
+    return h;
+  }
+
+  // Top action bar for office/admin to manage entries + view the log
+  var isAdmin = (typeof isOwner === 'function' && isOwner(u)) || u.role === 'admin';
+  if(isAdmin){
+    h += '<div style="padding:0 20px;margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap">';
+    h += '<button onclick="gotoPanel(\'contact-admin\')" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 16px;border-radius:6px;cursor:pointer;font-weight:700">⚙ Manage Numbers</button>';
+    h += '<button onclick="gotoPanel(\'contact-log\')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 16px;border-radius:6px;cursor:pointer">📋 Call Log</button>';
+    h += '</div>';
+  }
+
+  var visible = _contactVisibleDirectory(u);
+
+  if(!visible.length){
+    h += '<div class="bo-card" style="padding:32px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">';
+    h += '<div style="font-size:2.5rem;margin-bottom:10px">📵</div>';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:2px;color:var(--brown)">No Contacts Yet</div>';
+    h += '<div style="font-size:.78rem;margin-top:6px">' + (isAdmin ? 'Click <strong>Manage Numbers</strong> to add the office and manager phone lines.' : 'The office has not configured any phone numbers yet. Check back later.') + '</div>';
+    h += '</div>';
+    return h;
+  }
+
+  // Group: Office first, then Managers
+  var officeEntries = visible.filter(function(e){ return e.kind === 'office'; });
+  var agentEntries  = visible.filter(function(e){ return e.kind === 'agent'; });
+
+  if(officeEntries.length){
+    h += '<div style="padding:0 20px"><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:var(--blue);margin-bottom:8px">🏢 OFFICE</div></div>';
+    h += '<div style="padding:0 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:22px">';
+    officeEntries.forEach(function(e){
+      h += _contactCardHtml(e);
+    });
+    h += '</div>';
+  }
+
+  if(agentEntries.length){
+    h += '<div style="padding:0 20px"><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:var(--brown);margin-bottom:8px">👥 MANAGERS</div></div>';
+    h += '<div style="padding:0 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:22px">';
+    agentEntries.forEach(function(e){
+      h += _contactCardHtml(e);
+    });
+    h += '</div>';
+  }
+
+  // Personal call log for non-admins — they see their own calls only
+  if(!isAdmin){
+    var myCalls = (CONTACT_CALL_LOG || [])
+      .filter(function(c){ return c.callerId === u.id; })
+      .slice(0, 10);
+    if(myCalls.length){
+      h += '<div style="padding:0 20px;margin-top:24px"><div style="font-family:Bebas Neue,sans-serif;font-size:.9rem;letter-spacing:2px;color:var(--muted);margin-bottom:8px">YOUR RECENT CALLS</div></div>';
+      h += '<div style="padding:0 20px"><div class="bo-card" style="padding:14px 18px">';
+      myCalls.forEach(function(c){
+        h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">';
+        h += '<div style="flex:1;min-width:160px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);font-weight:600">'+escHtml(c.contactLabel||'Unknown')+'</div>';
+        if(c.note){
+          h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">"'+escHtml(c.note)+'"</div>';
+        }
+        h += '</div>';
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">'+new Date(c.ts).toLocaleString()+'</div>';
+        h += '</div>';
+      });
+      h += '</div></div>';
+    }
+  }
+  return h;
+}
+
+function _contactCardHtml(entry){
+  var color = entry.kind === 'office' ? '#0035a0' : '#059669';
+  var icon  = entry.kind === 'office' ? (entry.icon || '🏢') : '👤';
+  return '<div class="bo-card" style="padding:14px 16px;display:flex;align-items:center;gap:12px;border-left:4px solid '+color+'">'
+    +'<div style="font-size:1.8rem;flex-shrink:0">'+icon+'</div>'
+    +'<div style="flex:1;min-width:0">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;color:var(--brown)">'+escHtml(entry.label||'')+'</div>'
+    +(entry.subtitle ? '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:1px">'+escHtml(entry.subtitle)+'</div>' : '')
+    +'<div style="font-family:monospace;font-size:.78rem;color:var(--muted);margin-top:4px">'+_contactFormatPhone(entry.phone)+'</div>'
+    +'</div>'
+    +'<button onclick="_contactPlaceCall(\''+entry.id+'\')" style="background:'+color+';color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 14px;border-radius:5px;cursor:pointer;font-weight:700;flex-shrink:0;display:inline-flex;align-items:center;gap:5px"><span style="font-size:.9rem">📞</span> Call</button>'
+    +'</div>';
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  PANEL: Contact Admin — Owner/admin manages the phone directory
+// ════════════════════════════════════════════════════════════════════════
+function panelContactAdmin(){
+  var u = DB.current;
+  var h = panelHeader('⚙ Manage Contact Numbers');
+  if(!u || (!isOwner(u) && u.role !== 'admin')){
+    h += '<div class="bo-card" style="padding:30px;text-align:center;color:var(--red)">Owner or admin only.</div>';
+    return h;
+  }
+
+  h += '<div style="padding:0 20px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.55">Configure the phone numbers that appear on the Contact directory. <strong>Agents never see the raw digits</strong> — they only see the label and click Call.</div>';
+
+  // Add new entry form
+  h += '<div class="bo-card" style="padding:16px 20px;margin:0 20px 18px">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:var(--blue);margin-bottom:10px">+ ADD NEW CONTACT</div>';
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px">';
+  h += '<div><label class="f-label">Type</label><select id="ca-kind" class="f-select" onchange="_contactAdminToggleFields()">'
+    +'<option value="office">Office Department</option>'
+    +'<option value="agent">Manager (linked to agent)</option>'
+    +'</select></div>';
+  h += '<div><label class="f-label">Label (what agents see)</label><input id="ca-label" class="f-input" placeholder="e.g. Inventory Dept"></div>';
+  h += '<div id="ca-subtitle-wrap"><label class="f-label">Subtitle (optional)</label><input id="ca-subtitle" class="f-input" placeholder="e.g. Makenzie Gibson"></div>';
+  h += '<div id="ca-agent-wrap" style="display:none"><label class="f-label">Linked Agent</label><select id="ca-agent" class="f-select"><option value="">— Select —</option>';
+  (DB.agents || []).forEach(function(a){
+    if(!a || !a.active) return;
+    h += '<option value="'+a.id+'">'+escHtml(a.name)+' ('+escHtml(a.role||'')+')</option>';
+  });
+  h += '</select></div>';
+  h += '<div><label class="f-label">Phone Number</label><input id="ca-phone" class="f-input" placeholder="(555) 555-1234"></div>';
+  h += '<div><label class="f-label">Icon</label><input id="ca-icon" class="f-input" placeholder="🏢" maxlength="2"></div>';
+  h += '<div><label class="f-label">Sort Order</label><input id="ca-sort" type="number" class="f-input" value="100"></div>';
+  h += '</div>';
+  h += '<div style="text-align:right;margin-top:12px"><button onclick="_contactAdminAdd()" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 22px;border-radius:6px;cursor:pointer;font-weight:700">+ Add Contact</button></div>';
+  h += '</div>';
+
+  // Existing entries table
+  h += '<div style="padding:0 20px"><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:2px;color:var(--brown);margin-bottom:8px">EXISTING CONTACTS ('+CONTACT_DIRECTORY.length+')</div></div>';
+  if(!CONTACT_DIRECTORY.length){
+    h += '<div style="padding:0 20px"><div class="bo-card" style="padding:24px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No contacts configured yet. Add one above.</div></div>';
+    return h;
+  }
+  h += '<div style="padding:0 20px"><div class="bo-card" style="overflow-x:auto"><table style="width:100%;font-family:Barlow Condensed,sans-serif;font-size:.78rem;border-collapse:collapse">';
+  h += '<thead><tr style="background:var(--offwhite);text-align:left">';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border)">Type</th>';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border)">Label</th>';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border)">Phone</th>';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border)">Active</th>';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border);text-align:right">Actions</th>';
+  h += '</tr></thead><tbody>';
+  CONTACT_DIRECTORY.slice().sort(function(a,b){
+    if(a.kind !== b.kind) return a.kind === 'office' ? -1 : 1;
+    return (a.sortOrder||0) - (b.sortOrder||0);
+  }).forEach(function(e){
+    h += '<tr style="border-bottom:1px solid var(--border)">';
+    h += '<td style="padding:8px 10px">'+(e.kind === 'office' ? '🏢 Office' : '👤 Mgr')+'</td>';
+    h += '<td style="padding:8px 10px"><strong>'+escHtml(e.label||'')+'</strong>'+(e.subtitle ? '<br><span style="color:var(--muted);font-size:.7rem">'+escHtml(e.subtitle)+'</span>' : '')+'</td>';
+    h += '<td style="padding:8px 10px;font-family:monospace">'+_contactFormatPhone(e.phone||'')+'</td>';
+    h += '<td style="padding:8px 10px">'+(e.active === false ? '<span style="color:var(--muted)">disabled</span>' : '<span style="color:#059669">✓</span>')+'</td>';
+    h += '<td style="padding:8px 10px;text-align:right;white-space:nowrap">';
+    h += '<button onclick="_contactAdminToggle(\''+e.id+'\')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1px;padding:5px 9px;border-radius:4px;cursor:pointer;margin-right:4px">'+(e.active === false ? 'Enable' : 'Disable')+'</button>';
+    h += '<button onclick="_contactAdminDelete(\''+e.id+'\')" style="background:white;border:1px solid #dc2626;color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1px;padding:5px 9px;border-radius:4px;cursor:pointer">Delete</button>';
+    h += '</td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+
+function _contactAdminToggleFields(){
+  var kind   = document.getElementById('ca-kind').value;
+  var aWrap  = document.getElementById('ca-agent-wrap');
+  var sWrap  = document.getElementById('ca-subtitle-wrap');
+  if(kind === 'agent'){
+    aWrap.style.display = '';
+    sWrap.style.display = 'none';
+  } else {
+    aWrap.style.display = 'none';
+    sWrap.style.display = '';
+  }
+}
+if(typeof window !== 'undefined') window._contactAdminToggleFields = _contactAdminToggleFields;
+
+function _contactAdminAdd(){
+  var u = DB.current;
+  if(!u || (!isOwner(u) && u.role !== 'admin')){ alert('Owner or admin only.'); return; }
+  var kind    = (document.getElementById('ca-kind')||{value:'office'}).value;
+  var label   = (document.getElementById('ca-label')||{value:''}).value.trim();
+  var subtitle= (document.getElementById('ca-subtitle')||{value:''}).value.trim();
+  var phone   = (document.getElementById('ca-phone')||{value:''}).value.trim();
+  var icon    = (document.getElementById('ca-icon')||{value:''}).value.trim();
+  var sortStr = (document.getElementById('ca-sort')||{value:'100'}).value;
+  var sort    = parseInt(sortStr, 10) || 100;
+  var agentId = parseInt((document.getElementById('ca-agent')||{value:''}).value, 10) || null;
+
+  if(!label){ alert('Label is required.'); return; }
+  // Validate phone: 10 or 11 digits (US), or starts with +
+  var digits = phone.replace(/\D/g, '');
+  if(phone.charAt(0) !== '+' && digits.length !== 10 && digits.length !== 11){
+    alert('Please enter a valid 10-digit US phone number, or use + for international.');
+    return;
+  }
+  if(kind === 'agent' && !agentId){ alert('Please select the linked agent.'); return; }
+
+  var entry = {
+    id:            'ct-' + Date.now() + '-' + Math.random().toString(36).slice(2,7),
+    kind:          kind,
+    label:         label,
+    subtitle:      subtitle,
+    phone:         phone,
+    icon:          icon,
+    sortOrder:     sort,
+    linkedAgentId: kind === 'agent' ? agentId : null,
+    active:        true,
+    createdAt:     new Date().toISOString(),
+    createdBy:     u.id,
+    updatedAt:     new Date().toISOString()
+  };
+  // If linking to an agent, auto-fill subtitle with their name
+  if(kind === 'agent' && agentId){
+    var a = DB.agents.find(function(x){return x.id===agentId;});
+    if(a) entry.subtitle = a.name + (a.role ? ' · '+a.role : '');
+  }
+  CONTACT_DIRECTORY.push(entry);
+  _contactSaveDirectory();
+  alert('✓ Contact added.');
+  gotoPanel('contact-admin');
+}
+if(typeof window !== 'undefined') window._contactAdminAdd = _contactAdminAdd;
+
+function _contactAdminToggle(id){
+  var entry = CONTACT_DIRECTORY.find(function(e){return e.id===id;});
+  if(!entry) return;
+  entry.active = !(entry.active !== false);
+  entry.updatedAt = new Date().toISOString();
+  _contactSaveDirectory();
+  gotoPanel('contact-admin');
+}
+if(typeof window !== 'undefined') window._contactAdminToggle = _contactAdminToggle;
+
+function _contactAdminDelete(id){
+  if(!confirm('Delete this contact entry? The call log history is preserved.')) return;
+  var idx = CONTACT_DIRECTORY.findIndex(function(e){return e.id===id;});
+  if(idx >= 0){
+    CONTACT_DIRECTORY.splice(idx, 1);
+    _contactSaveDirectory();
+  }
+  gotoPanel('contact-admin');
+}
+if(typeof window !== 'undefined') window._contactAdminDelete = _contactAdminDelete;
+
+// ════════════════════════════════════════════════════════════════════════
+//  PANEL: Call Log — Owner/admin sees every call made
+// ════════════════════════════════════════════════════════════════════════
+function panelContactLog(){
+  var u = DB.current;
+  var h = panelHeader('📋 Call Log');
+  if(!u || (!isOwner(u) && u.role !== 'admin')){
+    h += '<div class="bo-card" style="padding:30px;text-align:center;color:var(--red)">Owner or admin only.</div>';
+    return h;
+  }
+  var log = CONTACT_CALL_LOG || [];
+  h += '<div style="padding:0 20px;margin-bottom:12px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted)"><strong>'+log.length+'</strong> total call'+(log.length===1?'':'s')+' logged. Most recent first.</div>';
+  if(!log.length){
+    h += '<div style="padding:0 20px"><div class="bo-card" style="padding:30px;text-align:center;color:var(--muted)">No calls yet.</div></div>';
+    return h;
+  }
+  h += '<div style="padding:0 20px"><div class="bo-card" style="overflow-x:auto"><table style="width:100%;font-family:Barlow Condensed,sans-serif;font-size:.78rem;border-collapse:collapse">';
+  h += '<thead><tr style="background:var(--offwhite);text-align:left">';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border)">When</th>';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border)">Caller</th>';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border)">Called</th>';
+  h += '<th style="padding:8px 10px;border-bottom:1px solid var(--border)">Note</th>';
+  h += '</tr></thead><tbody>';
+  log.slice(0, 200).forEach(function(c){
+    h += '<tr style="border-bottom:1px solid var(--border)">';
+    h += '<td style="padding:8px 10px;white-space:nowrap">'+new Date(c.ts).toLocaleString()+'</td>';
+    h += '<td style="padding:8px 10px">'+escHtml(c.callerName||'?')+'</td>';
+    h += '<td style="padding:8px 10px">'+escHtml(c.contactLabel||'?')+'</td>';
+    h += '<td style="padding:8px 10px;color:var(--muted)">'+(c.note ? escHtml(c.note) : '<em style="color:var(--muted)">— no note —</em>')+'</td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+  if(log.length > 200){
+    h += '<div style="padding:8px 20px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);text-align:center">Showing most recent 200 of '+log.length+' calls.</div>';
+  }
+  return h;
+}
+
+if(typeof window !== 'undefined'){
+  window.panelContactDirectory = panelContactDirectory;
+  window.panelContactAdmin     = panelContactAdmin;
+  window.panelContactLog       = panelContactLog;
 }
 
 function panelMeetings(){
