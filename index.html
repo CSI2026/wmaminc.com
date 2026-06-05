@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.05.2050';
+var BUILD_VERSION = '2026.06.05.2130';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -40288,6 +40288,135 @@ async function _contactLoadFromCloud(){
 }
 if(typeof window !== 'undefined') window._contactLoadFromCloud = _contactLoadFromCloud;
 
+// ════════════════════════════════════════════════════════════════════════
+//  AUTO-MIGRATE LOCAL CONTACTS TO CLOUD — Calvin 2026-06-05
+//
+//  Problem: contacts created on Calvin's MacBook BEFORE the cloud-sync
+//  code shipped are trapped in his localStorage. They never made it to
+//  Supabase, so Makenzie's device pulls an empty cloud and sees nothing.
+//
+//  Fix: when the Contact panel opens, check if (a) we have local
+//  contacts in memory AND (b) the cloud is empty. If so, push the local
+//  copy up to the cloud — a one-time migration that fixes the existing
+//  data without any user action.
+//
+//  Safety:
+//   - Only runs if local has data AND cloud is empty (we never overwrite
+//     a populated cloud)
+//   - Only runs once per session via the _contactMigrationRan flag
+//   - Only runs for office staff (the people likely to have created
+//     contacts in the first place)
+//   - Preserves the existing data exactly — just uploads it
+// ════════════════════════════════════════════════════════════════════════
+var _contactMigrationRan = false;
+
+async function _contactAutoMigrateIfNeeded(){
+  if(_contactMigrationRan) return;
+  if(typeof supaClient === 'undefined' || !supaClient) return;
+  // Only office staff can have meaningfully created contacts
+  if(typeof DB === 'undefined' || !DB.current) return;
+  if(typeof isOfficeRole !== 'function' || !isOfficeRole(DB.current)) return;
+  // Need local data to migrate
+  if(!Array.isArray(CONTACT_DIRECTORY) || CONTACT_DIRECTORY.length === 0) return;
+  try {
+    // Check what's in the cloud RIGHT NOW
+    var res = await supaClient.from('app_settings')
+      .select('value')
+      .eq('key', 'contact_directory')
+      .maybeSingle();
+    var cloudEmpty = !res || !res.data || !res.data.value;
+    if(!cloudEmpty){
+      // Cloud has data — also check it's not just an empty array
+      try {
+        var parsed = JSON.parse(res.data.value);
+        if(Array.isArray(parsed) && parsed.length > 0){
+          // Cloud already populated — nothing to do
+          _contactMigrationRan = true;
+          return;
+        }
+      } catch(e){ /* fall through and treat as empty */ }
+    }
+    // Cloud empty, local has data → migrate
+    console.log('[contact] auto-migrating '+CONTACT_DIRECTORY.length+' local contacts to cloud (one-time)');
+    await supaClient.from('app_settings').upsert(
+      {key:'contact_directory', value:JSON.stringify(CONTACT_DIRECTORY)},
+      {onConflict:'key'}
+    );
+    // Also migrate the call log if we have local entries and cloud is empty
+    if(Array.isArray(CONTACT_CALL_LOG) && CONTACT_CALL_LOG.length > 0){
+      var logRes = await supaClient.from('app_settings')
+        .select('value')
+        .eq('key', 'contact_call_log')
+        .maybeSingle();
+      var logCloudEmpty = !logRes || !logRes.data || !logRes.data.value;
+      if(logCloudEmpty){
+        console.log('[contact] auto-migrating '+CONTACT_CALL_LOG.length+' local call log entries to cloud');
+        await supaClient.from('app_settings').upsert(
+          {key:'contact_call_log', value:JSON.stringify(CONTACT_CALL_LOG)},
+          {onConflict:'key'}
+        );
+      }
+    }
+    _contactMigrationRan = true;
+    console.log('[contact] auto-migration complete — Makenzie and other devices will now see these contacts');
+  } catch(e){
+    console.warn('[contact] auto-migration failed:', e);
+    // Don't set the flag — let it retry next panel open
+  }
+}
+if(typeof window !== 'undefined') window._contactAutoMigrateIfNeeded = _contactAutoMigrateIfNeeded;
+
+// Manual one-click push — Owner/admin can force-push their local copy to
+// the cloud at any time. Use case: backup if the auto-migrate didn't
+// fire, or if someone wants to overwrite the cloud with their local
+// version on purpose.
+async function _contactManualPushToCloud(){
+  var u = DB.current;
+  if(!u || (!isOwner(u) && u.role !== 'admin')){
+    alert('Owner or admin only.');
+    return;
+  }
+  if(typeof supaClient === 'undefined' || !supaClient){
+    alert('Cannot reach the cloud right now. Try again when your connection is stable.');
+    return;
+  }
+  if(!Array.isArray(CONTACT_DIRECTORY) || CONTACT_DIRECTORY.length === 0){
+    alert('No local contacts to push. Add some first.');
+    return;
+  }
+  if(!confirm(
+    'Push your '+CONTACT_DIRECTORY.length+' local contact'
+    +(CONTACT_DIRECTORY.length===1?'':'s')
+    +' to the cloud?\n\n'
+    +'• This will OVERWRITE the cloud copy with your local copy\n'
+    +'• All other office devices will see your contacts on next refresh\n'
+    +'• Use this if Makenzie / other office staff cannot see contacts\n  you created\n\n'
+    +'Continue?'
+  )) return;
+  try {
+    var res = await supaClient.from('app_settings').upsert(
+      {key:'contact_directory', value:JSON.stringify(CONTACT_DIRECTORY)},
+      {onConflict:'key'}
+    );
+    if(res && res.error){
+      alert('Push failed: '+(res.error.message || 'unknown error'));
+      return;
+    }
+    // Also push call log if there's anything there
+    if(Array.isArray(CONTACT_CALL_LOG) && CONTACT_CALL_LOG.length > 0){
+      await supaClient.from('app_settings').upsert(
+        {key:'contact_call_log', value:JSON.stringify(CONTACT_CALL_LOG)},
+        {onConflict:'key'}
+      );
+    }
+    alert('✓ Pushed '+CONTACT_DIRECTORY.length+' contacts to the cloud. Other devices will see them on next refresh.');
+    _contactMigrationRan = true;  // suppress auto-migrate now
+  } catch(e){
+    alert('Push failed: '+(e.message || String(e)));
+  }
+}
+if(typeof window !== 'undefined') window._contactManualPushToCloud = _contactManualPushToCloud;
+
 function _contactSaveDirectory(){
   try { localStorage.setItem('wmam_contact_directory', JSON.stringify(CONTACT_DIRECTORY)); }
   catch(e){ console.warn('[contact] local save dir failed:', e); }
@@ -40495,10 +40624,33 @@ function panelContactDirectory(){
   // cross-device updates land for Makenzie/etc. when they navigate here.
   // Fire-and-forget; the panel renders against current memory first,
   // then re-renders on the next gotoPanel call after the cloud merge.
+  //
+  // Also: if Calvin has local contacts that never made it to the cloud
+  // (created before the sync code shipped), auto-migrate them now. This
+  // is a one-time, silent fix for the existing data.
   try {
-    if(typeof _contactLoadFromCloud === 'function'){
+    if(typeof _contactAutoMigrateIfNeeded === 'function'){
+      _contactAutoMigrateIfNeeded().then(function(){
+        // After migration, refresh from cloud + re-render if still here
+        if(typeof _contactLoadFromCloud === 'function'){
+          _contactLoadFromCloud().then(function(){
+            if(gotoPanel._current === 'contact'){
+              try { gotoPanel('contact'); } catch(e){}
+            }
+          }).catch(function(){});
+        }
+      }).catch(function(){
+        // If migration fails, still try to load whatever is in cloud
+        if(typeof _contactLoadFromCloud === 'function'){
+          _contactLoadFromCloud().then(function(){
+            if(gotoPanel._current === 'contact'){
+              try { gotoPanel('contact'); } catch(e){}
+            }
+          }).catch(function(){});
+        }
+      });
+    } else if(typeof _contactLoadFromCloud === 'function'){
       _contactLoadFromCloud().then(function(){
-        // If we're still on this panel after the refresh, re-render
         if(gotoPanel._current === 'contact'){
           try { gotoPanel('contact'); } catch(e){}
         }
@@ -40598,6 +40750,19 @@ function panelContactAdmin(){
   }
 
   h += '<div style="padding:0 20px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);line-height:1.55">Configure the phone numbers that appear on the Contact directory. <strong>Agents never see the raw digits</strong> — they only see the label and click Call. Use the <strong>↑ ↓</strong> arrows in the table below to reorder how contacts appear to agents.</div>';
+
+  // Calvin 2026-06-05 — cloud sync status + manual push button.
+  // Use this if Makenzie / other office staff cannot see contacts you
+  // created. Pushes your local copy to the cloud, where every device pulls.
+  h += '<div style="padding:0 20px;margin-bottom:18px">';
+  h += '<div class="bo-card" style="padding:12px 16px;background:linear-gradient(135deg,#f0f9ff,#e0f2fe);border-left:4px solid #0284c7;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">';
+  h += '<div style="flex:1;min-width:220px">';
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.9rem;letter-spacing:1.5px;color:#0284c7">☁ CLOUD SYNC</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);margin-top:2px;line-height:1.45">Saves now auto-sync to the cloud so every device sees them. If office staff still cannot see your contacts on their own login, click <strong>Push Now</strong> to force-upload your local copy.</div>';
+  h += '</div>';
+  h += '<button onclick="_contactManualPushToCloud()" style="background:#0284c7;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer;font-weight:700;white-space:nowrap;flex-shrink:0">☁ Push Now</button>';
+  h += '</div>';
+  h += '</div>';
 
   // Add new entry form
   h += '<div class="bo-card" style="padding:16px 20px;margin:0 20px 18px">';
