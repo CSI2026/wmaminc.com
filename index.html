@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.05.1900';
+var BUILD_VERSION = '2026.06.05.2050';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -40202,6 +40202,22 @@ function getMeetingJoinBtn(room, isLive){
 //
 // CONTACT_CALL_LOG: [{id, callerId, callerName, contactId, contactLabel,
 //                      ts, note, noteAt}]
+//
+// Calvin 2026-06-05 CROSS-DEVICE SYNC FIX:
+// Originally these were localStorage-only. That meant contacts created
+// on Calvin's MacBook were INVISIBLE to Makenzie on her own MacBook,
+// iPhone, iPad — every browser has its own localStorage. The "View As
+// Makenzie from Calvin's screen" trick worked because the data was in
+// CALVIN's localStorage but the panel rendered against Makenzie's
+// permissions. But Makenzie logging in directly saw an empty list.
+//
+// Fix: also write to Supabase app_settings (the existing key-value store
+// already used for brevo keys, call room data, etc). Load on app start
+// AND on Contact panel open so cross-device updates land quickly.
+//
+// Local-first design: localStorage is still the primary read source for
+// instant render. Supabase sync happens in the background and merges in.
+// If Supabase is unreachable, the local copy still works — no breakage.
 var CONTACT_DIRECTORY = [];
 var CONTACT_CALL_LOG  = [];
 
@@ -40217,17 +40233,93 @@ function _contactLoad(){
       var pl = JSON.parse(l);
       if(Array.isArray(pl)) CONTACT_CALL_LOG = pl;
     }
-  } catch(e){ console.warn('[contact] load failed:', e); }
+  } catch(e){ console.warn('[contact] local load failed:', e); }
 }
+
+// Cloud-fetch — pulls contacts from Supabase app_settings. Merges with
+// whatever's in memory, last-write-wins by updatedAt timestamp per entry.
+// Safe to call anytime — bails silently if supabase isn't ready.
+async function _contactLoadFromCloud(){
+  if(typeof supaClient === 'undefined' || !supaClient) return;
+  try {
+    var res = await supaClient.from('app_settings')
+      .select('key,value')
+      .in('key', ['contact_directory', 'contact_call_log']);
+    if(!res || res.error || !res.data) return;
+    res.data.forEach(function(row){
+      try {
+        var parsed = JSON.parse(row.value);
+        if(!Array.isArray(parsed)) return;
+        if(row.key === 'contact_directory'){
+          // Merge: keep newer entry per id by updatedAt
+          var byId = {};
+          CONTACT_DIRECTORY.forEach(function(e){ byId[e.id] = e; });
+          parsed.forEach(function(cloudEntry){
+            var local = byId[cloudEntry.id];
+            if(!local){
+              byId[cloudEntry.id] = cloudEntry;
+            } else {
+              var lT = local.updatedAt || local.createdAt || '';
+              var cT = cloudEntry.updatedAt || cloudEntry.createdAt || '';
+              if(cT >= lT) byId[cloudEntry.id] = cloudEntry;
+            }
+          });
+          CONTACT_DIRECTORY = Object.keys(byId).map(function(k){ return byId[k]; });
+        } else if(row.key === 'contact_call_log'){
+          // Call log: merge by id, keep all distinct. Cloud copy is authoritative
+          // for entries that exist there; local-only entries still kept.
+          var seen = {};
+          var merged = [];
+          parsed.forEach(function(c){ seen[c.id] = true; merged.push(c); });
+          CONTACT_CALL_LOG.forEach(function(c){ if(!seen[c.id]) merged.push(c); });
+          // Sort by ts desc
+          merged.sort(function(a,b){ return (b.ts||'').localeCompare(a.ts||''); });
+          CONTACT_CALL_LOG = merged.slice(0, 1000);
+        }
+      } catch(e){ console.warn('[contact] cloud parse failed for '+row.key+':', e); }
+    });
+    // Mirror cloud copy back to localStorage so subsequent reads are fast
+    try {
+      localStorage.setItem('wmam_contact_directory', JSON.stringify(CONTACT_DIRECTORY));
+      localStorage.setItem('wmam_contact_call_log', JSON.stringify(CONTACT_CALL_LOG));
+    } catch(e){}
+    console.log('[contact] cloud load complete: '+CONTACT_DIRECTORY.length+' contacts, '+CONTACT_CALL_LOG.length+' call log entries');
+  } catch(e){ console.warn('[contact] cloud load exception:', e); }
+}
+if(typeof window !== 'undefined') window._contactLoadFromCloud = _contactLoadFromCloud;
+
 function _contactSaveDirectory(){
   try { localStorage.setItem('wmam_contact_directory', JSON.stringify(CONTACT_DIRECTORY)); }
-  catch(e){ console.warn('[contact] save dir failed:', e); }
+  catch(e){ console.warn('[contact] local save dir failed:', e); }
+  // Push to cloud — best-effort, fire-and-forget
+  if(typeof supaClient !== 'undefined' && supaClient){
+    try {
+      supaClient.from('app_settings')
+        .upsert({key:'contact_directory', value:JSON.stringify(CONTACT_DIRECTORY)}, {onConflict:'key'})
+        .then(function(r){
+          if(r && r.error) console.warn('[contact] cloud save dir failed:', r.error);
+        }).catch(function(e){ console.warn('[contact] cloud save dir threw:', e); });
+    } catch(e){ console.warn('[contact] cloud save dir threw sync:', e); }
+  }
 }
 function _contactSaveLog(){
   try { localStorage.setItem('wmam_contact_call_log', JSON.stringify(CONTACT_CALL_LOG)); }
-  catch(e){ console.warn('[contact] save log failed:', e); }
+  catch(e){ console.warn('[contact] local save log failed:', e); }
+  if(typeof supaClient !== 'undefined' && supaClient){
+    try {
+      supaClient.from('app_settings')
+        .upsert({key:'contact_call_log', value:JSON.stringify(CONTACT_CALL_LOG)}, {onConflict:'key'})
+        .then(function(r){
+          if(r && r.error) console.warn('[contact] cloud save log failed:', r.error);
+        }).catch(function(e){ console.warn('[contact] cloud save log threw:', e); });
+    } catch(e){ console.warn('[contact] cloud save log threw sync:', e); }
+  }
 }
 _contactLoad();
+// Kick off cloud load on next tick — supaClient may not be ready yet
+setTimeout(function(){
+  if(typeof _contactLoadFromCloud === 'function') _contactLoadFromCloud();
+}, 1500);
 
 // Format a phone number for human display from any digit string. Optional
 // second arg is an extension; if present, appended as " ext. XXX".
@@ -40398,6 +40490,21 @@ function panelContactDirectory(){
     h += '<div class="bo-card" style="padding:30px;text-align:center;color:var(--muted)">Please sign in to view contacts.</div>';
     return h;
   }
+
+  // Calvin 2026-06-05 — pull fresh from cloud on every panel open so
+  // cross-device updates land for Makenzie/etc. when they navigate here.
+  // Fire-and-forget; the panel renders against current memory first,
+  // then re-renders on the next gotoPanel call after the cloud merge.
+  try {
+    if(typeof _contactLoadFromCloud === 'function'){
+      _contactLoadFromCloud().then(function(){
+        // If we're still on this panel after the refresh, re-render
+        if(gotoPanel._current === 'contact'){
+          try { gotoPanel('contact'); } catch(e){}
+        }
+      }).catch(function(){});
+    }
+  } catch(e){}
 
   // Top action bar for office/admin to manage entries + view the log
   var isAdmin = (typeof isOwner === 'function' && isOwner(u)) || u.role === 'admin';
