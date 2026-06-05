@@ -14681,6 +14681,17 @@ function processTCInventoryUpload(htmlText, batchId){
   // Commit to local inventory pool
   newDevices.forEach(function(d){ TC_INVENTORY.push(d); });
 
+  // ── Calvin 2026-06-04: TC uploads also create per-recipient acceptance ──
+  // signatures. Same rule applies to every carrier — uniform inventory rules.
+  // The helper groups newDevices by their assigned recipient (set by the
+  // parser via gmResolveAutoAssignee), creates a TC_TRANSFERS record with
+  // status 'pending-agent-signature', and flags each device acceptancePending.
+  try {
+    if(typeof invCreateAcceptanceTransfersForUpload === 'function'){
+      invCreateAcceptanceTransfersForUpload('TruConnect', newDevices, DB.current);
+    }
+  } catch(e){ console.warn('[processTCInventoryUpload] acceptance-transfer creation failed (devices still uploaded):', e); }
+
   // Record the batch
   if(typeof TC_BATCHES === 'undefined'){ window.TC_BATCHES = []; }
   TC_BATCHES.push({
@@ -16393,11 +16404,152 @@ function invValidateTransfer(campaign, imeis, fromId){
     var dev = _findDevice(imei);
     if(!dev)                                       errors.push({imei:imei, type:'not-found'});
     else if(dev.assignedTo !== fromId && dev.holderId !== fromId && dev.mmId !== fromId) errors.push({imei:imei, type:'not-held-by-sender', currentHolder:(dev.assignedToName||dev.holderName||'unassigned')});
+    // Calvin 2026-06-04: check acceptance-pending FIRST (before the generic
+    // already-in-pending-transfer) so users get a clear "sign first" message
+    // instead of the confusing "in a pending transfer" message. The
+    // acceptance transfer IS technically a pending transfer, but it's the
+    // recipient's OWN signature that's holding it up, which is a separate
+    // problem from another transfer the device might be in.
+    else if(dev.acceptancePending === true)        errors.push({imei:imei, type:'acceptance-pending', acceptanceTransfer:dev.acceptanceTransfer||null});
     else if(pendingImeis[imei])                    errors.push({imei:imei, type:'already-in-pending-transfer', transferId:pendingImeis[imei].id});
     else if(dev.status === 'activated')            errors.push({imei:imei, type:'already-activated'});
   });
   return {passed: errors.length===0, errors:errors};
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  invCreateAcceptanceTransfersForUpload — Calvin 2026-06-04
+//
+//  Called by EVERY carrier's inventory upload commit (GM, AW, TC, EX) after
+//  devices land in the carrier's INVENTORY pool. For each recipient that
+//  the parser auto-assigned, creates a 'pending-agent-signature' transfer
+//  record in the carrier's TRANSFERS array. The recipient sees this in:
+//   1. The forced acceptance modal on next login
+//   2. The Pending Transfers portal (already exists)
+//   3. Their device list (each flagged acceptancePending: true until signed)
+//
+//  Devices remain flagged acceptancePending and CANNOT be transferred
+//  onward (invValidateTransfer blocks them) until the holder signs.
+//
+//  Parameters:
+//    campaign    - the campaign name key in CAMPAIGN_REGISTRY ('Gen Mobile', 'TruConnect', etc.)
+//    devices     - array of device objects with at least {imei, assignedTo,
+//                   assignedToName, model, devType, devCost, market}
+//    uploader    - optional {id, name, role} of the user who ran the upload
+//                   (defaults to DB.current)
+//
+//  Returns: {transfersCreated: N, recipientCount: N, byRecipient: {name:{count,markets,imeis}}}
+// ════════════════════════════════════════════════════════════════════════
+function invCreateAcceptanceTransfersForUpload(campaign, devices, uploader){
+  if(typeof CAMPAIGN_REGISTRY !== 'object') return {transfersCreated:0, recipientCount:0, byRecipient:{}};
+  var cfg = CAMPAIGN_REGISTRY[campaign];
+  if(!cfg || !cfg.transfers){
+    console.warn('[invCreateAcceptanceTransfersForUpload] unknown campaign or no transfers store:', campaign);
+    return {transfersCreated:0, recipientCount:0, byRecipient:{}};
+  }
+  var transfersArr = cfg.transfers();
+  if(!Array.isArray(transfersArr)){
+    console.warn('[invCreateAcceptanceTransfersForUpload] transfers() did not return an array');
+    return {transfersCreated:0, recipientCount:0, byRecipient:{}};
+  }
+  var u            = uploader || DB.current || {};
+  var uploaderId   = u.id   || null;
+  var uploaderName = u.name || 'Inventory System';
+  var uploaderRole = u.role || 'system';
+
+  // Group by recipient
+  var byRecipient = {};
+  (devices || []).forEach(function(d){
+    if(!d || !d.assignedTo || !d.assignedToName) return; // unassigned → skip
+    var key = d.assignedToName;
+    if(!byRecipient[key]){
+      byRecipient[key] = {
+        recipientId:   d.assignedTo,
+        recipientName: d.assignedToName,
+        count:         0,
+        markets:       [],
+        imeis:         [],
+        devices:       []
+      };
+    }
+    byRecipient[key].count++;
+    if(d.market && byRecipient[key].markets.indexOf(d.market) < 0) byRecipient[key].markets.push(d.market);
+    if(d.imei) byRecipient[key].imeis.push(d.imei);
+    byRecipient[key].devices.push({
+      imei:     d.imei || '',
+      sim:      d.sim || '',
+      model:    d.model || '',
+      devType:  d.devType || '',
+      devCost:  d.devCost || 0,
+      market:   d.market || ''
+    });
+  });
+
+  var transfersCreated = 0;
+  Object.keys(byRecipient).forEach(function(recipientName){
+    var r = byRecipient[recipientName];
+    if(!r.recipientId || !r.imeis.length) return;
+    var nowISO = new Date().toISOString();
+    var recipAgent = (DB.agents || []).find(function(a){ return a && a.id === r.recipientId; }) || {};
+    var transferReq = {
+      id:                       cfg.id+'t-upload-'+Date.now()+'-'+r.recipientId,
+      campaign:                 campaign,
+      fromId:                   uploaderId,
+      fromName:                 uploaderName,
+      fromRole:                 uploaderRole,
+      toId:                     r.recipientId,
+      toName:                   r.recipientName,
+      toRole:                   recipAgent.role || '',
+      imeis:                    r.imeis.slice(),
+      // Canonical status the Pending Transfers panel watches for.
+      status:                   'pending-agent-signature',
+      createdAt:                nowISO,
+      source:                   'upload',
+      approvedBy:               uploaderName,
+      approvedAt:               nowISO,
+      agentSigned:              false,
+      agentSignedAt:            null,
+      agentConfirmedPossession: false,
+      devices:                  r.devices
+    };
+    transfersArr.push(transferReq);
+    transfersCreated++;
+    // Flag each device as not-yet-accepted
+    var pool = cfg.inventory();
+    if(Array.isArray(pool)){
+      r.imeis.forEach(function(imei){
+        var devRec = pool.find(function(d){return d.imei===imei;});
+        if(devRec){
+          devRec.acceptancePending  = true;
+          devRec.acceptanceTransfer = transferReq.id;
+        }
+      });
+    }
+    // Notify the recipient
+    try {
+      if(typeof pushNotification === 'function'){
+        pushNotification({
+          toIds:    [r.recipientId],
+          toRoles:  [],
+          icon:     '📦',
+          title:    cfg.label + ' Inventory — Signature Required',
+          body:     r.count + ' device(s) just landed in your '+cfg.label+' inventory for ' + (r.markets.join(', ') || 'your market') + '. Sign to accept responsibility. Until signed, these devices cannot be transferred onward.',
+          panel:    'pending-transfers',
+          priority: 'high'
+        });
+      }
+    } catch(e){ console.warn('[invCreateAcceptanceTransfersForUpload] notify failed:', e); }
+  });
+
+  try { if(typeof saveInventory === 'function') saveInventory(); } catch(e){}
+
+  return {
+    transfersCreated: transfersCreated,
+    recipientCount:   Object.keys(byRecipient).length,
+    byRecipient:      byRecipient
+  };
+}
+if(typeof window !== 'undefined') window.invCreateAcceptanceTransfersForUpload = invCreateAcceptanceTransfersForUpload;
 
 // Calvin 2026-05-01: per-market filter on the All Inventory dashboard.
 // Stores the selection on a window field so it survives re-renders.
@@ -27911,6 +28063,24 @@ function doLogin(){
   if(found && found.bgPassedModalPending && !isOfficeRole(found) && !isOwner(found) && !_foundIsLocked){
     setTimeout(function(){ try { bgShowPassedWelcomeModal(found); } catch(e){ console.warn('[doLogin] bg passed modal failed:', e); } }, 1200);
   }
+  // ── Calvin 2026-06-04: INVENTORY ACCEPTANCE MODAL ──
+  // If this user has any 'pending-agent-signature' transfers waiting across
+  // any carrier (GM/AW/TC/EX), show a forced modal listing every IMEI +
+  // device type + model + cost. They can: Sign All, Sign Later (defers
+  // to next login), or Skip (Office Override) if their profile is bypassed.
+  //
+  // Defer is session-scoped via window._invAcceptDeferred — cleared on
+  // logout / refresh, so they'll see it again next login until signed.
+  //
+  // Office staff still see the modal (because they might be the recipient
+  // of a transfer themselves), but the bypass flag adds the Skip button.
+  setTimeout(function(){
+    try {
+      if(typeof showInventoryAcceptanceModalIfNeeded === 'function'){
+        showInventoryAcceptanceModalIfNeeded(found);
+      }
+    } catch(e){ console.warn('[doLogin] inventory acceptance modal failed:', e); }
+  }, 1400);
   if(found.isReturning===true){ setTimeout(function(){ showReturningAgentForm(found); },400); return; }
   // ── Calvin 2026-06-04 MOBILE FIX ──
   // Wrap showLoginSplash in a guard: when the agent is locked, DON'T fire
@@ -41444,6 +41614,212 @@ if(typeof window !== 'undefined'){
   window._onbLockoutContinue = _onbLockoutContinue;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY ACCEPTANCE MODAL — Calvin 2026-06-04
+//
+//  Shown after login when the agent has 'pending-agent-signature' transfers
+//  in ANY carrier (GM/AW/TC/EX). Lists every IMEI, model, type, cost.
+//
+//  Three buttons:
+//    1. SIGN ALL — signs every pending acceptance transfer in one click,
+//       moves each device's acceptancePending flag to false, marks
+//       transfer.agentSigned=true, status='completed'.
+//    2. SIGN LATER — sets window._invAcceptDeferred so it doesn't fire
+//       again this session. Modal reappears next login.
+//    3. SKIP (OFFICE OVERRIDE) — only visible when agent.bypassOnboardingGate
+//       is true. Same effect as Sign Later but labeled clearly.
+//
+//  Office Override: when the bypass flag is set, the third button is shown.
+//  We don't suppress the modal because the user testing may want to see it
+//  fire and exercise the flow — they just have an explicit escape hatch.
+// ════════════════════════════════════════════════════════════════════════
+function _invCollectPendingAcceptanceForUser(user){
+  if(!user || !user.id) return [];
+  var pending = [];
+  if(typeof CAMPAIGN_REGISTRY !== 'object') return pending;
+  Object.keys(CAMPAIGN_REGISTRY).forEach(function(campKey){
+    var cfg = CAMPAIGN_REGISTRY[campKey];
+    if(!cfg || !cfg.transfers) return;
+    var transfersArr;
+    try { transfersArr = cfg.transfers(); } catch(e){ return; }
+    if(!Array.isArray(transfersArr)) return;
+    transfersArr.forEach(function(t){
+      if(!t) return;
+      if(t.toId !== user.id) return;
+      if(t.status !== 'pending-agent-signature') return;
+      if(t.agentSigned === true) return;
+      pending.push({campaign:campKey, cfg:cfg, transfer:t});
+    });
+  });
+  return pending;
+}
+
+function showInventoryAcceptanceModalIfNeeded(user){
+  if(!user) return;
+  if(window._invAcceptDeferred === user.id) return; // session-deferred for THIS user
+  var pending = _invCollectPendingAcceptanceForUser(user);
+  if(!pending.length) return;
+
+  // Already showing? Don't double-render
+  if(document.getElementById('inv-accept-modal-bg')) return;
+
+  var totalDevices = pending.reduce(function(sum, p){ return sum + (p.transfer.imeis||[]).length; }, 0);
+  var totalCost    = pending.reduce(function(sum, p){
+    return sum + (p.transfer.devices||[]).reduce(function(s,d){ return s + (parseFloat(d.devCost)||0); }, 0);
+  }, 0);
+
+  var bg = document.createElement('div');
+  bg.id = 'inv-accept-modal-bg';
+  bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:99700;display:flex;align-items:center;justify-content:center;padding:14px;overflow-y:auto';
+
+  var box = document.createElement('div');
+  box.style.cssText = 'background:white;border-radius:14px;max-width:680px;width:100%;box-shadow:0 14px 48px rgba(0,0,0,.5);overflow:hidden;max-height:92vh;display:flex;flex-direction:column';
+
+  var html = '';
+  html += '<div style="background:linear-gradient(135deg,#dc2626,#991b1b);color:white;padding:22px 26px;text-align:center;flex-shrink:0">';
+  html += '<div style="font-size:42px;line-height:1;margin-bottom:6px">📦</div>';
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;letter-spacing:2px">Inventory Signature Required</div>';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;opacity:.95;letter-spacing:.5px;margin-top:6px">'+totalDevices+' device'+(totalDevices===1?'':'s')+' assigned to you · Total value: $'+totalCost.toFixed(2)+'</div>';
+  html += '</div>';
+
+  html += '<div style="padding:18px 22px;font-family:Barlow Condensed,sans-serif;color:var(--brown);line-height:1.55;flex-shrink:0;border-bottom:1px solid var(--border)">';
+  html += '<p style="margin:0 0 8px"><strong>You are responsible for the devices listed below.</strong> By signing, you accept full responsibility for each IMEI and agree that any unaccounted-for device may be deducted from your commission at the listed cost.</p>';
+  html += '<p style="margin:0;font-size:.8rem;color:var(--muted)">Until you sign, these devices cannot be transferred to anyone else. The same record is available under <strong>Pending Transfers</strong> if you prefer to review them there individually.</p>';
+  html += '</div>';
+
+  html += '<div style="padding:14px 22px;flex:1;overflow-y:auto;background:var(--offwhite)">';
+  pending.forEach(function(p){
+    html += '<div style="background:white;border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:10px">';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">';
+    html += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;color:'+(p.cfg.color||'var(--blue)')+'">'+(p.cfg.icon||'📦')+' '+escHtml(p.cfg.label||p.campaign)+'</div>';
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">From: '+escHtml(p.transfer.fromName||'Inventory')+' · '+(p.transfer.imeis||[]).length+' device'+((p.transfer.imeis||[]).length===1?'':'s')+'</div>';
+    html += '</div>';
+    // Device table
+    html += '<table style="width:100%;font-family:Barlow Condensed,sans-serif;font-size:.74rem;border-collapse:collapse">';
+    html += '<thead><tr style="color:var(--muted);text-align:left">';
+    html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">IMEI</th>';
+    html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">Model</th>';
+    html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">Type</th>';
+    html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border);text-align:right">Cost</th>';
+    html += '</tr></thead><tbody>';
+    (p.transfer.devices||[]).slice(0,30).forEach(function(d){
+      html += '<tr>';
+      html += '<td style="padding:4px 6px;font-family:monospace;font-size:.7rem">'+escHtml(d.imei||'')+'</td>';
+      html += '<td style="padding:4px 6px">'+escHtml(d.model||'—')+'</td>';
+      html += '<td style="padding:4px 6px">'+escHtml(d.devType||'—')+'</td>';
+      html += '<td style="padding:4px 6px;text-align:right;font-weight:600">$'+(parseFloat(d.devCost)||0).toFixed(2)+'</td>';
+      html += '</tr>';
+    });
+    if((p.transfer.devices||[]).length > 30){
+      html += '<tr><td colspan="4" style="padding:6px;color:var(--muted);text-align:center;font-style:italic">…and '+((p.transfer.devices||[]).length - 30)+' more</td></tr>';
+    }
+    html += '</tbody></table>';
+    html += '</div>';
+  });
+  html += '</div>';
+
+  // Signature input + buttons
+  html += '<div style="padding:14px 22px;border-top:1px solid var(--border);flex-shrink:0;background:white">';
+  html += '<label class="f-label" style="display:block;margin-bottom:6px">Type your full legal name to sign for ALL devices above:</label>';
+  html += '<input type="text" id="inv-accept-sig" class="f-input" placeholder="Full Legal Name" style="font-family:cursive;font-size:1.05rem;margin-bottom:12px">';
+  html += '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">';
+  html += '<button onclick="_invAcceptSignLater('+user.id+')" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">Sign Later</button>';
+  if(user.bypassOnboardingGate === true){
+    html += '<button onclick="_invAcceptSkipOverride('+user.id+')" style="background:rgba(124,58,237,.1);border:1px solid #7c3aed;color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">⚙ Skip (Office Override)</button>';
+  }
+  html += '<button onclick="_invAcceptSignAll('+user.id+')" style="background:#059669;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:10px 22px;border-radius:6px;cursor:pointer;font-weight:700">✓ Sign All & Accept</button>';
+  html += '</div>';
+  html += '</div>';
+
+  box.innerHTML = html;
+  bg.appendChild(box);
+  document.body.appendChild(bg);
+}
+
+function _invAcceptCloseModal(){
+  var el = document.getElementById('inv-accept-modal-bg');
+  if(el) el.remove();
+}
+
+function _invAcceptSignLater(userId){
+  window._invAcceptDeferred = userId;
+  _invAcceptCloseModal();
+}
+
+function _invAcceptSkipOverride(userId){
+  if(!confirm('Office Override: Skip the inventory acceptance for this session?\n\nThis is for testing only. You will see this modal again on next login until you sign or until your office override is removed.')) return;
+  window._invAcceptDeferred = userId;
+  _invAcceptCloseModal();
+}
+
+function _invAcceptSignAll(userId){
+  var user = DB.agents.find(function(a){ return a && a.id === userId; });
+  if(!user) return;
+  var sig = (document.getElementById('inv-accept-sig')||{value:''}).value.trim();
+  if(!sig){ alert('Please type your full legal name in the signature box to sign.'); return; }
+
+  var pending = _invCollectPendingAcceptanceForUser(user);
+  if(!pending.length){ _invAcceptCloseModal(); return; }
+
+  var nowISO = new Date().toISOString();
+  var signedCount = 0;
+  pending.forEach(function(p){
+    var t = p.transfer;
+    t.agentSigned              = true;
+    t.agentSignedAt            = nowISO;
+    t.agentConfirmedPossession = true;
+    t.agentSignature           = sig;
+    t.status                   = 'completed';
+    // Clear acceptancePending flags on each device in this carrier's pool
+    var pool;
+    try { pool = p.cfg.inventory(); } catch(e){ pool = null; }
+    if(Array.isArray(pool)){
+      (t.imeis || []).forEach(function(imei){
+        var dev = pool.find(function(d){return d.imei===imei;});
+        if(dev){
+          delete dev.acceptancePending;
+          delete dev.acceptanceTransfer;
+        }
+      });
+    }
+    signedCount++;
+  });
+
+  try { if(typeof saveInventory === 'function') saveInventory(); } catch(e){}
+
+  // Notify office (Inventory dept + Owner) that the recipient signed
+  try {
+    if(typeof pushNotification === 'function'){
+      (DB.agents || []).filter(function(a){
+        return a && a.active && (
+          (typeof isInventory === 'function' && isInventory(a)) ||
+          (typeof isOwner === 'function' && isOwner(a))
+        );
+      }).forEach(function(officeUser){
+        pushNotification({
+          toIds:[officeUser.id], toRoles:[], icon:'✅',
+          title:'Inventory Signed — '+user.name,
+          body:user.name+' signed for '+signedCount+' pending inventory transfer'+(signedCount===1?'':'s')+'. Devices are now fully accepted and can be transferred onward.',
+          panel:'pending-transfers', priority:'normal'
+        });
+      });
+    }
+  } catch(e){}
+
+  _invAcceptCloseModal();
+  alert('✓ Signed. You have accepted responsibility for '+signedCount+' inventory transfer'+(signedCount===1?'':'s')+'. The devices are now fully yours.');
+  if(typeof renderBO === 'function') renderBO();
+}
+
+if(typeof window !== 'undefined'){
+  window.showInventoryAcceptanceModalIfNeeded = showInventoryAcceptanceModalIfNeeded;
+  window._invCollectPendingAcceptanceForUser  = _invCollectPendingAcceptanceForUser;
+  window._invAcceptSignLater   = _invAcceptSignLater;
+  window._invAcceptSkipOverride = _invAcceptSkipOverride;
+  window._invAcceptSignAll      = _invAcceptSignAll;
+  window._invAcceptCloseModal   = _invAcceptCloseModal;
+}
+
 function bgShowPassedWelcomeModal(agent){
   if(!agent) return;
   // Find which campaigns are passed
@@ -43653,14 +44029,21 @@ function gmConfirmInventoryUpload(batchId){
   if(!pending||pending.batchId!==batchId){ alert('Session expired. Please re-upload the file.'); return; }
   pending.devices.forEach(function(d){ GM_INVENTORY.push(d); });
 
-  // ── Calvin 2026-05-01 (updated) ──
-  // The parser (processGMInventoryUpload) ALREADY auto-assigns each device
-  // per its market via gmResolveAutoAssignee (MM-of-market → CM fallback).
-  // Here we just summarize who got what and notify recipients. We don't
-  // double-assign. If the parser couldn't resolve a recipient (no MM, no
-  // CM), the device lands as 'unassigned' and shows on the dashboard for
-  // manual placement.
-  var autoAssignSummary = {}; // {recipientName: {count, markets:[], recipientId, imeis:[]}}
+  // ── Calvin 2026-06-04: every recipient gets an acceptance-signature transfer ──
+  // The parser auto-assigns each device to a recipient (MM-of-market → CM fallback).
+  // We use the generic invCreateAcceptanceTransfersForUpload helper which:
+  //   • Creates one 'pending-agent-signature' transfer per recipient with all
+  //     their batched IMEIs + cost + model details
+  //   • Flags each device acceptancePending:true so it cannot be transferred
+  //     onward until the recipient signs
+  //   • Notifies each recipient that they have inventory to sign for
+  //   • Saves inventory + transfers atomically
+  // Same helper is used by every carrier's upload — keeps the rules uniform.
+  var acceptanceResult = invCreateAcceptanceTransfersForUpload('Gen Mobile', pending.devices, DB.current);
+
+  // Build the summary view (unchanged from before, kept for backwards
+  // compatibility with the upload-preview UI)
+  var autoAssignSummary = {};
   var unassignedCount = 0;
   pending.devices.forEach(function(d){
     if(!d.assignedToName){
@@ -43668,90 +44051,11 @@ function gmConfirmInventoryUpload(batchId){
       return;
     }
     var key = d.assignedToName;
-    if(!autoAssignSummary[key]) autoAssignSummary[key] = {count:0, markets:[], recipientId:d.assignedTo, imeis:[]};
+    if(!autoAssignSummary[key]) autoAssignSummary[key] = {count:0, markets:[], recipientId:d.assignedTo};
     autoAssignSummary[key].count++;
     if(autoAssignSummary[key].markets.indexOf(d.market) < 0){
       autoAssignSummary[key].markets.push(d.market);
     }
-    if(d.imei) autoAssignSummary[key].imeis.push(d.imei);
-  });
-
-  // ── Calvin 2026-06-04: CREATE TRANSFER-ACCEPTANCE RECORDS PER RECIPIENT ──
-  //
-  // Previously: GM_INVENTORY.push(d) made devices "owned" by Makenzie (or
-  // whoever the auto-assignee was) the instant the upload landed — no
-  // acceptance signature, no contract, no record of responsibility transfer.
-  // Calvin saw zero contracts for Makenzie to sign after she uploaded.
-  //
-  // Fix: for each recipient who got devices in this batch, create a
-  // GM_TRANSFERS record with status 'pending-agent-signature'. That's the
-  // exact status that the Pending Transfers panel watches for. The
-  // recipient will see "Sign to accept N devices" in their queue. Until
-  // they sign, devices are flagged as not-yet-accepted (devUnaccepted=true).
-  //
-  // The 'fromId' is the uploader (e.g. Makenzie if she did the upload, or
-  // Inv Dept user). For self-assignment (recipient === uploader), we still
-  // create the record but mark the source as the upload itself — the
-  // recipient signs to confirm they take responsibility for the devices.
-  var uploader = DB.current;
-  var uploaderId = uploader && uploader.id || null;
-  var uploaderName = uploader && uploader.name || 'Inventory System';
-  var uploaderRole = uploader && uploader.role || 'system';
-  var newTransfers = [];
-  Object.keys(autoAssignSummary).forEach(function(recipientName){
-    var s = autoAssignSummary[recipientName];
-    if(!s.recipientId || !s.imeis.length) return;
-    // Build device cost list from the just-uploaded entries
-    var deviceDetails = s.imeis.map(function(imei){
-      var d = pending.devices.find(function(x){return x.imei===imei;}) || {};
-      return {imei:imei, sim:d.sim||'', model:d.model||'', devType:d.devType||'', devCost:d.devCost||0, market:d.market||''};
-    });
-    var transferReq = {
-      id:                       'gmt-upload-'+(new Date().getTime())+'-'+s.recipientId,
-      fromId:                   uploaderId,
-      fromName:                 uploaderName,
-      fromRole:                 uploaderRole,
-      toId:                     s.recipientId,
-      toName:                   recipientName,
-      toRole:                   (DB.agents.find(function(a){return a.id===s.recipientId;})||{}).role || '',
-      imeis:                    s.imeis.slice(),
-      // 'pending-agent-signature' is the canonical status the Pending
-      // Transfers panel queries for at panelPendingTransfers (line 62953).
-      status:                   'pending-agent-signature',
-      // No upstream approval needed — the upload IS the approval (Inv Dept
-      // member is the one running the upload). Recipient just signs to
-      // accept responsibility.
-      createdAt:                new Date().toISOString(),
-      source:                   'upload',
-      approvedBy:               uploaderName,
-      approvedAt:               new Date().toISOString(),
-      agentSigned:              false,
-      agentSignedAt:            null,
-      agentConfirmedPossession: false,
-      devices:                  deviceDetails
-    };
-    GM_TRANSFERS.push(transferReq);
-    newTransfers.push(transferReq);
-    // Flag each device as not-yet-accepted so we know it's pending sig
-    deviceDetails.forEach(function(dd){
-      var devRec = GM_INVENTORY.find(function(d){return d.imei===dd.imei;});
-      if(devRec){
-        devRec.acceptancePending  = true;
-        devRec.acceptanceTransfer = transferReq.id;
-      }
-    });
-  });
-
-  // Notify each recipient — both for the new-inventory arrival AND that
-  // there's a transfer-acceptance signature waiting in their queue.
-  Object.keys(autoAssignSummary).forEach(function(name){
-    var s = autoAssignSummary[name];
-    pushNotification({
-      toIds:[s.recipientId], toRoles:[], icon:'📦',
-      title:'Inventory Assigned — Signature Required',
-      body:s.count+' device(s) just landed in your inventory for '+s.markets.join(', ')+'. Open Pending Transfers to sign for these devices and accept responsibility. Devices are flagged as pending until signed.',
-      panel:'pending-transfers', priority:'high'
-    });
   });
 
   // Notify any Gen Mobile Campaign Managers so they see the batch
@@ -46831,6 +47135,7 @@ function invInitiateTransfer(campaign){
       else if(err.type==='not-held-by-sender')       msg = 'IMEI '+err.imei+' is currently held by '+err.currentHolder+', not you';
       else if(err.type==='already-in-pending-transfer') msg = 'IMEI '+err.imei+' is already in a pending transfer';
       else if(err.type==='already-activated')        msg = 'IMEI '+err.imei+' is already activated and cannot be transferred';
+      else if(err.type==='acceptance-pending')       msg = 'IMEI '+err.imei+' — you have not signed for this device yet. Sign the acceptance transfer in Pending Transfers before transferring it onward.';
       html += '<div style="padding:3px 0">⛔ '+msg+'</div>';
     });
     if(validation.errors.length>10) html += '<div style="color:var(--muted)">…and '+(validation.errors.length-10)+' more</div>';
@@ -47877,6 +48182,7 @@ function gmInitiateTransfer(){
       else if(err.type==='not-held-by-sender')        msg += '• IMEI '+err.imei+' — not currently held by you (held by '+err.currentHolder+')\n';
       else if(err.type==='already-in-pending-transfer') msg += '• IMEI '+err.imei+' — already in another pending transfer\n';
       else if(err.type==='already-activated')         msg += '• IMEI '+err.imei+' — already marked as activated/sold\n';
+      else if(err.type==='acceptance-pending')        msg += '• IMEI '+err.imei+' — YOU MUST SIGN FOR THIS DEVICE FIRST. Open Pending Transfers and sign the acceptance form. Once signed, you can transfer it onward.\n';
     });
     if(check.errors.length>10) msg += '…and '+(check.errors.length-10)+' more\n';
     alert(msg);
