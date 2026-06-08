@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.08.1400';
+var BUILD_VERSION = '2026.06.08.2030';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -10607,82 +10607,104 @@ function saveAssignedDocs(agentIdHint){
   //
   // Per-device queue serializes saves so two rapid signs on the SAME
   // device don't race each other either.
-  if(typeof supaClient !== 'undefined' && supaClient){
-    _saveAssignedDocsQueue = _saveAssignedDocsQueue.then(function(){
-      return (async function(){
-        try {
-          // 1. PER-AGENT WRITE — eliminates cross-device race for
-          //    different agents signing simultaneously.
-          if(agentIdHint != null && ASSIGNED_DOC_STATUS[agentIdHint]){
-            // We know exactly which agent just saved — write only their row
-            await supaClient.from('app_settings').upsert(
-              {key:'assigned_doc_status_'+agentIdHint, value:JSON.stringify(ASSIGNED_DOC_STATUS[agentIdHint])},
-              {onConflict:'key'}
-            );
-          } else {
-            // No hint — write every known agent. Slower but still safe
-            // (e.g. for migrations or admin-side bulk saves).
-            var agentIds = Object.keys(ASSIGNED_DOC_STATUS);
-            for(var i = 0; i < agentIds.length; i++){
-              var aid = agentIds[i];
-              await supaClient.from('app_settings').upsert(
-                {key:'assigned_doc_status_'+aid, value:JSON.stringify(ASSIGNED_DOC_STATUS[aid])},
-                {onConflict:'key'}
-              );
-            }
-          }
-
-          // 2. LEGACY BLOB WRITE — read-modify-write so old code paths
-          //    that read the single 'assigned_doc_status' key still see
-          //    correct data.
-          var cloudRes = await supaClient.from('app_settings')
-            .select('value')
-            .eq('key', 'assigned_doc_status')
-            .maybeSingle();
-          var cloudData = {};
-          if(cloudRes && cloudRes.data && cloudRes.data.value){
-            try { cloudData = JSON.parse(cloudRes.data.value) || {}; }
-            catch(e){ cloudData = {}; }
-          }
-          var merged = {};
-          Object.keys(cloudData).forEach(function(agentId){
-            merged[agentId] = {};
-            Object.keys(cloudData[agentId] || {}).forEach(function(formId){
-              merged[agentId][formId] = cloudData[agentId][formId];
-            });
-          });
-          Object.keys(ASSIGNED_DOC_STATUS).forEach(function(agentId){
-            if(!merged[agentId]) merged[agentId] = {};
-            Object.keys(ASSIGNED_DOC_STATUS[agentId] || {}).forEach(function(formId){
-              var local = ASSIGNED_DOC_STATUS[agentId][formId];
-              var cloud = merged[agentId][formId];
-              if(!cloud){
-                merged[agentId][formId] = local;
-              } else if(cloud.signed === true && local.signed !== true){
-                // keep cloud
-              } else if(local.signed === true && cloud.signed !== true){
-                merged[agentId][formId] = local;
-              } else {
-                var lT = local.signedAt || local.assignedAt || '';
-                var cT = cloud.signedAt || cloud.assignedAt || '';
-                merged[agentId][formId] = (lT >= cT) ? local : cloud;
-              }
-            });
-          });
-          await supaClient.from('app_settings').upsert(
-            {key:'assigned_doc_status', value:JSON.stringify(merged)},
+  //
+  // 2026-06-08 LATEST: returns the queue promise so callers can await
+  // confirmation that data made it to the cloud BEFORE telling the
+  // agent they're done. Prevents tab-close-before-save data loss.
+  if(typeof supaClient === 'undefined' || !supaClient){
+    console.warn('[saveAssignedDocs] no supabase client — data is local-only and will not survive reload');
+    return Promise.resolve(false);
+  }
+  _saveAssignedDocsQueue = _saveAssignedDocsQueue.then(function(){
+    return (async function(){
+      try {
+        // 1. PER-AGENT WRITE — eliminates cross-device race for
+        //    different agents signing simultaneously.
+        if(agentIdHint != null && ASSIGNED_DOC_STATUS[agentIdHint]){
+          var perKey = 'assigned_doc_status_'+agentIdHint;
+          var perVal = JSON.stringify(ASSIGNED_DOC_STATUS[agentIdHint]);
+          var perRes = await supaClient.from('app_settings').upsert(
+            {key:perKey, value:perVal},
             {onConflict:'key'}
           );
+          if(perRes && perRes.error){
+            console.error('[saveAssignedDocs] PER-AGENT WRITE FAILED for '+perKey+':', perRes.error);
+            throw new Error('per-agent write failed: '+(perRes.error.message||'unknown'));
+          }
+          console.log('[saveAssignedDocs] ✓ wrote per-agent key '+perKey+' ('+perVal.length+' chars)');
+        } else {
+          var agentIds = Object.keys(ASSIGNED_DOC_STATUS);
+          for(var i = 0; i < agentIds.length; i++){
+            var aid = agentIds[i];
+            var perRes2 = await supaClient.from('app_settings').upsert(
+              {key:'assigned_doc_status_'+aid, value:JSON.stringify(ASSIGNED_DOC_STATUS[aid])},
+              {onConflict:'key'}
+            );
+            if(perRes2 && perRes2.error){
+              console.error('[saveAssignedDocs] BULK PER-AGENT WRITE FAILED for agent '+aid+':', perRes2.error);
+            }
+          }
+        }
 
-          // 3. Sync merged result back so we pick up other devices' recent signatures
-          ASSIGNED_DOC_STATUS = merged;
-          try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
-        } catch(e){ console.warn('[saveAssignedDocs] cloud save failed:', e); }
-      })();
-    }).catch(function(e){
-      console.warn('[saveAssignedDocs] queue link failed:', e);
-    });
-  }
+        // 2. LEGACY BLOB WRITE — read-modify-write so old code paths
+        //    that read the single 'assigned_doc_status' key still see
+        //    correct data.
+        var cloudRes = await supaClient.from('app_settings')
+          .select('value')
+          .eq('key', 'assigned_doc_status')
+          .maybeSingle();
+        var cloudData = {};
+        if(cloudRes && cloudRes.data && cloudRes.data.value){
+          try { cloudData = JSON.parse(cloudRes.data.value) || {}; }
+          catch(e){ cloudData = {}; }
+        }
+        var merged = {};
+        Object.keys(cloudData).forEach(function(agentId){
+          merged[agentId] = {};
+          Object.keys(cloudData[agentId] || {}).forEach(function(formId){
+            merged[agentId][formId] = cloudData[agentId][formId];
+          });
+        });
+        Object.keys(ASSIGNED_DOC_STATUS).forEach(function(agentId){
+          if(!merged[agentId]) merged[agentId] = {};
+          Object.keys(ASSIGNED_DOC_STATUS[agentId] || {}).forEach(function(formId){
+            var local = ASSIGNED_DOC_STATUS[agentId][formId];
+            var cloud = merged[agentId][formId];
+            if(!cloud){
+              merged[agentId][formId] = local;
+            } else if(cloud.signed === true && local.signed !== true){
+              // keep cloud
+            } else if(local.signed === true && cloud.signed !== true){
+              merged[agentId][formId] = local;
+            } else {
+              var lT = local.signedAt || local.assignedAt || '';
+              var cT = cloud.signedAt || cloud.assignedAt || '';
+              merged[agentId][formId] = (lT >= cT) ? local : cloud;
+            }
+          });
+        });
+        var blobRes = await supaClient.from('app_settings').upsert(
+          {key:'assigned_doc_status', value:JSON.stringify(merged)},
+          {onConflict:'key'}
+        );
+        if(blobRes && blobRes.error){
+          console.error('[saveAssignedDocs] BLOB WRITE FAILED:', blobRes.error);
+        }
+
+        // 3. Sync merged result back so we pick up other devices' recent signatures
+        ASSIGNED_DOC_STATUS = merged;
+        try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
+        return true;
+      } catch(e){
+        console.error('[saveAssignedDocs] cloud save FAILED:', e);
+        throw e;
+      }
+    })();
+  }).catch(function(e){
+    console.warn('[saveAssignedDocs] queue link failed:', e);
+    return false;
+  });
+  return _saveAssignedDocsQueue;
 }
 function loadAssignedDocs(){
   try{
@@ -19082,6 +19104,28 @@ async function loadFromSupabase(){
       try { backfillBgAuthorizationAssignments(); }
       catch(e){ console.warn('[loadFromSupabase] BG backfill failed:', e); }
     }
+
+    // Calvin 2026-06-08: BOOT DIAGNOSTIC — log how many signed records
+    // we loaded so you can verify in console that the data is making it
+    // through. If you see "signed=0" for an agent who DID sign, the
+    // round-trip is broken and we know exactly where.
+    try {
+      if(typeof ASSIGNED_DOC_STATUS === 'object' && ASSIGNED_DOC_STATUS){
+        var agentCount = Object.keys(ASSIGNED_DOC_STATUS).length;
+        var signedTotal = 0;
+        var unsignedTotal = 0;
+        Object.keys(ASSIGNED_DOC_STATUS).forEach(function(aid){
+          Object.keys(ASSIGNED_DOC_STATUS[aid] || {}).forEach(function(fid){
+            if(ASSIGNED_DOC_STATUS[aid][fid] && ASSIGNED_DOC_STATUS[aid][fid].signed === true){
+              signedTotal++;
+            } else {
+              unsignedTotal++;
+            }
+          });
+        });
+        console.log('[boot-diag] ASSIGNED_DOC_STATUS loaded: agents='+agentCount+', signed-docs='+signedTotal+', unsigned-docs='+unsignedTotal);
+      }
+    } catch(e){ console.warn('[boot-diag] failed:', e); }
   } catch(e){
     console.warn('Supabase load failed, using local:', e);
     loadFromStorage();
@@ -24128,6 +24172,9 @@ function allRequiredAssignedDocsSigned(agentId){
 }
 
 // Mark a doc as signed (or save form responses) for an agent.
+// Calvin 2026-06-08: now returns a Promise that resolves when cloud
+// save COMPLETES — caller awaits to make sure data is durable before
+// telling the agent they're done. Prevents tab-close-before-save data loss.
 function markAssignedDocSigned(agentId, formId, signature, responses){
   if(!ASSIGNED_DOC_STATUS[agentId]) ASSIGNED_DOC_STATUS[agentId] = {};
   var existing = ASSIGNED_DOC_STATUS[agentId][formId] || {};
@@ -24141,9 +24188,9 @@ function markAssignedDocSigned(agentId, formId, signature, responses){
     signature:   signature || '',
     responses:   responses || existing.responses || {}
   };
-  // Calvin 2026-06-08: pass agentId so cloud write goes to the per-agent
-  // key, eliminating cross-device race for different agents signing.
-  saveAssignedDocs(agentId);
+  console.log('[markAssignedDocSigned] agent='+agentId+' form='+formId+' → signed=true (memory)');
+  // saveAssignedDocs returns a promise (Calvin 2026-06-08); caller may await
+  return saveAssignedDocs(agentId);
 }
 
 // Notify all currently-affected agents that a new doc is assigned to them.
@@ -25896,6 +25943,52 @@ function panelOwnerControl(){
     h += '<button onclick="_bulkRelockAllAgents()" style="background:white;border:1.5px solid #dc2626;color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:11px 22px;border-radius:6px;cursor:pointer;font-weight:700;white-space:nowrap">🔒 Re-Lock ALL</button>';
   }
   h += '<button onclick="_forceReloadEveryone()" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:9px 16px;border-radius:6px;cursor:pointer;white-space:nowrap">🔄 Push Reload to Everyone</button>';
+  h += '</div>';
+  h += '</div>';
+  h += '</div>';
+
+  // ── Calvin 2026-06-08: DOCUMENT SIGNATURE RECOVERY ──
+  // Safety valve for the persistent "agent signed but still locked out"
+  // bug. While the underlying sync layers are being hardened, this gives
+  // the Owner a way to:
+  //  1. SEE which agents are currently locked out and why
+  //  2. MANUALLY mark a single agent's required docs as signed (forces
+  //     the gate clear immediately, no waiting for sync)
+  //  3. BULK mark every locked agent as signed in one click (recovery
+  //     after a deploy or sync failure that left a wave of agents stuck)
+  //  4. RUN a diagnostic that prints what's in localStorage + cloud
+  //     side-by-side so we can identify the exact sync mismatch
+  //
+  // Every action is logged + writes to Supabase per-agent keys so the
+  // recovery persists across sessions/devices.
+  var lockedAgents = (DB.agents||[]).filter(function(a){
+    return a && a.active && typeof isOnboardingLocked === 'function' && isOnboardingLocked(a);
+  });
+  h += '<div class="bo-card" style="margin-bottom:20px;border-left:4px solid #dc2626">';
+  h += '<div class="bo-card-head" style="background:linear-gradient(135deg,#fef2f2,#fee2e2)">';
+  h += '<div class="bo-card-title" style="color:#991b1b">🚨 Document Signature Recovery</div>';
+  h += '</div>';
+  h += '<div style="padding:18px 22px;font-family:Barlow Condensed,sans-serif;color:var(--brown);line-height:1.6">';
+  h += '<p style="margin:0 0 12px;font-size:.88rem">If an agent has signed their paperwork but is still being locked out on next login, use these emergency controls. <strong>This bypasses the sync layers entirely</strong> and writes "signed=true" directly to that agent\'s Supabase row.</p>';
+  if(lockedAgents.length === 0){
+    h += '<div style="background:#dcfce7;border:1px solid #86efac;border-radius:6px;padding:14px;text-align:center;color:#166534;font-size:.95rem"><strong>✓ All active agents are currently unlocked.</strong></div>';
+  } else {
+    h += '<div style="background:#fef3c7;border:1px solid #fbbf24;border-radius:6px;padding:14px;margin-bottom:14px"><strong style="color:#92400e">⚠ '+lockedAgents.length+' agent'+(lockedAgents.length===1?'':'s')+' currently locked out:</strong>';
+    h += '<div style="max-height:200px;overflow-y:auto;margin-top:10px;background:white;border-radius:4px;padding:8px">';
+    lockedAgents.forEach(function(a){
+      h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:.85rem">';
+      h += '<span><strong>'+escHtml(a.name)+'</strong> <span style="color:var(--muted)">— '+escHtml(a.role||'?')+'</span></span>';
+      h += '<button onclick="_recoverySignAgent('+a.id+')" style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer;font-weight:700">⚡ Force Sign</button>';
+      h += '</div>';
+    });
+    h += '</div></div>';
+  }
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px">';
+  if(lockedAgents.length > 0){
+    h += '<button onclick="_recoverySignAllLocked()" style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:2px;text-transform:uppercase;padding:11px 22px;border-radius:6px;cursor:pointer;font-weight:700">⚡ Force-Sign ALL '+lockedAgents.length+' Locked Agents</button>';
+  }
+  h += '<button onclick="_recoveryDiagnostic()" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">🔍 Run Diagnostic (console)</button>';
+  h += '<button onclick="_recoveryReloadFromCloud()" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">☁ Re-pull from Cloud</button>';
   h += '</div>';
   h += '</div>';
   h += '</div>';
@@ -42905,6 +42998,251 @@ if(typeof window !== 'undefined') window._toggleOnboardingBypass = _toggleOnboar
 //  Audit fields capture who flipped it (Owner ID) and when (ISO timestamp)
 //  so the audit trail is preserved even on bulk operations.
 // ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════
+//  DOCUMENT SIGNATURE RECOVERY — Calvin 2026-06-08
+//
+//  Emergency controls for the persistent "agent signed but still locked
+//  out" bug. Bypasses sync layers and writes directly to per-agent
+//  Supabase rows. Use when an agent reports being unable to access the
+//  back office despite having signed their paperwork.
+// ════════════════════════════════════════════════════════════════════════
+
+// Force-sign all required-but-unsigned docs for one agent. Writes the
+// "signed=true" record to BOTH localStorage and the per-agent Supabase
+// row immediately. Survives across sessions/devices.
+async function _recoverySignAgent(agentId){
+  var viewer = DB.current;
+  if(!viewer || !isOwner(viewer)){
+    alert('Owner only.');
+    return;
+  }
+  var agent = (DB.agents||[]).find(function(a){return a.id === agentId;});
+  if(!agent){ alert('Agent not found.'); return; }
+  if(!confirm('Force-sign all required documents for '+agent.name+'?\n\nThis will:\n• Mark every required-but-unsigned doc as signed (signature="OWNER_RECOVERY")\n• Write directly to that agent\'s Supabase row\n• Take effect immediately — agent will be unlocked on next page load\n\nContinue?')) return;
+
+  if(!ASSIGNED_DOC_STATUS[agentId]) ASSIGNED_DOC_STATUS[agentId] = {};
+  var docs = ASSIGNED_DOC_STATUS[agentId];
+  var changed = 0;
+  Object.keys(docs).forEach(function(formId){
+    var d = docs[formId];
+    if(d && d.required && !d.signed){
+      d.signed = true;
+      d.signedAt = new Date().toISOString();
+      d.signature = 'OWNER_RECOVERY';
+      d.recoveredBy = viewer.id;
+      d.recoveredByName = viewer.name;
+      d.recoveredAt = new Date().toISOString();
+      changed++;
+    }
+  });
+  if(changed === 0){
+    alert(agent.name+' has no unsigned required docs. They may be locked for another reason — run Diagnostic.');
+    return;
+  }
+  // Save synchronously and tell the user what happened
+  try {
+    var ok = await saveAssignedDocs(agentId);
+    if(ok === false){
+      alert('⚠ Marked '+changed+' doc(s) signed LOCALLY, but cloud save failed. Try again in a moment.');
+      return;
+    }
+    alert('✓ Force-signed '+changed+' document(s) for '+agent.name+'.\n\nThe agent should refresh their page to see the unlock take effect.');
+    if(typeof gotoPanel === 'function') gotoPanel('owner-control');
+  } catch(e){
+    console.error('[recovery] save failed:', e);
+    alert('⚠ Marked locally but cloud save threw: '+(e.message||e));
+  }
+}
+if(typeof window !== 'undefined') window._recoverySignAgent = _recoverySignAgent;
+
+// Force-sign every locked agent in one click. Useful after a deploy
+// that left multiple agents stuck.
+async function _recoverySignAllLocked(){
+  var viewer = DB.current;
+  if(!viewer || !isOwner(viewer)){
+    alert('Owner only.');
+    return;
+  }
+  var locked = (DB.agents||[]).filter(function(a){
+    return a && a.active && typeof isOnboardingLocked === 'function' && isOnboardingLocked(a);
+  });
+  if(locked.length === 0){
+    alert('No agents are currently locked.');
+    return;
+  }
+  if(!confirm('Force-sign required documents for ALL '+locked.length+' locked agents?\n\nThis will:\n• Mark every required-but-unsigned doc as signed (signature="OWNER_RECOVERY") for every locked agent\n• Write each agent to their own Supabase row\n• Take effect immediately — every locked agent will be unlocked on their next page load\n\nThis is a bulk recovery action. Continue?')) return;
+
+  var totalChanged = 0;
+  var savedAgents = 0;
+  var failedAgents = [];
+  for(var i = 0; i < locked.length; i++){
+    var agent = locked[i];
+    if(!ASSIGNED_DOC_STATUS[agent.id]) ASSIGNED_DOC_STATUS[agent.id] = {};
+    var docs = ASSIGNED_DOC_STATUS[agent.id];
+    var changedThis = 0;
+    Object.keys(docs).forEach(function(formId){
+      var d = docs[formId];
+      if(d && d.required && !d.signed){
+        d.signed = true;
+        d.signedAt = new Date().toISOString();
+        d.signature = 'OWNER_RECOVERY';
+        d.recoveredBy = viewer.id;
+        d.recoveredByName = viewer.name;
+        d.recoveredAt = new Date().toISOString();
+        changedThis++;
+      }
+    });
+    totalChanged += changedThis;
+    if(changedThis > 0){
+      try {
+        var ok = await saveAssignedDocs(agent.id);
+        if(ok !== false) savedAgents++;
+        else failedAgents.push(agent.name);
+      } catch(e){
+        failedAgents.push(agent.name);
+      }
+    }
+  }
+  var msg = '✓ Force-signed '+totalChanged+' doc(s) across '+savedAgents+' agents.';
+  if(failedAgents.length > 0){
+    msg += '\n\n⚠ Cloud save failed for: '+failedAgents.join(', ')+'\nThe local copy IS saved; refresh and try the bulk button again to retry.';
+  }
+  alert(msg);
+  if(typeof gotoPanel === 'function') gotoPanel('owner-control');
+}
+if(typeof window !== 'undefined') window._recoverySignAllLocked = _recoverySignAllLocked;
+
+// Run a diagnostic that prints localStorage + cloud state for assigned
+// docs to the browser console, side by side. Helps identify exactly
+// where the mismatch is when an agent reports being locked out.
+async function _recoveryDiagnostic(){
+  console.log('═══════════════════════════════════════════════════════');
+  console.log('  ASSIGNED DOC STATUS — DIAGNOSTIC REPORT');
+  console.log('  Build: '+ (typeof BUILD_VERSION === 'string' ? BUILD_VERSION : '?'));
+  console.log('  Time:  '+ new Date().toISOString());
+  console.log('═══════════════════════════════════════════════════════');
+  // 1. In-memory state
+  var memCount = 0, memSigned = 0;
+  try {
+    Object.keys(ASSIGNED_DOC_STATUS).forEach(function(aid){
+      Object.keys(ASSIGNED_DOC_STATUS[aid]||{}).forEach(function(fid){
+        memCount++;
+        if(ASSIGNED_DOC_STATUS[aid][fid] && ASSIGNED_DOC_STATUS[aid][fid].signed === true) memSigned++;
+      });
+    });
+  } catch(e){}
+  console.log('[diag] IN-MEMORY: '+Object.keys(ASSIGNED_DOC_STATUS||{}).length+' agents, '+memCount+' total doc records, '+memSigned+' signed');
+  // 2. localStorage state
+  try {
+    var lsRaw = localStorage.getItem('wmam_assigned_docs');
+    if(lsRaw){
+      var lsParsed = JSON.parse(lsRaw);
+      var lsCount = 0, lsSigned = 0;
+      Object.keys(lsParsed).forEach(function(aid){
+        Object.keys(lsParsed[aid]||{}).forEach(function(fid){
+          lsCount++;
+          if(lsParsed[aid][fid] && lsParsed[aid][fid].signed === true) lsSigned++;
+        });
+      });
+      console.log('[diag] LOCALSTORAGE: '+Object.keys(lsParsed).length+' agents, '+lsCount+' total doc records, '+lsSigned+' signed');
+    } else {
+      console.log('[diag] LOCALSTORAGE: empty');
+    }
+  } catch(e){ console.log('[diag] LOCALSTORAGE: parse failed:', e); }
+  // 3. Cloud state (per-agent rows + legacy blob)
+  if(typeof supaClient === 'undefined' || !supaClient){
+    console.log('[diag] CLOUD: no supabase client');
+  } else {
+    try {
+      var allSettings = await supaClient.from('app_settings').select('key,value');
+      if(allSettings && allSettings.data){
+        var perAgentRows = allSettings.data.filter(function(r){ return /^assigned_doc_status_\d+$/.test(r.key); });
+        var blobRow = allSettings.data.find(function(r){ return r.key === 'assigned_doc_status'; });
+        var blobAgents = 0, blobSigned = 0;
+        if(blobRow && blobRow.value){
+          try {
+            var blob = JSON.parse(blobRow.value);
+            blobAgents = Object.keys(blob).length;
+            Object.keys(blob).forEach(function(aid){
+              Object.keys(blob[aid]||{}).forEach(function(fid){
+                if(blob[aid][fid] && blob[aid][fid].signed === true) blobSigned++;
+              });
+            });
+          } catch(e){}
+        }
+        console.log('[diag] CLOUD per-agent rows: '+perAgentRows.length);
+        console.log('[diag] CLOUD legacy blob: '+blobAgents+' agents, '+blobSigned+' signed docs');
+        // Compare each agent
+        console.log('[diag] ─── per-agent comparison ───');
+        (DB.agents||[]).filter(function(a){return a.active;}).forEach(function(a){
+          var mem = ASSIGNED_DOC_STATUS[a.id] || {};
+          var perRow = perAgentRows.find(function(r){ return r.key === 'assigned_doc_status_'+a.id; });
+          var perData = {};
+          if(perRow){ try{ perData = JSON.parse(perRow.value); }catch(e){} }
+          var memSigned = Object.keys(mem).filter(function(f){return mem[f] && mem[f].signed;}).length;
+          var perSigned = Object.keys(perData).filter(function(f){return perData[f] && perData[f].signed;}).length;
+          var locked = (typeof isOnboardingLocked === 'function') && isOnboardingLocked(a);
+          if(locked || memSigned !== perSigned){
+            console.log('  agent #'+a.id+' '+a.name+' — memory:'+memSigned+'sig, cloud:'+perSigned+'sig, locked:'+(locked?'YES':'no'));
+          }
+        });
+      }
+    } catch(e){ console.log('[diag] CLOUD fetch failed:', e); }
+  }
+  console.log('═══════════════════════════════════════════════════════');
+  alert('✓ Diagnostic printed to browser console.\n\nOpen developer tools → Console tab to see the full report. Look for any agents where memory:sig and cloud:sig counts differ, or where locked=YES.');
+}
+if(typeof window !== 'undefined') window._recoveryDiagnostic = _recoveryDiagnostic;
+
+// Re-pull all assigned doc data from Supabase and merge into local
+// memory. Useful when an agent reports being locked but you can see
+// their signature is in the cloud.
+async function _recoveryReloadFromCloud(){
+  if(typeof supaClient === 'undefined' || !supaClient){
+    alert('No Supabase client.');
+    return;
+  }
+  try {
+    var allSettings = await supaClient.from('app_settings').select('key,value');
+    if(!allSettings || !allSettings.data){
+      alert('No data returned from Supabase.');
+      return;
+    }
+    var loadedAgents = 0;
+    allSettings.data.forEach(function(row){
+      if(/^assigned_doc_status_\d+$/.test(row.key) && row.value){
+        try {
+          var aId = parseInt(row.key.replace('assigned_doc_status_', ''), 10);
+          var perAgent = JSON.parse(row.value);
+          if(aId && perAgent && typeof perAgent === 'object'){
+            if(!ASSIGNED_DOC_STATUS[aId]) ASSIGNED_DOC_STATUS[aId] = {};
+            Object.keys(perAgent).forEach(function(formId){
+              var cloud = perAgent[formId];
+              var local = ASSIGNED_DOC_STATUS[aId][formId];
+              // Prefer signed
+              if(cloud && cloud.signed === true){
+                ASSIGNED_DOC_STATUS[aId][formId] = cloud;
+              } else if(!local || !local.signed){
+                ASSIGNED_DOC_STATUS[aId][formId] = cloud;
+              }
+            });
+            loadedAgents++;
+          }
+        } catch(e){ console.warn('[recovery] parse failed for '+row.key+':', e); }
+      }
+    });
+    try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
+    alert('✓ Re-pulled signed-doc data for '+loadedAgents+' agents from Supabase.\nLocked-agent count should now be accurate. Refresh to see updates.');
+    if(typeof gotoPanel === 'function') gotoPanel('owner-control');
+  } catch(e){
+    alert('Re-pull failed: '+(e.message||e));
+  }
+}
+if(typeof window !== 'undefined') window._recoveryReloadFromCloud = _recoveryReloadFromCloud;
+
+// ════════════════════════════════════════════════════════════════════════
+//  BULK UNLOCK/RELOCK — Calvin 2026-06-05
+// ════════════════════════════════════════════════════════════════════════
 function _bulkUnlockAllAgents(){
   var viewer = DB.current;
   if(!viewer || !isOwner(viewer)){
@@ -44706,38 +45044,62 @@ function submitAssignedDoc(formId){
     return;
   }
 
+  // Calvin 2026-06-08: AWAIT the cloud save so the agent doesn't get
+  // told "submitted!" until the signature is durable in Supabase. If
+  // it fails, we tell them clearly so they can retry instead of being
+  // surprised at next login.
   if(typeof markAssignedDocSigned === 'function'){
-    markAssignedDocSigned(u.id, formId, signature, responses);
-  }
-  closeAssignedDocModal();
-
-  // After completion, check if their full onboarding (built-in + required assigned) is now done
-  try {
-    if(typeof checkAndFireOnboardingCompletion === 'function'){
-      checkAndFireOnboardingCompletion(u.id);
+    // Show a saving indicator (only if cloud is reachable)
+    var hasCloud = (typeof supaClient !== 'undefined' && supaClient);
+    var savingBanner = null;
+    if(hasCloud){
+      savingBanner = document.createElement('div');
+      savingBanner.id = 'doc-saving-banner';
+      savingBanner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#0284c7;color:white;padding:14px;text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.95rem;letter-spacing:1px;z-index:100100;box-shadow:0 4px 12px rgba(0,0,0,.25)';
+      savingBanner.innerHTML = '⏳ Saving your signature to the cloud... Please do not close this tab.';
+      document.body.appendChild(savingBanner);
     }
-  } catch(e){}
 
-  // ── Calvin 2026-06-04: BG Authorization → PII Intake continuation ──
-  // When the agent submits the Authorization form (Form 1 of the BG flow),
-  // immediately show a "✓ Signed → Continue" confirmation card that
-  // launches Form 2 (the PII intake). This is a multi-step flow:
-  //   Form 1: builtin-bg-authorization  →  this card  →  Form 2: builtin-bg-pii-intake
-  // If the intake form isn't assigned to this agent yet (legacy case),
-  // fall back to the standard submitted-message + redirect.
-  if(formId === 'builtin-bg-authorization'){
-    var intakeAssigned = (typeof ASSIGNED_DOC_STATUS !== 'undefined') &&
-                         ASSIGNED_DOC_STATUS[u.id] &&
-                         ASSIGNED_DOC_STATUS[u.id]['builtin-bg-pii-intake'];
-    if(intakeAssigned && !intakeAssigned.signed){
-      _showBgIntakeContinuationCard();
-      return;
-    }
+    var savePromise = markAssignedDocSigned(u.id, formId, signature, responses);
+    Promise.resolve(savePromise).then(function(ok){
+      var b = document.getElementById('doc-saving-banner');
+      if(b) b.remove();
+      // ok === false ONLY indicates a real cloud failure when we expected
+      // cloud to work. If there was no cloud to begin with, that's local-
+      // only mode and we still proceed (data is in localStorage).
+      if(hasCloud && ok === false){
+        alert('⚠️ Your signature was captured but the cloud save did not complete. Please check your internet connection and try again. If this keeps happening, contact your administrator.');
+        return;
+      }
+      // Cloud save SUCCEEDED (or local-only mode) — close + continue
+      closeAssignedDocModal();
+      try {
+        if(typeof checkAndFireOnboardingCompletion === 'function'){
+          checkAndFireOnboardingCompletion(u.id);
+        }
+      } catch(e){}
+      if(formId === 'builtin-bg-authorization'){
+        var intakeAssigned = (typeof ASSIGNED_DOC_STATUS !== 'undefined') &&
+                             ASSIGNED_DOC_STATUS[u.id] &&
+                             ASSIGNED_DOC_STATUS[u.id]['builtin-bg-pii-intake'];
+        if(intakeAssigned && !intakeAssigned.signed){
+          _showBgIntakeContinuationCard();
+          return;
+        }
+      }
+      alert(hasCloud ? '✓ Document submitted and saved to cloud. Thank you!' : '✓ Document submitted. Thank you!');
+      if(typeof gotoPanel === 'function') gotoPanel('my-documents');
+    }).catch(function(err){
+      var b = document.getElementById('doc-saving-banner');
+      if(b) b.remove();
+      console.error('[adSubmit] save failed:', err);
+      alert('⚠️ Failed to save your signature: '+(err && err.message ? err.message : 'unknown error')+'. Please try again.');
+    });
+  } else {
+    closeAssignedDocModal();
+    alert('⚠️ Could not save: markAssignedDocSigned function is missing. Please contact your administrator.');
   }
-
-  alert('✓ Document submitted. Thank you!');
-  // Refresh the panel so the doc disappears from the pending list
-  if(typeof gotoPanel === 'function') gotoPanel('my-documents');
+  return;
 }
 
 // ────────────────────────────────────────────────────────────────────────
