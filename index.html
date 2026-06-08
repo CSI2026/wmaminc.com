@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.05.2330';
+var BUILD_VERSION = '2026.06.08.1400';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -10577,12 +10577,111 @@ var OB_TASK_NEXT_ID         = 1;
 // ════════════════════════════════════════════════════════════════════════
 var ASSIGNED_DOC_STATUS = {};
 
-function saveAssignedDocs(){
+// Calvin 2026-06-08: serialize cloud writes for assigned_doc_status to
+// eliminate the read-modify-write race. Without this, multiple rapid
+// signs could each read the cloud before any has written, causing
+// later writers to overwrite earlier ones. A simple promise chain
+// ensures saves run sequentially, so each one sees the previous write.
+var _saveAssignedDocsQueue = Promise.resolve();
+
+function saveAssignedDocs(agentIdHint){
+  // Always update localStorage immediately so the current user's UI is correct
   try{ localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); }catch(e){}
+
+  // ── Calvin 2026-06-08 ARCHITECTURAL FIX — per-agent cloud keys ──
+  // PREVIOUS BUG: this function used to UPSERT the entire ASSIGNED_DOC_STATUS
+  // blob (every agent's records) to a single Supabase row. When two
+  // agents on two different devices signed concurrently, both reads of
+  // the cloud could happen before either write — and the second writer
+  // would overwrite the first's signature.
+  //
+  // THE FIX: write each agent's records to a SEPARATE Supabase row keyed
+  // by agent id ('assigned_doc_status_<agentId>'). Concurrent saves on
+  // different agents never conflict because they touch different rows.
+  //
+  // The legacy single-row key 'assigned_doc_status' is STILL maintained
+  // (with read-modify-write merge) so the existing load handler keeps
+  // working, but the per-agent rows are the authoritative source going
+  // forward — even if the merged blob loses data, the per-agent rows
+  // act as a recovery source on next load.
+  //
+  // Per-device queue serializes saves so two rapid signs on the SAME
+  // device don't race each other either.
   if(typeof supaClient !== 'undefined' && supaClient){
-    (async function(){
-      try{ await supaClient.from('app_settings').upsert({key:'assigned_doc_status', value:JSON.stringify(ASSIGNED_DOC_STATUS)},{onConflict:'key'}); }catch(e){}
-    })();
+    _saveAssignedDocsQueue = _saveAssignedDocsQueue.then(function(){
+      return (async function(){
+        try {
+          // 1. PER-AGENT WRITE — eliminates cross-device race for
+          //    different agents signing simultaneously.
+          if(agentIdHint != null && ASSIGNED_DOC_STATUS[agentIdHint]){
+            // We know exactly which agent just saved — write only their row
+            await supaClient.from('app_settings').upsert(
+              {key:'assigned_doc_status_'+agentIdHint, value:JSON.stringify(ASSIGNED_DOC_STATUS[agentIdHint])},
+              {onConflict:'key'}
+            );
+          } else {
+            // No hint — write every known agent. Slower but still safe
+            // (e.g. for migrations or admin-side bulk saves).
+            var agentIds = Object.keys(ASSIGNED_DOC_STATUS);
+            for(var i = 0; i < agentIds.length; i++){
+              var aid = agentIds[i];
+              await supaClient.from('app_settings').upsert(
+                {key:'assigned_doc_status_'+aid, value:JSON.stringify(ASSIGNED_DOC_STATUS[aid])},
+                {onConflict:'key'}
+              );
+            }
+          }
+
+          // 2. LEGACY BLOB WRITE — read-modify-write so old code paths
+          //    that read the single 'assigned_doc_status' key still see
+          //    correct data.
+          var cloudRes = await supaClient.from('app_settings')
+            .select('value')
+            .eq('key', 'assigned_doc_status')
+            .maybeSingle();
+          var cloudData = {};
+          if(cloudRes && cloudRes.data && cloudRes.data.value){
+            try { cloudData = JSON.parse(cloudRes.data.value) || {}; }
+            catch(e){ cloudData = {}; }
+          }
+          var merged = {};
+          Object.keys(cloudData).forEach(function(agentId){
+            merged[agentId] = {};
+            Object.keys(cloudData[agentId] || {}).forEach(function(formId){
+              merged[agentId][formId] = cloudData[agentId][formId];
+            });
+          });
+          Object.keys(ASSIGNED_DOC_STATUS).forEach(function(agentId){
+            if(!merged[agentId]) merged[agentId] = {};
+            Object.keys(ASSIGNED_DOC_STATUS[agentId] || {}).forEach(function(formId){
+              var local = ASSIGNED_DOC_STATUS[agentId][formId];
+              var cloud = merged[agentId][formId];
+              if(!cloud){
+                merged[agentId][formId] = local;
+              } else if(cloud.signed === true && local.signed !== true){
+                // keep cloud
+              } else if(local.signed === true && cloud.signed !== true){
+                merged[agentId][formId] = local;
+              } else {
+                var lT = local.signedAt || local.assignedAt || '';
+                var cT = cloud.signedAt || cloud.assignedAt || '';
+                merged[agentId][formId] = (lT >= cT) ? local : cloud;
+              }
+            });
+          });
+          await supaClient.from('app_settings').upsert(
+            {key:'assigned_doc_status', value:JSON.stringify(merged)},
+            {onConflict:'key'}
+          );
+
+          // 3. Sync merged result back so we pick up other devices' recent signatures
+          ASSIGNED_DOC_STATUS = merged;
+          try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
+        } catch(e){ console.warn('[saveAssignedDocs] cloud save failed:', e); }
+      })();
+    }).catch(function(e){
+      console.warn('[saveAssignedDocs] queue link failed:', e);
+    });
   }
 }
 function loadAssignedDocs(){
@@ -18724,6 +18823,11 @@ async function loadFromSupabase(){
         // missing from cloud-load and the lockout fired again. Agent's work
         // was preserved in Supabase but unreachable.
         //
+        // Calvin 2026-06-08: ALSO load per-agent rows (assigned_doc_status_<id>).
+        // These are the authoritative source — saveAssignedDocs writes them
+        // first, then the merged blob as backup. Per-agent rows overlay
+        // the blob if both exist.
+        //
         // This single line completes the round-trip so signatures persist
         // across sessions, devices, and browser-cache-clears. The merge is
         // safe: only overwrites if cloud has a value, never wipes local
@@ -18762,6 +18866,29 @@ async function loadFromSupabase(){
               console.log('[load] assigned_doc_status loaded from Supabase — '+Object.keys(ASSIGNED_DOC_STATUS).length+' agents');
             }
           } catch(e){ console.warn('[load] assigned_doc_status parse failed:',e); }
+        }
+        // Per-agent rows (Calvin 2026-06-08) — authoritative, override blob
+        // Keys are 'assigned_doc_status_<agentId>'. Loaded after the blob
+        // so they take precedence for any agent who has a per-agent row.
+        if(/^assigned_doc_status_\d+$/.test(s.key) && s.value){
+          try {
+            var aId = parseInt(s.key.replace('assigned_doc_status_', ''), 10);
+            var perAgent = JSON.parse(s.value);
+            if(aId && perAgent && typeof perAgent === 'object'){
+              if(!ASSIGNED_DOC_STATUS[aId]) ASSIGNED_DOC_STATUS[aId] = {};
+              Object.keys(perAgent).forEach(function(formId){
+                var cloud = perAgent[formId];
+                var local = ASSIGNED_DOC_STATUS[aId][formId];
+                // Same preference rules — signed wins.
+                if(cloud && cloud.signed === true){
+                  ASSIGNED_DOC_STATUS[aId][formId] = cloud;
+                } else if(!local || !local.signed){
+                  ASSIGNED_DOC_STATUS[aId][formId] = cloud;
+                }
+              });
+              try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
+            }
+          } catch(e){ console.warn('[load] per-agent assigned_doc parse failed:',e); }
         }
         if(s.key==='payroll_access' && s.value){ try{var pa=JSON.parse(s.value);if(Array.isArray(pa))PAYROLL_ACCESS=pa;}catch(e){} }
         if(s.key==='payroll_upload_access' && s.value){ try{var pua=JSON.parse(s.value);if(Array.isArray(pua))PAYROLL_UPLOAD_ACCESS=pua;}catch(e){} }
@@ -19241,7 +19368,36 @@ function subscribeAgentsRealtime(){
         try{
           if(payload.new && payload.new.key){
             console.log('[realtime] app_setting "'+payload.new.key+'" updated');
-            // Re-load only the affected setting into memory if simple, else nudge a poll
+            // Calvin 2026-06-08: if assigned_doc_status changed remotely,
+            // re-load it into memory so this device's signed-status view
+            // is fresh. Prevents agent from re-signing a doc that's
+            // already signed elsewhere, and ensures gate checks are
+            // accurate. Merge logic preserves local-signed entries that
+            // may not yet be in the incoming payload.
+            if(payload.new.key === 'assigned_doc_status' && payload.new.value){
+              try {
+                var remoteData = JSON.parse(payload.new.value);
+                if(remoteData && typeof remoteData === 'object'){
+                  Object.keys(remoteData).forEach(function(agentId){
+                    if(!ASSIGNED_DOC_STATUS[agentId]) ASSIGNED_DOC_STATUS[agentId] = {};
+                    Object.keys(remoteData[agentId] || {}).forEach(function(formId){
+                      var remote = remoteData[agentId][formId];
+                      var local  = ASSIGNED_DOC_STATUS[agentId][formId];
+                      if(remote && remote.signed === true){
+                        // Remote signed — accept it
+                        ASSIGNED_DOC_STATUS[agentId][formId] = remote;
+                      } else if(!local || !local.signed){
+                        // Neither signed — take remote as authoritative
+                        ASSIGNED_DOC_STATUS[agentId][formId] = remote;
+                      }
+                      // else: local is signed, remote isn't — keep local
+                    });
+                  });
+                  try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
+                }
+              } catch(e){ console.warn('[realtime] assigned_doc_status merge failed:', e); }
+            }
+            // Re-render only the affected setting into memory if simple, else nudge a poll
             _smartReRender('app_settings');
           }
         }catch(e){}
@@ -23985,7 +24141,9 @@ function markAssignedDocSigned(agentId, formId, signature, responses){
     signature:   signature || '',
     responses:   responses || existing.responses || {}
   };
-  saveAssignedDocs();
+  // Calvin 2026-06-08: pass agentId so cloud write goes to the per-agent
+  // key, eliminating cross-device race for different agents signing.
+  saveAssignedDocs(agentId);
 }
 
 // Notify all currently-affected agents that a new doc is assigned to them.
