@@ -2568,6 +2568,11 @@ function loadFromStorage(){
   try { if(typeof syncIboModels === 'function') syncIboModels(); } catch(e){ console.warn('[loadFromStorage] syncIboModels failed:', e); }
   try { if(typeof ensureIboDownlinePackage === 'function') ensureIboDownlinePackage(); } catch(e){ console.warn('[loadFromStorage] ensureIboDownlinePackage failed:', e); }
   try { if(typeof makenzieBonusLoad === 'function') makenzieBonusLoad(); } catch(e){ console.warn('[loadFromStorage] makenzieBonusLoad failed:', e); }
+  // Calvin 2026-06-09: Payroll data self-heal. Fills in missing
+  // tribalLockedRate on agents whose locked rate is part of the locked
+  // comp spec but wasn't carried into the live DB. Idempotent — never
+  // overwrites an existing value.
+  try { if(typeof tcPayrollDataSelfHeal === 'function') tcPayrollDataSelfHeal(); } catch(e){ console.warn('[loadFromStorage] tcPayrollDataSelfHeal failed:', e); }
 }
 
 // ══════════════════════
@@ -3408,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.09.2030';
+var BUILD_VERSION = '2026.06.09.2230';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -6822,8 +6827,47 @@ function awCmRateFor(cm){
 
 // Look up the team's Campaign Manager / IBO. Returns agent or null.
 function tcMarketCM(team){
-  if(!team || !team.campaignManager) return null;
-  return DB.agents.find(function(a){return a.id===team.campaignManager;}) || null;
+  if(team && team.campaignManager){
+    var explicit = DB.agents.find(function(a){return a.id===team.campaignManager;});
+    if(explicit) return explicit;
+  }
+  // Calvin 2026-06-09 SELF-HEAL:
+  //   Production data often has teams with no campaignManager set on the
+  //   market record. Without this fallback, tcMarketCM returns null →
+  //   tcCmModelOf returns 'none' → CM-fill never fires → Tanita silently
+  //   loses ALL her override income. Self-heal:
+  //     1. If any team member has campaignManagerId set, use that
+  //     2. Else if there is exactly ONE active Campaign Manager in DB,
+  //        use them (the common small-business case — Tanita)
+  //     3. Else null (no fix possible without team setup)
+  if(team && Array.isArray(team.members) && team.members.length){
+    for(var i=0; i<team.members.length; i++){
+      var mem = DB.agents.find(function(a){return a.id===team.members[i];});
+      if(mem && mem.campaignManagerId){
+        var viaMem = DB.agents.find(function(a){return a.id===mem.campaignManagerId;});
+        if(viaMem) return viaMem;
+      }
+    }
+  }
+  var cms = DB.agents.filter(function(a){return a && a.active && a.role==='Campaign Manager';});
+  if(cms.length === 1) return cms[0];
+  return null;
+}
+
+// Resolve an agent's effective CM, honoring explicit campaignManagerId
+// but falling back to the lone-CM rule above. Used by payrollComputeDealSplit
+// (chargeback split path) so missing CM links don't silently zero out Tanita's
+// chargeback share.
+function tcResolveCmForAgent(agent){
+  if(!agent) return null;
+  if(agent.campaignManagerId){
+    var explicit = DB.agents.find(function(a){return a.id===agent.campaignManagerId;});
+    if(explicit) return explicit;
+  }
+  // Self-heal: lone CM in DB
+  var cms = DB.agents.filter(function(a){return a && a.active && a.role==='Campaign Manager';});
+  if(cms.length === 1) return cms[0];
+  return null;
 }
 
 // Apply retroactive sliding tier — same helper as gmSlidingTotal but
@@ -6922,15 +6966,22 @@ function payrollComputeDealSplit(opts){
   var aIsCM = (agent.role === 'Campaign Manager');
   var aIsIBO = (agent.role === 'IBO');
 
-  // Look up CM for tcModel (Tanita's market vs standard)
-  // If agent IS a CM or IBO, use their own tcModel/cmModel directly.
+  // Look up CM for tcModel (Tanita's market vs standard).
+  // If agent IS a CM or IBO, use their own tcModel directly.
+  // Otherwise resolve via tcResolveCmForAgent which self-heals missing
+  // campaignManagerId by falling back to the lone CM in DB (Tanita).
   var cmAgent;
   if(aIsCM || aIsIBO){
     cmAgent = agent;
   } else {
-    cmAgent = cmId ? DB.agents.find(function(x){return x.id===cmId;}) : null;
+    cmAgent = tcResolveCmForAgent(agent);
   }
-  var tcModel = (cmAgent && cmAgent.tcModel) || 'none';
+  // Refresh cmId to the resolved CM so downstream code routes correctly
+  // even when agent.campaignManagerId was empty in production data.
+  cmId = cmAgent ? cmAgent.id : null;
+  // Use tcCmModelOf so a missing tcModel on the CM record self-heals to
+  // 'tc-cm-difference' (for CMs) or 'tc-cm-consolidated' (for IBOs).
+  var tcModel = tcCmModelOf(cmAgent);
   var cmModel = (cmAgent && cmAgent.cmModel) || 'none';
 
   if(carrier === 'TruConnect'){
@@ -19421,6 +19472,13 @@ async function loadFromSupabase(){
         console.log('[boot-diag] ASSIGNED_DOC_STATUS loaded: agents='+agentCount+', signed-docs='+signedTotal+', unsigned-docs='+unsignedTotal);
       }
     } catch(e){ console.warn('[boot-diag] failed:', e); }
+
+    // Calvin 2026-06-09: same post-load syncs as loadFromStorage so the
+    // data self-heal runs whether we came in via local cache or Supabase.
+    try { if(typeof syncIboModels === 'function') syncIboModels(); } catch(e){ console.warn('[loadFromSupabase] syncIboModels failed:', e); }
+    try { if(typeof ensureIboDownlinePackage === 'function') ensureIboDownlinePackage(); } catch(e){ console.warn('[loadFromSupabase] ensureIboDownlinePackage failed:', e); }
+    try { if(typeof makenzieBonusLoad === 'function') makenzieBonusLoad(); } catch(e){ console.warn('[loadFromSupabase] makenzieBonusLoad failed:', e); }
+    try { if(typeof tcPayrollDataSelfHeal === 'function') tcPayrollDataSelfHeal(); } catch(e){ console.warn('[loadFromSupabase] tcPayrollDataSelfHeal failed:', e); }
   } catch(e){
     console.warn('Supabase load failed, using local:', e);
     loadFromStorage();
@@ -27858,6 +27916,40 @@ function syncIboModels(){
 }
 
 // ════════════════════════════════════════════════════════════════════════
+//  TC PAYROLL DATA SELF-HEAL (Calvin 2026-06-09)
+//
+//  Fills in missing payroll-critical fields that were never carried into
+//  the live DB but are part of the locked comp spec. Idempotent — never
+//  overwrites an explicit value, only fills gaps. Logs every change.
+//
+//  Currently handles:
+//    - Najee Burns: tribalLockedRate = 25 if unset (per locked comp spec)
+//    - Anyone with role 'IBO' but no tcModel: applyIboModelsIfIBO covers it
+//
+//  Triggered on every storage load (loadFromStorage), so any payfile run
+//  picks up the fix without requiring Calvin to manually edit profiles.
+// ════════════════════════════════════════════════════════════════════════
+function tcPayrollDataSelfHeal(){
+  if(!DB || !DB.agents) return;
+  var changed = false;
+  DB.agents.forEach(function(a){
+    if(!a || !a.active) return;
+    // Najee Burns locked $25 — per Calvin's standing locked comp spec
+    if(a.role === 'Team Leader' &&
+       typeof a.name === 'string' &&
+       a.name.trim().toLowerCase() === 'najee burns' &&
+       (typeof a.tribalLockedRate !== 'number')){
+      a.tribalLockedRate = 25;
+      console.log('[tcPayrollDataSelfHeal] Najee Burns → tribalLockedRate=25 (per locked spec)');
+      changed = true;
+    }
+  });
+  if(changed){
+    try{ saveToStorage(); }catch(e){ console.warn('[tcPayrollDataSelfHeal] save failed:', e); }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
 //  IBO DOWNLINE ONBOARDING PACKAGE (Calvin 2026-04-30)
 //
 //  Auto-seeded package for agents who fall under an IBO upline.
@@ -34249,24 +34341,26 @@ function payrollSplitPersonalVsOverrides(breakdown){
     var label = String(b.label || '').toLowerCase();
     var amountCents = Math.round((b.amount || 0) * 100);
 
-    // OVERRIDE patterns — pay from others' work
+    // OVERRIDE patterns — pay from another agent's enrollment work:
     //   "TL Tribal override on X"
     //   "MM NLAD override on X"
     //   "CM NLAD diff on X" / "CM Tribal diff on X"
-    //   "ibo-consolidated" (Juan getting paid for his agents' deals)
-    //   any other " on " phrase that signals downstream-agent attribution
-    //   "override on", "diff on", "fill on" all signal override income
+    //   "Makenzie bonus on X" (Stephanie's GM org)
+    // The " on X" suffix is the signal that this is downstream-agent
+    // attribution. Without it, it's personal pay — including:
+    //   "Personal Tribal (...)"
+    //   "Personal NLAD (...)"
+    //   "Tribal enrollments"
+    //   "NLAD enrollments"
+    //   "Tribal (... consolidated)" — IBO personal under consolidated model
+    //   "Port-in/out bonus"
+    //   "Chargebacks"
     var isOverride =
       label.indexOf(' override on ') >= 0 ||
       label.indexOf(' diff on ')     >= 0 ||
       label.indexOf(' fill on ')     >= 0 ||
-      label.indexOf('override (')    >= 0 ||
-      /\(.*consolidated.*\)/.test(label) && label.indexOf('personal') < 0;
+      label.indexOf(' bonus on ')    >= 0;
 
-    // CHARGEBACKS in commissions are routed via cascade, not here, but
-    // if a "Chargebacks" line item ever sneaks in we'll keep it on the
-    // personal side as a deduction-against-personal (rare path; the real
-    // chargeback path is payrollApplyDeductions).
     if(isOverride){
       overrideCents += amountCents;
       overrideLines.push(b);
@@ -34368,6 +34462,60 @@ function ppRenderCarrierPreview(carrier, parsed){
     if(inv.agingCredit)    h += '<span style="color:#059669">Aging Credits: <strong>$'+inv.agingCredit+'</strong></span>';
     if(inv.tcTotal)        h += '<span style="color:#059669;font-weight:700">TC Net: <strong>$'+inv.tcTotal+'</strong></span>';
     h += '</div></div>';
+  }
+
+  // ──────────── DATA INTEGRITY WARNINGS (Calvin 2026-06-09) ────────────
+  // Calls out any fields the engine auto-healed at runtime — so Calvin
+  // can fix them permanently in the agent profiles if he wants. Without
+  // this surface, self-heals are silent and easy to miss.
+  if(isTC){
+    var integrityWarnings = [];
+    // Check each matched agent for missing fields the engine had to heal
+    matched.forEach(function(m){
+      var a = m.agent;
+      // Najee: locked $25 per spec but no rate set on profile
+      if(a.role === 'Team Leader' &&
+         a.name && a.name.trim().toLowerCase() === 'najee burns' &&
+         typeof a.tribalLockedRate !== 'number'){
+        integrityWarnings.push({
+          severity: 'auto-healed',
+          message: '<strong>'+a.name+'</strong> has no <code>tribalLockedRate</code> set on profile — engine auto-applied $25 lock per spec'
+        });
+      }
+      // CM not set on TL/FA profile in tc-cm-difference market
+      if((a.role === 'Team Leader' || a.role === 'Field Agent') && !a.campaignManagerId){
+        var auto = tcResolveCmForAgent(a);
+        if(auto){
+          integrityWarnings.push({
+            severity: 'auto-healed',
+            message: '<strong>'+a.name+'</strong> has no Campaign Manager set on profile — engine auto-routed to <strong>'+auto.name+'</strong> (lone CM)'
+          });
+        } else {
+          integrityWarnings.push({
+            severity: 'error',
+            message: '<strong>'+a.name+'</strong> has no Campaign Manager set AND no fallback CM available — overrides cannot be paid'
+          });
+        }
+      }
+      // CM record missing tcModel
+      if(a.role === 'Campaign Manager' && !a.tcModel){
+        integrityWarnings.push({
+          severity: 'auto-healed',
+          message: '<strong>'+a.name+'</strong> has no <code>tcModel</code> set on profile — engine auto-applied <code>tc-cm-difference</code>'
+        });
+      }
+    });
+    if(integrityWarnings.length){
+      h += '<div style="background:rgba(217,119,6,.04);border:1px solid rgba(217,119,6,.35);border-radius:8px;padding:12px 14px;margin-bottom:14px">';
+      h += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;color:#92400E;letter-spacing:1.5px;margin-bottom:8px">⚠ '+integrityWarnings.length+' Data Self-Heal'+(integrityWarnings.length>1?'s':'')+' Applied</div>';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:10px">The engine filled in missing data so payroll calculates correctly. Optional: fix these in each agent\'s profile so the warnings stop appearing.</div>';
+      h += '<ul style="margin:0;padding-left:20px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;line-height:1.7">';
+      integrityWarnings.forEach(function(w){
+        var color = w.severity === 'error' ? '#991B1B' : '#92400E';
+        h += '<li style="color:'+color+'">'+w.message+'</li>';
+      });
+      h += '</ul></div>';
+    }
   }
 
   // Unmatched section first so the user sees what needs attention.
