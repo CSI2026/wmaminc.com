@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.09.1730';
+var BUILD_VERSION = '2026.06.09.2030';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -6738,7 +6738,17 @@ function tcTLTribalPersonalTotal(tlRecord, tlPersonalTribalCount){
 // Look up the tcModel for an agent record. Defaults to 'none'.
 function tcCmModelOf(agent){
   if(!agent) return 'none';
-  return agent.tcModel || 'none';
+  if(agent.tcModel) return agent.tcModel;
+  // Calvin 2026-06-09 SELF-HEAL:
+  //   If an agent is a Campaign Manager (or IBO) and tcModel was never
+  //   set on their profile, default to the most common arrangement.
+  //   Without this fallback, Tanita's overrides + CM-fill silently
+  //   disappear from payroll, which is exactly what was happening in
+  //   production. This NEVER overwrites an explicit tcModel — only fills
+  //   the gap when none is set, and only for CMs/IBOs.
+  if(agent.role === 'Campaign Manager') return 'tc-cm-difference';
+  if(agent.role === 'IBO')              return 'tc-cm-consolidated';
+  return 'none';
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -8240,11 +8250,13 @@ function tcCalculateWeek(weekRows){
   //   (which would Tanita-fill them at $28 each), we route IBO personal
   //   enrollments into a synthetic team bucket owned by the IBO.
   weekRows.forEach(function(r){
-    // Resolve the agent's own role/model first — IBOs split out
+    // Resolve the agent's own role/model first — IBOs split out.
+    // Use tcCmModelOf so missing tcModel on an IBO profile is self-healed
+    // (returns 'tc-cm-consolidated' for any agent with role='IBO').
     var enrollingAgent = DB.agents.find(function(a){return a.id===r.agentId;});
     var isIBOPersonal = enrollingAgent &&
                         enrollingAgent.role === 'IBO' &&
-                        enrollingAgent.tcModel === 'tc-cm-consolidated';
+                        tcCmModelOf(enrollingAgent) === 'tc-cm-consolidated';
 
     var team, teamId;
     if(isIBOPersonal){
@@ -34213,6 +34225,64 @@ function ppComputeAgentCommissions(parsed, carrier){
   return out;
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  Calvin 2026-06-09 — Categorize breakdown line items into Personal
+//  vs Overrides for the per-agent summary block.
+//
+//  PERSONAL: pay from the agent's own enrollments (their personal Tribal,
+//  NLAD, port-ins, consolidated IBO pay on their own deals).
+//
+//  OVERRIDES: pay from TEAM MEMBERS' enrollments (TL override on FA deals,
+//  CM-fill, MM override, IBO consolidated on others' enrollments,
+//  Makenzie's Stephanie-org bonus, etc).
+//
+//  This split is what Calvin needs to see at a glance to confirm
+//  Tanita/Sheila/Najee/etc. are getting their override income, not just
+//  personal pay.
+//
+//  Returns: { personalCents, overrideCents, personalLines, overrideLines }
+// ════════════════════════════════════════════════════════════════════
+function payrollSplitPersonalVsOverrides(breakdown){
+  var personalCents = 0, overrideCents = 0;
+  var personalLines = [], overrideLines = [];
+  (breakdown || []).forEach(function(b){
+    var label = String(b.label || '').toLowerCase();
+    var amountCents = Math.round((b.amount || 0) * 100);
+
+    // OVERRIDE patterns — pay from others' work
+    //   "TL Tribal override on X"
+    //   "MM NLAD override on X"
+    //   "CM NLAD diff on X" / "CM Tribal diff on X"
+    //   "ibo-consolidated" (Juan getting paid for his agents' deals)
+    //   any other " on " phrase that signals downstream-agent attribution
+    //   "override on", "diff on", "fill on" all signal override income
+    var isOverride =
+      label.indexOf(' override on ') >= 0 ||
+      label.indexOf(' diff on ')     >= 0 ||
+      label.indexOf(' fill on ')     >= 0 ||
+      label.indexOf('override (')    >= 0 ||
+      /\(.*consolidated.*\)/.test(label) && label.indexOf('personal') < 0;
+
+    // CHARGEBACKS in commissions are routed via cascade, not here, but
+    // if a "Chargebacks" line item ever sneaks in we'll keep it on the
+    // personal side as a deduction-against-personal (rare path; the real
+    // chargeback path is payrollApplyDeductions).
+    if(isOverride){
+      overrideCents += amountCents;
+      overrideLines.push(b);
+    } else {
+      personalCents += amountCents;
+      personalLines.push(b);
+    }
+  });
+  return {
+    personalCents:  personalCents,
+    overrideCents:  overrideCents,
+    personalLines:  personalLines,
+    overrideLines:  overrideLines
+  };
+}
+
 function ppRenderCarrierPreview(carrier, parsed){
   var match = ppMatchRowsToAgents(parsed, carrier);
   var matched = match.matched, unmatched = match.unmatched;
@@ -34559,32 +34629,105 @@ function ppRenderCarrierPreview(carrier, parsed){
       }
 
       // Per-agent net pay summary
+      // Calvin 2026-06-09: Split GROSS into PERSONAL + OVERRIDES so
+      // it's obvious at a glance whether each agent is getting their
+      // override income (CM-fill for Tanita, TL override for Sheila/Najee,
+      // MM bonus, etc).
       h += '<div style="background:rgba(0,53,148,.03);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:12px 14px">';
       h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--blue);font-weight:700;margin-bottom:8px">Net Pay Summary</div>';
       h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
       h += '<thead><tr style="border-bottom:1px solid rgba(0,53,148,.2)">';
       h += '<th style="text-align:left;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Agent</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Personal</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Overrides</th>';
       h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Gross</th>';
       h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Prior Debt</th>';
       h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Deductions</th>';
       h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Credits</th>';
-      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Net Pay</th>';
+      h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Final Pay</th>';
       h += '<th style="text-align:right;padding:6px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Carryover</th>';
       h += '</tr></thead><tbody>';
       Object.keys(cascadeResult.netByAgent || {}).sort(function(a,b){return parseInt(a)-parseInt(b);}).forEach(function(aid){
         var n = cascadeResult.netByAgent[aid];
         var ag = DB.agents.find(function(x){return x.id===parseInt(aid);}) || {name:'Agent #'+aid};
+        // Look up this agent's commission breakdown to split personal vs overrides
+        var agentComm = (commissions.byAgent || {})[aid] || (commissions.byAgent || {})[parseInt(aid,10)];
+        var split = payrollSplitPersonalVsOverrides(agentComm ? agentComm.breakdown : []);
         h += '<tr style="border-bottom:1px solid rgba(0,0,0,.05)">';
         h += '<td style="padding:6px 8px;font-size:.78rem"><strong>'+ag.name+'</strong></td>';
-        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:var(--muted)">$'+(n.grossCents/100).toFixed(2)+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:var(--ink)">'+(split.personalCents?'$'+(split.personalCents/100).toFixed(2):'—')+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(split.overrideCents?'#0F766E':'var(--muted2)')+';font-weight:'+(split.overrideCents?'600':'400')+'">'+(split.overrideCents?'+$'+(split.overrideCents/100).toFixed(2):'—')+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:var(--muted)"><strong>$'+(n.grossCents/100).toFixed(2)+'</strong></td>';
         h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(n.debtPaidCents?'#D97706':'var(--muted2)')+'">'+(n.debtPaidCents?'−$'+(n.debtPaidCents/100).toFixed(2):'—')+'</td>';
         h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(n.deductionsCents?'#991B1B':'var(--muted2)')+'">'+(n.deductionsCents?'−$'+(n.deductionsCents/100).toFixed(2):'—')+'</td>';
         h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(n.creditsCents?'#059669':'var(--muted2)')+'">'+(n.creditsCents?'+$'+(n.creditsCents/100).toFixed(2):'—')+'</td>';
-        h += '<td style="padding:6px 8px;text-align:right;font-size:.85rem;color:#059669;font-weight:700">$'+(n.netCents/100).toFixed(2)+'</td>';
+        h += '<td style="padding:6px 8px;text-align:right;font-size:.9rem;color:#059669;font-weight:700">$'+(n.netCents/100).toFixed(2)+'</td>';
         h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(n.carryoverCents?'#991B1B':'var(--muted2)')+'">'+(n.carryoverCents?'$'+(n.carryoverCents/100).toFixed(2):'—')+'</td>';
         h += '</tr>';
       });
       h += '</tbody></table></div></div>';
+
+      // ──────────── DIAGNOSTIC PANEL (collapsed by default) ────────────
+      // Calvin 2026-06-09: When live payroll numbers look wrong (e.g. an
+      // agent missing their overrides), expand this to see EXACTLY what
+      // the engine resolved for each agent: role, tcModel, CM chain, and
+      // the full commission breakdown line-by-line. Click 🔍 to expand.
+      h += '<details style="margin-top:14px;background:rgba(124,58,237,.04);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:10px 14px">';
+      h += '<summary style="cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.3px;text-transform:uppercase;color:#7c3aed;font-weight:700">🔍 Engine Diagnostic — agent setup, splits, cascade trail</summary>';
+      h += '<div style="margin-top:12px;font-family:ui-monospace,Menlo,monospace;font-size:.7rem;line-height:1.55;color:#3d3d4a">';
+
+      // For each matched agent, show their resolved attributes
+      h += '<div style="margin-bottom:14px"><strong style="color:#7c3aed">AGENT PROFILES (as seen by engine)</strong></div>';
+      h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:ui-monospace,Menlo,monospace;font-size:.68rem">';
+      h += '<thead><tr style="background:rgba(124,58,237,.08)"><th style="text-align:left;padding:4px 8px">Agent</th><th style="text-align:left;padding:4px 8px">id</th><th style="text-align:left;padding:4px 8px">role</th><th style="text-align:left;padding:4px 8px">tcModel</th><th style="text-align:left;padding:4px 8px">tribalLocked</th><th style="text-align:left;padding:4px 8px">CM</th><th style="text-align:left;padding:4px 8px">MM</th><th style="text-align:left;padding:4px 8px">TL</th></tr></thead><tbody>';
+      matched.forEach(function(m){
+        var a = m.agent;
+        var cm = a.campaignManagerId ? (DB.agents.find(function(x){return x.id===a.campaignManagerId;})||{}).name : '—';
+        var mm = a.marketManagerId   ? (DB.agents.find(function(x){return x.id===a.marketManagerId;})||{}).name   : '—';
+        var tl = a.teamLeaderId      ? (DB.agents.find(function(x){return x.id===a.teamLeaderId;})||{}).name      : '—';
+        h += '<tr><td style="padding:3px 8px"><strong>'+a.name+'</strong></td><td style="padding:3px 8px">'+a.id+'</td><td style="padding:3px 8px">'+(a.role||'?')+'</td><td style="padding:3px 8px;color:'+(a.tcModel?'#059669':'#991B1B')+'">'+(a.tcModel||'(none)')+'</td><td style="padding:3px 8px">'+(typeof a.tribalLockedRate==='number'?'$'+a.tribalLockedRate:'—')+'</td><td style="padding:3px 8px">'+cm+'</td><td style="padding:3px 8px">'+mm+'</td><td style="padding:3px 8px">'+tl+'</td></tr>';
+      });
+      h += '</tbody></table></div>';
+
+      // Per-agent commission breakdown
+      h += '<div style="margin-top:16px;margin-bottom:8px"><strong style="color:#7c3aed">COMMISSION BREAKDOWN (engine output)</strong></div>';
+      Object.keys(commissions.byAgent || {}).forEach(function(aid){
+        var entry = commissions.byAgent[aid];
+        var ag = DB.agents.find(function(x){return x.id===parseInt(aid,10);}) || {name:'#'+aid};
+        var split = payrollSplitPersonalVsOverrides(entry.breakdown);
+        h += '<div style="margin-bottom:10px;padding:6px 10px;background:rgba(0,0,0,.02);border-left:2px solid #7c3aed">';
+        h += '<div style="font-weight:700;color:#3d3d4a">'+ag.name+' — $'+(entry.commissionCents/100).toFixed(2)+' gross  <span style="color:#0F766E">(Personal $'+(split.personalCents/100).toFixed(2)+' + Overrides $'+(split.overrideCents/100).toFixed(2)+')</span></div>';
+        (entry.breakdown || []).forEach(function(b){
+          var labelLower = String(b.label||'').toLowerCase();
+          var isOv = labelLower.indexOf(' override on ')>=0 || labelLower.indexOf(' diff on ')>=0 || labelLower.indexOf(' fill on ')>=0;
+          h += '<div style="padding-left:14px;color:'+(isOv?'#0F766E':'#3d3d4a')+'">'+(isOv?'⊕':'•')+' ['+(b.count||0)+' × $'+(b.rate||0)+'] $'+(b.amount||0).toFixed(2)+' — '+b.label+'</div>';
+        });
+        h += '</div>';
+      });
+
+      // Cascade trail (chargebacks)
+      if(cascadeResult && cascadeResult.audit && cascadeResult.audit.length){
+        h += '<div style="margin-top:16px;margin-bottom:8px"><strong style="color:#7c3aed">CHARGEBACK CASCADE TRAIL (who paid back what)</strong></div>';
+        cascadeResult.audit.filter(function(a){return a.kind==='deduction';}).forEach(function(a){
+          h += '<div style="margin-bottom:6px;padding:4px 10px;background:rgba(153,27,27,.04);border-left:2px solid #991B1B">';
+          h += '<div style="font-weight:600">cancel of <strong>'+a.agentName+'</strong> #'+a.orderNum+' ('+(a.type||'?')+' — $'+((a.amountCents||0)/100).toFixed(2)+')</div>';
+          (a.trail||[]).forEach(function(t){
+            h += '<div style="padding-left:14px;color:#3d3d4a">↳ '+t.name+' ('+t.role+'): $'+((t.paidCents||0)/100).toFixed(2)+'</div>';
+          });
+          h += '</div>';
+        });
+      }
+
+      // Unmatched rows
+      if(unmatched && unmatched.length){
+        h += '<div style="margin-top:16px;margin-bottom:8px"><strong style="color:#991B1B">UNMATCHED ROWS</strong> (these agents got $0 from the engine because no matching DB agent record was found)</div>';
+        unmatched.forEach(function(u){
+          h += '<div style="padding:4px 10px;background:rgba(153,27,27,.08);color:#991B1B;margin-bottom:3px">⚠️ "'+(u.agentCode||u)+'" — '+(u.activations?u.activations.Total+' activations':'?')+' — could not find matching agent in DB</div>';
+        });
+      }
+
+      h += '</div></details>';
+
       h += '</div>';  // close DEDUCTIONS & CREDITS section
     }
   }
