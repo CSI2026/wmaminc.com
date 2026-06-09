@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.10.0430';
+var BUILD_VERSION = '2026.06.10.0630';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -8081,6 +8081,23 @@ function payrollApplyDeductions(opts){
                     ? payrollLookupDealPay(d.orderNum, carrier) : null;
     var useSplitMath = !!(splitData && splitData.splits && splitData.splits.length);
 
+    // ── Calvin 2026-06-10 FIX ──
+    // Device Upgrades are FLAT device-cost deductions ($10 base + $5 boost
+    // for Cloud T2 Elite tablets), NOT enrollment chargebacks. Split-math
+    // computes the original enrollment cap split (e.g. $18+$3+$7=$28 for
+    // a Tribal cancel) which is the wrong number entirely for a device
+    // cost. The named agent (or their market chain if unassigned) owes
+    // the device cost as a flat amount.
+    //
+    // Force the legacy cascade path for Device Upgrades — that path
+    // honors d.amountCents directly, which is where baseCents+boostCents
+    // lives. Without this guard, the +$5 tablet boost gets dropped
+    // because split-math never reads d.amountCents.
+    if(d.type === 'Device Upgrade'){
+      useSplitMath = false;
+      splitData = null;
+    }
+
     // ── Calvin 2026-05-15 PERMANENT FIX ──
     // If we don't have historical splits saved (sales week missing, agent-
     // code mismatch on original commit, etc.) we previously fell back to the
@@ -8098,7 +8115,7 @@ function payrollApplyDeductions(opts){
     // back more than we paid. If anything, we claw back slightly LESS than
     // a tier-2 agent earned, which is a small acceptable variance compared
     // to wrongly clawing back the full $28.
-    if(!useSplitMath && carrier === 'TruConnect' && agent && typeof payrollComputeDealSplit === 'function'){
+    if(!useSplitMath && carrier === 'TruConnect' && agent && d.type !== 'Device Upgrade' && typeof payrollComputeDealSplit === 'function'){
       try {
         var computed = payrollComputeDealSplit({
           carrier: 'TruConnect',
@@ -9858,25 +9875,20 @@ function parseTruConnectFile(arrayBuffer){
       }
       var rawCost = Number(r[uCostCol])||0;
       if(rawCost === 0) return;
-      // ── Calvin 2026-06-10 LOCKED SPEC (updated from real file) ──
-      // Cloud T2 Elite tablet: +$5 boost on top of the file's amount.
-      // The carrier deducts the standard cost but the company charges the
-      // agent $5 more because tablet costs are higher on expirations.
+      // ── Calvin 2026-06-10 LOCKED SPEC ──
+      // Cloud T2 Elite tablets: flat $15 deduction (per Calvin's locked
+      // rate spec). The carrier's listed price for these tablets is
+      // ignored — these are always $15 regardless of what the file says.
+      // All other device upgrades: use the carrier's listed price.
       //
-      // Match logic: case-insensitive trim, STARTS-WITH "cloud t2 elite".
-      // The real file (WIL-300) uses the product name
-      //   "Cloud T2 Elite Tablet 10 Cost"
-      // — NOT the bare "Cloud T2 Elite" the original spec assumed. The
-      // starts-with match catches both that exact wording and any future
-      // variants like "Cloud T2 Elite Tablet 12 Cost" without missing.
-      // All other product names: charge whatever the file says (no boost).
+      // Match: case-insensitive trim, STARTS-WITH "cloud t2 elite".
+      // Catches "Cloud T2 Elite", "Cloud T2 Elite Tablet 10 Cost",
+      // "Cloud T2 Elite Tablet 12 Cost", and any future variant.
       var productName = asStr(r[uProdCol]);
-      var baseCents = Math.abs(Math.round(rawCost * 100));
-      var boostCents = 0;
+      var filePriceCents = Math.abs(Math.round(rawCost * 100));
       var productNorm = String(productName||'').trim().toLowerCase();
-      if(productNorm.indexOf('cloud t2 elite') === 0){
-        boostCents = 500;   // +$5 tablet boost
-      }
+      var isCloudT2Elite = productNorm.indexOf('cloud t2 elite') === 0;
+      var finalCents = isCloudT2Elite ? 1500 : filePriceCents;
       result.deductions.push({
         type:        'Device Upgrade',
         agentName:   name,
@@ -9886,9 +9898,10 @@ function parseTruConnectFile(arrayBuffer){
         serial:      asStr(r[uSerCol]),
         productName: productName,
         date:        ppExcelDateToStr(r[uDateCol]),
-        amountCents: baseCents + boostCents,
-        baseCents:   baseCents,         // file's amount (for audit/UI display)
-        boostCents:  boostCents,        // diagnostic visibility
+        amountCents: finalCents,
+        // Internal audit fields (not surfaced in UI):
+        baseCents:   filePriceCents,     // what the carrier file said
+        rateOverride:isCloudT2Elite ? 'cloud-t2-elite-flat-15' : null,
         isTribal:    null,
         rawSheet:    upgSheet.name
       });
@@ -34804,40 +34817,31 @@ function ppRenderCarrierPreview(carrier, parsed){
     });
     // Cloud T2 Elite tablet boost notice (Calvin 2026-06-10 locked spec)
     // Plus: list EVERY unique product name found in Device Upgrades so
-    // Calvin can spot future variants that should also be boosted but
-    // don't match the current rule. If a new product appears, it shows
-    // up here as "not boosted" and Calvin can update the spec.
+    // Calvin 2026-06-10: list every distinct Device Upgrade product name
+    // appearing in the file so Calvin can spot new variants. No "boost"
+    // language — for Cloud T2 Elite tablets the rate is just $15 (the
+    // override is implementation detail, not user-facing).
     var allUpgrades = (parsed.deductions || []).filter(function(d){
       return d.type === 'Device Upgrade';
     });
-    var t2EliteDeductions = allUpgrades.filter(function(d){
-      return d.boostCents && d.boostCents > 0;
-    });
-    if(t2EliteDeductions.length){
-      var totalBoost = t2EliteDeductions.reduce(function(sum, d){return sum + d.boostCents;}, 0);
-      integrityWarnings.push({
-        severity: 'info-boost',
-        message: '💎 <strong>Cloud T2 Elite tablet boost</strong>: +$5 applied to '+t2EliteDeductions.length+' device upgrade'+(t2EliteDeductions.length>1?'s':'')+' (+$'+(totalBoost/100).toFixed(2)+' total) per locked spec'
-      });
-    }
-    // Surface ALL Device Upgrade product names — boosted and non-boosted —
-    // so Calvin sees at a glance whether a new variant needs a spec update.
     if(allUpgrades.length){
       var byProduct = {};
       allUpgrades.forEach(function(d){
         var key = (d.productName || '(no name)');
-        if(!byProduct[key]) byProduct[key] = {count:0, boosted:0, totalAmount:0};
+        if(!byProduct[key]) byProduct[key] = {count:0, totalAmount:0, override:!!d.rateOverride};
         byProduct[key].count++;
         byProduct[key].totalAmount += d.amountCents || 0;
-        if(d.boostCents > 0) byProduct[key].boosted++;
       });
-      var unboostedNames = Object.keys(byProduct).filter(function(k){
-        return byProduct[k].boosted === 0;
+      // Only flag products NOT covered by a rate override — those use the
+      // carrier's file price directly. Calvin sees this and can confirm
+      // the file price is the correct deduction (or update the spec).
+      var unoverriddenNames = Object.keys(byProduct).filter(function(k){
+        return !byProduct[k].override;
       });
-      if(unboostedNames.length){
-        var msg = '⚠ <strong>Device Upgrade products NOT receiving the +$5 boost</strong> (verify these are correct):';
+      if(unoverriddenNames.length){
+        var msg = '📋 <strong>Device Upgrade products in this file</strong> (charging carrier\'s listed price — verify these are correct):';
         msg += '<ul style="margin:4px 0 0 0;padding-left:18px">';
-        unboostedNames.forEach(function(name){
+        unoverriddenNames.forEach(function(name){
           var info = byProduct[name];
           msg += '<li><code>'+name+'</code> &mdash; '+info.count+' row'+(info.count>1?'s':'')+' totaling $'+(info.totalAmount/100).toFixed(2)+'</li>';
         });
