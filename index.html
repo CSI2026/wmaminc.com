@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.09.1530';
+var BUILD_VERSION = '2026.06.09.1730';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -7001,22 +7001,28 @@ function payrollComputeDealSplit(opts){
       splits.push({aid:aid, role:enrollerRole, cents:agentRate*100});
 
       // ── TL back-end override (only on FA enrollments) ──
-      // TL fills the gap from agent's rate up to TL's own rate.
-      // If TL has tribalLockedRate, that's the ceiling; otherwise it's the sliding rate.
+      // Calvin 2026-06-09 LOCKED SPEC (TANITA's market only):
+      //   tc-cm-difference: flat $3 per agent Tribal enrollment to the TL
+      //                     regardless of tier or lock.
+      //   Standard market:  TL gets ($25 - agent rate) — old behavior.
       var tlOverride = 0;
       if(tlId && agent.role === 'Field Agent'){
-        tlOverride = Math.max(0, tlRate - agentRate);
+        if(tcModel === 'tc-cm-difference'){
+          tlOverride = 3;
+        } else {
+          tlOverride = Math.max(0, tlRate - agentRate);
+        }
         if(tlOverride > 0){
           splits.push({aid:tlId, role:'tl-diff', cents:tlOverride*100});
         }
       }
 
-      // ── MM back-end override (option A — applies to FA and TL enrollments) ──
-      // MM fills the gap from the prior tier up to $25.
-      // For MM personal enrollment: MM already got $25, override is $0.
-      // For TL/FA enrollment: MM fills from (agent+TL) up to $25.
+      // ── MM back-end override ──
+      // Standard market: MM fills the gap from (agent+TL) up to $25.
+      // tc-cm-difference (Tanita's market): NO MM Tribal layer — Tanita
+      // takes whatever is left after agent+$3 TL.
       var mmOverride = 0;
-      if(mmId && !aIsMM && (agent.role === 'Field Agent' || aIsTL)){
+      if(tcModel !== 'tc-cm-difference' && mmId && !aIsMM && (agent.role === 'Field Agent' || aIsTL)){
         var afterTL = agentRate + tlOverride;
         mmOverride = Math.max(0, 25 - afterTL);
         if(mmOverride > 0){
@@ -7025,6 +7031,7 @@ function payrollComputeDealSplit(opts){
       }
 
       // ── CM fill (tc-cm-difference markets only — Tanita) ──
+      // Tanita absorbs whatever's left after agent + TL flat $3.
       if(tcModel === 'tc-cm-difference' && cmId){
         var cmFill = 28 - agentRate - tlOverride - mmOverride;
         if(cmFill > 0){
@@ -8220,10 +8227,39 @@ function tcCalculateWeek(weekRows){
   }
 
   // Pass 1: bucket rows by team and tally per-agent counts
+  //
+  // Calvin 2026-06-09 LOCKED IBO ROUTING:
+  //   An IBO (tcModel='tc-cm-consolidated') gets paid $25 flat Tribal /
+  //   $10 flat NLAD on ALL their personal enrollments — regardless of
+  //   what market the enrollment was made in. Even if Juan personally
+  //   enrolls a deal inside Tanita's Tulsa market, that deal must NOT
+  //   flow through Tanita's tc-cm-difference math; it must go to Juan
+  //   at the IBO consolidated rate.
+  //
+  //   To prevent IBO deals from contaminating the market-level math
+  //   (which would Tanita-fill them at $28 each), we route IBO personal
+  //   enrollments into a synthetic team bucket owned by the IBO.
   weekRows.forEach(function(r){
-    // Reuse the GM team-resolution helper — teams are shared across campaigns
-    var team = (typeof gmAgentTeam === 'function') ? gmAgentTeam(r.agentId) : null;
-    var teamId = team ? team.id : '__no_team__';
+    // Resolve the agent's own role/model first — IBOs split out
+    var enrollingAgent = DB.agents.find(function(a){return a.id===r.agentId;});
+    var isIBOPersonal = enrollingAgent &&
+                        enrollingAgent.role === 'IBO' &&
+                        enrollingAgent.tcModel === 'tc-cm-consolidated';
+
+    var team, teamId;
+    if(isIBOPersonal){
+      // Synthetic per-IBO bucket. Treat the IBO as both CM and TL/member
+      // of their own bucket. This keeps the consolidated path firing in
+      // Pass 2 regardless of what market the row's team was assigned to.
+      teamId = '__ibo_'+r.agentId;
+      team   = { id:teamId, name:(enrollingAgent.name||'IBO')+' (consolidated)',
+                 active:true, campaignManager:r.agentId, marketManager:null,
+                 leader:r.agentId, members:[r.agentId] };
+    } else {
+      team   = (typeof gmAgentTeam === 'function') ? gmAgentTeam(r.agentId) : null;
+      teamId = team ? team.id : '__no_team__';
+    }
+
     if(!byTeam[teamId]){
       byTeam[teamId] = { team:team, rows:[], nladCount:0, tribalCount:0,
                          portCount:0, agents:{} };
@@ -8403,13 +8439,26 @@ function tcCalculateWeek(weekRows){
       if(!tlRecord || tlRecord.role !== 'Team Leader') return;
       var aName = agentRecord.name || 'agent';
       var agentTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.agentTier);
-      // Calvin 2026-06-09 FIX: TL override rate must come from the TL's OWN
-      // personal count (not the agent's count) and must respect locked
-      // rates. Najee Burns is locked at $25 → his override is always
-      // ($25 - agent rate), never the sliding number.
-      var tlPersonalCount = (t.agents[thisAgentsTLId] || {tribal:0}).tribal || 0;
-      var tlTribalRate    = tcTLTribalRate(tlRecord, tlPersonalCount);
-      var diffPerEnrollment = tlTribalRate - agentTribalRate;
+
+      // Calvin 2026-06-09 LOCKED SPEC (TANITA's market only):
+      //   In tc-cm-difference markets, the TL override on every agent Tribal
+      //   enrollment is FLAT $3 — regardless of whether the agent is in
+      //   under-30 tier ($18) or 30+ tier ($23), and regardless of whether
+      //   the TL is sliding (Sheila) or locked (Najee).
+      //   Tanita absorbs whatever is left over to hit $28 (handled in Layer 4).
+      //
+      // In standard markets (tcModel !== 'tc-cm-difference'), the OLD spec
+      // still applies: TL gets the difference between TL's own rate and
+      // agent rate. TL's rate comes from TL's OWN personal count (and
+      // honors tribalLockedRate if set).
+      var diffPerEnrollment;
+      if(tcModel === 'tc-cm-difference'){
+        diffPerEnrollment = 3;   // FLAT per locked spec
+      } else {
+        var tlPersonalCount = (t.agents[thisAgentsTLId] || {tribal:0}).tribal || 0;
+        var tlTribalRate    = tcTLTribalRate(tlRecord, tlPersonalCount);
+        diffPerEnrollment   = Math.max(0, tlTribalRate - agentTribalRate);
+      }
       if(diffPerEnrollment > 0){
         bump(thisAgentsTLId, a.tribal * diffPerEnrollment,
              'TL Tribal override on '+aName+' ($'+diffPerEnrollment+'/each)',
@@ -8501,17 +8550,19 @@ function tcCalculateWeek(weekRows){
               ? TC_RATES.tribal.agentTier.tier1
               : TC_RATES.tribal.agentTier.tier2;
           }
-          // TL override paid in Layer 2 — only if this agent reports to a real TL.
-          // Calvin 2026-06-09 FIX: TL's rate must come from TL's OWN personal
-          // count and must respect tribalLockedRate. Najee at $25 locked
-          // means his override is always $25 - agent rate, not sliding.
+          // Calvin 2026-06-09 LOCKED SPEC (TANITA's market only):
+          //   In tc-cm-difference markets the TL override is FLAT $3 per
+          //   agent enrollment (handled in Layer 2). So CM fill = target
+          //   minus agent rate minus $3 — what's left over to hit $28.
+          //   For TL personal enrollments (no Layer 2 fires), CM fill =
+          //   target minus TL personal rate.
+          //   For MM/CM personals: no TL override at all, fill = target -
+          //   agent rate (already 0 for CM personals because we early-return).
           var tlOverridePaid = 0;
           if(!isThisAgentTL && !isThisAgentMM && agentRecord.teamLeaderId){
             var tlRecord = DB.agents.find(function(x){return x.id===agentRecord.teamLeaderId;});
             if(tlRecord && tlRecord.role === 'Team Leader'){
-              var tlPersCount = (t.agents[agentRecord.teamLeaderId] || {tribal:0}).tribal || 0;
-              var tlTribalRate = tcTLTribalRate(tlRecord, tlPersCount);
-              tlOverridePaid = Math.max(0, tlTribalRate - agentTribalRate);
+              tlOverridePaid = 3;   // FLAT — matches Layer 2
             }
           }
           var tribalLeftover = Math.max(0, cmTargets.tribalTarget - agentTribalRate - tlOverridePaid);
@@ -9157,12 +9208,41 @@ function ppMatchRowsToAgents(parsed, carrier){
   var matched = [], unmatched = [];
   var codeKey = carrier;  // agentCodes uses the full carrier name as key
   var rows = parsed.rows || {};
+
+  // Calvin 2026-06-09 CRITICAL FIX:
+  // The OLD matcher required agent.agentCodes[carrier] to be set on every
+  // single agent's profile. If it wasn't, the row went unmatched → engine
+  // got zero data → CMs (Tanita) got their personal pay but NO overrides
+  // or CM-fill on team members. This was the actual production cause of
+  // Tanita being short-paid the entire week.
+  //
+  // The NEW matcher tries IN ORDER:
+  //   1. Exact match on agent.agentCodes[carrier]
+  //   2. Case-insensitive match on agent.agentCodes[carrier]
+  //   3. Case-insensitive match on agent.name (full name)
+  // Only if all three fail does the row get unmatched.
+  function normalize(s){
+    return String(s||'').trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
   Object.keys(rows).forEach(function(code){
     var row = rows[code];
+    var codeNorm = normalize(code);
     var agent = DB.agents.find(function(a){
       var ac = a.agentCodes || {};
-      return ac[codeKey] && ac[codeKey].trim() === code.trim();
+      return ac[codeKey] && String(ac[codeKey]).trim() === String(code).trim();
     });
+    if(!agent){
+      agent = DB.agents.find(function(a){
+        var ac = a.agentCodes || {};
+        return ac[codeKey] && normalize(ac[codeKey]) === codeNorm;
+      });
+    }
+    if(!agent){
+      agent = DB.agents.find(function(a){
+        return a && a.active && a.name && normalize(a.name) === codeNorm;
+      });
+    }
     if(agent){ matched.push({ row: row, agent: agent }); }
     else     { unmatched.push(row); }
   });
