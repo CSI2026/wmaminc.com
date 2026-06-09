@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.09.2230';
+var BUILD_VERSION = '2026.06.09.2330';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -6837,9 +6837,9 @@ function tcMarketCM(team){
   //   tcCmModelOf returns 'none' → CM-fill never fires → Tanita silently
   //   loses ALL her override income. Self-heal:
   //     1. If any team member has campaignManagerId set, use that
-  //     2. Else if there is exactly ONE active Campaign Manager in DB,
-  //        use them (the common small-business case — Tanita)
-  //     3. Else null (no fix possible without team setup)
+  //     2. Else prefer any active CM with tcModel='tc-cm-difference' (Tanita)
+  //     3. Else any active Campaign Manager
+  //     4. Else null
   if(team && Array.isArray(team.members) && team.members.length){
     for(var i=0; i<team.members.length; i++){
       var mem = DB.agents.find(function(a){return a.id===team.members[i];});
@@ -6849,8 +6849,15 @@ function tcMarketCM(team){
       }
     }
   }
-  var cms = DB.agents.filter(function(a){return a && a.active && a.role==='Campaign Manager';});
-  if(cms.length === 1) return cms[0];
+  // Prefer a CM specifically for tc-cm-difference (Tanita) since this is
+  // the TC engine path. Picking Stephanie (GM CM) here would be wrong.
+  var preferred = DB.agents.find(function(a){
+    return a && a.active && a.role === 'Campaign Manager' && a.tcModel === 'tc-cm-difference';
+  });
+  if(preferred) return preferred;
+  // Fallback: any active CM
+  var anyCm = DB.agents.find(function(a){return a && a.active && a.role === 'Campaign Manager';});
+  if(anyCm) return anyCm;
   return null;
 }
 
@@ -6957,6 +6964,30 @@ function payrollComputeDealSplit(opts){
   if(!agent) return [];
   var splits = [];
 
+  // ════════════════════════════════════════════════════════════════════
+  //  Calvin 2026-06-09 — ENGINE-TIME SELF-HEAL (chargeback path)
+  //  Mirrors tcCalculateWeek's heal so chargeback splits match payouts.
+  // ════════════════════════════════════════════════════════════════════
+  // HEAL 1: Najee Burns auto-locked at $25 if not set
+  var nameNorm = String(agent.name||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  if(agent.role === 'Team Leader' &&
+     nameNorm.indexOf('najee') >= 0 && nameNorm.indexOf('burns') >= 0 &&
+     typeof agent.tribalLockedRate !== 'number'){
+    agent.tribalLockedRate = 25;
+  }
+  // Also heal if this enrollment is by a Field Agent whose TL is Najee
+  if(agent.role === 'Field Agent' && agent.teamLeaderId){
+    var tlRec = DB.agents.find(function(x){return x.id===agent.teamLeaderId;});
+    if(tlRec){
+      var tlNameNorm = String(tlRec.name||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+      if(tlRec.role === 'Team Leader' &&
+         tlNameNorm.indexOf('najee') >= 0 && tlNameNorm.indexOf('burns') >= 0 &&
+         typeof tlRec.tribalLockedRate !== 'number'){
+        tlRec.tribalLockedRate = 25;
+      }
+    }
+  }
+
   // Resolve chain: agent's TL, MM, CM (per their personal hierarchy)
   var tlId = (agent.role === 'Field Agent') ? (agent.teamLeaderId || null) : null;
   var mmId = agent.marketManagerId || null;
@@ -6966,18 +6997,26 @@ function payrollComputeDealSplit(opts){
   var aIsCM = (agent.role === 'Campaign Manager');
   var aIsIBO = (agent.role === 'IBO');
 
-  // Look up CM for tcModel (Tanita's market vs standard).
-  // If agent IS a CM or IBO, use their own tcModel directly.
-  // Otherwise resolve via tcResolveCmForAgent which self-heals missing
-  // campaignManagerId by falling back to the lone CM in DB (Tanita).
+  // HEAL 2: CM resolution — aggressive fallback for chargeback split
+  //   If agent has no explicit campaignManagerId, find ANY active CM
+  //   (prefer one with tcModel='tc-cm-difference'). Without this,
+  //   Tanita's chargeback share silently disappears.
   var cmAgent;
   if(aIsCM || aIsIBO){
     cmAgent = agent;
-  } else {
-    cmAgent = tcResolveCmForAgent(agent);
+  } else if(cmId){
+    cmAgent = DB.agents.find(function(x){return x.id===cmId;}) || null;
   }
-  // Refresh cmId to the resolved CM so downstream code routes correctly
-  // even when agent.campaignManagerId was empty in production data.
+  if(!cmAgent && !aIsCM && !aIsIBO){
+    cmAgent = DB.agents.find(function(a){
+      return a && a.active && a.role === 'Campaign Manager' && a.tcModel === 'tc-cm-difference';
+    });
+    if(!cmAgent){
+      cmAgent = DB.agents.find(function(a){
+        return a && a.active && a.role === 'Campaign Manager';
+      });
+    }
+  }
   cmId = cmAgent ? cmAgent.id : null;
   // Use tcCmModelOf so a missing tcModel on the CM record self-heals to
   // 'tc-cm-difference' (for CMs) or 'tc-cm-consolidated' (for IBOs).
@@ -8342,7 +8381,58 @@ function tcCalculateWeek(weekRows){
   Object.keys(byTeam).forEach(function(teamId){
     var t = byTeam[teamId];
     var team = t.team;
+
+    // ════════════════════════════════════════════════════════════════
+    //  ENGINE-TIME SELF-HEAL (Calvin 2026-06-09 — bulletproof)
+    //
+    //  Heals MUST happen here, not at load time, because:
+    //   1. loadFromStorage / loadFromSupabase may be skipped on refresh
+    //      from various code paths
+    //   2. realtime sync can replace DB.agents with un-healed data
+    //   3. tcCalculateWeek is the ONLY guaranteed-to-run path before
+    //      any payroll number is displayed
+    //
+    //  Each heal logs into warnings[] so the diagnostic UI surfaces it.
+    // ════════════════════════════════════════════════════════════════
+
+    // ── HEAL 1: Najee Burns auto-lock at $25 (per locked comp spec) ──
+    // Permissive name match so "Najee J Burns", " Najee Burns ", etc. all heal.
+    Object.keys(t.agents).forEach(function(aidStr){
+      var aidI = parseInt(aidStr, 10);
+      var ag = DB.agents.find(function(a){return a.id===aidI;});
+      if(!ag) return;
+      var nameNorm = String(ag.name||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+      var isNajee = nameNorm.indexOf('najee') >= 0 && nameNorm.indexOf('burns') >= 0;
+      if(isNajee && ag.role === 'Team Leader' && typeof ag.tribalLockedRate !== 'number'){
+        ag.tribalLockedRate = 25;
+        warnings.push('HEAL: '+ag.name+' (id '+ag.id+') auto-locked at $25 Tribal — per Calvin\'s locked comp spec. Set tribalLockedRate=25 on his profile to silence this warning.');
+        console.log('[tcCalculateWeek HEAL] '+ag.name+' → tribalLockedRate=25');
+      }
+    });
+
+    // ── HEAL 2: CM resolution with aggressive fallback ──
+    // tcMarketCM may return null when the team has no campaignManager set
+    // AND no team member has campaignManagerId set AND there are multiple
+    // CMs in the DB. Aggressive fallback: find any active agent with
+    // role='Campaign Manager' (prefer one with tcModel='tc-cm-difference').
     var cm = tcMarketCM(team);
+    if(!cm){
+      // Prefer a CM whose tcModel is explicitly tc-cm-difference (Tanita)
+      var preferredCM = DB.agents.find(function(a){
+        return a && a.active && a.role === 'Campaign Manager' && a.tcModel === 'tc-cm-difference';
+      });
+      // Else any active CM
+      if(!preferredCM){
+        preferredCM = DB.agents.find(function(a){
+          return a && a.active && a.role === 'Campaign Manager';
+        });
+      }
+      if(preferredCM){
+        cm = preferredCM;
+        warnings.push('HEAL: team "'+(team?team.name:teamId)+'" had no Campaign Manager set — auto-routed to '+cm.name+'. Set team.campaignManager on the market record to silence this warning.');
+        console.log('[tcCalculateWeek HEAL] team '+(team?team.name:teamId)+' → CM='+cm.name);
+      }
+    }
     var tcModel = tcCmModelOf(cm);
 
     // Calvin 2026-04-30 — IBO upline override (mirrors GM engine).
@@ -34219,7 +34309,7 @@ function panelPayrollUploadPreview(){
 //                                   // didn't enroll directly
 // ════════════════════════════════════════════════════════════════════════
 function ppComputeAgentCommissions(parsed, carrier){
-  var out = { byAgent:{}, totalCommissionCents:0, allAgentIds:[] };
+  var out = { byAgent:{}, totalCommissionCents:0, allAgentIds:[], warnings:[] };
   if(!parsed || !parsed.rows) return out;
 
   // 1) Match rows to agents so we have an agentId for each enrollment
@@ -34313,6 +34403,10 @@ function ppComputeAgentCommissions(parsed, carrier){
     out.totalCommissionCents += cents;
     out.allAgentIds.push(parseInt(aid, 10));
   });
+  // Propagate engine self-heal warnings so preview UI can display them
+  if(result.warnings && result.warnings.length){
+    out.warnings = (out.warnings || []).concat(result.warnings);
+  }
 
   return out;
 }
@@ -34815,14 +34909,28 @@ function ppRenderCarrierPreview(carrier, parsed){
       });
       h += '</tbody></table></div></div>';
 
-      // ──────────── DIAGNOSTIC PANEL (collapsed by default) ────────────
+      // ──────────── DIAGNOSTIC PANEL (open by default) ────────────
       // Calvin 2026-06-09: When live payroll numbers look wrong (e.g. an
-      // agent missing their overrides), expand this to see EXACTLY what
-      // the engine resolved for each agent: role, tcModel, CM chain, and
-      // the full commission breakdown line-by-line. Click 🔍 to expand.
-      h += '<details style="margin-top:14px;background:rgba(124,58,237,.04);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:10px 14px">';
-      h += '<summary style="cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.3px;text-transform:uppercase;color:#7c3aed;font-weight:700">🔍 Engine Diagnostic — agent setup, splits, cascade trail</summary>';
+      // agent missing their overrides), this shows EXACTLY what the engine
+      // resolved for each agent + every self-heal that fired. Open by
+      // default so issues are visible without extra clicks.
+      h += '<details open style="margin-top:14px;background:rgba(124,58,237,.04);border:1px solid rgba(124,58,237,.25);border-radius:8px;padding:10px 14px">';
+      h += '<summary style="cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.3px;text-transform:uppercase;color:#7c3aed;font-weight:700">🔍 Engine Diagnostic — build '+(typeof BUILD_VERSION==='string'?BUILD_VERSION:'?')+' — click to collapse</summary>';
       h += '<div style="margin-top:12px;font-family:ui-monospace,Menlo,monospace;font-size:.7rem;line-height:1.55;color:#3d3d4a">';
+
+      // ENGINE HEAL WARNINGS — show what the engine auto-fixed at calc time
+      if(commissions.warnings && commissions.warnings.length){
+        var healWarnings = commissions.warnings.filter(function(w){return /^HEAL:/i.test(w);});
+        if(healWarnings.length){
+          h += '<div style="margin-bottom:14px;padding:10px 12px;background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.4);border-radius:6px">';
+          h += '<div style="font-weight:700;color:#92400E;margin-bottom:6px">⚙️ ENGINE-TIME SELF-HEALS ('+healWarnings.length+')</div>';
+          h += '<ul style="margin:0;padding-left:20px;color:#92400E">';
+          healWarnings.forEach(function(w){
+            h += '<li>'+w.replace(/^HEAL:\s*/i,'')+'</li>';
+          });
+          h += '</ul></div>';
+        }
+      }
 
       // For each matched agent, show their resolved attributes
       h += '<div style="margin-bottom:14px"><strong style="color:#7c3aed">AGENT PROFILES (as seen by engine)</strong></div>';
