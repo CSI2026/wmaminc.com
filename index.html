@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.08.2030';
+var BUILD_VERSION = '2026.06.08.2230';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -10646,53 +10646,54 @@ function saveAssignedDocs(agentIdHint){
           }
         }
 
-        // 2. LEGACY BLOB WRITE — read-modify-write so old code paths
-        //    that read the single 'assigned_doc_status' key still see
-        //    correct data.
-        var cloudRes = await supaClient.from('app_settings')
-          .select('value')
-          .eq('key', 'assigned_doc_status')
-          .maybeSingle();
-        var cloudData = {};
-        if(cloudRes && cloudRes.data && cloudRes.data.value){
-          try { cloudData = JSON.parse(cloudRes.data.value) || {}; }
-          catch(e){ cloudData = {}; }
-        }
-        var merged = {};
-        Object.keys(cloudData).forEach(function(agentId){
-          merged[agentId] = {};
-          Object.keys(cloudData[agentId] || {}).forEach(function(formId){
-            merged[agentId][formId] = cloudData[agentId][formId];
-          });
-        });
-        Object.keys(ASSIGNED_DOC_STATUS).forEach(function(agentId){
-          if(!merged[agentId]) merged[agentId] = {};
-          Object.keys(ASSIGNED_DOC_STATUS[agentId] || {}).forEach(function(formId){
-            var local = ASSIGNED_DOC_STATUS[agentId][formId];
-            var cloud = merged[agentId][formId];
-            if(!cloud){
-              merged[agentId][formId] = local;
-            } else if(cloud.signed === true && local.signed !== true){
-              // keep cloud
-            } else if(local.signed === true && cloud.signed !== true){
-              merged[agentId][formId] = local;
-            } else {
-              var lT = local.signedAt || local.assignedAt || '';
-              var cT = cloud.signedAt || cloud.assignedAt || '';
-              merged[agentId][formId] = (lT >= cT) ? local : cloud;
+        // 2. LEGACY BLOB WRITE — REMOVED (Calvin 2026-06-08 production fix)
+        //
+        // ROOT CAUSE FOUND: the legacy 'assigned_doc_status' blob grew so
+        // large (every agent's full doc history in one row) that Supabase
+        // started rejecting writes with error 57014 'canceling statement
+        // due to statement timeout'. Every save was failing — agents
+        // would sign locally, the blob write would 500, then on next
+        // load the blob fetch would also fail or return stale data, and
+        // the agent would appear unsigned again.
+        //
+        // FIX: stop writing to the blob. Per-agent rows (written above)
+        // are small, fast, and never time out. They're authoritative
+        // anyway — the load handler prefers them over the blob.
+        //
+        // The blob row in Supabase can stay (loaded as backup) but we
+        // no longer fight to keep it in sync. Reading it on load remains
+        // safe because the per-agent rows overlay anything stale.
+        //
+        // 3. Sync our local view of the freshly-saved record so other
+        //    operations in this session see consistent data
+        try {
+          if(agentIdHint != null){
+            // Reload this specific agent's row from cloud so we pick up
+            // any concurrent edits from other devices for THIS agent
+            var refresh = await supaClient.from('app_settings')
+              .select('value')
+              .eq('key', 'assigned_doc_status_'+agentIdHint)
+              .maybeSingle();
+            if(refresh && refresh.data && refresh.data.value){
+              try {
+                var fresh = JSON.parse(refresh.data.value);
+                if(fresh && typeof fresh === 'object'){
+                  if(!ASSIGNED_DOC_STATUS[agentIdHint]) ASSIGNED_DOC_STATUS[agentIdHint] = {};
+                  Object.keys(fresh).forEach(function(formId){
+                    var f = fresh[formId];
+                    var l = ASSIGNED_DOC_STATUS[agentIdHint][formId];
+                    // Same prefer-signed merge as elsewhere
+                    if(f && f.signed === true){
+                      ASSIGNED_DOC_STATUS[agentIdHint][formId] = f;
+                    } else if(!l || !l.signed){
+                      ASSIGNED_DOC_STATUS[agentIdHint][formId] = f;
+                    }
+                  });
+                }
+              } catch(e){ /* parse fail — keep local */ }
             }
-          });
-        });
-        var blobRes = await supaClient.from('app_settings').upsert(
-          {key:'assigned_doc_status', value:JSON.stringify(merged)},
-          {onConflict:'key'}
-        );
-        if(blobRes && blobRes.error){
-          console.error('[saveAssignedDocs] BLOB WRITE FAILED:', blobRes.error);
-        }
-
-        // 3. Sync merged result back so we pick up other devices' recent signatures
-        ASSIGNED_DOC_STATUS = merged;
+          }
+        } catch(e){ /* refresh fail — non-fatal */ }
         try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
         return true;
       } catch(e){
@@ -18818,7 +18819,20 @@ async function loadFromSupabase(){
     }
 
     // Load settings (EmailJS keys)
+    // Calvin 2026-06-08: the 'assigned_doc_status' blob row has grown so
+    // large in production that fetching the full app_settings table can
+    // time out (Postgres error 57014). Strategy: try the full load first,
+    // and if it returns null (likely timeout on the giant blob), fall
+    // back to loading WITHOUT that single row. Per-agent rows are the
+    // authoritative source anyway.
     var settings = await sbSelect('app_settings');
+    if(!settings && supaClient){
+      console.warn('[loadFromSupabase] full app_settings load failed — retrying without giant assigned_doc_status blob');
+      try {
+        var fb = await supaClient.from('app_settings').select('key,value').neq('key', 'assigned_doc_status');
+        if(fb && !fb.error && fb.data) settings = fb.data;
+      } catch(e){ console.warn('[loadFromSupabase] fallback also failed:', e); }
+    }
     if(settings){
       // Calvin 2026-05-14: app_settings load is direct now — no queue check needed
       settings.forEach(function(s){
@@ -25989,6 +26003,7 @@ function panelOwnerControl(){
   }
   h += '<button onclick="_recoveryDiagnostic()" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">🔍 Run Diagnostic (console)</button>';
   h += '<button onclick="_recoveryReloadFromCloud()" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer">☁ Re-pull from Cloud</button>';
+  h += '<button onclick="_recoveryPurgeBloatedBlob()" style="background:#92400e;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:10px 18px;border-radius:6px;cursor:pointer;font-weight:700" title="Deletes the giant legacy blob row that is causing 57014 timeouts. Per-agent rows preserve all data.">🗑 Purge Bloated Blob Row</button>';
   h += '</div>';
   h += '</div>';
   h += '</div>';
@@ -43154,10 +43169,13 @@ async function _recoveryDiagnostic(){
     console.log('[diag] CLOUD: no supabase client');
   } else {
     try {
-      var allSettings = await supaClient.from('app_settings').select('key,value');
+      // Calvin 2026-06-08: exclude the bloated 'assigned_doc_status'
+      // blob row from the fetch — it's so large in production that
+      // requesting it times out. Per-agent rows are what we actually need.
+      var allSettings = await supaClient.from('app_settings').select('key,value').neq('key', 'assigned_doc_status');
       if(allSettings && allSettings.data){
         var perAgentRows = allSettings.data.filter(function(r){ return /^assigned_doc_status_\d+$/.test(r.key); });
-        var blobRow = allSettings.data.find(function(r){ return r.key === 'assigned_doc_status'; });
+        var blobRow = null;  // intentionally skipped; per-agent rows are authoritative
         var blobAgents = 0, blobSigned = 0;
         if(blobRow && blobRow.value){
           try {
@@ -43194,6 +43212,35 @@ async function _recoveryDiagnostic(){
 }
 if(typeof window !== 'undefined') window._recoveryDiagnostic = _recoveryDiagnostic;
 
+// Purge the bloated legacy 'assigned_doc_status' blob row. Calvin 2026-06-08:
+// in production this row grew so large that Supabase write timeouts (error
+// 57014) started causing every save to fail. Per-agent rows ('assigned_doc_status_<id>')
+// hold the same data without the bloat — they're loaded preferentially.
+// Once purged, every save succeeds again.
+async function _recoveryPurgeBloatedBlob(){
+  var viewer = DB.current;
+  if(!viewer || !isOwner(viewer)){
+    alert('Owner only.');
+    return;
+  }
+  if(typeof supaClient === 'undefined' || !supaClient){
+    alert('No Supabase client.');
+    return;
+  }
+  if(!confirm('PURGE the bloated assigned_doc_status blob row from Supabase?\n\nThis row has grown so large it is causing save timeouts (error 57014) and locking out agents who just signed paperwork.\n\nPer-agent rows (assigned_doc_status_<id>) will continue to work — they have all the same data without the bloat.\n\nThis is a one-time, safe operation. Continue?')) return;
+  try {
+    var res = await supaClient.from('app_settings').delete().eq('key', 'assigned_doc_status');
+    if(res && res.error){
+      alert('Purge failed: '+res.error.message);
+      return;
+    }
+    alert('✓ Bloated blob row purged. Save timeouts should stop. Agents who sign will now persist correctly.\n\nNo data was lost — per-agent rows still hold everything.');
+  } catch(e){
+    alert('Purge threw: '+(e.message||e));
+  }
+}
+if(typeof window !== 'undefined') window._recoveryPurgeBloatedBlob = _recoveryPurgeBloatedBlob;
+
 // Re-pull all assigned doc data from Supabase and merge into local
 // memory. Useful when an agent reports being locked but you can see
 // their signature is in the cloud.
@@ -43203,9 +43250,11 @@ async function _recoveryReloadFromCloud(){
     return;
   }
   try {
-    var allSettings = await supaClient.from('app_settings').select('key,value');
+    // Calvin 2026-06-08: skip the bloated 'assigned_doc_status' blob
+    // row — it times out. Per-agent rows are authoritative.
+    var allSettings = await supaClient.from('app_settings').select('key,value').neq('key', 'assigned_doc_status');
     if(!allSettings || !allSettings.data){
-      alert('No data returned from Supabase.');
+      alert('No data returned from Supabase. The table may be timing out — try again in a moment.');
       return;
     }
     var loadedAgents = 0;
