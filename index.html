@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.09.1330';
+var BUILD_VERSION = '2026.06.09.1530';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -6691,6 +6691,50 @@ var TC_RATES = {
   portInOut: 7
 };
 
+// ════════════════════════════════════════════════════════════════════
+//  TL TRIBAL RATE RESOLVER — Calvin 2026-06-09
+//
+//  Centralized helper. Returns the per-deal Tribal rate that a specific
+//  Team Leader should be paid. Respects in this order:
+//
+//   1. agent.tribalLockedRate    (Najee Burns is locked at $25 flat)
+//   2. TL's personal count tier  (sliding $23 under 30 / $25 at 30+)
+//
+//  All TL payout AND override math must call this — never call
+//  tcTierRate(..., TC_RATES.tribal.tlTier) directly with an arbitrary
+//  count, because that ignores the lock and (worse) might pass the
+//  agent's count instead of the TL's count. Both have happened.
+//
+//  Use sites:
+//   • Layer 1 personal Tribal (TL enrolls themselves)
+//   • Layer 2 TL override (TL fills gap above an agent under them)
+//   • Layer 4 CM-difference fill (CM fills remainder)
+//   • payrollComputeDealSplit (chargeback splits)
+// ════════════════════════════════════════════════════════════════════
+function tcTLTribalRate(tlRecord, tlPersonalTribalCount){
+  if(!tlRecord) return 0;
+  // 1. Locked rate wins
+  if(typeof tlRecord.tribalLockedRate === 'number' && tlRecord.tribalLockedRate >= 0){
+    return tlRecord.tribalLockedRate;
+  }
+  // 2. Sliding based on TL's OWN personal Tribal count
+  var n = tlPersonalTribalCount || 0;
+  return (n <= TC_RATES.tribal.tlTier.tier1Cap)
+    ? TC_RATES.tribal.tlTier.tier1
+    : TC_RATES.tribal.tlTier.tier2;
+}
+
+// Compute total Tribal pay across a TL's personal deals, honoring lock.
+// If locked at $25, all N deals pay $25 each. If sliding, uses retroactive
+// tier math (the first 30 also pay $25 if the TL hit tier 2).
+function tcTLTribalPersonalTotal(tlRecord, tlPersonalTribalCount){
+  if(!tlRecord || !tlPersonalTribalCount) return 0;
+  if(typeof tlRecord.tribalLockedRate === 'number' && tlRecord.tribalLockedRate >= 0){
+    return tlPersonalTribalCount * tlRecord.tribalLockedRate;
+  }
+  return tcSlidingTotal(tlPersonalTribalCount, TC_RATES.tribal.tlTier);
+}
+
 // Look up the tcModel for an agent record. Defaults to 'none'.
 function tcCmModelOf(agent){
   if(!agent) return 'none';
@@ -8305,10 +8349,13 @@ function tcCalculateWeek(weekRows){
           tribalPay  = a.tribal * tribalRate;
           tribalLabel = 'Personal Tribal ($'+tribalRate+' CM rate)';
         } else if(isThisAgentTL){
-          // TLs (any of them) get TL sliding rate on personal Tribal
-          tribalPay  = tcSlidingTotal(a.tribal, TC_RATES.tribal.tlTier);
+          // TLs (any of them) get TL rate on personal Tribal.
+          // Honors tribalLockedRate if set (Najee = $25 locked).
+          tribalPay  = tcTLTribalPersonalTotal(agentRecord, a.tribal);
           tribalRate = a.tribal ? tribalPay / a.tribal : 0;
-          tribalLabel = 'Personal Tribal (TL sliding)';
+          tribalLabel = (typeof agentRecord.tribalLockedRate === 'number')
+            ? 'Personal Tribal (TL locked $'+agentRecord.tribalLockedRate+')'
+            : 'Personal Tribal (TL sliding)';
         } else {
           // Field Agent (or MM doing personal Tribal — no MM layer in Tribal)
           tribalPay  = tcSlidingTotal(a.tribal, TC_RATES.tribal.agentTier);
@@ -8356,7 +8403,12 @@ function tcCalculateWeek(weekRows){
       if(!tlRecord || tlRecord.role !== 'Team Leader') return;
       var aName = agentRecord.name || 'agent';
       var agentTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.agentTier);
-      var tlTribalRate    = tcTierRate(a.tribal, TC_RATES.tribal.tlTier);
+      // Calvin 2026-06-09 FIX: TL override rate must come from the TL's OWN
+      // personal count (not the agent's count) and must respect locked
+      // rates. Najee Burns is locked at $25 → his override is always
+      // ($25 - agent rate), never the sliding number.
+      var tlPersonalCount = (t.agents[thisAgentsTLId] || {tribal:0}).tribal || 0;
+      var tlTribalRate    = tcTLTribalRate(tlRecord, tlPersonalCount);
       var diffPerEnrollment = tlTribalRate - agentTribalRate;
       if(diffPerEnrollment > 0){
         bump(thisAgentsTLId, a.tribal * diffPerEnrollment,
@@ -8435,25 +8487,30 @@ function tcCalculateWeek(weekRows){
 
         // Tribal: max(0, tribalTarget − agent_tier_rate − tl_override_paid). Total per Tribal = tribalTarget.
         if(a.tribal){
-          // Agent's actual Tribal rate based on THEIR personal count tier
+          // Agent's actual Tribal rate based on THEIR personal count tier.
+          // Calvin 2026-06-09 FIX: TL's own personal Tribal rate must honor
+          // tribalLockedRate. Najee at $25 locked means his per-deal rate
+          // is always $25, and CM fill is computed from that, not from
+          // sliding tier ($23) — otherwise Tanita is overpaid by $2/deal.
           var agentTribalRate;
           if(isThisAgentTL){
-            // TLs got TL sliding ($23/$25)
-            agentTribalRate = (a.tribal <= TC_RATES.tribal.tlTier.tier1Cap)
-              ? TC_RATES.tribal.tlTier.tier1
-              : TC_RATES.tribal.tlTier.tier2;
+            agentTribalRate = tcTLTribalRate(agentRecord, a.tribal);
           } else {
             // Field Agent (or MM) got agent sliding ($18/$23)
             agentTribalRate = (a.tribal <= TC_RATES.tribal.agentTier.tier1Cap)
               ? TC_RATES.tribal.agentTier.tier1
               : TC_RATES.tribal.agentTier.tier2;
           }
-          // TL override paid in Layer 2 — only if this agent reports to a real TL
+          // TL override paid in Layer 2 — only if this agent reports to a real TL.
+          // Calvin 2026-06-09 FIX: TL's rate must come from TL's OWN personal
+          // count and must respect tribalLockedRate. Najee at $25 locked
+          // means his override is always $25 - agent rate, not sliding.
           var tlOverridePaid = 0;
           if(!isThisAgentTL && !isThisAgentMM && agentRecord.teamLeaderId){
             var tlRecord = DB.agents.find(function(x){return x.id===agentRecord.teamLeaderId;});
             if(tlRecord && tlRecord.role === 'Team Leader'){
-              var tlTribalRate = tcTierRate(a.tribal, TC_RATES.tribal.tlTier);
+              var tlPersCount = (t.agents[agentRecord.teamLeaderId] || {tribal:0}).tribal || 0;
+              var tlTribalRate = tcTLTribalRate(tlRecord, tlPersCount);
               tlOverridePaid = Math.max(0, tlTribalRate - agentTribalRate);
             }
           }
