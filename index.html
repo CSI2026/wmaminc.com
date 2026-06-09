@@ -3408,7 +3408,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.08.2230';
+var BUILD_VERSION = '2026.06.09.1230';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -9302,17 +9302,41 @@ function parseTruConnectFile(arrayBuffer){
   //   4=Person ID, 5=Order DD: Order Number, 6=Agent Name,
   //   7=State, 8=Rate Plan, 9=Team Name, 10=Status, 11=Tribal,
   //   12=My TC App, 13=TC Plus, 14=ISO Pay Rate, 15=TC Plus, 16=Total
+  // Calvin 2026-06-09: header-based auto-detect + diagnostic logging
   var paySheet = loadSheet(/TC\s*Pay\s*Summary/i);
   if(paySheet){
-    paySheet.rows.slice(1).forEach(function(r){
+    var payHdr = paySheet.rows[0] || [];
+    var pAgentCol  = findColByHeader(payHdr, [/agent\s*name/i, /^iso\s*agent/i], 6);
+    var pTeamCol   = findColByHeader(payHdr, [/team\s*name/i, /^team\b/i], 9);
+    var pStateCol  = findColByHeader(payHdr, [/^state$/i], 7);
+    var pDateCol   = findColByHeader(payHdr, [/^date$/i], 1);
+    var pPersonCol = findColByHeader(payHdr, [/person.*id/i], 4);
+    var pOrderCol  = findColByHeader(payHdr, [/order.*number/i, /order\s*#/i], 5);
+    var pRateCol   = findColByHeader(payHdr, [/rate\s*plan/i], 8);
+    var pTribCol   = findColByHeader(payHdr, [/^tribal$/i], 11);
+    var pAppCol    = findColByHeader(payHdr, [/my\s*tc\s*app/i], 12);
+    var pPlusCol   = findColByHeader(payHdr, [/^tc\s*plus$/i], 13);
+    var pIsoRtCol  = findColByHeader(payHdr, [/iso\s*pay\s*rate/i], 14);
+    var pTcpAmtCol = findColByHeader(payHdr, [/tc\s*plus\s*pay/i, /tc\s*plus\s*rate/i], 15);
+    var pTotCol    = findColByHeader(payHdr, [/^total$/i], 16);
+    if(pAgentCol !== 6 || pTeamCol !== 9){
+      console.log('[TC parser] Pay Summary: column auto-detected agent='+pAgentCol+' team='+pTeamCol+' (spec=6,9 — header shifted)');
+    }
+    var paySheetCount = 0;
+    var paySheetDiagLogged = 0;
+    paySheet.rows.slice(1).forEach(function(r, idx){
       if(!r || r.length === 0) return;
-      var name = asStr(r[6]);   // col G
+      var name = asStr(r[pAgentCol]);
       if(!name || /^total/i.test(name)) return;
+      if(paySheetDiagLogged < 5 && /^\d+$/.test(String(name).trim())){
+        console.warn('[TC parser] Pay Summary row '+(idx+2)+' agentName looks numeric ("'+name+'"). Full row:', r);
+        paySheetDiagLogged++;
+      }
       if(!result.rows[name]){
         result.rows[name] = {
           agentCode: name,
-          teamName:  asStr(r[9]),
-          state:     asStr(r[7]),
+          teamName:  asStr(r[pTeamCol]),
+          state:     asStr(r[pStateCol]),
           activations: { Total:0, Tribal:0, MyTcApp:0, TcPlus:0 },
           grossCents: 0,
           details:    [],
@@ -9322,30 +9346,34 @@ function parseTruConnectFile(arrayBuffer){
       }
       var row = result.rows[name];
       row.activations.Total++;
-      if(parseYN(r[11])) row.activations.Tribal++;
-      if(parseYN(r[12])) row.activations.MyTcApp++;
-      if(parseYN(r[13])) row.activations.TcPlus++;
+      if(parseYN(r[pTribCol])) row.activations.Tribal++;
+      if(parseYN(r[pAppCol])) row.activations.MyTcApp++;
+      if(parseYN(r[pPlusCol])) row.activations.TcPlus++;
 
-      var iso = Number(r[14])||0;
-      var tcp = Number(r[15])||0;
-      var tot = Number(r[16]) || (iso+tcp);
+      var iso = Number(r[pIsoRtCol])||0;
+      var tcp = Number(r[pTcpAmtCol])||0;
+      var tot = Number(r[pTotCol]) || (iso+tcp);
       row.grossCents += Math.round(tot * 100);
 
       row.details.push({
-        date:      ppExcelDateToStr(r[1]),
-        personId:  asStr(r[4]),
-        orderNum:  asStr(r[5]),
-        state:     asStr(r[7]),
-        ratePlan:  asStr(r[8]),
-        team:      asStr(r[9]),
-        tribal:    parseYN(r[11]),
-        myTcApp:   parseYN(r[12]),
-        tcPlus:    parseYN(r[13]),
+        date:      ppExcelDateToStr(r[pDateCol]),
+        personId:  asStr(r[pPersonCol]),
+        orderNum:  asStr(r[pOrderCol]),
+        state:     asStr(r[pStateCol]),
+        ratePlan:  asStr(r[pRateCol]),
+        team:      asStr(r[pTeamCol]),
+        tribal:    parseYN(r[pTribCol]),
+        myTcApp:   parseYN(r[pAppCol]),
+        tcPlus:    parseYN(r[pPlusCol]),
         isoRate:   iso,
         tcPlusAmt: tcp,
         total:     tot
       });
+      paySheetCount++;
     });
+    if(paySheetCount === 0){
+      console.warn('[TC parser] Pay Summary parsed but matched ZERO activation rows. Header row was:', payHdr);
+    }
   }
 
   // ── SHEET: "TC Cancels-14 Day Chargeback" — 14-day cancels ────────
@@ -9356,23 +9384,67 @@ function parseTruConnectFile(arrayBuffer){
   //   11=Team Name, 12=Status, 13=Tribal, 14=My TC App, 15=TC Plus,
   //   16=ISO Pay Rate, 17=ISO TC Plus Pay Rate, 18=Total
   // Calvin's spec: charge agent $28 (Tribal) or $10 (NLAD), NOT the carrier's $40
+  //
+  // Calvin 2026-06-09 — SELF-HEALING + DIAGNOSTIC:
+  // The locked spec was tested against a specific TC payfile format. If
+  // TruConnect later shifts columns (adds/removes a column upstream),
+  // the spec-locked indices read the WRONG cell — which means "agent
+  // name" comes back as a number or unrelated value, every row falls
+  // into "unmatched", and payroll is broken.
+  //
+  // FIX: scan the header row for columns by NAME first. If we find a
+  // header literally containing "Agent Name", use that index. Otherwise
+  // fall back to the spec-locked index. This is self-healing without
+  // breaking the existing behavior.
+  //
+  // Also: if a row fails to match, log the entire row contents to the
+  // browser console so the next failure is debuggable in one upload.
+  function findColByHeader(headerRow, patterns, fallbackIdx){
+    if(!headerRow || !headerRow.length) return fallbackIdx;
+    for(var i = 0; i < headerRow.length; i++){
+      var h = String(headerRow[i] || '').trim();
+      if(!h) continue;
+      for(var p = 0; p < patterns.length; p++){
+        if(patterns[p].test(h)) return i;
+      }
+    }
+    return fallbackIdx;
+  }
   var cancelSheet = loadSheet(/Cancels.*14.*Chargeback/i);
   if(cancelSheet){
-    cancelSheet.rows.slice(1).forEach(function(r){
+    var cancelHdr = cancelSheet.rows[0] || [];
+    var cAgentCol = findColByHeader(cancelHdr, [/agent\s*name/i, /^iso\s*agent/i], 8);
+    var cTeamCol  = findColByHeader(cancelHdr, [/team\s*name/i, /^team\b/i], 11);
+    var cOrderCol = findColByHeader(cancelHdr, [/order.*number/i, /order\s*#/i], 7);
+    var cDateCol  = findColByHeader(cancelHdr, [/^date$/i], 1);
+    var cRemCol   = findColByHeader(cancelHdr, [/removal.*date/i], 4);
+    var cTribCol  = findColByHeader(cancelHdr, [/^tribal$/i], 13);
+    var cTotCol   = findColByHeader(cancelHdr, [/^total$/i], 18);
+    if(cAgentCol !== 8 || cTeamCol !== 11){
+      console.log('[TC parser] Cancels-14: column auto-detected agent='+cAgentCol+' team='+cTeamCol+' (spec=8,11 — header shifted)');
+    }
+    var cancelDiagLogged = 0;  // cap diagnostic logs at 5 per upload
+    cancelSheet.rows.slice(1).forEach(function(r, idx){
       if(!r || r.length === 0) return;
-      var name = asStr(r[8]);   // col I
+      var name = asStr(r[cAgentCol]);
       if(!name || /^total/i.test(name)) return;
-      var isTribal = parseYN(r[13]);
+      // Diagnostic: if the "name" we got looks like a number (the symptom
+      // Calvin reported), dump the whole row so we can see what's in there.
+      if(cancelDiagLogged < 5 && /^\d+$/.test(String(name).trim())){
+        console.warn('[TC parser] Cancels-14 row '+(idx+2)+' agentName looks numeric ("'+name+'"). Full row:', r);
+        cancelDiagLogged++;
+      }
+      var isTribal = parseYN(r[cTribCol]);
       result.deductions.push({
         type:        '14-day Cancel',
         agentName:   name,
-        teamName:    asStr(r[11]),
-        orderNum:    asStr(r[7]),
-        date:        ppExcelDateToStr(r[1]),
-        removalDate: ppExcelDateToStr(r[4]),
+        teamName:    asStr(r[cTeamCol]),
+        orderNum:    asStr(r[cOrderCol]),
+        date:        ppExcelDateToStr(r[cDateCol]),
+        removalDate: ppExcelDateToStr(r[cRemCol]),
         isTribal:    isTribal,
         amountCents: isTribal ? 2800 : 1000,
-        carrierTotal: Number(r[18])||0,    // typically -40 (informational)
+        carrierTotal: Number(r[cTotCol])||0,    // typically -40 (informational)
         rawSheet:    cancelSheet.name
       });
     });
@@ -9385,23 +9457,41 @@ function parseTruConnectFile(arrayBuffer){
   //   5=Person Assigned, 6=Date Sold, 7=Product: Product Name,
   //   8=Product: Upgrade Cost (NEGATIVE)
   // Calvin's spec: charge agent abs(I) = exact upgrade cost
+  // Calvin 2026-06-09: header-based auto-detect + diag
   var upgSheet = loadSheet(/TC\s*Device\s*Upgrade/i);
   if(upgSheet){
-    upgSheet.rows.slice(1).forEach(function(r){
+    var upgHdr = upgSheet.rows[0] || [];
+    var uAgentCol = findColByHeader(upgHdr, [/person\s*assigned/i, /agent\s*name/i], 5);
+    var uTeamCol  = findColByHeader(upgHdr, [/team\s*dd/i, /team\s*name/i, /^team\b/i], 1);
+    var uPOCol    = findColByHeader(upgHdr, [/purchase\s*order/i, /^po\b/i], 2);
+    var uSerCol   = findColByHeader(upgHdr, [/serial/i], 3);
+    var uEnrCol   = findColByHeader(upgHdr, [/enrollment/i], 4);
+    var uDateCol  = findColByHeader(upgHdr, [/date\s*sold/i, /^date$/i], 6);
+    var uProdCol  = findColByHeader(upgHdr, [/product.*name/i], 7);
+    var uCostCol  = findColByHeader(upgHdr, [/upgrade\s*cost/i, /^cost$/i], 8);
+    if(uAgentCol !== 5){
+      console.log('[TC parser] Device Upgrades: column auto-detected agent='+uAgentCol+' (spec=5 — header shifted)');
+    }
+    var upgDiagLogged = 0;
+    upgSheet.rows.slice(1).forEach(function(r, idx){
       if(!r || r.length === 0) return;
-      var name = asStr(r[5]);   // col F
+      var name = asStr(r[uAgentCol]);
       if(!name || /^total/i.test(name)) return;
-      var rawCost = Number(r[8])||0;
+      if(upgDiagLogged < 5 && /^\d+$/.test(String(name).trim())){
+        console.warn('[TC parser] Device Upgrades row '+(idx+2)+' agentName looks numeric ("'+name+'"). Full row:', r);
+        upgDiagLogged++;
+      }
+      var rawCost = Number(r[uCostCol])||0;
       if(rawCost === 0) return;
       result.deductions.push({
         type:        'Device Upgrade',
         agentName:   name,
-        teamName:    asStr(r[1]),
-        orderNum:    asStr(r[4]),         // enrollment#
-        poNumber:    asStr(r[2]),
-        serial:      asStr(r[3]),
-        productName: asStr(r[7]),
-        date:        ppExcelDateToStr(r[6]),
+        teamName:    asStr(r[uTeamCol]),
+        orderNum:    asStr(r[uEnrCol]),
+        poNumber:    asStr(r[uPOCol]),
+        serial:      asStr(r[uSerCol]),
+        productName: asStr(r[uProdCol]),
+        date:        ppExcelDateToStr(r[uDateCol]),
         amountCents: Math.abs(Math.round(rawCost * 100)),
         isTribal:    null,
         rawSheet:    upgSheet.name
@@ -9416,101 +9506,132 @@ function parseTruConnectFile(arrayBuffer){
   //   7=Date, 8=Application ID, 9=State, 10=Number Ported,
   //   11=Number Ported Date, 12=Total
   // Calvin's spec: agent gets $7 (Calvin keeps $5 of the $12 carrier pays)
+  // Calvin 2026-06-09: header-based auto-detect + diag
   var portSheet = loadSheet(/Port\s*In\s*Spif/i);
   if(portSheet){
-    portSheet.rows.slice(1).forEach(function(r){
+    var portHdr = portSheet.rows[0] || [];
+    var poAgentCol = findColByHeader(portHdr, [/agent\s*name/i], 5);
+    var poTeamCol  = findColByHeader(portHdr, [/team\s*name/i, /^team\b/i], 3);
+    var poOrderCol = findColByHeader(portHdr, [/order.*number/i, /order\s*#/i], 2);
+    var poDateCol  = findColByHeader(portHdr, [/^date$/i], 7);
+    var poTotCol   = findColByHeader(portHdr, [/^total$/i], 12);
+    if(poAgentCol !== 5){
+      console.log('[TC parser] Port-In Spif: column auto-detected agent='+poAgentCol+' (spec=5 — header shifted)');
+    }
+    var portDiagLogged = 0;
+    portSheet.rows.slice(1).forEach(function(r, idx){
       if(!r || r.length === 0) return;
-      var name = asStr(r[5]);   // col F
+      var name = asStr(r[poAgentCol]);
       if(!name || /^total/i.test(name)) return;
+      if(portDiagLogged < 5 && /^\d+$/.test(String(name).trim())){
+        console.warn('[TC parser] Port-In Spif row '+(idx+2)+' agentName looks numeric ("'+name+'"). Full row:', r);
+        portDiagLogged++;
+      }
       result.credits.push({
         type:        'Port Spif',
         agentName:   name,
-        teamName:    asStr(r[3]),
-        orderNum:    asStr(r[2]),
-        date:        ppExcelDateToStr(r[7]),
-        amountCents: 700,                       // $7 flat to agent
+        teamName:    asStr(r[poTeamCol]),
+        orderNum:    asStr(r[poOrderCol]),
+        date:        ppExcelDateToStr(r[poDateCol]),
+        amountCents: 700,                        // $7 flat to agent
         rawSheet:    portSheet.name,
-        carrierTotal: Number(r[12])||0          // typically 12 (informational)
+        carrierTotal: Number(r[poTotCol])||0     // typically 12 (informational)
       });
     });
   }
 
   // ── SHEET: "TC Credits" — aging phone CREDITS (refunds) ───────────
-  // Headers (0-indexed):
-  //   0=ISO Name, 1=Inventory: Lot Name, 2=Serial Number,
-  //   3=Status, 4=Person Assigned, 5=Enrollment Number,
-  //   6=Team DD, 7=Carrier, 8=Location, 9=P.O. Due Date,
-  //   10=Date Sold, 11=Scheduled Deducted Date (US),
-  //   12=Scheduled Credit Date (US), 13=Actual Credited Date (US),
-  //   14=Deducted, 15=Credited (positive amount), 16=Purchase Order Number,
-  //   17=Comments, 18=RMA Credit Date, 19=RMA Requested,
-  //   20=RMA Credit Amount, 21=Order Source, 22=Device Cost,
-  //   23=Original Purchase Order Number
+  // Headers (0-indexed): see locked spec above (col E=4 = Person Assigned)
   // Calvin's spec: refund the FULL amount to whoever originally paid (lookup by order/serial)
+  // Calvin 2026-06-09: header-based auto-detect + diag
   var creditSheet = loadSheet(/^\s*TC\s*Credits\s*$/i);
   if(creditSheet){
-    creditSheet.rows.slice(1).forEach(function(r){
+    var crHdr = creditSheet.rows[0] || [];
+    var crAgentCol = findColByHeader(crHdr, [/person\s*assigned/i, /agent\s*name/i], 4);
+    var crTeamCol  = findColByHeader(crHdr, [/team\s*dd/i, /team\s*name/i, /^team\b/i], 6);
+    var crSerCol   = findColByHeader(crHdr, [/serial/i], 2);
+    var crEnrCol   = findColByHeader(crHdr, [/enrollment/i], 5);
+    var crCredCol  = findColByHeader(crHdr, [/^credited$/i, /^credit\s*amount/i], 15);
+    var crPOCol    = findColByHeader(crHdr, [/^purchase\s*order\s*number$/i, /^po\s*number$/i], 16);
+    var crOrigPOCol= findColByHeader(crHdr, [/original.*purchase\s*order/i, /original.*po/i], 23);
+    var crDateCol  = findColByHeader(crHdr, [/actual\s*credited\s*date/i], 13);
+    var crDevCostCol = findColByHeader(crHdr, [/device\s*cost/i], 22);
+    if(crAgentCol !== 4){
+      console.log('[TC parser] Credits: column auto-detected agent='+crAgentCol+' (spec=4 — header shifted)');
+    }
+    var crDiagLogged = 0;
+    creditSheet.rows.slice(1).forEach(function(r, idx){
       if(!r || r.length === 0) return;
-      var name = asStr(r[4]);   // col E
+      var name = asStr(r[crAgentCol]);
       if(!name || /^total/i.test(name)) return;
-      var creditedAmt = Number(r[15])||0;
+      if(crDiagLogged < 5 && /^\d+$/.test(String(name).trim())){
+        console.warn('[TC parser] Credits row '+(idx+2)+' agentName looks numeric ("'+name+'"). Full row:', r);
+        crDiagLogged++;
+      }
+      var creditedAmt = Number(r[crCredCol])||0;
       if(creditedAmt === 0) return;
       result.credits.push({
         type:           'Aging Phone Credit',
         agentName:      name,
-        teamName:       asStr(r[6]),
-        orderNum:       asStr(r[5]),    // enrollment number
-        serial:         asStr(r[2]),
-        poNumber:       asStr(r[16]),
-        origPoNumber:   asStr(r[23]),
-        date:           ppExcelDateToStr(r[13]),
+        teamName:       asStr(r[crTeamCol]),
+        orderNum:       asStr(r[crEnrCol]),
+        serial:         asStr(r[crSerCol]),
+        poNumber:       asStr(r[crPOCol]),
+        origPoNumber:   asStr(r[crOrigPOCol]),
+        date:           ppExcelDateToStr(r[crDateCol]),
         amountCents:    Math.abs(Math.round(creditedAmt * 100)),
         requiresLookup: true,
-        deviceCost:     Number(r[22])||0,
+        deviceCost:     Number(r[crDevCostCol])||0,
         rawSheet:       creditSheet.name
       });
     });
   }
 
   // ── SHEET: "TC Deductions" — aging phone DEDUCTIONS (charges) ─────
-  // Headers (0-indexed):
-  //   0=ISO Name, 1=Team DD, 2=Shipped to State,
-  //   3=Inventory: Lot Name, 4=Product: Product Name, 5=Serial Number,
-  //   6=Status, 7=Person Assigned Name, 8=P.O. Shipped Date,
-  //   9=P.O. Due Date, 10=Order DD, 11=Order Date Sold (US),
-  //   12=Date Sold, 13=Product: Cost,
-  //   14=Scheduled Deducted Date (US), 15=Actual Deducted Date (US),
-  //   16=Deducted (NEGATIVE — take abs()), 17=Purchase Order Number,
-  //   18=Comments, 19=First Call Made, 20=First Call Date,
-  //   21=Order Source, 22=Device Cost,
-  //   23=Shipped Date (US), 24=Due Date (US)
-  // Calvin's spec:
-  //   - If Person Assigned Name is populated → charge that agent (cascade)
-  //   - If BLANK → look up team in DB.teams, charge its campaignManager directly
-  //   - Use abs(col Q "Deducted") for amount
+  // Headers (0-indexed): see locked spec (col H=7 = Person Assigned Name)
+  // Calvin's spec: lookup-or-cascade per locked rules.
+  // Calvin 2026-06-09: header-based auto-detect + diag
   var deductSheet = loadSheet(/^\s*TC\s*Deductions\s*$/i);
   if(deductSheet){
-    deductSheet.rows.slice(1).forEach(function(r){
+    var ddHdr = deductSheet.rows[0] || [];
+    var ddAgentCol = findColByHeader(ddHdr, [/person\s*assigned/i, /agent\s*name/i], 7);
+    var ddTeamCol  = findColByHeader(ddHdr, [/team\s*dd/i, /team\s*name/i, /^team\b/i], 1);
+    var ddProdCol  = findColByHeader(ddHdr, [/product.*name/i], 4);
+    var ddSerCol   = findColByHeader(ddHdr, [/serial/i], 5);
+    var ddStatCol  = findColByHeader(ddHdr, [/^status$/i], 6);
+    var ddDedAmtCol= findColByHeader(ddHdr, [/^deducted$/i, /^deduct\s*amount/i], 16);
+    var ddPOCol    = findColByHeader(ddHdr, [/purchase\s*order\s*number/i, /^po\s*number$/i], 17);
+    var ddDateCol  = findColByHeader(ddHdr, [/actual\s*deducted\s*date/i], 15);
+    var ddDevCostCol = findColByHeader(ddHdr, [/device\s*cost/i], 22);
+    if(ddAgentCol !== 7){
+      console.log('[TC parser] Deductions: column auto-detected agent='+ddAgentCol+' (spec=7 — header shifted)');
+    }
+    var ddDiagLogged = 0;
+    deductSheet.rows.slice(1).forEach(function(r, idx){
       if(!r || r.length === 0) return;
-      var name = asStr(r[7]);   // col H — may be BLANK
-      var teamName = asStr(r[1]); // col B (Team DD)
-      var rawDeducted = Number(r[16])||0;
+      var name = asStr(r[ddAgentCol]);
+      var teamName = asStr(r[ddTeamCol]);
+      var rawDeducted = Number(r[ddDedAmtCol])||0;
       if(rawDeducted === 0) return;
-      // Skip if no team AND no agent — there's nothing to attribute
       if(!name && !teamName) return;
+      // diag only if we DO have a name and it looks numeric (a real bug indicator)
+      if(name && ddDiagLogged < 5 && /^\d+$/.test(String(name).trim())){
+        console.warn('[TC parser] Deductions row '+(idx+2)+' agentName looks numeric ("'+name+'"). Full row:', r);
+        ddDiagLogged++;
+      }
       result.deductions.push({
         type:           'Aging Phone',
-        agentName:      name,                // may be empty string
+        agentName:      name,
         teamName:       teamName,
-        orderNum:       asStr(r[17]),        // PO Number — used for credit lookup
-        poNumber:       asStr(r[17]),
-        serial:         asStr(r[5]),
-        productName:    asStr(r[4]),
-        status:         asStr(r[6]),
-        date:           ppExcelDateToStr(r[15]),
+        orderNum:       asStr(r[ddPOCol]),
+        poNumber:       asStr(r[ddPOCol]),
+        serial:         asStr(r[ddSerCol]),
+        productName:    asStr(r[ddProdCol]),
+        status:         asStr(r[ddStatCol]),
+        date:           ppExcelDateToStr(r[ddDateCol]),
         amountCents:    Math.abs(Math.round(rawDeducted * 100)),
-        unassigned:     !name,               // flag: lookup market chain at apply time
-        deviceCost:     Number(r[22])||0,
+        unassigned:     !name,
+        deviceCost:     Number(r[ddDevCostCol])||0,
         rawSheet:       deductSheet.name
       });
     });
