@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.09.2330';
+var BUILD_VERSION = '2026.06.10.0030';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -7043,6 +7043,17 @@ function payrollComputeDealSplit(opts){
           splits.push({aid:iboId, role:(aIsIBO?'ibo-personal':'ibo-consolidated'), cents:1000});
         }
       }
+      // ── Calvin 2026-06-09 LOCKED SPEC ──
+      // Tanita gets $3 on Juan's Tribal cancels (mirrors her $3 payout).
+      // NLAD cancels = no Tanita share (mirrors $0 payout).
+      if(opts.isTribal){
+        var tcDiffCM = DB.agents.find(function(a){
+          return a && a.active && a.role === 'Campaign Manager' && a.tcModel === 'tc-cm-difference';
+        });
+        if(tcDiffCM && tcDiffCM.id !== iboId){
+          splits.push({aid:tcDiffCM.id, role:'cm-fill', cents:300});
+        }
+      }
       // Note: the agent (if not the IBO themselves) intentionally gets NO split.
       return splits;
     }
@@ -7958,6 +7969,51 @@ function payrollApplyDeductions(opts){
   // ── PHASE 1: Apply deductions with cascade ────────────────────────
   deductions.forEach(function(d){
     var agent = resolveAgent(d.agentName);
+
+    // ── Calvin 2026-06-09: MANUAL DEDUCTION DIRECT-CHARGE PATH ──
+    // K-Anna's manual entries (isManual:true) charge the named agent
+    // DIRECTLY for the full amount — no cascade to TL/MM/CM, no per-deal
+    // split. This is because manual deductions are arbitrary admin
+    // entries (e.g. expired inventory pre-charge of $50) and don't
+    // represent a carrier chargeback whose split is known.
+    //
+    // If the agent doesn't have enough commission this week, the
+    // remainder carries over as debt (same as any other deduction).
+    if(d.isManual){
+      if(!agent){
+        unresolved.push({
+          kind:'deduction', deduction:d,
+          reason:'manual deduction: agent name not matched: '+d.agentName
+        });
+        return;
+      }
+      var b = ensureBalance(agent.id);
+      var amt = Math.abs(d.amountCents || 0);
+      var paid = Math.min(b.remainingCents, amt);
+      var carry = amt - paid;
+      b.remainingCents  -= paid;
+      b.deductionsCents += paid;
+      if(carry > 0){
+        b.carryoverCents += carry;
+        // Also persist the carryover as new debt
+        if(!dryRun && typeof payrollAddDebt === 'function'){
+          payrollAddDebt(agent.id, carry, (d.type || 'Manual Deduction')+' '+(d.orderNum||''), weekId);
+        }
+      }
+      audit.push({
+        kind:'deduction',
+        type: d.type || 'Manual Deduction',
+        orderNum: d.orderNum || '',
+        amountCents: amt,
+        agentName: agent.name,
+        appliedTo: agent.id,
+        trail: [{aid:agent.id, role:'manual', name:agent.name, paidCents:paid}],
+        carryoverCents: carry,
+        isManual: true
+      });
+      return;
+    }
+
     var chain;
     var sourceLabel;  // for audit trail — who the deduction was originally attributed to
     var resolvedVia  = '';
@@ -8472,6 +8528,24 @@ function tcCalculateWeek(weekRows){
       if(t.tribalCount) bump(cmId, tribalPay,  'Tribal ('+marketLabel+' consolidated)', t.tribalCount, TC_RATES.cmConsolidated.tribalFlat);
       if(t.portCount)   bump(cmId, portPay,    'Port-in/out bonus',                     t.portCount,   TC_RATES.portInOut);
       if(cbCents)       bump(cmId, cbCents/100,'Chargebacks',                           0,             0);
+
+      // ── Calvin 2026-06-09 LOCKED SPEC ──
+      // Tanita (or whoever holds tcModel='tc-cm-difference' in DB) ALSO
+      // gets her $3 CM fill on each Juan Tribal enrollment. NOT on NLAD.
+      // Per Calvin: "any orders from juan for tribal tanita gets the 3
+      // difference and she doesn't get anything for tc nlad orders".
+      // Math: Juan $25 + Tanita $3 = $28 per Tribal (ceiling).
+      //       Juan $10 + Tanita $0 = $10 per NLAD (no fill).
+      if(t.tribalCount){
+        var tcDiffCM = DB.agents.find(function(a){
+          return a && a.active && a.role === 'Campaign Manager' && a.tcModel === 'tc-cm-difference';
+        });
+        if(tcDiffCM && tcDiffCM.id !== cmId){
+          bump(tcDiffCM.id, t.tribalCount * 3,
+               'CM Tribal fill on '+(cm.name||'IBO')+' consolidated ($3/each)',
+               t.tribalCount, 3);
+        }
+      }
 
       // Other agents: $0 with explicit "routed" line for tracking
       Object.keys(t.agents).forEach(function(aidStr){
@@ -9888,55 +9962,22 @@ function parseTruConnectFile(arrayBuffer){
     });
   }
 
-  // ── SHEET: "TC Deductions" — aging phone DEDUCTIONS (charges) ─────
-  // Headers (0-indexed): see locked spec (col H=7 = Person Assigned Name)
-  // Calvin's spec: lookup-or-cascade per locked rules.
-  // Calvin 2026-06-09: header-based auto-detect + diag
-  var deductSheet = loadSheet(/^\s*TC\s*Deductions\s*$/i);
-  if(deductSheet){
-    var ddHdr = deductSheet.rows[0] || [];
-    var ddAgentCol = findColByHeader(ddHdr, [/person\s*assigned/i, /agent\s*name/i], 7);
-    var ddTeamCol  = findColByHeader(ddHdr, [/team\s*dd/i, /team\s*name/i, /^team\b/i], 1);
-    var ddProdCol  = findColByHeader(ddHdr, [/product.*name/i], 4);
-    var ddSerCol   = findColByHeader(ddHdr, [/serial/i], 5);
-    var ddStatCol  = findColByHeader(ddHdr, [/^status$/i], 6);
-    var ddDedAmtCol= findColByHeader(ddHdr, [/^deducted$/i, /^deduct\s*amount/i], 16);
-    var ddPOCol    = findColByHeader(ddHdr, [/purchase\s*order\s*number/i, /^po\s*number$/i], 17);
-    var ddDateCol  = findColByHeader(ddHdr, [/actual\s*deducted\s*date/i], 15);
-    var ddDevCostCol = findColByHeader(ddHdr, [/device\s*cost/i], 22);
-    if(ddAgentCol !== 7){
-      console.log('[TC parser] Deductions: column auto-detected agent='+ddAgentCol+' (spec=7 — header shifted)');
-    }
-    var ddDiagLogged = 0;
-    deductSheet.rows.slice(1).forEach(function(r, idx){
-      if(!r || r.length === 0) return;
-      var name = asStr(r[ddAgentCol]);
-      var teamName = asStr(r[ddTeamCol]);
-      var rawDeducted = Number(r[ddDedAmtCol])||0;
-      if(rawDeducted === 0) return;
-      if(!name && !teamName) return;
-      // diag only if we DO have a name and it looks numeric (a real bug indicator)
-      if(name && ddDiagLogged < 5 && /^\d+$/.test(String(name).trim())){
-        console.warn('[TC parser] Deductions row '+(idx+2)+' agentName looks numeric ("'+name+'"). Full row:', r);
-        ddDiagLogged++;
-      }
-      result.deductions.push({
-        type:           'Aging Phone',
-        agentName:      name,
-        teamName:       teamName,
-        orderNum:       asStr(r[ddPOCol]),
-        poNumber:       asStr(r[ddPOCol]),
-        serial:         asStr(r[ddSerCol]),
-        productName:    asStr(r[ddProdCol]),
-        status:         asStr(r[ddStatCol]),
-        date:           ppExcelDateToStr(r[ddDateCol]),
-        amountCents:    Math.abs(Math.round(rawDeducted * 100)),
-        unassigned:     !name,
-        deviceCost:     Number(r[ddDevCostCol])||0,
-        rawSheet:       deductSheet.name
-      });
-    });
-  }
+  // ── SHEET: "TC Deductions" — aging phone DEDUCTIONS ────────────────
+  // Calvin 2026-06-09: REMOVED FROM AUTO-DEDUCTION FLOW.
+  //   Aging phone deductions show up on the TC invoice 2–3 weeks AFTER
+  //   we already manually deducted them from the agent (so we have
+  //   funds in reserve before the phone formally ages out). Auto-
+  //   applying them here causes the agent's real pay that week to be
+  //   double-charged. K-Anna logs the proactive deductions via the
+  //   "Payroll Adjustments" section on the preview screen.
+  //
+  //   Sheet is intentionally NOT read. Refunds (when an aged phone
+  //   gets re-activated) are handled via the manual credits input.
+  //
+  // If you ever need to re-enable, restore the parser block from
+  // git history pre-v2330. Per locked spec, KEEP THIS SKIPPED.
+  // ────────────────────────────────────────────────────────────────────
+  // (Sheet read intentionally omitted — see comment above.)
 
   return result;
 }
@@ -34475,20 +34516,54 @@ function ppRenderCarrierPreview(carrier, parsed){
   var match = ppMatchRowsToAgents(parsed, carrier);
   var matched = match.matched, unmatched = match.unmatched;
   var isTC = carrier === 'TruConnect';
+  var u = DB.current || {};
   // Compute actual agent commissions via the engine — this is the real
   // money math, not the carrier's per-row rate.
   var commissions = ppComputeAgentCommissions(parsed, carrier);
+
+  // ── Manual Adjustments (Calvin 2026-06-09) ──
+  // K-Anna / Payroll can add per-agent deductions and credits via the UI.
+  // Stored on window._ppManualAdjustments[carrier] = {deductions:[], credits:[]}
+  // Each row: {agentId, agentName, amountCents, reason}
+  if(!window._ppManualAdjustments) window._ppManualAdjustments = {};
+  if(!window._ppManualAdjustments[carrier]){
+    window._ppManualAdjustments[carrier] = { deductions:[], credits:[] };
+  }
+  var manualAdj = window._ppManualAdjustments[carrier];
+
+  // Merge parsed + manual into the cascade input
+  var allDeductions = (parsed.deductions || []).slice();
+  var allCredits    = (parsed.credits    || []).slice();
+  manualAdj.deductions.forEach(function(d){
+    allDeductions.push({
+      type:        d.reason || 'Manual Deduction',
+      agentName:   d.agentName,
+      orderNum:    'MANUAL-DD-'+(d.id||''),
+      amountCents: d.amountCents,
+      isManual:    true
+    });
+  });
+  manualAdj.credits.forEach(function(c){
+    allCredits.push({
+      type:        c.reason || 'Manual Credit',
+      agentName:   c.agentName,
+      orderNum:    'MANUAL-CR-'+(c.id||''),
+      amountCents: c.amountCents,
+      isManual:    true
+    });
+  });
+
   // Apply deductions and credits via the cascade engine (dry run for preview).
   // This mirrors what will happen at commit time, so the user sees final
   // net pay before saving.
   var cascadeResult = null;
   var totalDeductions = 0, totalCredits = 0, totalCarryover = 0, totalDebtCleared = 0;
-  if(isTC && (parsed.deductions || parsed.credits)){
+  if(isTC && (allDeductions.length || allCredits.length)){
     try{
       cascadeResult = payrollApplyDeductions({
         commissions: commissions,
-        deductions:  parsed.deductions || [],
-        credits:     parsed.credits    || [],
+        deductions:  allDeductions,
+        credits:     allCredits,
         carrier:     carrier,
         weekId:      'preview',
         dryRun:      true
@@ -34870,6 +34945,80 @@ function ppRenderCarrierPreview(carrier, parsed){
         h += '</ul></div>';
       }
 
+      // ──────────── MANUAL ADJUSTMENTS (Calvin 2026-06-09) ────────────
+      // K-Anna / Payroll can add per-agent deductions (e.g. expired
+      // inventory pre-charges) and credits (e.g. expired-device refunds
+      // + commission reimbursement when an aged phone gets re-activated)
+      // before committing the week. Applied immediately on add — Net Pay
+      // Summary below reflects them in real time.
+      if(isTC){
+        var canEditAdj = u && (u.role === 'Owner' || /payroll|k.?anna/i.test(String(u.username||'')+' '+String(u.name||'')) || (u.role === 'Office Staff' && u.isPayrollManager));
+        // Build agent dropdown options once
+        var agentOpts = '<option value="">— Select agent —</option>';
+        DB.agents.filter(function(a){return a && a.active && a.role !== 'Owner';})
+          .sort(function(a,b){return (a.name||'').localeCompare(b.name||'');})
+          .forEach(function(a){
+            agentOpts += '<option value="'+a.id+'">'+a.name+' ('+(a.role||'')+')</option>';
+          });
+
+        h += '<div style="background:rgba(217,119,6,.04);border:1px solid rgba(217,119,6,.3);border-radius:8px;padding:12px 14px;margin-bottom:14px">';
+        h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">';
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:#92400E;font-weight:700">💰 Manual Adjustments (Payroll)</div>';
+        if(canEditAdj){
+          h += '<div style="display:flex;gap:6px">';
+          h += '<button onclick="ppAddManualAdj(\''+carrier+'\',\'deduction\')" style="padding:5px 10px;background:#991B1B;color:#fff;border:0;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:.5px;cursor:pointer">+ Add Deduction</button>';
+          h += '<button onclick="ppAddManualAdj(\''+carrier+'\',\'credit\')" style="padding:5px 10px;background:#059669;color:#fff;border:0;border-radius:4px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:.5px;cursor:pointer">+ Add Credit</button>';
+          h += '</div>';
+        }
+        h += '</div>';
+
+        if(!canEditAdj && manualAdj.deductions.length===0 && manualAdj.credits.length===0){
+          h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);font-style:italic">No manual adjustments. (Visible to Owner + Payroll.)</div>';
+        } else if(manualAdj.deductions.length===0 && manualAdj.credits.length===0){
+          h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">No manual adjustments yet. Use the buttons above to add deductions (e.g. expired inventory pre-charge) or credits (e.g. expired-device reimbursement).</div>';
+        } else {
+          // Show deductions
+          if(manualAdj.deductions.length){
+            h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.64rem;letter-spacing:1px;text-transform:uppercase;color:#991B1B;font-weight:700;margin-bottom:4px">DEDUCTIONS ('+manualAdj.deductions.length+')</div>';
+            manualAdj.deductions.forEach(function(d, idx){
+              h += '<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:#fff;border:1px solid rgba(153,27,27,.2);border-radius:4px;margin-bottom:4px;flex-wrap:wrap">';
+              if(canEditAdj){
+                h += '<select onchange="ppUpdateManualAdj(\''+carrier+'\',\'deduction\','+idx+',\'agentId\',this.value)" style="padding:4px 6px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;border:1px solid var(--border);border-radius:3px;flex:1;min-width:160px">'+
+                  agentOpts.replace('value="'+d.agentId+'"','value="'+d.agentId+'" selected')+'</select>';
+                h += '<input type="number" step="0.01" min="0" value="'+((d.amountCents||0)/100).toFixed(2)+'" onchange="ppUpdateManualAdj(\''+carrier+'\',\'deduction\','+idx+',\'amount\',this.value)" placeholder="0.00" style="width:90px;padding:4px 6px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;border:1px solid var(--border);border-radius:3px;text-align:right" />';
+                h += '<input type="text" value="'+(d.reason||'Expired Inventory').replace(/"/g,'&quot;')+'" onchange="ppUpdateManualAdj(\''+carrier+'\',\'deduction\','+idx+',\'reason\',this.value)" placeholder="Reason" style="flex:1;min-width:140px;padding:4px 6px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;border:1px solid var(--border);border-radius:3px" />';
+                h += '<button onclick="ppRemoveManualAdj(\''+carrier+'\',\'deduction\','+idx+')" title="Remove" style="padding:4px 8px;background:transparent;color:#991B1B;border:1px solid #991B1B;border-radius:3px;font-size:.7rem;cursor:pointer">✕</button>';
+              } else {
+                h += '<div style="flex:1;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><strong>'+(d.agentName||'(no agent)')+'</strong></div>';
+                h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#991B1B;font-weight:700">−$'+((d.amountCents||0)/100).toFixed(2)+'</div>';
+                h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);min-width:120px">'+(d.reason||'')+'</div>';
+              }
+              h += '</div>';
+            });
+          }
+          // Show credits
+          if(manualAdj.credits.length){
+            h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.64rem;letter-spacing:1px;text-transform:uppercase;color:#059669;font-weight:700;margin-top:8px;margin-bottom:4px">CREDITS ('+manualAdj.credits.length+')</div>';
+            manualAdj.credits.forEach(function(c, idx){
+              h += '<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:#fff;border:1px solid rgba(5,150,105,.2);border-radius:4px;margin-bottom:4px;flex-wrap:wrap">';
+              if(canEditAdj){
+                h += '<select onchange="ppUpdateManualAdj(\''+carrier+'\',\'credit\','+idx+',\'agentId\',this.value)" style="padding:4px 6px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;border:1px solid var(--border);border-radius:3px;flex:1;min-width:160px">'+
+                  agentOpts.replace('value="'+c.agentId+'"','value="'+c.agentId+'" selected')+'</select>';
+                h += '<input type="number" step="0.01" min="0" value="'+((c.amountCents||0)/100).toFixed(2)+'" onchange="ppUpdateManualAdj(\''+carrier+'\',\'credit\','+idx+',\'amount\',this.value)" placeholder="0.00" style="width:90px;padding:4px 6px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;border:1px solid var(--border);border-radius:3px;text-align:right" />';
+                h += '<input type="text" value="'+(c.reason||'Expired Device Refund').replace(/"/g,'&quot;')+'" onchange="ppUpdateManualAdj(\''+carrier+'\',\'credit\','+idx+',\'reason\',this.value)" placeholder="Reason" style="flex:1;min-width:140px;padding:4px 6px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;border:1px solid var(--border);border-radius:3px" />';
+                h += '<button onclick="ppRemoveManualAdj(\''+carrier+'\',\'credit\','+idx+')" title="Remove" style="padding:4px 8px;background:transparent;color:#991B1B;border:1px solid #991B1B;border-radius:3px;font-size:.7rem;cursor:pointer">✕</button>';
+              } else {
+                h += '<div style="flex:1;font-family:Barlow Condensed,sans-serif;font-size:.78rem"><strong>'+(c.agentName||'(no agent)')+'</strong></div>';
+                h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#059669;font-weight:700">+$'+((c.amountCents||0)/100).toFixed(2)+'</div>';
+                h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);min-width:120px">'+(c.reason||'')+'</div>';
+              }
+              h += '</div>';
+            });
+          }
+        }
+        h += '</div>';
+      }
+
       // Per-agent net pay summary
       // Calvin 2026-06-09: Split GROSS into PERSONAL + OVERRIDES so
       // it's obvious at a glance whether each agent is getting their
@@ -34994,6 +35143,66 @@ function ppRenderCarrierPreview(carrier, parsed){
 
 // Handle "Assign" click on an unmatched row — saves code to agent profile,
 // then re-renders the preview so the row moves to the Matched section.
+// ════════════════════════════════════════════════════════════════════
+//  MANUAL PAYROLL ADJUSTMENTS (Calvin 2026-06-09)
+//
+//  K-Anna / Payroll can add per-agent deductions and credits at preview
+//  time. They merge into the cascade engine input before commit.
+//
+//  Stored on window._ppManualAdjustments[carrier] = { deductions:[], credits:[] }
+//  Each row: { id, agentId, agentName, amountCents, reason }
+//
+//  The same shape is persisted into the saved week record on commit
+//  so the agent's pay history reflects the manual lines.
+// ════════════════════════════════════════════════════════════════════
+function ppManualAdjStore(carrier){
+  if(!window._ppManualAdjustments) window._ppManualAdjustments = {};
+  if(!window._ppManualAdjustments[carrier]) window._ppManualAdjustments[carrier] = {deductions:[], credits:[]};
+  return window._ppManualAdjustments[carrier];
+}
+function ppAddManualAdj(carrier, kind){
+  var store = ppManualAdjStore(carrier);
+  var bucket = kind === 'credit' ? store.credits : store.deductions;
+  bucket.push({
+    id:          Date.now() + '-' + Math.floor(Math.random()*1000),
+    agentId:     null,
+    agentName:   '',
+    amountCents: 0,
+    reason:      kind === 'credit' ? 'Expired Device Refund' : 'Expired Inventory'
+  });
+  gotoPanel('payroll-upload-preview');  // re-render
+}
+function ppUpdateManualAdj(carrier, kind, idx, field, value){
+  var store = ppManualAdjStore(carrier);
+  var bucket = kind === 'credit' ? store.credits : store.deductions;
+  if(!bucket[idx]) return;
+  var row = bucket[idx];
+  if(field === 'agentId'){
+    var aid = parseInt(value, 10);
+    if(aid){
+      var ag = DB.agents.find(function(a){return a.id===aid;});
+      row.agentId   = aid;
+      row.agentName = ag ? ag.name : '';
+    } else {
+      row.agentId = null;
+      row.agentName = '';
+    }
+  } else if(field === 'amount'){
+    var dollars = parseFloat(value);
+    row.amountCents = isFinite(dollars) ? Math.round(Math.abs(dollars) * 100) : 0;
+  } else if(field === 'reason'){
+    row.reason = String(value || '').trim();
+  }
+  gotoPanel('payroll-upload-preview');  // re-render
+}
+function ppRemoveManualAdj(carrier, kind, idx){
+  var store = ppManualAdjStore(carrier);
+  var bucket = kind === 'credit' ? store.credits : store.deductions;
+  if(!bucket[idx]) return;
+  bucket.splice(idx, 1);
+  gotoPanel('payroll-upload-preview');
+}
+
 function ppAssignUnmatched(carrier, code){
   var sel = document.getElementById('pp-assign-'+carrier.replace(/\s+/g,'')+'-'+code.replace(/[^\w]/g,''));
   if(!sel || !sel.value){ alert('Pick an agent first.'); return; }
@@ -35113,12 +35322,43 @@ function ppCommitStaged(){
     // Apply deductions and credits via cascade. This mutates the debt
     // ledger (clears prior debt, adds new carryover). Updates each row's
     // grossCents to reflect NET pay (after deductions/credits/debt).
-    if(carrier === 'TruConnect' && (parsed.deductions || parsed.credits)){
+    //
+    // Calvin 2026-06-09: ALSO merges K-Anna's manual adjustments from
+    // window._ppManualAdjustments[carrier] into the cascade input so
+    // they apply at commit, are tracked in the audit trail, and persist
+    // on the week record for the agent's pay history.
+    var manualAdj = (window._ppManualAdjustments || {})[carrier] || {deductions:[], credits:[]};
+    var allDed = (parsed.deductions || []).slice();
+    var allCred = (parsed.credits || []).slice();
+    manualAdj.deductions.forEach(function(d){
+      if(!d.agentId || !d.amountCents) return;
+      allDed.push({
+        type:        d.reason || 'Manual Deduction',
+        agentName:   d.agentName,
+        orderNum:    'MANUAL-DD-'+(d.id||''),
+        amountCents: d.amountCents,
+        isManual:    true,
+        manualId:    d.id
+      });
+    });
+    manualAdj.credits.forEach(function(c){
+      if(!c.agentId || !c.amountCents) return;
+      allCred.push({
+        type:        c.reason || 'Manual Credit',
+        agentName:   c.agentName,
+        orderNum:    'MANUAL-CR-'+(c.id||''),
+        amountCents: c.amountCents,
+        isManual:    true,
+        manualId:    c.id
+      });
+    });
+
+    if(carrier === 'TruConnect' && (allDed.length || allCred.length)){
       try{
         var cascadeFinal = payrollApplyDeductions({
           commissions: commissions,
-          deductions:  parsed.deductions || [],
-          credits:     parsed.credits    || [],
+          deductions:  allDed,
+          credits:     allCred,
           carrier:     carrier,
           weekId:      weekRecord.id,
           dryRun:      false   // for real this time
@@ -35140,6 +35380,8 @@ function ppCommitStaged(){
         weekRecord.deductionAudit = cascadeFinal.audit;
         weekRecord.deductionsParsed = parsed.deductions || [];
         weekRecord.creditsParsed = parsed.credits || [];
+        weekRecord.manualDeductions = manualAdj.deductions.slice();
+        weekRecord.manualCredits = manualAdj.credits.slice();
         weekRecord.unresolvedDeductions = cascadeFinal.unresolved;
       }catch(e){
         console.warn('[ppCommitStaged] cascade apply failed:', e);
@@ -35152,6 +35394,7 @@ function ppCommitStaged(){
   window._ppStaged = null;
   window._ppDetections = null;
   window._ppFileBuffer = null;
+  window._ppManualAdjustments = null;  // clear manual entries after commit
   alert('✓ '+saved+' week(s) saved to payroll history.');
   gotoPanel('payroll-upload');
 }
