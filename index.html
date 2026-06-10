@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.10.0630';
+var BUILD_VERSION = '2026.06.10.0730';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -19464,6 +19464,9 @@ async function loadFromSupabase(){
         if(s.key==='training_completions' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TRAINING_COMPLETIONS = v;}catch(e){} }
         if(s.key==='training_nextid'      && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) TRAINING_NEXT_ID = n;}catch(e){} }
         if(s.key==='completion_nextid'    && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) COMPLETION_NEXT_ID = n;}catch(e){} }
+        // Calvin 2026-06-10 — failed-BG cost ledger + weekly invoices
+        if(s.key==='failed_bg_costs'      && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) FAILED_BG_COSTS = v;}catch(e){} }
+        if(s.key==='bg_fail_invoices'     && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) BG_FAIL_INVOICES = v;}catch(e){} }
         // Ship A7 — Onboarding uploads
         if(s.key==='upload_submissions'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) UPLOAD_SUBMISSIONS = v;}catch(e){} }
         if(s.key==='upload_nextid'        && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) UPLOAD_NEXT_ID = n;}catch(e){} }
@@ -19589,6 +19592,17 @@ async function loadFromSupabase(){
     loadCampaignDocs();
     loadAgentContracts();
     loadAssignedDocs();  // Calvin 2026-06-03 — assignable docs framework
+    // Calvin 2026-06-10: load failed-BG cost ledger from localStorage
+    // (Supabase load happens via app_settings batch loader elsewhere)
+    if(typeof loadFailedBgCostsFromLocal === 'function'){
+      try{ loadFailedBgCostsFromLocal(); }catch(e){}
+    }
+    // Calvin 2026-06-10: fire weekly invoice auto-check on boot.
+    // Deferred 8s so app_settings batch loader has time to populate ledger.
+    setTimeout(function(){
+      try{ if(typeof checkAndFireWeeklyBgInvoice === 'function') checkAndFireWeeklyBgInvoice(); }
+      catch(e){ console.warn('[boot weeklyBgInvoice] failed:', e); }
+    }, 8000);
     // Restore any link URL overrides saved by owner
     try{
       var lo = localStorage.getItem('wmam_links_overrides');
@@ -21544,21 +21558,381 @@ function bgFirePassedEmail(agent, campaigns){
 
 // Send the 'failed' email — professional, mentions other opportunities
 function bgFireFailedEmail(agent, campaigns, reason){
-  if(!agent || !agent.email) return;
-  if(typeof notifyByEmail !== 'function') return;
-  notifyByEmail({
-    toAgent: {id: agent.id, name: agent.name, email: agent.email},
-    eventType: 'bgcheck.failed',
-    payload: {
-      firstName: (agent.name||'').split(' ')[0],
-      fullName:  agent.name,
-      campaigns: campaigns,
-      campaignsList: campaigns.join(', '),
-      reason:    reason || '',
-      appUrl:    (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+  if(!agent) return;
+  // ── Calvin 2026-06-10 ENHANCED FAIL HANDLING ──
+  // On any BG failure for any campaign:
+  //   1. Email the agent (existing — uses bgcheck.failed template)
+  //   2. Email the IMMEDIATE manager (TL → MM fallback) + push notification
+  //   3. Record cost to the FAILED_BG_COSTS ledger ($21 per failed campaign,
+  //      billed to the immediate manager who hired them)
+  //   4. Push notification to wider upline (MM, CM) for awareness
+  //
+  // Idempotent on cost: ledger entries are keyed by agentId+campaign+failedAt
+  // so the same fail doesn't double-bill, even if bgDecide is called twice.
+
+  // 1. Agent email
+  if(agent.email && typeof notifyByEmail === 'function'){
+    notifyByEmail({
+      toAgent: {id: agent.id, name: agent.name, email: agent.email},
+      eventType: 'bgcheck.failed',
+      payload: {
+        firstName: (agent.name||'').split(' ')[0],
+        fullName:  agent.name,
+        campaigns: campaigns,
+        campaignsList: campaigns.join(', '),
+        reason:    reason || '',
+        appUrl:    (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+      }
+    }).catch(function(e){ console.warn('[bgFireFailedEmail] agent email failed:', e); });
+  }
+
+  // 2. Find immediate manager (TL > MM fallback per Calvin's locked spec)
+  var immediateMgr = null;
+  if(agent.teamLeaderId){
+    immediateMgr = (DB.agents||[]).find(function(a){return a && a.id === agent.teamLeaderId && a.active;});
+  }
+  if(!immediateMgr && agent.marketManagerId){
+    immediateMgr = (DB.agents||[]).find(function(a){return a && a.id === agent.marketManagerId && a.active;});
+  }
+
+  // 3. Email + notify immediate manager
+  if(immediateMgr){
+    if(immediateMgr.email && typeof notifyByEmail === 'function'){
+      notifyByEmail({
+        toAgent: {id: immediateMgr.id, name: immediateMgr.name, email: immediateMgr.email},
+        eventType: 'bgcheck.failed_upline',
+        payload: {
+          firstName:    (immediateMgr.name||'').split(' ')[0],
+          managerName:  immediateMgr.name,
+          agentName:    agent.name,
+          campaigns:    campaigns,
+          campaignsList: campaigns.join(', '),
+          reason:       reason || '',
+          costPerFail:  '$21.00',
+          costTotal:    '$'+(campaigns.length * 21).toFixed(2),
+          appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        }
+      }).catch(function(e){ console.warn('[bgFireFailedEmail] upline email failed:', e); });
     }
-  }).catch(function(e){ console.warn('[bgFireFailedEmail] failed:', e); });
+    if(typeof pushNotification === 'function'){
+      try{
+        pushNotification({
+          toIds: [immediateMgr.id], toRoles: [],
+          icon: '⚠',
+          title: 'BG Check Failed — '+agent.name,
+          body: agent.name+' failed BG for '+campaigns.join(', ')+'. They are no longer eligible to work these campaigns. Weekly reimbursement invoice will follow.',
+          panel: 'bg-check-queue',
+          priority: 'high',
+          skipEmail: true   // already sent above
+        });
+      }catch(e){}
+    }
+  }
+
+  // 4. Wider upline (MM + CM + Owner) — awareness ping, no email
+  if(typeof pushNotification === 'function'){
+    var uplineIds = [];
+    if(agent.marketManagerId && agent.marketManagerId !== (immediateMgr && immediateMgr.id)){
+      uplineIds.push(agent.marketManagerId);
+    }
+    if(agent.campaignManagerId && agent.campaignManagerId !== (immediateMgr && immediateMgr.id)){
+      uplineIds.push(agent.campaignManagerId);
+    }
+    if(typeof OWNER_ID !== 'undefined' && OWNER_ID) uplineIds.push(OWNER_ID);
+    uplineIds = uplineIds.filter(function(id, i){ return id && uplineIds.indexOf(id) === i; });
+    if(uplineIds.length){
+      try{
+        pushNotification({
+          toIds: uplineIds, toRoles: [],
+          icon: '⚠',
+          title: 'BG Failed — '+agent.name+' ('+campaigns.length+' campaign'+(campaigns.length>1?'s':'')+')',
+          body: agent.name+' failed BG for '+campaigns.join(', ')+'. Hired by '+(immediateMgr ? immediateMgr.name : '(no manager set)')+'.',
+          panel: 'bg-check-queue',
+          priority: 'normal'
+        });
+      }catch(e){}
+    }
+  }
+
+  // 5. Record cost to ledger ($21 per failed campaign, billed to immediate mgr)
+  try{
+    if(typeof FAILED_BG_COSTS === 'undefined') window.FAILED_BG_COSTS = [];
+    campaigns.forEach(function(camp){
+      // Idempotent: skip if we already logged this agent+campaign+fail
+      var existing = FAILED_BG_COSTS.find(function(c){
+        return c.agentId === agent.id && c.campaignName === camp && c.status !== 'reversed';
+      });
+      if(existing) return;
+      FAILED_BG_COSTS.push({
+        id:           Date.now()+'-'+Math.floor(Math.random()*10000),
+        agentId:      agent.id,
+        agentName:    agent.name,
+        campaignName: camp,
+        managerId:    immediateMgr ? immediateMgr.id : null,
+        managerName:  immediateMgr ? immediateMgr.name : '(no manager assigned)',
+        failedAt:     new Date().toISOString(),
+        amountCents:  2100,   // $21 per Calvin's locked spec
+        reason:       reason || '',
+        status:       'open',     // 'open' | 'invoiced' | 'reversed'
+        invoiceId:    null,
+        invoicedAt:   null
+      });
+    });
+    // Persist to localStorage and Supabase
+    if(typeof saveFailedBgCosts === 'function') saveFailedBgCosts();
+  }catch(e){ console.warn('[bgFireFailedEmail] cost ledger write failed:', e); }
 }
+
+// ════════════════════════════════════════════════════════════════════
+//  FAILED BG COST LEDGER + WEEKLY INVOICE  (Calvin 2026-06-10)
+//
+//  Tracks the $21-per-fail cost the company eats when a BG check comes
+//  back negative. Locked spec: bills the IMMEDIATE manager (TL > MM
+//  fallback) who hired the agent.
+//
+//  Schema (FAILED_BG_COSTS):
+//    {id, agentId, agentName, campaignName, managerId, managerName,
+//     failedAt, amountCents:2100, reason, status:'open'|'invoiced'|'reversed',
+//     invoiceId, invoicedAt}
+//
+//  Schema (BG_FAIL_INVOICES):
+//    {id, weekStart, weekEnd, managerId, managerName, lineItems:[...],
+//     totalCents, sentAt, sentTo:['kanna@...','makenzie@...','mgr@...']}
+//
+//  Weekly cycle (Calvin's spec): Sunday-Saturday window. Generate +
+//  email K-Anna + Makenzie + the manager. No e-sign required.
+// ════════════════════════════════════════════════════════════════════
+var FAILED_BG_COSTS = [];
+var BG_FAIL_INVOICES = [];
+
+function saveFailedBgCosts(){
+  try{ localStorage.setItem('wmam_failed_bg_costs', JSON.stringify(FAILED_BG_COSTS)); }catch(e){}
+  try{ localStorage.setItem('wmam_bg_fail_invoices', JSON.stringify(BG_FAIL_INVOICES)); }catch(e){}
+  // Push to Supabase app_settings if available
+  try{
+    if(typeof supaClient !== 'undefined' && supaClient){
+      supaClient.from('app_settings').upsert([
+        {key:'failed_bg_costs',  value:JSON.stringify(FAILED_BG_COSTS)},
+        {key:'bg_fail_invoices', value:JSON.stringify(BG_FAIL_INVOICES)}
+      ]).then(function(){}).catch(function(){});
+    }
+  }catch(e){}
+}
+
+function loadFailedBgCostsFromLocal(){
+  try{
+    var c = localStorage.getItem('wmam_failed_bg_costs');
+    if(c) FAILED_BG_COSTS = JSON.parse(c) || [];
+    var i = localStorage.getItem('wmam_bg_fail_invoices');
+    if(i) BG_FAIL_INVOICES = JSON.parse(i) || [];
+  }catch(e){ console.warn('[loadFailedBgCostsFromLocal] failed:', e); }
+}
+
+// Compute the Sunday-Saturday window containing a given date (defaults to today).
+// Returns {start: 'YYYY-MM-DD', end: 'YYYY-MM-DD'} where start is Sunday and
+// end is the following Saturday.
+function bgFailWeekRange(refDate){
+  var d = refDate ? new Date(refDate) : new Date();
+  d.setHours(0,0,0,0);
+  var day = d.getDay(); // 0=Sun, 6=Sat
+  var sunday = new Date(d); sunday.setDate(d.getDate() - day);
+  var saturday = new Date(sunday); saturday.setDate(sunday.getDate() + 6);
+  function fmt(x){ return x.toISOString().slice(0,10); }
+  return { start: fmt(sunday), end: fmt(saturday) };
+}
+
+// Generate the weekly invoice for a given Sunday-Saturday window. Returns
+// the list of created invoices (one per manager who has open fails in that
+// window). If no open fails exist for any manager, returns [].
+//
+// If `sendEmail=true` (default), automatically emails K-Anna + Makenzie +
+// each respective manager with the invoice details.
+function generateFailedBgInvoice(weekRefDate, sendEmail){
+  if(sendEmail === undefined) sendEmail = true;
+  var range = bgFailWeekRange(weekRefDate);
+  var u = DB.current || {};
+  // Find all OPEN failed-BG costs whose failedAt falls in the window
+  var inWindow = (FAILED_BG_COSTS||[]).filter(function(c){
+    if(c.status !== 'open') return false;
+    if(!c.failedAt) return false;
+    var d = c.failedAt.slice(0,10);
+    return d >= range.start && d <= range.end;
+  });
+  if(!inWindow.length){
+    console.log('[generateFailedBgInvoice] no open fails in '+range.start+' to '+range.end);
+    return [];
+  }
+
+  // Group by managerId (null managers grouped together as "unassigned")
+  var byMgr = {};
+  inWindow.forEach(function(c){
+    var key = c.managerId || 'unassigned';
+    if(!byMgr[key]) byMgr[key] = {
+      managerId:   c.managerId,
+      managerName: c.managerName,
+      items:       []
+    };
+    byMgr[key].items.push(c);
+  });
+
+  var invoicesCreated = [];
+  Object.keys(byMgr).forEach(function(key){
+    var group = byMgr[key];
+    var totalCents = group.items.reduce(function(s,c){return s + (c.amountCents||0);}, 0);
+    var invoiceId = 'BGINV-'+Date.now()+'-'+key;
+    var invoice = {
+      id:          invoiceId,
+      weekStart:   range.start,
+      weekEnd:     range.end,
+      managerId:   group.managerId,
+      managerName: group.managerName,
+      lineItems:   group.items.map(function(c){
+        return {
+          costId:       c.id,
+          agentName:    c.agentName,
+          campaignName: c.campaignName,
+          failedAt:     c.failedAt,
+          reason:       c.reason || '',
+          amountCents:  c.amountCents
+        };
+      }),
+      totalCents:    totalCents,
+      generatedAt:   new Date().toISOString(),
+      generatedById: u.id || null,
+      generatedByName: u.name || '',
+      sentAt:        null,
+      sentTo:        []
+    };
+
+    // Mark all line items as invoiced
+    group.items.forEach(function(c){
+      c.status = 'invoiced';
+      c.invoiceId = invoiceId;
+      c.invoicedAt = invoice.generatedAt;
+    });
+
+    BG_FAIL_INVOICES.push(invoice);
+    invoicesCreated.push(invoice);
+
+    if(sendEmail) sendFailedBgInvoiceEmail(invoice);
+  });
+
+  saveFailedBgCosts();
+  return invoicesCreated;
+}
+
+// Email the invoice to K-Anna, Makenzie, and the manager being billed.
+// No e-sign required per Calvin's spec — informational only.
+function sendFailedBgInvoiceEmail(invoice){
+  if(typeof notifyByEmail !== 'function') return;
+  // Find the manager's email
+  var mgr = invoice.managerId
+    ? (DB.agents||[]).find(function(a){return a && a.id === invoice.managerId;})
+    : null;
+  // K-Anna and Makenzie are looked up by username
+  var kanna   = (DB.agents||[]).find(function(a){
+    return a && a.username && /^k[-.]?anna$/i.test(a.username);
+  });
+  var makenzie = (DB.agents||[]).find(function(a){
+    return a && a.username && /^makenzie\.gibson$/i.test(a.username);
+  });
+  var recipients = [];
+  if(kanna && kanna.email)       recipients.push({id:kanna.id, name:kanna.name, email:kanna.email});
+  if(makenzie && makenzie.email) recipients.push({id:makenzie.id, name:makenzie.name, email:makenzie.email});
+  if(mgr && mgr.email)           recipients.push({id:mgr.id, name:mgr.name, email:mgr.email});
+  if(!recipients.length){
+    console.warn('[sendFailedBgInvoiceEmail] no recipients found for invoice '+invoice.id);
+    return;
+  }
+  invoice.sentTo = recipients.map(function(r){return r.email;});
+  invoice.sentAt = new Date().toISOString();
+  // Build a single payload with line-item breakdown
+  var payload = {
+    invoiceId:    invoice.id,
+    weekStart:    invoice.weekStart,
+    weekEnd:      invoice.weekEnd,
+    managerName:  invoice.managerName,
+    lineCount:    invoice.lineItems.length,
+    totalDollars: (invoice.totalCents/100).toFixed(2),
+    lineItems:    invoice.lineItems.map(function(li){
+      return {
+        agentName:    li.agentName,
+        campaignName: li.campaignName,
+        failedAt:     li.failedAt.slice(0,10),
+        reason:       li.reason,
+        amountDollars: (li.amountCents/100).toFixed(2)
+      };
+    }),
+    appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+  };
+  recipients.forEach(function(r){
+    notifyByEmail({
+      toAgent: r,
+      eventType: 'billing.bg_fail_weekly_invoice',
+      payload: payload
+    }).catch(function(e){ console.warn('[sendFailedBgInvoiceEmail] '+r.email+' failed:', e); });
+  });
+  saveFailedBgCosts();
+  console.log('[sendFailedBgInvoiceEmail] invoice '+invoice.id+' sent to '+invoice.sentTo.join(', '));
+}
+
+if(typeof window !== 'undefined'){
+  window.FAILED_BG_COSTS = FAILED_BG_COSTS;
+  window.BG_FAIL_INVOICES = BG_FAIL_INVOICES;
+  window.bgFailWeekRange = bgFailWeekRange;
+  window.generateFailedBgInvoice = generateFailedBgInvoice;
+  window.sendFailedBgInvoiceEmail = sendFailedBgInvoiceEmail;
+  window.saveFailedBgCosts = saveFailedBgCosts;
+  window.loadFailedBgCostsFromLocal = loadFailedBgCostsFromLocal;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  WEEKLY BG-FAIL INVOICE AUTO-FIRE (Calvin 2026-06-10)
+//
+//  Runs on app boot + every 6 hours via autoRefresh. Checks whether the
+//  PREVIOUS Sunday-Saturday window has open BG fails that haven't been
+//  invoiced yet. If yes AND today is Sunday or later → fires the invoice.
+//
+//  Idempotent: skips if an invoice for that week already exists.
+//
+//  This means as long as ANYONE opens the app between Sunday and the next
+//  fail being recorded, the prior week's invoice will fire automatically.
+// ════════════════════════════════════════════════════════════════════
+function checkAndFireWeeklyBgInvoice(){
+  try{
+    var now = new Date();
+    // Find LAST Saturday — the end of the just-completed week
+    var prevSat = new Date(now);
+    prevSat.setHours(0,0,0,0);
+    prevSat.setDate(now.getDate() - now.getDay() - 1);  // day=0 (Sun) → -1=Sat
+    var prevWeek = bgFailWeekRange(prevSat);
+
+    // If an invoice for this week already exists → done
+    var existing = (BG_FAIL_INVOICES||[]).find(function(inv){
+      return inv.weekStart === prevWeek.start && inv.weekEnd === prevWeek.end;
+    });
+    if(existing){
+      // Already generated; nothing to do.
+      return {fired:false, reason:'already-exists', weekStart:prevWeek.start};
+    }
+    // Are there open costs in that window?
+    var openInWindow = (FAILED_BG_COSTS||[]).filter(function(c){
+      if(c.status !== 'open' || !c.failedAt) return false;
+      var d = c.failedAt.slice(0,10);
+      return d >= prevWeek.start && d <= prevWeek.end;
+    });
+    if(!openInWindow.length){
+      return {fired:false, reason:'no-open-costs', weekStart:prevWeek.start};
+    }
+    console.log('[weeklyBgInvoice] auto-firing for completed week '+prevWeek.start+' → '+prevWeek.end+' ('+openInWindow.length+' fail'+(openInWindow.length!==1?'s':'')+')');
+    var invoices = generateFailedBgInvoice(prevSat, true);
+    return {fired:true, invoiceCount:invoices.length, weekStart:prevWeek.start};
+  }catch(e){
+    console.warn('[weeklyBgInvoice] check failed:', e);
+    return {fired:false, reason:'error', error:String(e)};
+  }
+}
+if(typeof window !== 'undefined') window.checkAndFireWeeklyBgInvoice = checkAndFireWeeklyBgInvoice;
 
 if(typeof window !== 'undefined'){
   window.bgEnsure = bgEnsure;
@@ -24707,9 +25081,165 @@ function markAssignedDocSigned(agentId, formId, signature, responses){
     responses:   responses || existing.responses || {}
   };
   console.log('[markAssignedDocSigned] agent='+agentId+' form='+formId+' → signed=true (memory)');
+  // ── Calvin 2026-06-10 LIFELINE AUTOMATION ──
+  // When BOTH BG forms (auth + PII intake) are signed, auto-fire the
+  // next-steps chain. Either form being signed triggers a check — if the
+  // OTHER form is also already signed, we proceed; otherwise we wait.
+  //
+  //   1. Submit agent to BG queue per Lifeline campaign they're set up for
+  //   2. Email agent: "pending BG results, next steps coming"
+  //   3. Notify Onboarding/HR/Owner: "[name] ready to run BG"
+  //
+  // Idempotent — re-signing won't re-fire (uses agent.bgAuthSignedFiredAt).
+  if(formId === 'builtin-bg-authorization' || formId === 'builtin-bg-pii-intake'){
+    var docs = ASSIGNED_DOC_STATUS[agentId] || {};
+    var authSigned = docs['builtin-bg-authorization'] && docs['builtin-bg-authorization'].signed;
+    var piiSigned  = docs['builtin-bg-pii-intake']    && docs['builtin-bg-pii-intake'].signed;
+    // If PII form was never assigned, accept auth-only as the trigger
+    // (back-compat for agents from before the 2-form split).
+    var piiAssigned = !!docs['builtin-bg-pii-intake'];
+    var bothDone = authSigned && (piiSigned || !piiAssigned);
+    if(bothDone){
+      try{ if(typeof onBgAuthSigned === 'function') onBgAuthSigned(agentId); }
+      catch(e){ console.warn('[markAssignedDocSigned] onBgAuthSigned hook failed:', e); }
+    } else {
+      console.log('[markAssignedDocSigned] BG forms not yet complete for agent '+agentId+
+        ' (auth='+!!authSigned+' pii='+!!piiSigned+' piiAssigned='+piiAssigned+') — waiting');
+    }
+  }
   // saveAssignedDocs returns a promise (Calvin 2026-06-08); caller may await
   return saveAssignedDocs(agentId);
 }
+
+// ════════════════════════════════════════════════════════════════════
+//  LIFELINE BG AUTH SIGNED HOOK  (Calvin 2026-06-10)
+//
+//  When agent signs the BG Authorization form, automatically:
+//   1. Submit them to the BG check queue for each Lifeline campaign
+//      (requiresBgCheck=true) that they're being set up for. The set
+//      is determined by:
+//        a. Existing agentCodes (if office staff pre-coded them)
+//        b. OR all active Lifeline campaigns (default — better to
+//           queue too many than miss one; office reviews the queue
+//           anyway).
+//   2. Send "pending BG results" email to agent with next-steps
+//      messaging (using existing notifyByEmail infrastructure).
+//   3. Notify Onboarding dept + Owner that BG is ready to run.
+//
+//  Idempotent: stores agent.bgAuthSignedFiredAt to prevent re-firing.
+// ════════════════════════════════════════════════════════════════════
+function onBgAuthSigned(agentId){
+  var agent = (DB.agents||[]).find(function(a){return a && a.id === agentId;});
+  if(!agent){ console.warn('[onBgAuthSigned] no agent'); return; }
+  if(agent.bgAuthSignedFiredAt){
+    console.log('[onBgAuthSigned] already fired for agent '+agentId+' — skipping');
+    return;
+  }
+  agent.bgAuthSignedFiredAt = new Date().toISOString();
+
+  // ── 1. Determine which campaigns to queue ──
+  // Pull from CAMPAIGNS_REGISTRY (requiresBgCheck=true means Lifeline carriers).
+  var lifelineCampaigns = [];
+  try{
+    var reg = (typeof CAMPAIGNS_REGISTRY !== 'undefined' && Array.isArray(CAMPAIGNS_REGISTRY))
+              ? CAMPAIGNS_REGISTRY : [];
+    reg.forEach(function(c){
+      if(c && c.active && c.requiresBgCheck) lifelineCampaigns.push(c.name);
+    });
+  }catch(e){ console.warn('[onBgAuthSigned] could not read CAMPAIGNS_REGISTRY:', e); }
+  if(!lifelineCampaigns.length){
+    // Fallback to the standard Lifeline carrier list
+    lifelineCampaigns = ['TruConnect','Gen Mobile','Assurance','Excess'];
+  }
+
+  // Narrow further: if agent has any coded campaigns, ONLY queue those
+  // (office is intentionally setting them up for those specific carriers).
+  // Otherwise queue all Lifeline campaigns.
+  var coded = agent.agentCodes ? Object.keys(agent.agentCodes).filter(function(k){
+    return !!(agent.agentCodes[k] && String(agent.agentCodes[k]).trim());
+  }) : [];
+  var campaignsToQueue;
+  if(coded.length){
+    campaignsToQueue = lifelineCampaigns.filter(function(c){return coded.indexOf(c) >= 0;});
+    if(!campaignsToQueue.length) campaignsToQueue = lifelineCampaigns;
+  } else {
+    campaignsToQueue = lifelineCampaigns;
+  }
+
+  // ── 2. Submit to BG queue for each campaign ──
+  var queuedNames = [];
+  campaignsToQueue.forEach(function(camp){
+    try{
+      // Skip if already decided (passed/failed) — only submit fresh checks
+      var existing = (agent.bgChecks||{})[camp];
+      if(existing && (existing.status === 'passed' || existing.status === 'pending')) return;
+      if(typeof bgSubmit === 'function' && bgSubmit(agentId, camp)){
+        queuedNames.push(camp);
+      }
+    }catch(e){ console.warn('[onBgAuthSigned] bgSubmit '+camp+' failed:', e); }
+  });
+  console.log('[onBgAuthSigned] agent '+agentId+' ('+agent.name+') queued for: '+queuedNames.join(', '));
+
+  // ── 3. Email agent: pending results, next steps ──
+  if(typeof notifyByEmail === 'function' && agent.email){
+    try{
+      notifyByEmail({
+        toAgent: {id: agent.id, name: agent.name, email: agent.email},
+        eventType: 'onboarding.bg_pending_results',
+        payload: {
+          firstName:    (agent.name||'').split(' ')[0],
+          fullName:     agent.name,
+          campaigns:    queuedNames.length ? queuedNames : campaignsToQueue,
+          appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        }
+      }).catch(function(e){ console.warn('[onBgAuthSigned] agent email failed:', e); });
+    }catch(e){ console.warn('[onBgAuthSigned] agent email threw:', e); }
+  }
+
+  // ── 4. In-app notification to agent ──
+  if(typeof pushNotification === 'function'){
+    try{
+      pushNotification({
+        toIds: [agent.id], toRoles: [],
+        icon: '⏳',
+        title: 'Background Check Pending',
+        body: 'You signed the BG Authorization. We will process your background check and notify you of next steps via email.',
+        panel: 'my-documents',
+        priority: 'normal',
+        skipEmail: true  // already sent above with rich template
+      });
+    }catch(e){ console.warn('[onBgAuthSigned] agent push failed:', e); }
+  }
+
+  // ── 5. Notify office (Onboarding + Owner + HR) that BG is ready to run ──
+  if(typeof pushNotification === 'function'){
+    var officeIds = [];
+    (DB.agents||[]).forEach(function(s){
+      if(!s || !s.active) return;
+      if(typeof isOwner === 'function' && isOwner(s)) officeIds.push(s.id);
+      else if(typeof isOnboarding === 'function' && isOnboarding(s)) officeIds.push(s.id);
+      else if(s.depts && (s.depts.hr || s.depts.onboarding)) officeIds.push(s.id);
+    });
+    // De-dup
+    officeIds = officeIds.filter(function(id, i){ return officeIds.indexOf(id) === i; });
+    if(officeIds.length){
+      try{
+        pushNotification({
+          toIds: officeIds, toRoles: [],
+          icon: '🔍',
+          title: 'BG Ready to Run — '+agent.name,
+          body: agent.name+' just signed the BG Authorization. They are in the BG Check Queue ready for review.',
+          panel: 'bg-check-queue',
+          priority: 'high'
+        });
+      }catch(e){ console.warn('[onBgAuthSigned] office push failed:', e); }
+    }
+  }
+
+  // Persist the bgAuthSignedFiredAt flag
+  try{ if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); }catch(e){}
+}
+if(typeof window !== 'undefined') window.onBgAuthSigned = onBgAuthSigned;
 
 // Notify all currently-affected agents that a new doc is assigned to them.
 // Called when an admin saves an assignment change.
@@ -31228,7 +31758,7 @@ function gotoPanel(id, params){
     'supply-mgmt':panelSupplyMgmt,'pending-transfers':panelPendingTransfers,
     'agent-codes':panelAgentCodes,'goal-settings':panelGoalSettings,
     'form-builder':panelFormBuilder,announce:panelAnnounce,
-    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,'bg-check-queue':panelBgCheckQueue,
+    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,'bg-check-queue':panelBgCheckQueue,'bg-fail-invoices':panelBgFailInvoices,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
     agents:panelAgents,'ll-teams':panelMarketsAdmin,
@@ -43927,6 +44457,40 @@ function panelBgCheckQueue(){
   h += 'Decisions can be reversed (with confirmation + audit log).';
   h += '</div>';
 
+  // ── Calvin 2026-06-10: Failed-BG Weekly Invoice (Sun-Sat) ──
+  // Generate + email the $21-per-fail invoice to K-Anna, Makenzie, and
+  // the immediate manager who hired each failed agent. The button is a
+  // manual trigger for now — automatic Sunday-morning firing can be added
+  // later via a scheduled job. Open costs (not yet invoiced) show as a
+  // pending count so office knows when invoices are due.
+  try{
+    var openCount = (FAILED_BG_COSTS||[]).filter(function(c){return c.status === 'open';}).length;
+    var openTotal = (FAILED_BG_COSTS||[])
+      .filter(function(c){return c.status === 'open';})
+      .reduce(function(s,c){return s+(c.amountCents||0);},0);
+    var thisWeek = bgFailWeekRange();
+    var thisWeekOpen = (FAILED_BG_COSTS||[]).filter(function(c){
+      if(c.status !== 'open' || !c.failedAt) return false;
+      var d = c.failedAt.slice(0,10);
+      return d >= thisWeek.start && d <= thisWeek.end;
+    });
+    h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid #dc2626"><div class="bo-card-head"><div class="bo-card-title">💸 Failed-BG Weekly Reimbursement Invoice</div></div>';
+    h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.55">';
+    h += '<strong>$21 per failed BG check</strong> — billed to the immediate manager (TL or MM) who hired the agent. ';
+    h += 'Weekly invoice runs Sunday–Saturday and emails K-Anna + Makenzie + the manager. No e-sign required. ';
+    h += '<br><br>';
+    h += '<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;background:rgba(0,0,0,.03);padding:10px 14px;border-radius:6px;margin-bottom:10px">';
+    h += '<div><strong style="color:#dc2626">'+openCount+'</strong> open cost'+(openCount!==1?'s':'')+' total ($'+(openTotal/100).toFixed(2)+')</div>';
+    h += '<div style="color:var(--muted)">|</div>';
+    h += '<div><strong style="color:#dc2626">'+thisWeekOpen.length+'</strong> in current week ('+thisWeek.start+' → '+thisWeek.end+')</div>';
+    h += '</div>';
+    h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+    h += '<button onclick="bgGenerateInvoiceClick()" class="btn-fire" style="padding:9px 18px;font-size:.74rem;background:#dc2626">📧 Generate + Email Weekly Invoice Now</button>';
+    h += '<button onclick="gotoPanel(\'bg-fail-invoices\')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 18px;border-radius:5px;cursor:pointer">📋 View Past Invoices ('+(BG_FAIL_INVOICES||[]).length+')</button>';
+    h += '</div>';
+    h += '</div></div>';
+  }catch(e){ console.warn('[panelBgCheckQueue] invoice section render failed:', e); }
+
   // ── Submit New BG Check (add agent + campaign) ──
   h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">➕ Submit Agent for Background Check</div></div>';
   h += '<div style="padding:14px 18px;display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end">';
@@ -44070,7 +44634,7 @@ function bgDecideClick(agentId, campaign, newStatus){
     var emailWord = newStatus === 'passed' ? 'PASS' : 'FAIL';
     var emailNote = newStatus === 'passed'
       ? 'They will receive a congratulations email + be auto-prompted at next login to begin onboarding.'
-      : 'They will receive a professional turn-down email mentioning future BG-free opportunities.';
+      : 'They will receive a professional turn-down email + their immediate manager (TL/MM) gets notified. A $21 cost will be added to the weekly invoice ledger.';
     if(!confirm(emailWord + ' background check?\n\n' + agent.name + ' / ' + campaign + '\n\n' + emailNote)) return;
   }
   var reason = '';
@@ -44080,6 +44644,104 @@ function bgDecideClick(agentId, campaign, newStatus){
   bgDecide(agentId, campaign, newStatus, {reason: reason});
   gotoPanel('bg-check-queue');
 }
+
+// ════════════════════════════════════════════════════════════════════
+//  Failed-BG Invoice manual trigger (Calvin 2026-06-10)
+//  Generates this week's invoice + emails K-Anna + Makenzie + manager.
+// ════════════════════════════════════════════════════════════════════
+function bgGenerateInvoiceClick(){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var range = bgFailWeekRange();
+  var thisWeek = (FAILED_BG_COSTS||[]).filter(function(c){
+    if(c.status !== 'open' || !c.failedAt) return false;
+    var d = c.failedAt.slice(0,10);
+    return d >= range.start && d <= range.end;
+  });
+  if(!thisWeek.length){
+    alert('No open failed-BG costs in the current week ('+range.start+' → '+range.end+'). Nothing to invoice.');
+    return;
+  }
+  // Group preview by manager
+  var byMgr = {};
+  thisWeek.forEach(function(c){
+    var key = c.managerName || '(unassigned)';
+    if(!byMgr[key]) byMgr[key] = {count:0, total:0};
+    byMgr[key].count++;
+    byMgr[key].total += c.amountCents||0;
+  });
+  var preview = Object.keys(byMgr).map(function(k){
+    return '  • '+k+': '+byMgr[k].count+' fail'+(byMgr[k].count!==1?'s':'')+' = $'+(byMgr[k].total/100).toFixed(2);
+  }).join('\n');
+  var grandTotal = thisWeek.reduce(function(s,c){return s+(c.amountCents||0);},0);
+  if(!confirm('Generate weekly invoices for '+range.start+' → '+range.end+'?\n\n'+preview+'\n\nGrand total: $'+(grandTotal/100).toFixed(2)+'\n\nEmails will go to K-Anna, Makenzie, and each respective manager.')) return;
+  try{
+    var invoices = generateFailedBgInvoice(undefined, true);
+    alert('✓ '+invoices.length+' invoice'+(invoices.length!==1?'s':'')+' generated and emailed.\n\nGrand total: $'+(grandTotal/100).toFixed(2));
+    gotoPanel('bg-check-queue');
+  }catch(e){
+    console.error('[bgGenerateInvoiceClick] failed:', e);
+    alert('⚠ Invoice generation failed: '+(e.message||e));
+  }
+}
+if(typeof window !== 'undefined') window.bgGenerateInvoiceClick = bgGenerateInvoiceClick;
+
+// ════════════════════════════════════════════════════════════════════
+//  Failed-BG Invoices Viewer Panel (Calvin 2026-06-10)
+// ════════════════════════════════════════════════════════════════════
+function panelBgFailInvoices(){
+  var u = DB.current;
+  if(!isOfficeRole(u)){
+    return panelHeader('🔒 Failed-BG Invoices') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Office staff only.</div></div>';
+  }
+  var h = panelHeader('💸 Failed-BG Weekly Invoices');
+  h += '<div style="background:rgba(0,0,0,.03);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.76rem;color:var(--brown);line-height:1.5">';
+  h += 'All historical weekly invoices for $21-per-fail BG check reimbursements. Each invoice covers one Sunday–Saturday window and one immediate manager. ';
+  h += '<a href="#bg-check-queue" onclick="gotoPanel(\'bg-check-queue\');return false;" style="color:var(--blue);text-decoration:underline">← Back to BG Queue</a>';
+  h += '</div>';
+  var invoices = (BG_FAIL_INVOICES||[]).slice().sort(function(a,b){
+    return String(b.generatedAt||'').localeCompare(String(a.generatedAt||''));
+  });
+  if(!invoices.length){
+    h += '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No invoices generated yet.</div></div>';
+    return h;
+  }
+  h += '<div class="bo-card"><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+  h += '<thead><tr style="border-bottom:2px solid var(--border);background:var(--offwhite)">';
+  h += '<th style="text-align:left;padding:10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Week</th>';
+  h += '<th style="text-align:left;padding:10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Manager</th>';
+  h += '<th style="text-align:right;padding:10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Fails</th>';
+  h += '<th style="text-align:right;padding:10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Total</th>';
+  h += '<th style="text-align:left;padding:10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Sent</th>';
+  h += '<th style="text-align:left;padding:10px;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Details</th>';
+  h += '</tr></thead><tbody>';
+  invoices.forEach(function(inv){
+    h += '<tr style="border-bottom:1px solid var(--border)">';
+    h += '<td style="padding:10px;font-size:.78rem"><strong>'+inv.weekStart+'</strong> → '+inv.weekEnd+'</td>';
+    h += '<td style="padding:10px;font-size:.78rem">'+escHtml(inv.managerName||'(unassigned)')+'</td>';
+    h += '<td style="padding:10px;text-align:right;font-size:.78rem">'+inv.lineItems.length+'</td>';
+    h += '<td style="padding:10px;text-align:right;font-size:.88rem;color:#dc2626;font-weight:700">$'+(inv.totalCents/100).toFixed(2)+'</td>';
+    h += '<td style="padding:10px;font-size:.7rem;color:var(--muted)">';
+    if(inv.sentAt){
+      h += new Date(inv.sentAt).toLocaleDateString()+'<br>'+escHtml((inv.sentTo||[]).join(', '));
+    } else {
+      h += '<em>not sent</em>';
+    }
+    h += '</td>';
+    h += '<td style="padding:10px;font-size:.7rem"><details><summary style="cursor:pointer;color:var(--blue)">'+inv.lineItems.length+' line item'+(inv.lineItems.length!==1?'s':'')+'</summary><div style="margin-top:6px;padding:8px;background:var(--offwhite);border-radius:4px">';
+    inv.lineItems.forEach(function(li){
+      h += '<div style="padding:3px 0;font-size:.72rem"><strong>'+escHtml(li.agentName)+'</strong> &middot; '+escHtml(li.campaignName)+' &middot; '+li.failedAt.slice(0,10)+' &middot; $'+(li.amountCents/100).toFixed(2);
+      if(li.reason) h += ' <em style="color:var(--muted)">('+escHtml(li.reason)+')</em>';
+      h += '</div>';
+    });
+    h += '</div></details></td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div></div>';
+  return h;
+}
+if(typeof window !== 'undefined') window.panelBgFailInvoices = panelBgFailInvoices;
 
 function bgDecideManyClick(agentId, newStatus){
   var rows = Array.prototype.slice.call(document.querySelectorAll('.bg-row-cb'));
@@ -56258,6 +56920,24 @@ function tcSubmit(){
     if(!sig.trim()) errors.push('Type your signature');
     if(sig.trim().toLowerCase() !== u.name.trim().toLowerCase()){
       errors.push('Signature must match your name exactly');
+    }
+
+    // ── Calvin 2026-06-10 LOCKED: 2-day minimum training rule ──
+    // Manager cannot mark training complete until at least 2 days have
+    // elapsed from the scheduled training date. This protects against
+    // ghost-coding agents who never actually attended training.
+    // Owner is exempt for recovery cases.
+    if(session && session.date && !isOwner(u)){
+      try{
+        var schedDate = new Date(session.date + 'T00:00:00');
+        var msSince = Date.now() - schedDate.getTime();
+        var daysSince = msSince / (1000*60*60*24);
+        if(daysSince < 2){
+          var earliest = new Date(schedDate.getTime() + 2*24*60*60*1000);
+          var earliestStr = earliest.toISOString().slice(0,10);
+          errors.push('Training cannot be marked complete until at least 2 days after the scheduled date ('+session.date+'). Earliest completion: '+earliestStr+'.');
+        }
+      }catch(e){ console.warn('[tcSubmit] 2-day gate parse failed:', e); }
     }
 
     if(errors.length){
