@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.10.1830';
+var BUILD_VERSION = '2026.06.10.1930';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -12198,6 +12198,31 @@ function isOnboarding(u){
   return false;
 }
 function isHRorInv(u)    { return isHR(u)||isInventory(u); }
+
+// ── Calvin 2026-06-10 v1930: CANONICAL ONBOARDING STAFF LIST ──
+// Returns the array of active agents who should be notified at every step
+// of the applicant lifecycle. Includes: Owner + Onboarding + HR depts +
+// anyone with explicit onboarding/hr grant. Used by every applicant
+// notification call site so K-Anna, Makenzie, and any future onboarding
+// staff get pinged consistently — no individual filter can drift.
+function getOnboardingStaff(opts){
+  opts = opts || {};
+  var excludeId = opts.excludeId || null;
+  return (DB.agents||[]).filter(function(a){
+    if(!a || !a.active) return false;
+    if(excludeId && a.id === excludeId) return false;
+    return isOwner(a)
+        || isOnboarding(a)
+        || isHR(a)
+        || (a.depts && (a.depts.onboarding === true || a.depts.hr === true))
+        || (typeof agentHasDeptAccess === 'function' && (agentHasDeptAccess(a, 'onboarding') || agentHasDeptAccess(a, 'hr')));
+  });
+}
+function getOnboardingStaffIds(opts){ return getOnboardingStaff(opts).map(function(a){return a.id;}); }
+if(typeof window !== 'undefined'){
+  window.getOnboardingStaff = getOnboardingStaff;
+  window.getOnboardingStaffIds = getOnboardingStaffIds;
+}
 function isOfficeRole(u) {
   // Calvin 2026-06-03: extended to include Owner, admin, and explicit
   // "Office Staff" role for the mass email/text access + the new "Office"
@@ -12526,7 +12551,15 @@ function canAccess(u, area){
     // Top-nav button visible to anyone with onboarding/HR responsibilities so
     // K-Anna et al. can find pending applicants instantly without drilling
     // into the Onboarding panel.
-    case 'agents-pending':   return !!(isOnboarding(u) || hasGrant('onboarding') || (u.depts && (u.depts.hr || u.depts.onboarding)));
+    case 'agents-pending':
+      // Calvin 2026-06-10 v1930: ALL of onboarding/HR sees the Agents Pending
+      // tab. This must match getOnboardingStaff so the notification recipients
+      // and the panel visibility list NEVER drift apart. If a user gets a
+      // notification, they MUST be able to open the panel and act on it.
+      if(typeof getOnboardingStaff === 'function'){
+        return getOnboardingStaffIds().indexOf(u.id) >= 0;
+      }
+      return !!(isOnboarding(u) || hasGrant('onboarding') || (u.depts && (u.depts.hr || u.depts.onboarding)));
 
     // ── Campaign-gated inventory panels (Gen Mobile) ──
     case 'gm-inventory':
@@ -22198,15 +22231,35 @@ function isAgentPendingBgReview(agent){
 if(typeof window !== 'undefined') window.isAgentPendingBgReview = isAgentPendingBgReview;
 
 function saveApplicants(){
-  try{ localStorage.setItem('wmam_applicants_pre_bg', JSON.stringify(APPLICANTS_PRE_BG)); }catch(e){}
+  // Calvin 2026-06-10 v1930: saveApplicants now returns a Promise so the public
+  // signing page can await the cloud write before showing the success page.
+  // Without this guarantee, the applicant might submit, see "all done", but the
+  // Supabase row never updated — and K-Anna's session would never see the
+  // signed state on refresh. Now we wait.
+  try{ localStorage.setItem('wmam_applicants_pre_bg', JSON.stringify(APPLICANTS_PRE_BG)); }catch(e){
+    console.warn('[saveApplicants] localStorage failed:', e);
+  }
+  if(typeof supaClient === 'undefined' || !supaClient){
+    return Promise.resolve({ok:true, cloudWrite:false});
+  }
   try{
-    if(typeof supaClient !== 'undefined' && supaClient){
-      supaClient.from('app_settings').upsert(
-        [{key:'applicants_pre_bg', value:JSON.stringify(APPLICANTS_PRE_BG)}],
-        {onConflict:'key'}
-      ).then(function(){}).catch(function(){});
-    }
-  }catch(e){}
+    return supaClient.from('app_settings').upsert(
+      [{key:'applicants_pre_bg', value:JSON.stringify(APPLICANTS_PRE_BG)}],
+      {onConflict:'key'}
+    ).then(function(res){
+      if(res && res.error){
+        console.warn('[saveApplicants] Supabase error:', res.error);
+        return {ok:false, cloudWrite:false, error:res.error};
+      }
+      return {ok:true, cloudWrite:true};
+    }).catch(function(e){
+      console.warn('[saveApplicants] Supabase write failed:', e);
+      return {ok:false, cloudWrite:false, error:e};
+    });
+  }catch(e){
+    console.warn('[saveApplicants] Supabase write threw:', e);
+    return Promise.resolve({ok:false, cloudWrite:false, error:e});
+  }
 }
 
 function loadApplicantsFromLocal(){
@@ -22328,17 +22381,16 @@ function inviteApplicant(opts){
   saveApplicants();
   // Fire welcome email with both signing links
   _applicantSendInvitationEmail(app);
-  // Notify office in-app
+  // ── Calvin 2026-06-10 v1930: notify ENTIRE onboarding department ──
+  // K-Anna, Makenzie, and every onboarding/HR staff member need visibility
+  // of every applicant invitation so they can track pending work.
   if(typeof pushNotification === 'function'){
-    var officeIds = (DB.agents||[]).filter(function(a){
-      return a && a.active && (isOwner(a) || isOnboarding(a) || (a.depts && (a.depts.hr || a.depts.onboarding)));
-    }).map(function(a){return a.id;});
     try{
       pushNotification({
-        toIds: officeIds, toRoles:[],
+        toIds: getOnboardingStaffIds({excludeId: u.id}), toRoles:[],
         icon: '📧',
         title: 'Applicant Invited — '+app.name,
-        body: app.name+' was invited to onboarding for '+app.program+'. They have 7 days to sign their BG forms.',
+        body: app.name+' was invited to onboarding for '+app.program+(app.invitedByName ? ' by '+app.invitedByName : '')+'. They have 7 days to sign their BG forms.',
         panel: 'agents-pending',
         priority: 'normal',
         skipEmail: true
@@ -22388,7 +22440,9 @@ function markApplicantFormSigned(applicantId, formType, signature, responses){
   };
   // v1630: if this was a resubmit, clear the rejected-fields list since
   // the applicant just provided fresh data for all of them.
+  var wasResubmit = false;
   if(formType === 'pii' && Array.isArray(app.rejectedFields) && app.rejectedFields.length){
+    wasResubmit = true;
     app.rejectedFieldsCleared = (app.rejectedFieldsCleared || []).concat(app.rejectedFields);
     app.rejectedFields = [];
     app.rejectedFieldNote = '';
@@ -22397,50 +22451,77 @@ function markApplicantFormSigned(applicantId, formType, signature, responses){
   var bothDone = app.forms.auth.signed && app.forms.pii.signed;
   if(bothDone && app.stage === 'awaiting-esign'){
     app.stage = 'bg-ready-to-run';
-    // Notify office — both forms signed, ready to run BG
-    _applicantNotifyOfficeBgReady(app);
+    // Notify office — both forms signed, ready to run BG (URGENT)
+    _applicantNotifyOfficeBgReady(app, wasResubmit);
+  } else {
+    // Calvin 2026-06-10 v1930: notify onboarding for EACH individual form
+    // signed (not just when both are done). K-Anna needs visibility at every
+    // step so she can track who's where.
+    _applicantNotifyOfficeFormSigned(app, formType);
   }
   saveApplicants();
   return app;
 }
 
-function _applicantNotifyOfficeBgReady(app){
+// Calvin 2026-06-10 v1930: ping onboarding when an individual form is signed.
+// Lower-priority than the "both signed" alert — informational, not urgent.
+function _applicantNotifyOfficeFormSigned(app, formType){
   if(typeof pushNotification !== 'function') return;
-  var officeIds = (DB.agents||[]).filter(function(a){
-    return a && a.active && (isOwner(a) || isOnboarding(a) || (a.depts && (a.depts.hr || a.depts.onboarding)));
-  }).map(function(a){return a.id;});
+  var formLabel = formType === 'auth' ? 'BG Authorization' : 'PII Intake';
+  var otherForm = formType === 'auth' ? 'PII Intake' : 'BG Authorization';
+  try{
+    pushNotification({
+      toIds: getOnboardingStaffIds(), toRoles:[],
+      icon: '📝',
+      title: app.name+' Signed '+formLabel,
+      body: app.name+' signed the '+formLabel+'. Waiting on '+otherForm+' before BG can be submitted to vendor.',
+      panel: 'agents-pending',
+      priority: 'normal',
+      skipEmail: true
+    });
+  }catch(e){}
+}
+
+function _applicantNotifyOfficeBgReady(app, wasResubmit){
+  if(typeof pushNotification !== 'function') return;
+  var officeIds = getOnboardingStaffIds();
+  var titleText = wasResubmit
+    ? '🔁 RESUBMITTED — '+app.name+' Fixed Their Information'
+    : '🔥 ACTION NEEDED — '+app.name+' Signed BG Forms';
+  var bodyText = wasResubmit
+    ? app.name+' resubmitted their PII after office requested changes. They are ready for BG re-review in the Agents Pending panel.'
+    : app.name+' completed BG Authorization + PII Intake. They are in the Agents Pending panel ready for BG submission to the vendor.';
   if(officeIds.length){
     try{
       pushNotification({
         toIds: officeIds, toRoles:[],
-        icon: '🔥',
-        title: '🔥 ACTION NEEDED — '+app.name+' Signed BG Forms',
-        body: app.name+' completed BG Authorization + PII Intake. They are in the Agents Pending panel ready for BG submission to the vendor.',
+        icon: wasResubmit ? '🔁' : '🔥',
+        title: titleText,
+        body: bodyText,
         panel: 'agents-pending',
         priority: 'urgent',
         skipEmail: false
       });
     }catch(e){}
   }
-  // Also email office (Onboarding dept)
+  // Email every onboarding staff member
   var origin = (typeof location !== 'undefined' && location.origin) ? location.origin + (location.pathname||'/') : 'https://wmaminc.com/';
-  (DB.agents||[]).forEach(function(a){
-    if(!a || !a.active || !a.email) return;
-    if(isOwner(a) || isOnboarding(a) || (a.depts && (a.depts.hr || a.depts.onboarding))){
-      if(typeof notifyByEmail === 'function'){
-        notifyByEmail({
-          toAgent: {id:a.id, name:a.name, email:a.email},
-          eventType: 'applicant.signed_office',
-          payload: {
-            firstName: (a.name||'').split(' ')[0],
-            applicantName: app.name,
-            applicantId: app.id,
-            program: app.program,
-            appProfileUrl: origin + '#agents-pending',
-            appUrl: origin
-          }
-        }).catch(function(e){ console.warn('[office bg-ready email] failed:', e); });
-      }
+  getOnboardingStaff().forEach(function(a){
+    if(!a.email) return;
+    if(typeof notifyByEmail === 'function'){
+      notifyByEmail({
+        toAgent: {id:a.id, name:a.name, email:a.email},
+        eventType: 'applicant.signed_office',
+        payload: {
+          firstName: (a.name||'').split(' ')[0],
+          applicantName: app.name,
+          applicantId: app.id,
+          program: app.program,
+          isResubmit: !!wasResubmit,
+          appProfileUrl: origin + '#agents-pending',
+          appUrl: origin
+        }
+      }).catch(function(e){ console.warn('[office bg-ready email] failed:', e); });
     }
   });
 }
@@ -22608,6 +22689,21 @@ function approveApplicant(applicantId){
         });
       }catch(e){}
     }
+    // Calvin 2026-06-10 v1930: also notify the rest of onboarding department
+    // (peers of whoever approved) so K-Anna sees Makenzie's approvals, etc.
+    try{
+      var deciderId = (DB.current && DB.current.id) || null;
+      var deciderName = (DB.current && DB.current.name) || 'office';
+      pushNotification({
+        toIds: getOnboardingStaffIds({excludeId: deciderId}), toRoles:[],
+        icon: '✅',
+        title: 'Approved by '+deciderName+' — '+newAgent.name,
+        body: deciderName+' approved '+newAgent.name+'. Account created, welcome email sent, campaign contracts auto-fired.',
+        panel: 'agents-pending',
+        priority: 'normal',
+        skipEmail: true
+      });
+    }catch(e){}
   }
 
   // Save the new agent to Supabase
@@ -22711,6 +22807,20 @@ function rejectApplicant(applicantId, reason){
         });
       }catch(e){}
     }
+    // Calvin 2026-06-10 v1930: notify onboarding peers
+    try{
+      var deciderId2 = (DB.current && DB.current.id) || null;
+      var deciderName2 = (DB.current && DB.current.name) || 'office';
+      pushNotification({
+        toIds: getOnboardingStaffIds({excludeId: deciderId2}), toRoles:[],
+        icon: '✗',
+        title: 'Rejected by '+deciderName2+' — '+app.name,
+        body: deciderName2+' rejected '+app.name+'. Turn-down email sent to applicant, $21 cost ledger entry created.',
+        panel: 'agents-pending',
+        priority: 'normal',
+        skipEmail: true
+      });
+    }catch(e){}
   }
   return app;
 }
@@ -22751,6 +22861,29 @@ function rejectApplicantField(applicantId, fieldId, note){
   saveApplicants();
   // Fire resubmit email
   _applicantSendResubmitEmail(app);
+  // Calvin 2026-06-10 v1930: notify onboarding peers so K-Anna sees Makenzie's
+  // resubmit requests (and vice versa) without losing the thread.
+  if(typeof pushNotification === 'function'){
+    try{
+      var deciderId = (DB.current && DB.current.id) || null;
+      var deciderName = (DB.current && DB.current.name) || 'office';
+      // Look up the field's human-readable label
+      var labelText = fieldId;
+      try{
+        var lab = _piiFieldLabels();
+        if(lab && lab.labels && lab.labels[fieldId]) labelText = lab.labels[fieldId];
+      }catch(e){}
+      pushNotification({
+        toIds: getOnboardingStaffIds({excludeId: deciderId}), toRoles:[],
+        icon: '🔁',
+        title: 'Resubmit requested — '+app.name,
+        body: deciderName+' asked '+app.name+' to resubmit "'+labelText+'". Applicant got an email; applicant is back in awaiting-esign.',
+        panel: 'agents-pending',
+        priority: 'normal',
+        skipEmail: true
+      });
+    }catch(e){}
+  }
   return app;
 }
 
@@ -46440,6 +46573,35 @@ function panelAgentsPending(){
       }
     });
   }, 50);
+
+  // ── Calvin 2026-06-10 v1930: AUTO-POLL while panel is open ──
+  // K-Anna doesn't want to click Refresh every time. Every 20 seconds while
+  // she's looking at Agents Pending, we re-fetch from Supabase. If the data
+  // changed, we re-render the panel. If she navigates away, the next render
+  // resets the poll.
+  try{
+    if(typeof window._apPollTimer !== 'undefined' && window._apPollTimer){
+      clearInterval(window._apPollTimer);
+    }
+    window._apPollTimer = setInterval(function(){
+      // Only poll if user is still on this panel
+      var bodyEl = document.getElementById('boBody');
+      if(!bodyEl || bodyEl.innerHTML.indexOf('EMAIL-FIRST ONBOARDING') < 0){
+        clearInterval(window._apPollTimer);
+        window._apPollTimer = null;
+        return;
+      }
+      // Snapshot current data to detect change
+      var before = JSON.stringify(APPLICANTS_PRE_BG||[]);
+      refreshApplicantsFromSupabase().then(function(updated){
+        var after = JSON.stringify(APPLICANTS_PRE_BG||[]);
+        if(after !== before){
+          // Something changed — re-render
+          try{ if(typeof gotoPanel === 'function') gotoPanel('agents-pending'); }catch(e){}
+        }
+      });
+    }, 20*1000);
+  }catch(e){ console.warn('[agents-pending poll] failed to start:', e); }
 
   // Group applicants by program → campaign → stage
   // Calvin 2026-06-10 v1330: a Lifeline applicant can be set up for multiple
@@ -72726,20 +72888,36 @@ function _publicSignSubmit(applicantId, token, formType){
   if(btn){ btn.disabled = true; btn.innerHTML = '⏳ Saving...'; }
   try{
     markApplicantFormSigned(applicantId, formType, sig.trim(), responses);
-    var otherType = formType === 'auth' ? 'pii' : 'auth';
-    var otherSigned = app.forms[otherType] && app.forms[otherType].signed;
-    // ── Calvin 2026-06-10 v1530: AUTO-PROGRESS TO NEXT FORM ──
-    // Old UX: after signing form 1, told them to go back to email for form 2.
-    // Calvin's feedback: that's a wasted step. They're already on the signing
-    // page — just render the second form directly. Use the applicant's other
-    // token (we have it because we know the applicant record). They go from
-    // form 1 → success card with auto-redirect (1.5s) → form 2 → final
-    // "both done, BG check coming" success page.
-    if(!otherSigned){
-      var otherToken = app.tokens && app.tokens[otherType];
-      _renderApplicantContinueToNextForm(app, otherToken, otherType, formType);
+    // Calvin 2026-06-10 v1930: AWAIT the cloud write so K-Anna's session can
+    // see the signed state on her next refresh. If the cloud write fails, we
+    // tell the applicant so they can retry instead of silently losing it.
+    var saveResult = saveApplicants();
+    var saveDone = function(){
+      var otherType = formType === 'auth' ? 'pii' : 'auth';
+      var otherSigned = app.forms[otherType] && app.forms[otherType].signed;
+      if(!otherSigned){
+        var otherToken = app.tokens && app.tokens[otherType];
+        _renderApplicantContinueToNextForm(app, otherToken, otherType, formType);
+      } else {
+        _renderApplicantSignedSuccess(app, 'Thank you! Both background check forms are now signed. Our office team will run your background check and email you the results — including your login credentials if approved.', false);
+      }
+    };
+    if(saveResult && typeof saveResult.then === 'function'){
+      saveResult.then(function(r){
+        if(r && r.ok === false && r.cloudWrite === false){
+          // Cloud write failed — keep button enabled so they can retry
+          _publicSignShowError('We saved your form locally, but could not reach our server. Please check your connection and try submitting again.');
+          if(btn){ btn.disabled = false; btn.innerHTML = 'Submit Signature →'; }
+          return;
+        }
+        saveDone();
+      }).catch(function(e){
+        _publicSignShowError('Save failed: '+(e.message||e));
+        if(btn){ btn.disabled = false; btn.innerHTML = 'Submit Signature →'; }
+      });
     } else {
-      _renderApplicantSignedSuccess(app, 'Thank you! Both background check forms are now signed. Our office team will run your background check and email you the results — including your login credentials if approved.', false);
+      // Synchronous save (no Supabase) — proceed
+      saveDone();
     }
   }catch(e){
     _publicSignShowError('Save failed: '+(e.message||e));
