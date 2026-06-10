@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.10.2030';
+var BUILD_VERSION = '2026.06.10.2130';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -8170,21 +8170,51 @@ function payrollApplyDeductions(opts){
                     ? payrollLookupDealPay(d.orderNum, carrier) : null;
     var useSplitMath = !!(splitData && splitData.splits && splitData.splits.length);
 
-    // ── Calvin 2026-06-10 FIX ──
-    // Device Upgrades are FLAT device-cost deductions ($10 base + $5 boost
-    // for Cloud T2 Elite tablets), NOT enrollment chargebacks. Split-math
-    // computes the original enrollment cap split (e.g. $18+$3+$7=$28 for
-    // a Tribal cancel) which is the wrong number entirely for a device
-    // cost. The named agent (or their market chain if unassigned) owes
-    // the device cost as a flat amount.
+    // ── Calvin 2026-06-10 v2130: DEVICE UPGRADE chargeback now mirrors the
+    // original enrollment's payout splits ──
     //
-    // Force the legacy cascade path for Device Upgrades — that path
-    // honors d.amountCents directly, which is where baseCents+boostCents
-    // lives. Without this guard, the +$5 tablet boost gets dropped
-    // because split-math never reads d.amountCents.
+    // Calvin's rule (locked): "we can only take back from the agent what
+    // we gave them. Juan was paid $15 + Tanita got $3 override → deduct
+    // $15 from Juan + $3 from Tanita." So we look up dealPaySplits[orderNum]
+    // for the original enrollment and deduct each recipient their EXACT
+    // paid amount.
+    //
+    // CAP: never deduct more than d.amountCents total (the carrier's stated
+    // chargeback cost). If sum of original splits > d.amountCents, scale
+    // proportionally. If sum < d.amountCents, the difference is COMPANY LOSS
+    // (we paid out less than the carrier is taking back) — logged for P&L.
+    //
+    // If no original splits exist (orphan device or pre-splits-feature
+    // week), fall back to charging d.amountCents to the named agent via the
+    // legacy cascade (preserves Cloud T2 Elite $15 locked behavior).
     if(d.type === 'Device Upgrade'){
-      useSplitMath = false;
-      splitData = null;
+      if(useSplitMath && splitData && splitData.splits && splitData.splits.length){
+        // We have the original enrollment splits. Use them, but clamp the
+        // TOTAL to d.amountCents (Cloud T2 Elite locked $15, or whatever
+        // the parser set).
+        var origTotal = splitData.splits.reduce(function(s,sp){return s+(sp.cents||0);},0);
+        var cap = Math.abs(d.amountCents||0);
+        if(origTotal > 0 && origTotal > cap){
+          // Scale each split proportionally so the total equals cap
+          var scaleFactor = cap / origTotal;
+          var scaled = splitData.splits.map(function(sp){
+            return {aid:sp.aid, role:sp.role, cents:Math.round(sp.cents * scaleFactor)};
+          });
+          splitData = Object.assign({}, splitData, {splits:scaled, deviceCapped:true, originalTotalCents:origTotal});
+        }
+        // Track company loss when carrier charge > what we paid out
+        if(origTotal > 0 && cap > origTotal){
+          d._companyLossCents = cap - origTotal;
+        }
+        // useSplitMath stays true — we'll deduct via the splits below
+      } else {
+        // No original split data — keep the legacy cascade behavior
+        // (charges d.amountCents to the named agent, cascades upward if
+        // they can't pay). For Cloud T2 Elite this preserves the $15 flat
+        // deduction; for other tablets it deducts the carrier's price.
+        useSplitMath = false;
+        splitData = null;
+      }
     }
 
     // ── Calvin 2026-05-15 PERMANENT FIX ── (v2030 enhanced)
@@ -8345,8 +8375,27 @@ function payrollApplyDeductions(opts){
       amountCents: d.amountCents,
       isTribal:    d.isTribal,
       splitMath:   useSplitMath,           // tells display layer the source of trail
-      trail:       trail
+      trail:       trail,
+      companyLossCents: d._companyLossCents || 0
     });
+
+    // Calvin 2026-06-10 v2130: track company tablet-loss in P&L.
+    // When a tablet costs more to charge back than we paid out (carrier $25
+    // − agents got $15+$3 = $7 company loss), log the difference to
+    // OPERATING_COSTS so the dashboard reflects the real margin hit.
+    if(!dryRun && d.type === 'Device Upgrade' && d._companyLossCents > 0 && typeof p3LogAutoCost === 'function'){
+      try{
+        p3LogAutoCost({
+          category:'device-loss',
+          date: (d.date && /^\d{4}-\d{2}-\d{2}/.test(d.date)) ? d.date.slice(0,10) : null,
+          amountCents: d._companyLossCents,
+          description: 'Tablet loss — '+(d.productName||'device')+' #'+(d.orderNum||'?')+
+            ' (carrier $'+(d.amountCents/100).toFixed(2)+
+            ' − agents paid $'+(((d.amountCents - d._companyLossCents)||0)/100).toFixed(2)+')',
+          refId: 'device-loss:'+(d.orderNum||'')+':'+(d.serial||'')+':'+weekId
+        });
+      }catch(e){ console.warn('[device-loss op-cost] failed:', e); }
+    }
   });
 
   // ── PHASE 2: Apply credits ────────────────────────────────────────
@@ -12041,15 +12090,65 @@ var PURCHASE_NEXT_ID = 1;
 // ════════════════════════════════════════════════════════════════════════
 var OPERATING_COSTS = [];
 var OP_COST_NEXT_ID = 1;
+
+// ── Calvin 2026-06-10 v2130: AUTO-LOG OPERATING COST ──
+// Centralized helper that adds a cost entry to OPERATING_COSTS, dedupes by
+// (category, refId), persists to localStorage + Supabase. Used by:
+//   - rejectApplicant (BG-fail $21)
+//   - Device Upgrade chargeback (company tablet loss)
+//   - Inventory expired-device sweep
+// Returns the cost record, or null if duplicate (refId already logged).
+function p3LogAutoCost(opts){
+  if(!opts || !opts.category || !opts.amountCents) return null;
+  if(typeof OPERATING_COSTS === 'undefined') return null;
+  var refId = opts.refId || null;
+  // Dedupe — never log the same refId twice
+  if(refId){
+    var existing = OPERATING_COSTS.find(function(c){
+      return c.category === opts.category && c.refId === refId;
+    });
+    if(existing) return null;
+  }
+  var rec = {
+    id: OP_COST_NEXT_ID++,
+    date: opts.date || (new Date().toISOString().slice(0,10)),
+    category: opts.category,
+    description: opts.description || '',
+    amountCents: Math.abs(opts.amountCents),
+    refId: refId,
+    automatic: true,    // flag so K-Anna can see this was system-logged
+    createdAt: new Date().toISOString(),
+    createdBy: 'system'
+  };
+  OPERATING_COSTS.push(rec);
+  // Persist
+  try{ localStorage.setItem('wmam_operating_costs', JSON.stringify(OPERATING_COSTS)); }catch(e){}
+  try{
+    if(typeof supaClient !== 'undefined' && supaClient){
+      supaClient.from('app_settings').upsert(
+        [{key:'operating_costs', value:JSON.stringify(OPERATING_COSTS)}],
+        {onConflict:'key'}
+      ).then(function(){}).catch(function(){});
+    }
+  }catch(e){}
+  return rec;
+}
+if(typeof window !== 'undefined') window.p3LogAutoCost = p3LogAutoCost;
 var OP_COST_CATEGORIES = [
-  {id:'rent',       label:'🏢 Office Rent',       color:'#0891b2'},
-  {id:'software',   label:'💻 Software / Subs',   color:'#7c3aed'},
-  {id:'marketing',  label:'📢 Marketing / Ads',   color:'#BE185D'},
-  {id:'insurance',  label:'🛡️ Insurance',         color:'#16a34a'},
-  {id:'legal',      label:'⚖️ Legal / Accounting', color:'#D97706'},
-  {id:'bank-fees',  label:'🏦 Bank / Processing', color:'#475569'},
-  {id:'supplies',   label:'📋 Office Supplies',   color:'#64748b'},
-  {id:'other',      label:'📦 Other',             color:'#6b7280'}
+  {id:'rent',          label:'🏢 Office Rent',         color:'#0891b2'},
+  {id:'software',      label:'💻 Software / Subs',     color:'#7c3aed'},
+  {id:'marketing',     label:'📢 Marketing / Ads',     color:'#BE185D'},
+  {id:'insurance',     label:'🛡️ Insurance',           color:'#16a34a'},
+  {id:'legal',         label:'⚖️ Legal / Accounting',   color:'#D97706'},
+  {id:'bank-fees',     label:'🏦 Bank / Processing',   color:'#475569'},
+  {id:'supplies',      label:'📋 Office Supplies',     color:'#64748b'},
+  // Calvin 2026-06-10 v2130: automatic-loss tracking categories — populated
+  // by the system, not entered by Calvin. They show in P&L like manual op
+  // costs so the dashboard reflects real company loss.
+  {id:'bg-fail',       label:'❌ BG-Fail Invoices',    color:'#dc2626'},
+  {id:'device-loss',   label:'📱 Tablet Loss (carrier > paid)', color:'#991B1B'},
+  {id:'expired-device',label:'📅 Expired Devices',     color:'#9A3412'},
+  {id:'other',         label:'📦 Other',               color:'#6b7280'}
 ];
 // Default seed: National Call every Monday at 9:00 AM CST.
 // This is what Calvin specified as the credit-bearing call.
@@ -22217,6 +22316,19 @@ function bgFireFailedEmail(agent, campaigns, reason){
         invoiceId:    null,
         invoicedAt:   null
       });
+      // Calvin 2026-06-10 v2130: mirror to OPERATING_COSTS so the company's
+      // P&L Year-to-Date reflects this $21 expense immediately. Until the
+      // manager pays the weekly invoice, it sits as a company cost. (When
+      // they pay, mark the cost as reversed via the invoice flow — separate
+      // ledger reconciliation.)
+      if(typeof p3LogAutoCost === 'function'){
+        p3LogAutoCost({
+          category:'bg-fail',
+          amountCents:2100,
+          description:'BG-fail $21 — '+agent.name+' / '+camp+(immediateMgr ? ' (manager: '+immediateMgr.name+')' : ''),
+          refId:'bg-fail:'+agent.id+':'+camp
+        });
+      }
     });
     // Persist to localStorage and Supabase
     if(typeof saveFailedBgCosts === 'function') saveFailedBgCosts();
@@ -67373,9 +67485,13 @@ function _p3FmtDate(s){
 function _p3WeeksInRange(start, end){
   var weeks = (typeof PAYROLL_WEEKS !== 'undefined' && Array.isArray(PAYROLL_WEEKS)) ? PAYROLL_WEEKS : [];
   return weeks.filter(function(w){
-    var pe = w.periodEnd || '';
-    if(!pe) return false;
-    return pe >= start && pe <= end;
+    // Calvin 2026-06-10 v2130: fall back to periodStart or uploadedAt when
+    // periodEnd is missing/malformed. The carrier table (line 67906) aggregates
+    // ALL weeks unconditionally — date-range filter shouldn't be more strict.
+    var d = w.periodEnd || w.periodStart || (w.uploadedAt ? String(w.uploadedAt).slice(0,10) : '');
+    if(!d) return false;
+    d = String(d).slice(0,10);  // normalize YYYY-MM-DD even if stored as ISO with time
+    return d >= start && d <= end;
   });
 }
 // Operating costs in range
