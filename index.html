@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.10.1530';
+var BUILD_VERSION = '2026.06.10.1630';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -20672,6 +20672,24 @@ function _renderEmailTemplate(eventType, payload, recipient){
       return {subject: subjectCx, html: _emailWrap(null, bodyHtmlCx), text: textCx};
     }
 
+    case 'applicant.resubmit_request': {
+      var piiUrl3 = payload.piiUrl || (appUrl + '?sign=' + (payload.piiToken || ''));
+      var fieldsList = payload.rejectedFieldsList || '';
+      var note = payload.rejectedFieldNote || '';
+      var subjectRR = '⚠ Action Needed — Please Resubmit Your Information';
+      var bodyHtmlRR = ''
+        + '<p>Hi '+_emailEsc(firstName)+',</p>'
+        + '<p>Thanks for submitting your background check forms. Our office team reviewed your information and needs you to <strong>resubmit a few items</strong> before we can run your background check.</p>'
+        + (fieldsList ? '<p style="background:#fef3c7;border-left:4px solid #f59e0b;padding:12px 16px;margin:18px 0;color:#78350f"><strong>Items to resubmit:</strong><br>'+_emailEsc(fieldsList)+'</p>' : '')
+        + (note ? '<p style="background:#f0f9ff;border-left:4px solid #0891b2;padding:12px 16px;margin:18px 0;color:#0c4a6e"><strong>Note from office:</strong><br>'+_emailEsc(note)+'</p>' : '')
+        + '<p>Click the button below to open your Personal Information form. Your previous answers are already saved — you only need to fix the items above.</p>'
+        + '<p style="text-align:center;margin:24px 0"><a href="'+_emailEsc(piiUrl3)+'" style="display:inline-block;background:#f59e0b;color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:6px;font-weight:700;letter-spacing:.5px;min-width:280px">📋 Resubmit Your Information →</a></p>'
+        + '<p style="font-size:13px;color:#666666">If you need help, reach out to the manager who invited you.</p>'
+        + '<p style="margin-top:24px">— The WMAMinc Onboarding Team</p>';
+      var textRR = 'Hi '+firstName+',\n\nThanks for submitting your background check forms. Our office team reviewed your information and needs you to resubmit a few items.\n\n'+(fieldsList ? 'Items to resubmit: '+fieldsList+'\n' : '')+(note ? 'Note from office: '+note+'\n' : '')+'\nClick this link to open your form (your previous answers are saved — you only need to fix the items above):\n'+piiUrl3+'\n\nIf you need help, reach out to the manager who invited you.\n\n— The WMAMinc Onboarding Team';
+      return {subject: subjectRR, html: _emailWrap(null, bodyHtmlRR), text: textRR};
+    }
+
     case 'applicant.signed_office': {
       var applicantName2 = payload.applicantName || '';
       var program3 = payload.program || '';
@@ -22368,6 +22386,13 @@ function markApplicantFormSigned(applicantId, formType, signature, responses){
     signature: signature || '',
     responses: responses || {}
   };
+  // v1630: if this was a resubmit, clear the rejected-fields list since
+  // the applicant just provided fresh data for all of them.
+  if(formType === 'pii' && Array.isArray(app.rejectedFields) && app.rejectedFields.length){
+    app.rejectedFieldsCleared = (app.rejectedFieldsCleared || []).concat(app.rejectedFields);
+    app.rejectedFields = [];
+    app.rejectedFieldNote = '';
+  }
   // Check if both are done
   var bothDone = app.forms.auth.signed && app.forms.pii.signed;
   if(bothDone && app.stage === 'awaiting-esign'){
@@ -22699,6 +22724,59 @@ function resendApplicantInvitation(applicantId){
   app.remindedAt = new Date().toISOString();
   saveApplicants();
   return app;
+}
+
+// ── Calvin 2026-06-10 v1630: Reject & Resubmit per field ──
+// Office can mark specific PII fields as bad (blurry photo, wrong ID, etc.).
+// Sets app.rejectedFields = [fieldId, ...], flips stage back to 'awaiting-esign'
+// for the PII form, fires a new email with the PII signing link, applicant
+// re-fills only the rejected fields (existing responses pre-fill the rest).
+function rejectApplicantField(applicantId, fieldId, note){
+  var app = (APPLICANTS_PRE_BG||[]).find(function(a){return a && a.id === applicantId;});
+  if(!app){ return null; }
+  app.rejectedFields = Array.isArray(app.rejectedFields) ? app.rejectedFields : [];
+  if(app.rejectedFields.indexOf(fieldId) < 0) app.rejectedFields.push(fieldId);
+  app.rejectedFieldNote = (note||'').trim();
+  // Flip the PII form back to unsigned so the applicant can resign,
+  // and clear the rejected field's response so they have to refill.
+  if(app.forms && app.forms.pii){
+    app.forms.pii.signed = false;
+    app.forms.pii.signedAt = null;
+    if(app.forms.pii.responses){
+      delete app.forms.pii.responses[fieldId];
+    }
+  }
+  // Stage goes back to awaiting-esign — only PII needs re-signing
+  app.stage = 'awaiting-esign';
+  saveApplicants();
+  // Fire resubmit email
+  _applicantSendResubmitEmail(app);
+  return app;
+}
+
+function _applicantSendResubmitEmail(app){
+  if(!app || !app.email || typeof notifyByEmail !== 'function') return;
+  var origin = (typeof location !== 'undefined' && location.origin)
+    ? location.origin + (location.pathname||'/').split('#')[0].split('?')[0]
+    : 'https://wmaminc.com/';
+  notifyByEmail({
+    toAgent: {id:0, name:app.name, email:app.email},
+    eventType: 'applicant.resubmit_request',
+    payload: {
+      firstName:    (app.name||'').split(' ')[0],
+      fullName:     app.name,
+      rejectedFields: app.rejectedFields || [],
+      rejectedFieldsList: (app.rejectedFields||[]).join(', '),
+      rejectedFieldNote: app.rejectedFieldNote || '',
+      piiToken:     app.tokens && app.tokens.pii,
+      piiUrl:       origin + '?sign=' + (app.tokens && app.tokens.pii),
+      appUrl:       origin
+    }
+  }).catch(function(e){ console.warn('[resubmit email] failed:', e); });
+}
+
+if(typeof window !== 'undefined'){
+  window.rejectApplicantField = rejectApplicantField;
 }
 
 // Daily scan: send 3-day reminders to applicants who haven't signed.
@@ -31935,17 +32013,22 @@ function _obShowBgPackage(agentId){
     respKeys.forEach(function(k){
       var v = resp[k];
       var display = '';
-      if(typeof v === 'string'){
-        // Image data (data: URLs) collapse to a "view" link
-        if(v.indexOf('data:image/') === 0){
-          display = '<a href="'+v+'" target="_blank" style="color:var(--blue);text-decoration:underline">📷 View image (opens in new tab)</a>';
-        } else {
-          display = '<span style="font-family:monospace;font-size:.85em">'+escHtml(v||'(empty)')+'</span>';
-        }
+      var isImg = (typeof v === 'string' && v.indexOf('data:image/') === 0);
+      if(isImg){
+        // Calvin 2026-06-10 v1630: inline thumb + download. NEVER opens new tab.
+        var agentObj = (DB.agents||[]).find(function(x){return x && x.id === agentId;}) || {name:'agent'};
+        var dlName = (agentObj.name+'_'+k).replace(/[^a-z0-9._\-]/gi,'_')+'.jpg';
+        display = '<div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">'
+          + '<img src="'+v+'" onclick="_showPhotoLightbox(this.src, \''+escHtml(k)+' — '+escHtml(agentObj.name||'agent').replace(/\'/g,"\\\'")+'\')" '
+          + 'style="max-width:200px;max-height:200px;border:1px solid #d1d5db;border-radius:6px;cursor:zoom-in;box-shadow:0 2px 6px rgba(0,0,0,.08)" alt="'+escHtml(k)+'">'
+          + '<div style="display:flex;flex-direction:column;gap:5px;font-size:11px">'
+          + '<button onclick="_showPhotoLightbox(\''+v+'\', \''+escHtml(k)+' — '+escHtml(agentObj.name||'agent').replace(/\'/g,"\\\'")+'\')" style="background:#003594;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:5px;cursor:pointer;font-weight:700;min-width:140px">🔍 View Full Size</button>'
+          + '<button onclick="(function(){var a=document.createElement(\'a\');a.href=\''+v+'\';a.download=\''+dlName+'\';document.body.appendChild(a);a.click();document.body.removeChild(a);})()" style="background:#16a34a;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:5px;cursor:pointer;font-weight:700;min-width:140px">⬇ Download</button>'
+          + '</div></div>';
       } else if(v == null){
         display = '<em style="color:var(--muted)">(empty)</em>';
       } else {
-        display = '<span style="font-family:monospace;font-size:.85em">'+escHtml(String(v))+'</span>';
+        display = '<span style="font-family:monospace;font-size:.85em">'+escHtml(String(v||'(empty)'))+'</span>';
       }
       h += '<tr style="border-bottom:1px solid rgba(0,0,0,.06)">';
       h += '<td style="padding:7px 8px;color:var(--muted);font-weight:700;white-space:nowrap;vertical-align:top">'+escHtml(k)+'</td>';
@@ -46554,22 +46637,52 @@ function _obShowApplicantBgPackage(applicantId){
     h += '</div>';
     h += '<div style="background:var(--offwhite);border:1px solid var(--border);border-radius:8px;padding:12px 14px">';
     h += '<table style="width:100%;font-family:Barlow Condensed,sans-serif;font-size:.78rem;border-collapse:collapse">';
+    var rejectedSet = (app.rejectedFields || []);
     respKeys.forEach(function(k){
       var v = resp[k];
+      var isImg = (typeof v === 'string' && v.indexOf('data:image/') === 0);
+      var isRejected = rejectedSet.indexOf(k) >= 0;
       var display = '';
-      if(typeof v === 'string' && v.indexOf('data:image/') === 0){
-        display = '<a href="'+v+'" target="_blank" style="color:var(--blue);text-decoration:underline">📷 View image (opens in new tab)</a>';
+      if(isImg){
+        // Calvin 2026-06-10 v1630: inline thumb + download + reject. NEVER opens new tab.
+        var dlName = (app.name+'_'+k).replace(/[^a-z0-9._\-]/gi,'_')+'.jpg';
+        display = '<div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">'
+          + '<img src="'+v+'" onclick="_showPhotoLightbox(this.src, \''+escHtml(k)+' — '+escHtml(app.name).replace(/\'/g,"\\\'")+'\')" '
+          + 'style="max-width:200px;max-height:200px;border:1px solid #d1d5db;border-radius:6px;cursor:zoom-in;box-shadow:0 2px 6px rgba(0,0,0,.08)" alt="'+escHtml(k)+'">'
+          + '<div style="display:flex;flex-direction:column;gap:5px;font-size:11px">'
+          + '<button onclick="_showPhotoLightbox(\''+v+'\', \''+escHtml(k)+' — '+escHtml(app.name).replace(/\'/g,"\\\'")+'\')" style="background:#003594;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:5px;cursor:pointer;font-weight:700;min-width:140px">🔍 View Full Size</button>'
+          + '<button onclick="(function(){var a=document.createElement(\'a\');a.href=\''+v+'\';a.download=\''+dlName+'\';document.body.appendChild(a);a.click();document.body.removeChild(a);})()" style="background:#16a34a;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:5px;cursor:pointer;font-weight:700;min-width:140px">⬇ Download</button>'
+          + (isRejected
+              ? '<span style="background:#fef2f2;color:#dc2626;border:1px solid #dc2626;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:5px;font-weight:700;text-align:center">⚠ Rejected — awaiting resubmit</span>'
+              : '<button onclick="_uiRejectFieldAndResubmit('+app.id+', \''+escHtml(k)+'\')" style="background:#fef2f2;color:#dc2626;border:1px solid #dc2626;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:5px;cursor:pointer;font-weight:700;min-width:140px">✗ Reject &amp; Resubmit</button>'
+            )
+          + '</div></div>';
       } else if(v == null || v === ''){
         display = '<em style="color:var(--muted)">(empty)</em>';
       } else {
         display = '<span style="font-family:monospace;font-size:.85em">'+escHtml(String(v))+'</span>';
+        // Non-image fields can also be rejected (e.g. bad SSN, wrong address)
+        if(!isRejected){
+          display += ' <button onclick="_uiRejectFieldAndResubmit('+app.id+', \''+escHtml(k)+'\')" style="background:#fef2f2;color:#dc2626;border:1px solid #dc2626;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;text-transform:uppercase;padding:3px 8px;border-radius:4px;cursor:pointer;font-weight:700;margin-left:8px">✗ Reject</button>';
+        } else {
+          display += ' <span style="background:#fef2f2;color:#dc2626;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;padding:3px 8px;border-radius:4px;font-weight:700;margin-left:8px">⚠ REJECTED</span>';
+        }
       }
-      h += '<tr style="border-bottom:1px solid rgba(0,0,0,.06)">';
+      var rowBg = isRejected ? 'background:rgba(220,38,38,.05)' : '';
+      h += '<tr style="border-bottom:1px solid rgba(0,0,0,.06);'+rowBg+'">';
       h += '<td style="padding:7px 8px;color:var(--muted);font-weight:700;white-space:nowrap;vertical-align:top">'+escHtml(k)+'</td>';
       h += '<td style="padding:7px 8px;color:var(--brown);word-break:break-word">'+display+'</td>';
       h += '</tr>';
     });
     h += '</table></div></div>';
+
+    // Banner if any fields are pending resubmit
+    if(rejectedSet.length){
+      h += '<div style="background:#fef3c7;border:1.5px solid #f59e0b;border-radius:8px;padding:12px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif">';
+      h += '<div style="font-size:.85rem;font-weight:700;color:#78350f;letter-spacing:1px;margin-bottom:6px">⏳ '+rejectedSet.length+' field(s) pending resubmission from applicant</div>';
+      h += '<div style="font-size:.74rem;color:#92400e">Applicant was emailed a link to fix: '+rejectedSet.map(escHtml).join(', ')+'. Approval is blocked until they resubmit.</div>';
+      h += '</div>';
+    }
   } else {
     h += '<div style="background:rgba(220,38,38,.04);border:1px solid rgba(220,38,38,.2);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.76rem;color:var(--brown)">⚠ No PII responses on file. Applicant has only signed the Authorization but not the PII Intake.</div>';
   }
@@ -46655,6 +46768,24 @@ function _uiOverridePassLegacy(agentId){
   alert('✓ Cleared. '+agent.name+' is no longer in the Pending panel.');
   gotoPanel('agents-pending');
 }
+
+// ── Calvin 2026-06-10 v1630: Reject field & ask applicant to resubmit ──
+function _uiRejectFieldAndResubmit(applicantId, fieldId){
+  var app = (APPLICANTS_PRE_BG||[]).find(function(a){return a && a.id === applicantId;});
+  if(!app){ alert('Applicant not found'); return; }
+  var note = prompt('Reject "'+fieldId+'" — Note to applicant (optional, shown to them):\n\nExample: "Photo is blurry, please retake with better lighting" or "ID is expired"', '');
+  if(note === null) return; // user hit cancel
+  if(!confirm('Send '+app.name+' an email asking them to resubmit "'+fieldId+'"?\n\nThe field will be cleared and they\'ll get a link to refill just the rejected items. Existing data they already filled out stays saved.')) return;
+  rejectApplicantField(applicantId, fieldId, note);
+  alert('✓ Sent.\n\n'+app.name+' was emailed a resubmit link for "'+fieldId+'".');
+  // Refresh the BG package modal to reflect the new state
+  var ex = document.getElementById('ob-bg-package-modal');
+  if(ex){
+    ex.remove();
+    _obShowApplicantBgPackage(applicantId);
+  }
+}
+if(typeof window !== 'undefined') window._uiRejectFieldAndResubmit = _uiRejectFieldAndResubmit;
 
 function _uiRefreshApplicantsPanel(){
   var btn = document.getElementById('ap-refresh-btn');
@@ -72020,6 +72151,11 @@ function _renderApplicantSigningPage(app, token){
   var formTitle = formType === 'auth' ? 'Background Check Authorization' : 'Personal Information Intake';
   var formNumber = formType === 'auth' ? '1 of 2' : '2 of 2';
 
+  // Calvin 2026-06-10 v1630: If office rejected specific fields, show a banner
+  // at the top of the form telling the applicant what to fix.
+  var rejectedFields = (formType === 'pii' && Array.isArray(app.rejectedFields)) ? app.rejectedFields : [];
+  var isResubmit = rejectedFields.length > 0;
+
   var html = ''
     + '<div id="public-sign-root" style="position:fixed;inset:0;background:#f5f5f4;z-index:99999;overflow-y:auto;font-family:Arial,Helvetica,sans-serif;padding:0">'
     + '<div style="max-width:760px;margin:24px auto;padding:0 16px">'
@@ -72030,6 +72166,17 @@ function _renderApplicantSigningPage(app, token){
     + '</div>'
     + '<div style="background:white;padding:24px 26px;border-radius:0 0 10px 10px;box-shadow:0 4px 20px rgba(0,0,0,.08)">';
 
+  // Resubmit banner (only on PII when fields were rejected)
+  if(isResubmit){
+    html += '<div style="background:#fef3c7;border:2px solid #f59e0b;border-radius:10px;padding:16px 18px;margin-bottom:20px">'
+      + '<div style="font-size:1.05rem;font-weight:700;color:#78350f;margin-bottom:6px">⚠ Resubmission Requested</div>'
+      + '<div style="font-size:13px;color:#92400e;line-height:1.5">Our office needs you to fix the following item(s) before we can run your background check:</div>'
+      + '<div style="margin-top:8px;padding:8px 12px;background:white;border-radius:6px;border:1px solid #f59e0b;font-size:13px;color:#1f2937;font-weight:600">'+rejectedFields.map(_escapeHtml).join(' · ')+'</div>'
+      + (app.rejectedFieldNote ? '<div style="margin-top:10px;padding:8px 12px;background:#fff;border-left:3px solid #0891b2;font-size:13px;color:#0c4a6e;font-style:italic">Note: '+_escapeHtml(app.rejectedFieldNote)+'</div>' : '')
+      + '<div style="margin-top:10px;font-size:12px;color:#78350f">Your other answers are pre-filled — you only need to fix the items highlighted in yellow below.</div>'
+      + '</div>';
+  }
+
   // Document body (for signature-mode forms like BG Auth)
   if(form.docMode === 'signature' && form.documentBody){
     var bodyText = String(form.documentBody)
@@ -72039,9 +72186,14 @@ function _renderApplicantSigningPage(app, token){
   }
 
   // Render form fields
+  // v1630: pre-fill from saved responses (so resubmits don't lose data) +
+  // highlight rejected fields so the applicant knows what to fix.
+  var savedResponses = (formType === 'pii' && app.forms && app.forms.pii && app.forms.pii.responses) ? app.forms.pii.responses : {};
   html += '<form id="public-sign-form" onsubmit="return false">';
   (form.fields || []).forEach(function(fld){
-    html += _renderPublicSignField(fld);
+    var savedVal = savedResponses[fld.id];
+    var isRejected = rejectedFields.indexOf(fld.id) >= 0;
+    html += _renderPublicSignField(fld, savedVal, isRejected);
   });
 
   // Signature field (always required at the end)
@@ -72070,13 +72222,22 @@ function _renderApplicantSigningPage(app, token){
 }
 
 // Render a single field for the public signing page (compact subset of the form renderer)
-function _renderPublicSignField(fld){
+// Calvin 2026-06-10 v1630: accepts savedVal (pre-fill from previous submission)
+// and isRejected (highlight as needing resubmit).
+function _renderPublicSignField(fld, savedVal, isRejected){
+  if(savedVal === undefined) savedVal = '';
   var label = _escapeHtml(fld.label || '');
   var req = fld.required ? '<span style="color:#dc2626"> *</span>' : '';
   var width = fld.width === 'half' ? 'width:48%' : fld.width === 'third' ? 'width:31%' : 'width:100%';
-  var wrap_open  = '<div style="display:inline-block;'+width+';vertical-align:top;padding:6px;box-sizing:border-box">';
+  // Rejected fields get a yellow border + warning label
+  var wrapBg = isRejected ? 'background:#fef3c7;border:2px solid #f59e0b;border-radius:8px' : '';
+  var rejectBadge = isRejected ? '<span style="background:#f59e0b;color:white;font-size:10px;padding:2px 8px;border-radius:100px;margin-left:6px;letter-spacing:1px;text-transform:uppercase;font-weight:700">⚠ Fix this</span>' : '';
+  var wrap_open  = '<div style="display:inline-block;'+width+';vertical-align:top;padding:6px;box-sizing:border-box;'+wrapBg+'">';
   var wrap_close = '</div>';
   var helper = fld.helperText ? '<div style="font-size:11px;color:#666;margin-top:4px">'+_escapeHtml(fld.helperText)+'</div>' : '';
+  // Escape saved value for use as HTML attribute / text
+  var sv = (typeof savedVal === 'string') ? savedVal : '';
+  var svAttr = _escapeHtml(sv);
   switch(fld.type){
     case 'heading':
       return '<div style="margin:18px 0 6px 0;padding-bottom:4px;border-bottom:2px solid #003594;font-weight:700;color:#003594;font-size:14px;letter-spacing:.5px">'+label+'</div>';
@@ -72084,57 +72245,364 @@ function _renderPublicSignField(fld){
     case 'email':
     case 'phone':
       var ph = _escapeHtml(fld.placeholder || '');
-      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+'</label>'
-        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="'+(fld.type === 'email' ? 'email' : fld.type === 'phone' ? 'tel' : 'text')+'" placeholder="'+ph+'"'
+      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+rejectBadge+'</label>'
+        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="'+(fld.type === 'email' ? 'email' : fld.type === 'phone' ? 'tel' : 'text')+'" placeholder="'+ph+'" value="'+svAttr+'"'
         + ' style="width:100%;padding:9px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box">'
         + helper + wrap_close;
     case 'date':
-      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+'</label>'
-        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="date" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box">'
+      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+rejectBadge+'</label>'
+        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="date" value="'+svAttr+'" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box">'
         + helper + wrap_close;
     case 'textarea':
-      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+'</label>'
-        + '<textarea id="psf-'+_escapeHtml(fld.id)+'" rows="3" placeholder="'+_escapeHtml(fld.placeholder||'')+'" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box;font-family:inherit"></textarea>'
+      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+rejectBadge+'</label>'
+        + '<textarea id="psf-'+_escapeHtml(fld.id)+'" rows="3" placeholder="'+_escapeHtml(fld.placeholder||'')+'" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box;font-family:inherit">'+svAttr+'</textarea>'
         + helper + wrap_close;
     case 'toggle':
+      var togChecked = (sv === 'Yes' || sv === 'yes' || sv === 'true' || sv === '1') ? ' checked' : '';
       return wrap_open + '<label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#374151;cursor:pointer">'
-        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="checkbox" style="width:18px;height:18px"> '+label
+        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="checkbox"'+togChecked+' style="width:18px;height:18px"> '+label+rejectBadge
         + '</label>' + helper + wrap_close;
     case 'radio':
       var opts = (fld.options||[]).map(function(opt){
-        return '<label style="display:block;margin:4px 0;font-size:13px;cursor:pointer"><input type="radio" name="psf-'+_escapeHtml(fld.id)+'" value="'+_escapeHtml(opt)+'" style="margin-right:6px"> '+_escapeHtml(opt)+'</label>';
+        var checked = (sv === opt) ? ' checked' : '';
+        return '<label style="display:block;margin:4px 0;font-size:13px;cursor:pointer"><input type="radio" name="psf-'+_escapeHtml(fld.id)+'" value="'+_escapeHtml(opt)+'"'+checked+' style="margin-right:6px"> '+_escapeHtml(opt)+'</label>';
       }).join('');
-      return wrap_open + '<div style="font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+'</div>'
+      return wrap_open + '<div style="font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+rejectBadge+'</div>'
         + opts + helper + wrap_close;
     case 'file':
+      // Pre-fill data URL if available (so resubmits show prior photo)
+      var fileExtra = sv && sv.indexOf('data:image/') === 0
+        ? '<div id="psf-'+_escapeHtml(fld.id)+'-preview" style="margin-top:6px"><div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap"><img src="'+sv+'" onclick="_showPhotoLightbox(this.src, \''+_escapeHtml(fld.label||fld.id).replace(/\'/g,"\\\'")+'\')" style="max-width:200px;max-height:200px;border:1px solid #d1d5db;border-radius:6px;cursor:zoom-in"><div style="font-size:12px;color:#444">Previously uploaded — choose a new file above to replace.</div></div></div>'
+        : '<div id="psf-'+_escapeHtml(fld.id)+'-preview" style="margin-top:6px"></div>';
+      var fileScript = sv && sv.indexOf('data:image/') === 0 ? ' data-prefilled="'+_escapeHtml(sv)+'"' : '';
+      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+rejectBadge+'</label>'
+        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="file" accept="image/*" capture="environment" data-field="'+_escapeHtml(fld.id)+'"'+fileScript+' onchange="_publicSignReadFile(this)" style="width:100%;padding:9px 12px;font-size:13px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box;background:white">'
+        + fileExtra
+        + helper + wrap_close;
     case 'badgePhoto':
-      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+'</label>'
-        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="file" accept="image/*" capture="environment" data-field="'+_escapeHtml(fld.id)+'" onchange="_publicSignReadFile(this)" style="width:100%;padding:9px 12px;font-size:13px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box;background:white">'
-        + '<div id="psf-'+_escapeHtml(fld.id)+'-preview" style="margin-top:6px"></div>'
+      // Calvin 2026-06-10 v1630: front-cam capture on mobile + dedicated
+      // "Take Selfie" button that opens a desktop webcam modal via getUserMedia.
+      var bpExtra = sv && sv.indexOf('data:image/') === 0
+        ? '<div id="psf-'+_escapeHtml(fld.id)+'-preview" style="margin-top:6px"><div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap"><img src="'+sv+'" onclick="_showPhotoLightbox(this.src, \'badge photo\')" style="max-width:200px;max-height:200px;border:1px solid #d1d5db;border-radius:6px;cursor:zoom-in"><div style="font-size:12px;color:#444">Previously uploaded — upload or take a new one to replace.</div></div></div>'
+        : '<div id="psf-'+_escapeHtml(fld.id)+'-preview" style="margin-top:6px"></div>';
+      var bpAttr = sv && sv.indexOf('data:image/') === 0 ? ' data-prefilled="'+_escapeHtml(sv)+'"' : '';
+      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+rejectBadge+'</label>'
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:stretch">'
+          + '<input id="psf-'+_escapeHtml(fld.id)+'" type="file" accept="image/*" capture="user" data-field="'+_escapeHtml(fld.id)+'"'+bpAttr+' onchange="_publicSignReadFile(this)" style="flex:1;min-width:220px;padding:9px 12px;font-size:13px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box;background:white">'
+          + '<button type="button" onclick="_openSelfieCapture(\''+_escapeHtml(fld.id)+'\')" style="background:#003594;color:white;border:none;font-size:13px;padding:9px 18px;border-radius:6px;cursor:pointer;font-weight:600;white-space:nowrap">📷 Take Selfie</button>'
+        + '</div>'
+        + bpExtra
         + helper + wrap_close;
     case 'signature':
       return ''; // Signature is rendered separately at the bottom
     default:
-      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+'</label>'
-        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="text" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box">'
+      return wrap_open + '<label style="display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600">'+label+req+rejectBadge+'</label>'
+        + '<input id="psf-'+_escapeHtml(fld.id)+'" type="text" value="'+svAttr+'" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:6px;box-sizing:border-box">'
         + helper + wrap_close;
   }
 }
 
 // Read uploaded image into a data URL we can save with the form
+// ════════════════════════════════════════════════════════════════════
+//  v1630 UPGRADES (Calvin 2026-06-10)
+//  - Image compression: photos downsampled to ≤1200px JPEG to fit Supabase
+//  - DOB validation: must be 18+
+//  - Email validation: format + disposable-domain blocklist
+//  - Selfie capture on desktop via getUserMedia
+//  - Inline photo previews + downloads in BG Package modal
+//  - Reject & Resubmit button per field
+// ════════════════════════════════════════════════════════════════════
+
+// ── DOB validator ──
+function _isAdult(dobString){
+  if(!dobString) return false;
+  var dob = new Date(dobString);
+  if(isNaN(dob.getTime())) return false;
+  var today = new Date();
+  var age = today.getFullYear() - dob.getFullYear();
+  var m = today.getMonth() - dob.getMonth();
+  if(m < 0 || (m === 0 && today.getDate() < dob.getDate())) age--;
+  return age >= 18;
+}
+
+// ── Email validator: format + disposable blocklist ──
+// Calvin's spec: gmail/yahoo/ymail/outlook etc. all OK. Block disposable +
+// obviously-fake patterns.
+function _isValidEmail(email){
+  email = String(email||'').trim().toLowerCase();
+  if(!email) return false;
+  // RFC-lite format check (no IP literals, no quoted locals — common-case mail)
+  if(!/^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$/.test(email)) return false;
+  var parts = email.split('@');
+  var local = parts[0], domain = parts[1];
+  if(!local || !domain || local.length < 2) return false;
+  // Block obviously-fake locals — exact matches only, no digit suffixes.
+  // "test@..." is clearly bogus, but "test123@..." or "tester@..." could be
+  // a real handle, so we don't reject those.
+  if(/^(test|fake|asdf|qwerty|noreply|noemail|nothanks|none|admin|root)$/.test(local)) return false;
+  // Block disposable / temp-mail domains
+  var disposable = [
+    'mailinator.com','10minutemail.com','10minutemail.net','guerrillamail.com','sharklasers.com',
+    'temp-mail.org','temp-mail.com','tempmail.com','tempmail.io','throwaway.email','throwawaymail.com',
+    'fakeinbox.com','trashmail.com','trashmail.io','getairmail.com','maildrop.cc','tempinbox.com',
+    'mohmal.com','inboxalias.com','dispostable.com','yopmail.com','mintemail.com','spamgourmet.com',
+    'meltmail.com','spambox.us','mailcatch.com','spamfree24.org','tempemail.net','tempemail.co',
+    'jetable.org','mvrht.com','mytrashmail.com','spam4.me','emailondeck.com','mailnesia.com',
+    'mintmail.com','mailtothis.com','tmail.com','tempmail.dev'
+  ];
+  if(disposable.indexOf(domain) >= 0) return false;
+  // Reasonable length
+  if(email.length > 254) return false;
+  return true;
+}
+
+// ── Image compression: resize + JPEG-encode an uploaded file ──
+// Brings 5-15 MB phone photos down to ~150-400 KB so they fit in Supabase.
+function _compressImageToDataUrl(file, maxDim, quality){
+  return new Promise(function(resolve, reject){
+    var reader = new FileReader();
+    reader.onerror = function(){ reject(new Error('Could not read file')); };
+    reader.onload = function(e){
+      var img = new Image();
+      img.onerror = function(){ reject(new Error('Could not decode image')); };
+      img.onload = function(){
+        try{
+          var w = img.width, h = img.height;
+          var scale = Math.min(1, maxDim / Math.max(w, h));
+          var cw = Math.round(w * scale), ch = Math.round(h * scale);
+          var canvas = document.createElement('canvas');
+          canvas.width = cw; canvas.height = ch;
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, cw, ch);
+          var dataUrl = canvas.toDataURL('image/jpeg', quality || 0.85);
+          resolve(dataUrl);
+        }catch(err){ reject(err); }
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+if(typeof window !== 'undefined'){
+  window._isAdult = _isAdult;
+  window._isValidEmail = _isValidEmail;
+  window._compressImageToDataUrl = _compressImageToDataUrl;
+}
+
+// ── Lightbox: inline modal image viewer (NEVER opens new tab) ──
+// Click any photo preview → expands in a full-screen overlay inside the
+// back-office. Has a Download button. Esc closes.
+function _showPhotoLightbox(dataUrl, fileLabel){
+  // Strip any existing lightbox
+  var ex = document.getElementById('wmam-photo-lightbox');
+  if(ex) ex.remove();
+  var ov = document.createElement('div');
+  ov.id = 'wmam-photo-lightbox';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:100400;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px';
+  ov.tabIndex = 0;
+  ov.onclick = function(e){ if(e.target === ov) ov.remove(); };
+  // Toolbar
+  var bar = document.createElement('div');
+  bar.style.cssText = 'position:absolute;top:14px;left:14px;right:14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap';
+  var label = document.createElement('div');
+  label.style.cssText = 'color:white;font-family:Barlow Condensed,sans-serif;font-size:.9rem;letter-spacing:1.5px';
+  label.textContent = fileLabel || 'Photo';
+  bar.appendChild(label);
+  var btnGroup = document.createElement('div');
+  btnGroup.style.cssText = 'display:flex;gap:8px';
+  var dl = document.createElement('button');
+  dl.innerHTML = '⬇ Download';
+  dl.style.cssText = 'background:white;border:none;color:#003594;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;padding:8px 16px;border-radius:5px;cursor:pointer;font-weight:700';
+  dl.onclick = function(){
+    var a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = (fileLabel || 'photo').replace(/[^a-z0-9._\-]/gi,'_') + '.jpg';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+  btnGroup.appendChild(dl);
+  var cls = document.createElement('button');
+  cls.innerHTML = '✕ Close';
+  cls.style.cssText = 'background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.4);color:white;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;padding:8px 14px;border-radius:5px;cursor:pointer';
+  cls.onclick = function(){ ov.remove(); };
+  btnGroup.appendChild(cls);
+  bar.appendChild(btnGroup);
+  ov.appendChild(bar);
+  // Image
+  var img = document.createElement('img');
+  img.src = dataUrl;
+  img.style.cssText = 'max-width:95vw;max-height:85vh;object-fit:contain;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.4)';
+  ov.appendChild(img);
+  // Esc closes
+  document.addEventListener('keydown', function escClose(e){
+    if(e.key === 'Escape'){
+      var l = document.getElementById('wmam-photo-lightbox');
+      if(l) l.remove();
+      document.removeEventListener('keydown', escClose);
+    }
+  });
+  document.body.appendChild(ov);
+  ov.focus();
+}
+if(typeof window !== 'undefined') window._showPhotoLightbox = _showPhotoLightbox;
+
+// ── Desktop Selfie Capture (getUserMedia) ──
+// Mobile already uses capture="user" for front cam. Desktop needs this
+// modal that streams the webcam, captures a still, and saves it as the
+// field's data URL.
+function _openSelfieCapture(fieldId){
+  // Strip any existing capture modal
+  var ex = document.getElementById('wmam-selfie-modal');
+  if(ex){ try{ ex.querySelector('video').srcObject.getTracks().forEach(function(t){t.stop();}); }catch(e){} ex.remove(); }
+  var stream = null;
+  var ov = document.createElement('div');
+  ov.id = 'wmam-selfie-modal';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:100500;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px';
+  var box = document.createElement('div');
+  box.style.cssText = 'background:white;border-radius:14px;max-width:560px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.4)';
+  box.innerHTML = ''
+    + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">'
+    + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.25rem;letter-spacing:2px;color:#003594">📷 Take Selfie</div>'
+    + '<button onclick="_closeSelfieCapture()" style="background:#f5f5f4;border:1px solid #d1d5db;color:#666;font-size:13px;padding:6px 12px;border-radius:5px;cursor:pointer">Close ✕</button>'
+    + '</div>'
+    + '<div id="selfie-status" style="margin-bottom:10px;font-size:13px;color:#666;text-align:center">Requesting camera permission…</div>'
+    + '<video id="selfie-video" autoplay playsinline muted style="width:100%;max-height:380px;background:#000;border-radius:10px;display:block"></video>'
+    + '<canvas id="selfie-canvas" style="display:none"></canvas>'
+    + '<div id="selfie-preview" style="display:none;margin-top:10px;text-align:center"></div>'
+    + '<div style="margin-top:16px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">'
+    + '<button id="selfie-capture-btn" onclick="_selfieCaptureFrame(\''+_escapeHtml(fieldId)+'\')" style="background:#003594;color:white;border:none;padding:12px 26px;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:1px">📸 Capture</button>'
+    + '<button id="selfie-retake-btn" onclick="_selfieRetake()" style="display:none;background:#f5f5f4;border:1px solid #d1d5db;color:#374151;padding:12px 20px;border-radius:6px;font-size:14px;cursor:pointer">↻ Retake</button>'
+    + '<button id="selfie-use-btn" onclick="_selfieUse(\''+_escapeHtml(fieldId)+'\')" style="display:none;background:#16a34a;color:white;border:none;padding:12px 26px;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:1px">✓ Use This Photo</button>'
+    + '</div>'
+    + '<div style="margin-top:14px;padding:10px 14px;background:#fffbeb;border:1px solid #f59e0b;border-radius:8px;font-size:12px;color:#78350f">'
+    + '<strong>Tip:</strong> Face the camera directly with good lighting. No sunglasses, hats, or filters. The photo will be on your company badge.'
+    + '</div>';
+  ov.appendChild(box);
+  document.body.appendChild(ov);
+
+  // Start the camera
+  var statusEl = document.getElementById('selfie-status');
+  var videoEl = document.getElementById('selfie-video');
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    statusEl.textContent = '⚠ Your browser does not support webcam capture. Please use the file picker instead, or try this from your phone.';
+    statusEl.style.color = '#dc2626';
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({video: {facingMode: 'user', width: {ideal:1280}, height: {ideal:960}}, audio: false})
+    .then(function(s){
+      stream = s;
+      window._selfieStream = s;
+      videoEl.srcObject = s;
+      statusEl.textContent = 'Camera ready. Smile and click Capture.';
+      statusEl.style.color = '#16a34a';
+    })
+    .catch(function(err){
+      console.warn('[selfie] getUserMedia failed:', err);
+      var msg = '⚠ Could not access your webcam.';
+      if(err.name === 'NotAllowedError') msg = '⚠ Camera access denied. Please allow camera permission and try again, or use the file picker.';
+      else if(err.name === 'NotFoundError') msg = '⚠ No camera found. Please use the file picker instead.';
+      statusEl.textContent = msg;
+      statusEl.style.color = '#dc2626';
+    });
+}
+
+function _closeSelfieCapture(){
+  try{
+    if(window._selfieStream){
+      window._selfieStream.getTracks().forEach(function(t){t.stop();});
+      window._selfieStream = null;
+    }
+  }catch(e){}
+  var ov = document.getElementById('wmam-selfie-modal');
+  if(ov) ov.remove();
+}
+
+function _selfieCaptureFrame(fieldId){
+  var video = document.getElementById('selfie-video');
+  var canvas = document.getElementById('selfie-canvas');
+  var preview = document.getElementById('selfie-preview');
+  if(!video || !canvas) return;
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  var ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  var dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  window._selfieCapturedDataUrl = dataUrl;
+  video.style.display = 'none';
+  preview.innerHTML = '<img src="'+dataUrl+'" style="max-width:100%;max-height:380px;border-radius:10px;border:2px solid #16a34a">';
+  preview.style.display = 'block';
+  document.getElementById('selfie-capture-btn').style.display = 'none';
+  document.getElementById('selfie-retake-btn').style.display = 'inline-block';
+  document.getElementById('selfie-use-btn').style.display = 'inline-block';
+  document.getElementById('selfie-status').textContent = 'Looks good? Use this photo or retake.';
+}
+
+function _selfieRetake(){
+  var video = document.getElementById('selfie-video');
+  var preview = document.getElementById('selfie-preview');
+  video.style.display = 'block';
+  preview.style.display = 'none';
+  preview.innerHTML = '';
+  document.getElementById('selfie-capture-btn').style.display = 'inline-block';
+  document.getElementById('selfie-retake-btn').style.display = 'none';
+  document.getElementById('selfie-use-btn').style.display = 'none';
+  document.getElementById('selfie-status').textContent = 'Camera ready. Smile and click Capture.';
+}
+
+function _selfieUse(fieldId){
+  var dataUrl = window._selfieCapturedDataUrl;
+  if(!dataUrl){ alert('No photo captured.'); return; }
+  var input = document.getElementById('psf-'+fieldId);
+  if(input){
+    input.dataset.dataUrl = dataUrl;
+    var prev = document.getElementById('psf-'+fieldId+'-preview');
+    if(prev){
+      prev.innerHTML = '<div style="margin-top:6px;display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">'
+        +'<img src="'+dataUrl+'" onclick="_showPhotoLightbox(this.src, \'selfie\')" '
+        +'style="max-width:200px;max-height:200px;border:1px solid #d1d5db;border-radius:6px;cursor:zoom-in;box-shadow:0 2px 6px rgba(0,0,0,.08)" alt="Selfie preview">'
+        +'<div style="display:flex;flex-direction:column;gap:6px;font-size:12px;color:#444">'
+        +'<div>✓ Selfie captured</div>'
+        +'<button type="button" onclick="_openSelfieCapture(\''+_escapeHtml(fieldId)+'\')" style="background:white;border:1px solid #d1d5db;color:#374151;font-size:11px;padding:4px 10px;border-radius:4px;cursor:pointer">↻ Retake</button>'
+        +'</div></div>';
+    }
+  }
+  _closeSelfieCapture();
+}
+
+if(typeof window !== 'undefined'){
+  window._openSelfieCapture = _openSelfieCapture;
+  window._closeSelfieCapture = _closeSelfieCapture;
+  window._selfieCaptureFrame = _selfieCaptureFrame;
+  window._selfieRetake = _selfieRetake;
+  window._selfieUse = _selfieUse;
+}
+
 function _publicSignReadFile(input){
   var file = input.files && input.files[0];
   if(!file) return;
   var fieldId = input.getAttribute('data-field');
-  var reader = new FileReader();
-  reader.onload = function(e){
-    input.dataset.dataUrl = e.target.result;
-    var prev = document.getElementById('psf-'+fieldId+'-preview');
+  var prev = document.getElementById('psf-'+fieldId+'-preview');
+  if(prev) prev.innerHTML = '<div style="margin-top:4px;font-size:12px;color:#666">⏳ Compressing photo...</div>';
+  // Calvin 2026-06-10 v1630: compress to keep payload small enough for Supabase
+  _compressImageToDataUrl(file, 1400, 0.82).then(function(dataUrl){
+    input.dataset.dataUrl = dataUrl;
     if(prev){
-      prev.innerHTML = '<img src="'+e.target.result+'" style="max-width:160px;max-height:160px;border:1px solid #d1d5db;border-radius:6px;margin-top:4px">';
+      // Inline thumb + click-to-enlarge
+      prev.innerHTML = '<div style="margin-top:6px;display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap">'
+        +'<img src="'+dataUrl+'" onclick="_showPhotoLightbox(this.src, \''+_escapeHtml(file.name||'photo')+'\')" '
+        +'style="max-width:200px;max-height:200px;border:1px solid #d1d5db;border-radius:6px;cursor:zoom-in;box-shadow:0 2px 6px rgba(0,0,0,.08)" '
+        +'alt="Photo preview">'
+        +'<div style="display:flex;flex-direction:column;gap:6px;font-size:12px;color:#444">'
+        +'<div>✓ '+_escapeHtml(file.name || 'photo')+' uploaded</div>'
+        +'<button type="button" onclick="document.getElementById(\'psf-'+_escapeHtml(fieldId)+'\').click()" style="background:white;border:1px solid #d1d5db;color:#374151;font-size:11px;padding:4px 10px;border-radius:4px;cursor:pointer">↻ Replace</button>'
+        +'</div></div>';
     }
-  };
-  reader.readAsDataURL(file);
+  }).catch(function(err){
+    if(prev) prev.innerHTML = '<div style="color:#dc2626;font-size:12px">⚠ Could not process photo. Try a different file.</div>';
+    console.warn('[publicSignReadFile] compression failed:', err);
+  });
 }
 
 function _publicSignSubmit(applicantId, token, formType){
@@ -72169,7 +72637,8 @@ function _publicSignSubmit(applicantId, token, formType){
     if(fld.type === 'toggle'){
       val = el.checked ? 'Yes' : '';
     } else if(fld.type === 'file' || fld.type === 'badgePhoto'){
-      val = el.dataset.dataUrl || '';
+      // v1630: prefer newly-uploaded data; fall back to pre-filled value
+      val = el.dataset.dataUrl || el.dataset.prefilled || '';
     } else {
       val = (el.value || '').trim();
     }
@@ -72187,6 +72656,19 @@ function _publicSignSubmit(applicantId, token, formType){
   if(missing.length){
     _publicSignShowError('Please complete: '+missing.join(', '));
     return;
+  }
+  // ── Calvin 2026-06-10 v1630: DOB must be 18+, email must be real ──
+  if(formType === 'pii'){
+    var dobVal = responses.bgi4;
+    if(dobVal && !_isAdult(dobVal)){
+      _publicSignShowError('You must be at least 18 years old to submit this form. Please check your date of birth.');
+      return;
+    }
+    var emailVal = responses.bgi21;
+    if(emailVal && !_isValidEmail(emailVal)){
+      _publicSignShowError('Please use a real, working email address. Disposable or temporary email services (mailinator, 10minutemail, etc.) are not accepted.');
+      return;
+    }
   }
   // Save signature into the applicant record (localStorage + Supabase)
   var btn = document.querySelector('#public-sign-form button[type="submit"]');
