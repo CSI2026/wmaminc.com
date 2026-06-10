@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.10.1930';
+var BUILD_VERSION = '2026.06.10.2030';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -7310,15 +7310,99 @@ function payrollLookupDealPay(orderNum, carrier){
   var sorted = PAYROLL_WEEKS.slice().sort(function(a,b){
     return (b.uploadedAt||'').localeCompare(a.uploadedAt||'');
   });
+  // Normalize the orderNum for matching (trim, strip leading zeros, lowercase)
+  var needle = String(orderNum).trim();
+  var needleAlt = needle.replace(/^0+/,'').toLowerCase();
   for(var i=0;i<sorted.length;i++){
     var w = sorted[i];
     if(carrier && w.carrier !== carrier) continue;
-    if(w.dealPaySplits && w.dealPaySplits[orderNum]){
+    if(!w.dealPaySplits) continue;
+    // Direct hit first
+    if(w.dealPaySplits[orderNum]){
       return Object.assign({}, w.dealPaySplits[orderNum], {weekId: w.id, periodEnd: w.periodEnd});
+    }
+    // Normalized hit second — handles "081826307" vs "81826307" mismatches
+    var keys = Object.keys(w.dealPaySplits);
+    for(var k=0;k<keys.length;k++){
+      var keyNorm = String(keys[k]).trim().replace(/^0+/,'').toLowerCase();
+      if(keyNorm === needleAlt){
+        return Object.assign({}, w.dealPaySplits[keys[k]], {weekId: w.id, periodEnd: w.periodEnd});
+      }
     }
   }
   return null;
 }
+
+// ── Calvin 2026-06-10 v2030: HISTORICAL TIER LOOKUP ──
+// When the original dealPaySplits row is missing (older payfile, mismatched
+// orderNum format), we still need to know what TIER the agent was at when
+// the deal was paid — otherwise the chargeback claws back the wrong amount.
+//
+// Calvin's rule: "if she gets paid 23 for the deal we only take back 23, but
+// if we paid her 25 on a chargeback we must also charge hers back for the 25."
+//
+// Strategy:
+//   Pass 1: find the pay week whose [periodStart, periodEnd] contains the
+//           sale date, then count this agent's tribal/nlad enrollments in
+//           that week's saved splits. That's the tier they were paid at.
+//   Pass 2: if no date match, use the agent's most-recent pay week with
+//           data. Most TLs are at stable tiers, so this approximates well.
+//   Pass 3: if no data anywhere, return null so the caller decides.
+//
+// Returns: {tribalCount, nladCount, weekId, dateMatch} or null
+function payrollLookupAgentTierAtDate(agentId, saleDate, carrier){
+  if(!PAYROLL_WEEKS || !PAYROLL_WEEKS.length) return null;
+  if(!agentId) return null;
+  var sd = saleDate ? new Date(saleDate) : null;
+  if(sd && isNaN(sd.getTime())) sd = null;
+  // Pass 1: date-matching week
+  if(sd){
+    for(var i=0;i<PAYROLL_WEEKS.length;i++){
+      var w = PAYROLL_WEEKS[i];
+      if(carrier && w.carrier !== carrier) continue;
+      if(!w.dealPaySplits) continue;
+      var ps = w.periodStart ? new Date(w.periodStart) : null;
+      var pe = w.periodEnd   ? new Date(w.periodEnd)   : null;
+      if(!ps || !pe) continue;
+      if(sd < ps || sd > pe) continue;
+      var tCount = 0, nCount = 0;
+      var keys = Object.keys(w.dealPaySplits);
+      for(var k=0;k<keys.length;k++){
+        var dp = w.dealPaySplits[keys[k]];
+        if(dp && dp.enrollerAid === agentId){
+          if(dp.tribal) tCount++; else nCount++;
+        }
+      }
+      // Only return if the agent actually appeared in this week. Otherwise
+      // we fall through to Pass 2 — the agent may have been in a different
+      // pay period (data misaligned) but still have history elsewhere.
+      if(tCount > 0 || nCount > 0){
+        return {tribalCount:tCount, nladCount:nCount, weekId:w.id, dateMatch:true};
+      }
+      break;  // date matched a week but agent had zero — skip to Pass 2
+    }
+  }
+  // Pass 2: most-recent week with data for this agent
+  var sorted = PAYROLL_WEEKS.slice().sort(function(a,b){return (b.uploadedAt||'').localeCompare(a.uploadedAt||'');});
+  for(var j=0;j<sorted.length;j++){
+    var w2 = sorted[j];
+    if(carrier && w2.carrier !== carrier) continue;
+    if(!w2.dealPaySplits) continue;
+    var tC = 0, nC = 0;
+    var keys2 = Object.keys(w2.dealPaySplits);
+    for(var kk=0;kk<keys2.length;kk++){
+      var dp2 = w2.dealPaySplits[keys2[kk]];
+      if(dp2 && dp2.enrollerAid === agentId){
+        if(dp2.tribal) tC++; else nC++;
+      }
+    }
+    if(tC > 0 || nC > 0){
+      return {tribalCount:tC, nladCount:nC, weekId:w2.id, dateMatch:false};
+    }
+  }
+  return null;
+}
+if(typeof window !== 'undefined') window.payrollLookupAgentTierAtDate = payrollLookupAgentTierAtDate;
 
 // ════════════════════════════════════════════════════════════════════════
 //  CARRYOVER DEBT LEDGER (Calvin 2026-04-30)
@@ -8103,7 +8187,7 @@ function payrollApplyDeductions(opts){
       splitData = null;
     }
 
-    // ── Calvin 2026-05-15 PERMANENT FIX ──
+    // ── Calvin 2026-05-15 PERMANENT FIX ── (v2030 enhanced)
     // If we don't have historical splits saved (sales week missing, agent-
     // code mismatch on original commit, etc.) we previously fell back to the
     // old broken cascade that charged the named agent the FULL carrier cap.
@@ -8114,32 +8198,53 @@ function payrollApplyDeductions(opts){
     // gives us the correct per-recipient breakdown using current spec, even
     // when the historical record wasn't saved cleanly.
     //
-    // We can't know the agent's exact slide-tier from the chargeback row
-    // alone, so we use the conservative under-tier rate (the lower amount).
-    // This is intentional: it's "fair" in Calvin's words — we never claw
-    // back more than we paid. If anything, we claw back slightly LESS than
-    // a tier-2 agent earned, which is a small acceptable variance compared
-    // to wrongly clawing back the full $28.
+    // v2030 upgrade: we now look up the agent's ACTUAL historical tier from
+    // the pay week that contains the sale date. So when Sheila was paid
+    // tier-2 ($25) on payfile 300, we know her tribal count was 30+ and the
+    // computed chargeback rate matches what she was actually paid.
+    // Without this lookup we'd under-claw at tier-1 ($23) and lose $2/deal.
     if(!useSplitMath && carrier === 'TruConnect' && agent && d.type !== 'Device Upgrade' && typeof payrollComputeDealSplit === 'function'){
       try {
+        // Look up the agent's tier-count at the time the deal was paid
+        var hist = (typeof payrollLookupAgentTierAtDate === 'function')
+          ? payrollLookupAgentTierAtDate(agent.id, d.date, 'TruConnect')
+          : null;
+        var tribalCount = hist ? hist.tribalCount : 0;
+        var nladCount   = hist ? hist.nladCount   : 0;
+        // If we have NO history at all, default to tier-2 (31 tribal) — most
+        // active TLs hit tier 2 by mid-week, so under-clawing at tier-1 is
+        // the dangerous default (real-money loss), whereas tier-2 matches
+        // Sheila/Najee's typical state. K-Anna can manually adjust if needed.
+        if(!hist){
+          tribalCount = 31;
+          nladCount   = 31;
+        }
         var computed = payrollComputeDealSplit({
           carrier: 'TruConnect',
           agentId: agent.id,
           isTribal: !!d.isTribal,
-          agentTribalTotalThatWeek: 1,  // conservative: under-tier rate
-          agentNladTotalThatWeek:   1
+          agentTribalTotalThatWeek: tribalCount,
+          agentNladTotalThatWeek:   nladCount
         });
         if(computed && computed.length){
           splitData = {
-            date: '',
+            date: d.date || '',
             orderNum: d.orderNum || '',
             tribal: !!d.isTribal,
             enrollerAid: agent.id,
             enrollerName: agent.name,
             splits: computed,
-            recomputed: true   // audit flag: this was on-the-fly
+            recomputed: true,   // audit flag: this was on-the-fly
+            tierSource: hist ? (hist.dateMatch ? 'historical-date-match' : 'historical-most-recent') : 'default-tier-2',
+            tierWeekId: hist ? hist.weekId : null,
+            tierTribalCount: tribalCount,
+            tierNladCount: nladCount
           };
           useSplitMath = true;
+          // Diagnostic so K-Anna can audit when the fallback fired
+          if(typeof console !== 'undefined'){
+            console.log('[chargeback recomputed] '+(agent.name)+' #'+(d.orderNum||'?')+' — tribal='+tribalCount+' nlad='+nladCount+' source='+splitData.tierSource);
+          }
         }
       } catch(e){
         console.warn('[payrollApplyDeductions] on-the-fly split compute failed:', e);
@@ -37619,6 +37724,43 @@ function ppRenderCarrierPreview(carrier, parsed){
 
       // Cascade trail (chargebacks)
       if(cascadeResult && cascadeResult.audit && cascadeResult.audit.length){
+        // ── Calvin 2026-06-10 v2030: PER-AGENT DEDUCTION BREAKDOWN ──
+        // Mirrors the commission breakdown style (grouped per agent + totals)
+        // so K-Anna can scan "Sheila Love owes $X" at a glance instead of
+        // hunting through every line. The line-by-line cascade trail is kept
+        // below for orderNum-level audit.
+        var dedAudit = cascadeResult.audit.filter(function(a){return a.kind==='deduction';});
+        if(dedAudit.length){
+          // Group by recipient agent → bucket by (type, role, paidCents)
+          var byRecip = {};  // {agentName: {totalCents, buckets:{key:{count, paidCents, type, role}}}}
+          dedAudit.forEach(function(a){
+            (a.trail||[]).forEach(function(t){
+              if(!t || !t.name) return;
+              var rec = byRecip[t.name] || (byRecip[t.name] = {totalCents:0, buckets:{}});
+              rec.totalCents += (t.paidCents||0);
+              var key = (a.type||'?')+'|'+(t.role||'?')+'|'+(t.paidCents||0);
+              var b = rec.buckets[key] || (rec.buckets[key] = {count:0, paidCents:(t.paidCents||0), type:(a.type||'?'), role:(t.role||'?')});
+              b.count += 1;
+            });
+          });
+          h += '<div style="margin-top:16px;margin-bottom:8px"><strong style="color:#991B1B">DEDUCTION BREAKDOWN (per agent — what was clawed back)</strong></div>';
+          // Sort recipients by total deducted desc (biggest pain first)
+          Object.keys(byRecip).sort(function(x,y){return byRecip[y].totalCents - byRecip[x].totalCents;}).forEach(function(recipName){
+            var rec = byRecip[recipName];
+            h += '<div style="margin-bottom:10px;padding:6px 10px;background:rgba(153,27,27,.04);border-left:2px solid #991B1B">';
+            h += '<div style="font-weight:700;color:#3d3d4a">'+recipName+' — <span style="color:#991B1B">−$'+(rec.totalCents/100).toFixed(2)+'</span> total deductions</div>';
+            // Sort buckets within agent by total impact desc
+            Object.keys(rec.buckets).sort(function(x,y){
+              return (rec.buckets[y].count * rec.buckets[y].paidCents) - (rec.buckets[x].count * rec.buckets[x].paidCents);
+            }).forEach(function(bkey){
+              var b = rec.buckets[bkey];
+              var lineTotal = (b.count * b.paidCents) / 100;
+              var rate = (b.paidCents/100).toFixed(0);
+              h += '<div style="padding-left:14px;color:#3d3d4a">• ['+b.count+' × $'+rate+'] $'+lineTotal.toFixed(2)+' — '+b.type+' ('+b.role+')</div>';
+            });
+            h += '</div>';
+          });
+        }
         h += '<div style="margin-top:16px;margin-bottom:8px"><strong style="color:#7c3aed">CHARGEBACK CASCADE TRAIL (who paid back what)</strong></div>';
         cascadeResult.audit.filter(function(a){return a.kind==='deduction';}).forEach(function(a){
           h += '<div style="margin-bottom:6px;padding:4px 10px;background:rgba(153,27,27,.04);border-left:2px solid #991B1B">';
