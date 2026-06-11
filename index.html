@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.10.2230';
+var BUILD_VERSION = '2026.06.10.2330';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -22595,12 +22595,51 @@ function inviteApplicant(opts){
     migratedFromAgent: opts.migratedFromAgent || null
   };
   APPLICANTS_PRE_BG.push(app);
-  saveApplicants();
-  // Fire welcome email with both signing links
+
+  // ── Calvin 2026-06-10 v2330: ATOMIC INVITE ──
+  // OLD bug: saveApplicants() fired-and-forgot the cloud write, then the
+  // welcome email went out immediately. If the cloud write was still in
+  // flight (or failed) when the applicant clicked the link, their browser
+  // session loaded an OLD APPLICANTS_PRE_BG from Supabase that didn't
+  // include them → "Signing Link Issue" page.
+  //
+  // NEW: await the cloud write before emailing. If the cloud write fails,
+  // roll back the local push and throw an error so the UI shows it instead
+  // of sending an email with a doomed link.
+  var saveResult = saveApplicants();
+  // saveApplicants returns a Promise (v1930+). Wrap email+notify in a then.
+  if(saveResult && typeof saveResult.then === 'function'){
+    return saveResult.then(function(r){
+      if(r && r.ok === false && r.cloudWrite === false){
+        // Roll back the local push so we don't have a phantom applicant
+        // that exists locally but never reached Supabase.
+        var idx = APPLICANTS_PRE_BG.indexOf(app);
+        if(idx >= 0) APPLICANTS_PRE_BG.splice(idx, 1);
+        try{ localStorage.setItem('wmam_applicants_pre_bg', JSON.stringify(APPLICANTS_PRE_BG)); }catch(e){}
+        var errMsg = (r.error && (r.error.message || r.error)) || 'unknown error';
+        throw new Error('Could not save invitation to cloud. The email was NOT sent. Please check your connection and try again. (Server error: '+errMsg+')');
+      }
+      // Cloud write succeeded — safe to email + notify
+      _applicantSendInvitationEmail(app);
+      if(typeof pushNotification === 'function'){
+        try{
+          pushNotification({
+            toIds: getOnboardingStaffIds({excludeId: u.id}), toRoles:[],
+            icon: '📧',
+            title: 'Applicant Invited — '+app.name,
+            body: app.name+' was invited to onboarding for '+app.program+(app.invitedByName ? ' by '+app.invitedByName : '')+'. They have 7 days to sign their BG forms.',
+            panel: 'agents-pending',
+            priority: 'normal',
+            skipEmail: true
+          });
+        }catch(e){}
+      }
+      return app;
+    });
+  }
+  // Fallback path (no Promise from saveApplicants — should not happen in
+  // production, but covers test environments without supaClient):
   _applicantSendInvitationEmail(app);
-  // ── Calvin 2026-06-10 v1930: notify ENTIRE onboarding department ──
-  // K-Anna, Makenzie, and every onboarding/HR staff member need visibility
-  // of every applicant invitation so they can track pending work.
   if(typeof pushNotification === 'function'){
     try{
       pushNotification({
@@ -47410,15 +47449,38 @@ function _invSubmit(){
     return;
   }
   try{
-    var app = inviteApplicant({
+    // ── Calvin 2026-06-10 v2330: ATOMIC INVITE ──
+    // inviteApplicant is now async — it awaits the Supabase write before
+    // returning so the email never goes out for an applicant who hasn't
+    // reached the cloud. Show a "Sending..." state and disable the submit
+    // button while waiting.
+    var submitBtn = document.querySelector('#invite-applicant-modal button[type="submit"], #invite-applicant-modal #inv-submit-btn');
+    if(submitBtn){ submitBtn.disabled = true; submitBtn.textContent = '⏳ Sending invitation...'; }
+    var inviteResult = inviteApplicant({
       name: name, email: email, phone: phone,
       program: program, campaigns: campaigns,
       teamLeaderId: tlId, marketManagerId: mmId,
       campaignManagerId: cmId, iboId: iboId
     });
-    document.getElementById('invite-applicant-modal').remove();
-    alert('✅ Invitation sent.\n\n'+app.name+' was emailed two private signing links — one for BG Authorization, one for PII Intake. They have 7 days to sign before the invitation auto-expires.\n\nYou will get an urgent notification when both forms are signed.');
-    gotoPanel('agents-pending');
+    // inviteApplicant returns a Promise — wait for the cloud write
+    if(inviteResult && typeof inviteResult.then === 'function'){
+      inviteResult.then(function(app){
+        var modal = document.getElementById('invite-applicant-modal');
+        if(modal) modal.remove();
+        alert('✅ Invitation sent.\n\n'+app.name+' was emailed two private signing links — one for BG Authorization, one for PII Intake. They have 7 days to sign before the invitation auto-expires.\n\nYou will get an urgent notification when both forms are signed.');
+        gotoPanel('agents-pending');
+      }).catch(function(e){
+        if(submitBtn){ submitBtn.disabled = false; submitBtn.textContent = 'Send Invitation'; }
+        var box2 = document.getElementById('inv-error');
+        if(box2){ box2.style.display = 'block'; box2.textContent = '⚠ ' + (e.message || e); }
+      });
+    } else {
+      // Synchronous fallback (test environments without supaClient)
+      var app = inviteResult;
+      document.getElementById('invite-applicant-modal').remove();
+      alert('✅ Invitation sent.\n\n'+app.name+' was emailed two private signing links — one for BG Authorization, one for PII Intake. They have 7 days to sign before the invitation auto-expires.\n\nYou will get an urgent notification when both forms are signed.');
+      gotoPanel('agents-pending');
+    }
   }catch(e){
     var box2 = document.getElementById('inv-error');
     if(box2){ box2.style.display = 'block'; box2.textContent = '⚠ ' + (e.message || e); }
@@ -72647,7 +72709,13 @@ function _handleApplicantSigningPage(){
   if(!token) return false;  // not a signing URL
   console.log('[applicant signing] token detected:', token.slice(0,8)+'...');
 
-  // Wait until applicants are loaded from Supabase, then look up
+  // ── Calvin 2026-06-10 v2330: PATIENT POLLING + SUPABASE RETRY ──
+  // The applicant's browser is a fresh session — no localStorage, must
+  // load everything from Supabase. The previous 5-second poll was too
+  // short on slow connections, and didn't retry the Supabase load
+  // periodically. Now we poll for 30 seconds, retrying loadFromSupabase
+  // every 5 seconds in case the applicant's invitation was JUST written
+  // and hasn't propagated yet.
   function tryLookup(){
     var app = (typeof findApplicantByToken === 'function') ? findApplicantByToken(token) : null;
     if(app){
@@ -72656,17 +72724,39 @@ function _handleApplicantSigningPage(){
     }
     return false;
   }
-  // Try immediately; if not found, wait a bit for the Supabase load to finish
-  if(!tryLookup()){
-    var attempts = 0;
-    var poll = setInterval(function(){
-      attempts++;
-      if(tryLookup() || attempts > 10){ clearInterval(poll); }
-      if(attempts > 10){
-        _renderApplicantSigningError('This signing link is invalid or has expired. Please contact the manager who invited you for a fresh invitation.');
+
+  if(tryLookup()) return true;
+
+  var attempts = 0;
+  var MAX_ATTEMPTS = 60;   // 60 × 500ms = 30 seconds
+  var poll = setInterval(function(){
+    attempts++;
+    if(tryLookup()){ clearInterval(poll); return; }
+    // Every 10 attempts (5s), retry the Supabase load to pick up newly
+    // propagated data. Two retries at 5s and 15s gives the cloud write
+    // time to land even on slow connections.
+    if(attempts === 10 || attempts === 30){
+      if(typeof refreshApplicantsFromSupabase === 'function'){
+        refreshApplicantsFromSupabase().then(function(){
+          tryLookup();
+        }).catch(function(e){ console.warn('[applicant signing] retry refresh failed:', e); });
       }
-    }, 500);
-  }
+    }
+    if(attempts >= MAX_ATTEMPTS){
+      clearInterval(poll);
+      // Diagnostic: log what we know so the office can debug
+      console.warn('[applicant signing] FAILED to find applicant after '+(MAX_ATTEMPTS*500)+'ms.');
+      console.warn('  token (first 8 chars):', token.slice(0,8)+'...');
+      console.warn('  APPLICANTS_PRE_BG count:', (APPLICANTS_PRE_BG||[]).length);
+      console.warn('  APPLICANTS_PRE_BG IDs:', (APPLICANTS_PRE_BG||[]).map(function(a){return a && a.id;}).join(','));
+      console.warn('  supaClient available:', typeof supaClient !== 'undefined' && !!supaClient);
+      _renderApplicantSigningError(
+        'This signing link is invalid or has expired.<br><br>'+
+        'If your invitation was sent in the last few minutes, please wait 30 seconds and refresh this page. '+
+        'Otherwise, contact the manager who invited you and ask them to resend the invitation.'
+      );
+    }
+  }, 500);
   return true;
 }
 
