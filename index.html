@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.0230';
+var BUILD_VERSION = '2026.06.11.0330';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -8112,6 +8112,51 @@ function payrollApplyDeductions(opts){
         trail: [{aid:agent.id, role:'manual', name:agent.name, paidCents:paid}],
         carryoverCents: carry,
         isManual: true
+      });
+      return;
+    }
+
+    // ── Calvin 2026-06-11 v0330 NO-ROLLUP PATH (GM chargebacks) ──
+    // GM chargebacks/upsells hit the enrolling agent directly per Calvin's
+    // locked spec. They do NOT roll up to TL/MM/CM the way TC deductions do.
+    // The named agent absorbs what their commission can cover; the rest
+    // becomes their personal carryover debt for next week.
+    //
+    // Pattern mirrors isManual exactly; the difference is the trail role
+    // ('agent-absorbed' vs 'manual') so the UI can label the source
+    // correctly in the Cascade Trail column.
+    if(d.noRollup){
+      if(!agent){
+        unresolved.push({
+          kind:'deduction', deduction:d,
+          reason:'no-rollup deduction: agent name not matched: '+d.agentName
+        });
+        return;
+      }
+      var bnr = ensureBalance(agent.id);
+      var amtnr = Math.abs(d.amountCents || 0);
+      var paidnr = Math.min(bnr.remainingCents, amtnr);
+      var carrynr = amtnr - paidnr;
+      bnr.remainingCents  -= paidnr;
+      bnr.deductionsCents += paidnr;
+      if(carrynr > 0){
+        bnr.carryoverCents += carrynr;
+        if(!dryRun && typeof payrollAddDebt === 'function'){
+          payrollAddDebt(agent.id, carrynr, (d.type || 'Chargeback')+' '+(d.orderNum||''), weekId);
+        }
+      }
+      audit.push({
+        kind:'deduction',
+        type: d.type || 'Chargeback',
+        typeSub: d.typeSub || '',
+        orderNum: d.orderNum || '',
+        amountCents: amtnr,
+        agentName: agent.name,
+        appliedTo: agent.id,
+        trail: [{aid:agent.id, role:'agent-absorbed', name:agent.name, paidCents:paidnr}],
+        carryoverCents: carrynr,
+        noRollup: true,
+        gmChargeback: !!d.gmChargeback
       });
       return;
     }
@@ -37168,6 +37213,72 @@ function payrollSplitPersonalVsOverrides(breakdown){
   };
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  Calvin 2026-06-11 v0330: GM chargebacks → cascade deductions
+//
+//  Convert each row.chargebacks[] entry into a cascade-format deduction
+//  with noRollup:true, so the existing TC deductions table renders each
+//  individual chargeback as a line item (type / agent / order # / amount /
+//  trail). Also restore the pre-chargeback gross on commissions.byAgent
+//  so the cascade has the correct starting amount to deduct from.
+//
+//  Math is preserved exactly:
+//   engine output (already net of CB) + |CB| = pre-CB gross
+//   cascade then subtracts |CB| = engine output (= what agent receives)
+//
+//  Mutates: commissions.byAgent[aid].commissionCents (adds CB back)
+//           allDeductions (appends one entry per chargeback)
+//  Returns: number of chargebacks added (for diagnostics)
+// ════════════════════════════════════════════════════════════════════
+function ppInjectGMChargebacksAsCascadeDeductions(match, commissions, allDeductions){
+  if(!match || !match.matched || !commissions || !commissions.byAgent || !allDeductions){
+    return 0;
+  }
+  var count = 0;
+  match.matched.forEach(function(m){
+    var row = m.row;
+    if(!row || !row.chargebackTotal || !row.chargebacks || !row.chargebacks.length) return;
+    var aid = m.agent.id;
+    var cbTotalAbs = Math.abs(row.chargebackTotal || 0);
+    // Restore the pre-chargeback gross on commissions so cascade math works
+    if(commissions.byAgent[aid]){
+      commissions.byAgent[aid].commissionCents += cbTotalAbs;
+    }
+    // Push each chargeback as an individual cascade-format deduction
+    row.chargebacks.forEach(function(cb){
+      // ── Calvin 2026-06-11 v0330b: TC-style main+sub label ──
+      // TC renders: "14-day Cancel" (main red) + "Tribal" (small gray sub).
+      // GM mirror:  "Upsell"        (main red) + "Cloud T2 Elite" (small gray sub).
+      // We split into `type` (main) and `typeSub` (subtitle) so the existing
+      // TC deduction renderer can show both fields identically.
+      var typeMain;
+      var rawType = (cb.type || '').trim();
+      if(rawType){
+        // Capitalize first letter of each word
+        typeMain = rawType.replace(/\b\w/g, function(c){ return c.toUpperCase(); });
+      } else {
+        typeMain = 'Chargeback';
+      }
+      var typeSub = (cb.model || '').trim();
+      allDeductions.push({
+        type:        typeMain,
+        typeSub:     typeSub,
+        agentName:   m.agent.name,
+        orderNum:    cb.order || '',
+        amountCents: Math.abs(cb.amount || 0),
+        noRollup:    true,
+        // Preserve carrier-side detail for any future audit
+        gmChargeback: true,
+        cbModel:     cb.model || '',
+        cbImei:      cb.imei || '',
+        cbDate:      cb.date || ''
+      });
+      count++;
+    });
+  });
+  return count;
+}
+
 function ppRenderCarrierPreview(carrier, parsed){
   var match = ppMatchRowsToAgents(parsed, carrier);
   var matched = match.matched, unmatched = match.unmatched;
@@ -37215,6 +37326,14 @@ function ppRenderCarrierPreview(carrier, parsed){
       isManual:    true
     });
   });
+
+  // ── Calvin 2026-06-11 v0330: GM chargebacks become cascade line items ──
+  // Each row.chargebacks[] entry → one deduction in allDeductions with
+  // noRollup:true. Also restores the pre-chargeback gross on commissions
+  // so the cascade has correct math (net is unchanged from current production).
+  if(carrier === 'Gen Mobile'){
+    ppInjectGMChargebacksAsCascadeDeductions(match, commissions, allDeductions);
+  }
 
   // Apply deductions and credits via the cascade engine (dry run for preview).
   // This mirrors what will happen at commit time, so the user sees final
@@ -37523,6 +37642,14 @@ function ppRenderCarrierPreview(carrier, parsed){
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">My TC App</th>';
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">TC Plus</th>';
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Pay</th>';
+    } else if(carrier === 'Gen Mobile'){
+      // Calvin 2026-06-11 v0330b: GM-specific bonus columns matching TC's layout.
+      // Per Calvin: "instead of TC plus it should be email for gen mobiles version"
+      h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Tribal</th>';
+      h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">BYOD</th>';
+      h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Email</th>';
+      h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Pay</th>';
+      h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Chargebacks</th>';
     } else {
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Pay</th>';
       h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Chargebacks</th>';
@@ -37549,6 +37676,15 @@ function ppRenderCarrierPreview(carrier, parsed){
         h += '<td style="padding:8px 10px;text-align:right">'+(act.MyTcApp||0)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right">'+(act.TcPlus||0)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(commCents?'$'+(commCents/100).toFixed(2):'—')+'</td>';
+      } else if(carrier === 'Gen Mobile'){
+        // Calvin 2026-06-11 v0330b: GM bonus columns (Tribal/BYOD/Email) to match TC's layout
+        var gAct = m.row.activations || {};
+        var gCb  = m.row.chargebackTotal || 0;
+        h += '<td style="padding:8px 10px;text-align:right">'+(gAct.TRB||0)+'</td>';
+        h += '<td style="padding:8px 10px;text-align:right">'+(gAct.BYOD_SIM||0)+'</td>';
+        h += '<td style="padding:8px 10px;text-align:right">'+(gAct.Email||0)+'</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(commCents?'$'+(commCents/100).toFixed(2):'—')+'</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:'+(gCb?'#991B1B':'var(--muted2)')+'">'+(gCb?'$'+(gCb/100).toFixed(2):'—')+'</td>';
       } else {
         var cb = m.row.chargebackTotal || 0;
         h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(commCents?'$'+(commCents/100).toFixed(2):'—')+'</td>';
@@ -37575,6 +37711,13 @@ function ppRenderCarrierPreview(carrier, parsed){
         h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
         h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
         h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">$'+(commCents/100).toFixed(2)+'</td>';
+      } else if(carrier === 'Gen Mobile'){
+        // Tribal / BYOD / Email / Pay / Chargebacks — match the new GM column layout
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted)">0</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">$'+(commCents/100).toFixed(2)+'</td>';
+        h += '<td style="padding:8px 10px;text-align:right;color:var(--muted2)">—</td>';
       } else {
         h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">$'+(commCents/100).toFixed(2)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right;color:var(--muted2)">—</td>';
@@ -37592,12 +37735,23 @@ function ppRenderCarrierPreview(carrier, parsed){
   // (per-agent gross/deductions/credits/net) still shows so the office has
   // visual parity between carriers.
   if((isTC || carrier === 'Gen Mobile') && cascadeResult){
-    var ded = parsed.deductions || [];
-    var cre = parsed.credits || [];
+    // Calvin 2026-06-11 v0330: For GM, parsed.deductions is empty (no
+    // separate deductions tab in the GM carrier file) but allDeductions
+    // contains the chargebacks injected by ppInjectGMChargebacksAsCascadeDeductions.
+    // Drive the table off allDeductions / allCredits so GM chargebacks show
+    // up as line items the same way TC's parsed deductions do.
+    var ded = (carrier === 'Gen Mobile') ? allDeductions : (parsed.deductions || []);
+    var cre = (carrier === 'Gen Mobile') ? allCredits    : (parsed.credits    || []);
     if(ded.length || cre.length){
       h += '<div style="margin-top:24px;padding-top:18px;border-top:2px solid var(--border)">';
       h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:#991B1B;letter-spacing:1.5px;margin-bottom:10px">⚠ DEDUCTIONS & CREDITS</div>';
-      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:14px">Cascade rule: deduction hits the named agent first; if their commission can\'t cover it, the remainder rolls up to TL → MM → CM. Anything still uncovered after the chain becomes carryover debt for next week.</div>';
+      // GM chargebacks DON'T cascade — they hit the enrolling agent directly per Calvin's locked spec.
+      // TC deductions DO cascade. Show the right description per carrier.
+      if(carrier === 'Gen Mobile'){
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:14px">Each chargeback / upsell hits the enrolling agent directly. If their commission can\'t cover it, the remainder becomes carryover debt for next week (no rollup to TL/MM/CM).</div>';
+      } else {
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:14px">Cascade rule: deduction hits the named agent first; if their commission can\'t cover it, the remainder rolls up to TL → MM → CM. Anything still uncovered after the chain becomes carryover debt for next week.</div>';
+      }
 
       // Deductions table
       if(ded.length){
@@ -37665,12 +37819,29 @@ function ppRenderCarrierPreview(carrier, parsed){
           if(namedAgentSliceCents == null) namedAgentSliceCents = carrierTotalCents;
 
           h += '<tr style="border-bottom:1px solid rgba(0,0,0,.05)">';
-          h += '<td style="padding:7px 8px;font-size:.74rem"><strong style="color:#991B1B">'+a.type+'</strong>'+(a.isTribal?'<span style="font-size:.6rem;color:var(--muted);margin-left:6px">Tribal</span>':a.isTribal===false?'<span style="font-size:.6rem;color:var(--muted);margin-left:6px">NLAD</span>':'')+'</td>';
+          // ── Calvin 2026-06-11 v0330b TYPE COLUMN ──
+          //   TC: "14-day Cancel" (main) + "Tribal"/"NLAD" (sub from isTribal)
+          //   GM: "Upsell" (main) + model name (sub from typeSub)
+          // The renderer prefers `a.typeSub` (any explicit subtitle) and
+          // falls back to a.isTribal for legacy TC entries.
+          var typeSubText = '';
+          if(a.typeSub){
+            typeSubText = a.typeSub;
+          } else if(a.isTribal){
+            typeSubText = 'Tribal';
+          } else if(a.isTribal === false){
+            typeSubText = 'NLAD';
+          }
+          h += '<td style="padding:7px 8px;font-size:.74rem"><strong style="color:#991B1B">'+a.type+'</strong>'+
+            (typeSubText ? '<span style="font-size:.6rem;color:var(--muted);margin-left:6px">'+escHtml(typeSubText)+'</span>' : '')+'</td>';
           h += '<td style="padding:7px 8px;font-size:.74rem">'+a.agentName+'</td>';
           h += '<td style="padding:7px 8px;font-family:monospace;font-size:.7rem;color:var(--muted)">'+(a.orderNum||'—')+'</td>';
           // Amount column: named agent's own share (what they were paid for this deal)
           h += '<td style="padding:7px 8px;text-align:right;font-weight:700;color:#991B1B">−$'+(namedAgentSliceCents/100).toFixed(2);
-          if(carrierTotalCents !== namedAgentSliceCents && carrierTotalCents > 0){
+          // ── Calvin 2026-06-11 v0330b: only show "carrier $X" for TC ──
+          // GM chargebacks ARE the carrier amount — there is no separate
+          // carrier rate. Suppress the subtitle for noRollup deductions.
+          if(!a.noRollup && carrierTotalCents !== namedAgentSliceCents && carrierTotalCents > 0){
             h += '<div style="font-size:.6rem;color:var(--muted);font-weight:400;margin-top:2px">carrier $'+(carrierTotalCents/100).toFixed(2)+'</div>';
           }
           h += '</td>';
@@ -38251,6 +38422,16 @@ function ppCommitStaged(){
       });
     });
 
+    // ── Calvin 2026-06-11 v0330: GM chargebacks become cascade line items ──
+    // Same as preview — restore pre-CB gross on commissions and push each
+    // individual chargeback to allDed with noRollup:true. The cascade then
+    // applies them per-agent; trail shows "agent-absorbed" with carryover
+    // debt for any uncovered remainder. Math nets back exactly to the
+    // engine's net output.
+    if(carrier === 'Gen Mobile'){
+      ppInjectGMChargebacksAsCascadeDeductions(match, commissions, allDed);
+    }
+
     // Calvin 2026-06-11 v0230: opened for GM too — see preview cascade
     if((carrier === 'TruConnect' || carrier === 'Gen Mobile') && (allDed.length || allCred.length)){
       try{
@@ -38266,7 +38447,10 @@ function ppCommitStaged(){
         rows.forEach(function(row){
           var net = cascadeFinal.netByAgent[row.agentId];
           if(net){
-            row.grossCommissionCents = row.grossCents;  // preserve gross for audit
+            // Calvin 2026-06-11 v0330: use the cascade's gross (which is the
+            // restored pre-CB gross for GM) rather than the snapshotted
+            // row.grossCents (which was the engine's net for GM).
+            row.grossCommissionCents = (typeof net.grossCents === 'number') ? net.grossCents : row.grossCents;
             row.grossCents           = net.netCents;     // net is what they actually receive
             row.deductionsApplied    = net.deductionsCents;
             row.creditsApplied       = net.creditsCents;
