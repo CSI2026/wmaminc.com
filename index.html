@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.10.2130';
+var BUILD_VERSION = '2026.06.10.2230';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -46772,30 +46772,86 @@ if(typeof window !== 'undefined') window.bgGenerateInvoiceClick = bgGenerateInvo
 // Office's view of the applicant list can go stale if an applicant signed
 // their forms in a different browser session. Calling this fetches the
 // latest applicant data from the cloud and refreshes the panel.
+// ── Calvin 2026-06-10 v2230: applicant last-modified timestamp ──
+// Used by refreshApplicantsFromSupabase to decide which version (local or
+// cloud) is newer when merging. Returns 0 for missing/invalid timestamps.
+function _appLastModified(app){
+  if(!app) return 0;
+  function ts(s){
+    if(!s) return 0;
+    try{ var t = new Date(s).getTime(); return isNaN(t) ? 0 : t; }catch(e){ return 0; }
+  }
+  return Math.max(
+    ts(app.decidedAt),
+    ts(app.forms && app.forms.pii && app.forms.pii.signedAt),
+    ts(app.forms && app.forms.auth && app.forms.auth.signedAt),
+    ts(app.remindedAt),
+    ts(app.invitedAt)
+  );
+}
+
 async function refreshApplicantsFromSupabase(){
   try{
     if(typeof supaClient === 'undefined' || !supaClient){ return false; }
     var res = await supaClient.from('app_settings').select('value').eq('key','applicants_pre_bg').maybeSingle();
-    if(res && res.data && res.data.value){
-      try{
-        var v = JSON.parse(res.data.value);
-        if(Array.isArray(v)){
-          // Replace in-place so any code holding a reference still sees the new list
-          APPLICANTS_PRE_BG.length = 0;
-          v.forEach(function(a){ APPLICANTS_PRE_BG.push(a); });
-          // Also keep localStorage in sync so refresh-without-cloud works
-          try{ localStorage.setItem('wmam_applicants_pre_bg', JSON.stringify(APPLICANTS_PRE_BG)); }catch(e){}
-          return true;
-        }
-      }catch(e){ console.warn('[refreshApplicantsFromSupabase] parse failed:', e); }
+    if(!res || !res.data || !res.data.value){ return false; }
+    var cloud;
+    try{ cloud = JSON.parse(res.data.value); }catch(e){ console.warn('[refreshApplicants] cloud parse failed:', e); return false; }
+    if(!Array.isArray(cloud)) return false;
+
+    // ── Calvin 2026-06-10 v2230 MERGE-NOT-REPLACE ──
+    // The old code did APPLICANTS_PRE_BG.length=0 then re-push from cloud.
+    // That wiped applicants that existed locally but hadn't yet replicated
+    // to cloud (race during invite or signing). Test Williams disappearing
+    // from K-Anna's panel after signing was caused by this — the public
+    // signing page's cloud write hadn't completed when K-Anna's session
+    // ran the 20-second auto-poll, so refresh saw the OLD applicants_pre_bg
+    // row in Supabase and wiped the freshly-signed Test Williams locally.
+    //
+    // New behavior: union of local + cloud, keyed by app.id. For overlapping
+    // IDs, take whichever has the newer last-modified timestamp. For local-
+    // only IDs (race: just invited/signed, cloud not yet updated), KEEP the
+    // local copy so it survives until the cloud write completes (and the
+    // next refresh picks up the cloud version once it's newer).
+    var localById = {};
+    (APPLICANTS_PRE_BG||[]).forEach(function(a){ if(a && a.id != null) localById[a.id] = a; });
+    var merged = [];
+    var sawAny = false;
+    cloud.forEach(function(c){
+      if(!c || c.id == null) return;
+      sawAny = true;
+      var l = localById[c.id];
+      if(l){
+        var lTime = _appLastModified(l);
+        var cTime = _appLastModified(c);
+        merged.push(cTime >= lTime ? c : l);
+        delete localById[c.id];   // consumed
+      } else {
+        merged.push(c);
+      }
+    });
+    // Anything still in localById is local-only → KEEP it.
+    Object.keys(localById).forEach(function(id){ merged.push(localById[id]); });
+    // Sanity: if cloud was non-empty AND we end up with fewer rows than
+    // before this refresh, log it so future audits can see the merge
+    // worked correctly (instead of silently wiping rows like the old code).
+    if(sawAny && merged.length < (APPLICANTS_PRE_BG||[]).length){
+      console.log('[refreshApplicants] merge shrank list — local-only IDs preserved despite cloud being smaller. before='+APPLICANTS_PRE_BG.length+' after='+merged.length);
     }
-    return false;
+    var changed = JSON.stringify(merged) !== JSON.stringify(APPLICANTS_PRE_BG||[]);
+    APPLICANTS_PRE_BG.length = 0;
+    merged.forEach(function(a){ APPLICANTS_PRE_BG.push(a); });
+    try{ localStorage.setItem('wmam_applicants_pre_bg', JSON.stringify(APPLICANTS_PRE_BG)); }catch(e){}
+    return changed;
   }catch(e){
     console.warn('[refreshApplicantsFromSupabase] failed:', e);
     return false;
   }
 }
-if(typeof window !== 'undefined') window.refreshApplicantsFromSupabase = refreshApplicantsFromSupabase;
+if(typeof window !== 'undefined'){
+  window.refreshApplicantsFromSupabase = refreshApplicantsFromSupabase;
+  window._appLastModified = _appLastModified;
+}
 
 function panelAgentsPending(){
   var u = DB.current;
@@ -67481,23 +67537,68 @@ function _p3FmtDate(s){
 }
 
 // ── DATA AGGREGATION ──
-// Filter PAYROLL_WEEKS to weeks whose periodEnd falls in [start, end].
+// ── Calvin 2026-06-10 v2230: NORMALIZE DATE FORMATS ──
+// The TC carrier file parser stores periodStart/periodEnd in "M/D/YYYY"
+// format (line 9823, e.g. "5/31/2026"). The OPERATING_COSTS table uses
+// "YYYY-MM-DD". When _p3WeeksInRange string-compared "5/31/2026" against
+// "2026-06-10", lexical ordering put '5' > '2' so EVERY committed week
+// was silently excluded from YTD — leaving the dashboard at $0 even
+// though weeks were in PAYROLL_WEEKS. Normalize to ISO before comparing.
+function _p3NormalizeDate(s){
+  if(s == null) return '';
+  s = String(s).trim();
+  if(!s) return '';
+  // Already ISO YYYY-MM-DD (or with time): take the date prefix
+  var iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(iso) return iso[0];
+  // US M/D/YYYY or MM/DD/YYYY
+  var us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if(us){
+    var mm = us[1].padStart(2,'0');
+    var dd = us[2].padStart(2,'0');
+    return us[3]+'-'+mm+'-'+dd;
+  }
+  // Last resort: try Date parse (handles "Sun Jun 07 2026 00:00:00 GMT…")
+  try{
+    var d = new Date(s);
+    if(!isNaN(d.getTime())){
+      var y = d.getFullYear();
+      var m = String(d.getMonth()+1).padStart(2,'0');
+      var dy = String(d.getDate()).padStart(2,'0');
+      return y+'-'+m+'-'+dy;
+    }
+  }catch(e){}
+  return s;  // give up, return as-is
+}
+if(typeof window !== 'undefined') window._p3NormalizeDate = _p3NormalizeDate;
+
+// Filter PAYROLL_WEEKS to weeks whose any-available-date falls in [start, end].
 function _p3WeeksInRange(start, end){
   var weeks = (typeof PAYROLL_WEEKS !== 'undefined' && Array.isArray(PAYROLL_WEEKS)) ? PAYROLL_WEEKS : [];
   return weeks.filter(function(w){
-    // Calvin 2026-06-10 v2130: fall back to periodStart or uploadedAt when
-    // periodEnd is missing/malformed. The carrier table (line 67906) aggregates
-    // ALL weeks unconditionally — date-range filter shouldn't be more strict.
-    var d = w.periodEnd || w.periodStart || (w.uploadedAt ? String(w.uploadedAt).slice(0,10) : '');
-    if(!d) return false;
-    d = String(d).slice(0,10);  // normalize YYYY-MM-DD even if stored as ISO with time
-    return d >= start && d <= end;
+    // Normalize ALL candidate date fields. If ANY of them falls in the
+    // range, include the week. Previously we picked one date and silently
+    // excluded; now we're forgiving so dashboard reflects reality.
+    var candidates = [
+      _p3NormalizeDate(w.periodEnd),
+      _p3NormalizeDate(w.periodStart),
+      _p3NormalizeDate(w.uploadedAt)
+    ].filter(function(d){return d && /^\d{4}-\d{2}-\d{2}/.test(d);});
+    if(!candidates.length) return false;
+    for(var i=0;i<candidates.length;i++){
+      var d = candidates[i].slice(0,10);
+      if(d >= start && d <= end) return true;
+    }
+    return false;
   });
 }
-// Operating costs in range
+// Operating costs in range (also normalize for safety)
 function _p3CostsInRange(start, end){
   return (OPERATING_COSTS||[]).filter(function(c){
-    return c.date && c.date >= start && c.date <= end;
+    if(!c || !c.date) return false;
+    var d = _p3NormalizeDate(c.date).slice(0,10);
+    if(!d) return false;
+    return d >= start && d <= end;
   });
 }
 // Aggregate one set of weeks: returns {revenue, payout, chargebacks, activations, byCarrier:{...}, agentTotals:{aid:{name,acts,gross}}}
