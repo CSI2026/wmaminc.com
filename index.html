@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.0130';
+var BUILD_VERSION = '2026.06.11.0230';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -37223,7 +37223,10 @@ function ppRenderCarrierPreview(carrier, parsed){
   var totalDeductions = 0, totalCredits = 0, totalCarryover = 0, totalDebtCleared = 0;
   // Calvin 2026-06-10: ALWAYS run cascade for TC so Net Pay Summary
   // renders with editable cells, even when file has zero deductions.
-  if(isTC){
+  // Calvin 2026-06-11 v0230: also run for GM so the office has cascade-
+  // backed visualization parity. With no manual adjustments yet, this is
+  // a no-op; once K-Anna adds a deduction or credit, the cascade applies.
+  if(isTC || carrier === 'Gen Mobile'){
     try{
       cascadeResult = payrollApplyDeductions({
         commissions: commissions,
@@ -37286,12 +37289,9 @@ function ppRenderCarrierPreview(carrier, parsed){
   //  when his file had no auto-parsed deductions (the common case now
   //  that Aging Phone is skipped).
   // ══════════════════════════════════════════════════════════════════
-  if(isTC){
-    // Calvin 2026-06-10: hasPayrollUploadAccess handles lowercase 'owner'
-    // role correctly via isOwner(), plus K-Anna/admin/payroll-dept.
-    // Previously this used u.role === 'Owner' (capitalized) which failed
-    // for production data where Calvin's role is stored as 'owner'.
-    // (canEditAdj declared at function top — see ppRenderCarrierPreview header.)
+  // Calvin 2026-06-11 v0230: opened for GM too — manual adjustments
+  // infrastructure (window._ppManualAdjustments) is already carrier-agnostic.
+  if(isTC || carrier === 'Gen Mobile'){
     var agentOpts = '<option value="">— Select agent —</option>';
     DB.agents.filter(function(a){return a && a.active && a.role !== 'Owner';})
       .sort(function(a,b){return (a.name||'').localeCompare(b.name||'');})
@@ -37586,8 +37586,12 @@ function ppRenderCarrierPreview(carrier, parsed){
     h += '<div style="padding:16px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No rows matched yet. Assign unmatched codes above to build the import.</div>';
   }
 
-  // ── DEDUCTIONS & CREDITS SECTION (TruConnect only for now) ────────
-  if(isTC && cascadeResult){
+  // ── DEDUCTIONS & CREDITS SECTION ────────
+  // Calvin 2026-06-11 v0230: now renders for both TC and GM. With no
+  // deductions/credits, the inner tables don't render; the Net Pay Summary
+  // (per-agent gross/deductions/credits/net) still shows so the office has
+  // visual parity between carriers.
+  if((isTC || carrier === 'Gen Mobile') && cascadeResult){
     var ded = parsed.deductions || [];
     var cre = parsed.credits || [];
     if(ded.length || cre.length){
@@ -37970,7 +37974,7 @@ function ppRenderCarrierPreview(carrier, parsed){
       h += '</div></details>';
 
     }  // end Net Pay Summary + Diagnostic block (Calvin 2026-06-10)
-  }  // end if(isTC && cascadeResult)
+  }  // end if(cascadeResult) — TC + GM (Calvin 2026-06-11 v0230)
 
   h += '</div></div>';
   return h;
@@ -38247,7 +38251,8 @@ function ppCommitStaged(){
       });
     });
 
-    if(carrier === 'TruConnect' && (allDed.length || allCred.length)){
+    // Calvin 2026-06-11 v0230: opened for GM too — see preview cascade
+    if((carrier === 'TruConnect' || carrier === 'Gen Mobile') && (allDed.length || allCred.length)){
       try{
         var cascadeFinal = payrollApplyDeductions({
           commissions: commissions,
@@ -38467,7 +38472,14 @@ function panelPayrollWeekDetail(){
   // After commit, each row.grossCents is REPLACED with NET (after deductions).
   // Show what each agent ACTUALLY receives this week, with their gross +
   // deductions + final pay broken down so K-Anna can hand off to disbursement.
-  if(w.carrier === 'TruConnect'){
+  //
+  // ── Calvin 2026-06-11 v0230 PARITY ──
+  // Now renders for BOTH TC and GM. TC pulls deductions from the cascade
+  // engine (parsed.deductions). GM's chargebacks are applied in-engine,
+  // so we derive the deductions column from r.chargebackTotal and
+  // back-compute grossCommissionCents = grossCents + |chargebackTotal|
+  // so the columns add up correctly for the office to read.
+  if(w.carrier === 'TruConnect' || w.carrier === 'Gen Mobile'){
     h += '<div class="bo-card" style="margin-top:16px;border-left:4px solid #059669"><div class="bo-card-head"><div class="bo-card-title">💵 Final Pay — what each agent receives this week</div></div>';
     h += '<div style="padding:14px 18px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
     h += '<thead><tr style="border-bottom:2px solid var(--border)">';
@@ -38480,9 +38492,17 @@ function panelPayrollWeekDetail(){
     h += '<th style="text-align:right;padding:8px 10px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">Carryover Debt</th>';
     h += '</tr></thead><tbody>';
     var totalGross = 0, totalDed = 0, totalCred = 0, totalNet = 0, totalDebtPaid = 0, totalCarry = 0;
+    var _isGM = (w.carrier === 'Gen Mobile');
     (w.rows||[]).slice().sort(function(a,b){return (b.grossCents||0)-(a.grossCents||0);}).forEach(function(r){
-      var grossComm = r.grossCommissionCents !== undefined ? r.grossCommissionCents : r.grossCents;
-      var deductionsApplied = r.deductionsApplied || 0;
+      // For GM: deductions come from row.chargebackTotal (already netted into grossCents
+      // by the in-engine pass). Reconstruct the GROSS amount by adding back the absorbed
+      // chargebacks, so the office sees gross → deduction → net columns add up.
+      // For TC: cascade engine sets the explicit *Applied fields.
+      var gmCBCents = _isGM ? Math.abs(r.chargebackTotal || 0) : 0;
+      var grossComm = r.grossCommissionCents !== undefined
+                      ? r.grossCommissionCents
+                      : ((r.grossCents || 0) + gmCBCents);
+      var deductionsApplied = _isGM ? gmCBCents : (r.deductionsApplied || 0);
       var creditsApplied = r.creditsApplied || 0;
       var priorDebt = r.priorDebtPaid || 0;
       var carryover = r.carryoverDebtAdded || 0;
@@ -47334,21 +47354,28 @@ function _obShowApplicantBgPackage(applicantId){
   // Common scenario: agent has been selling under code "MMG12345" for
   // weeks; once K-Anna approves, the new agent record carries that code
   // and prior payroll lines stop being "unmatched."
+  //
+  // ── Calvin 2026-06-11 v0230 CRITICAL: STORAGE KEY MATCHES MATCHER ──
+  // The payroll matcher (ppMatchRowsToAgents) looks up agent.agentCodes[carrier]
+  // where carrier is 'TruConnect' / 'Gen Mobile' / 'Assurance' (with the
+  // space in "Gen Mobile"). v2430 had stored under 'GenMobile' (no space)
+  // which silently failed to match. Now we store with the correct keys and
+  // use id-safe DOM ids separately.
   var existingCodes = (app.codes && typeof app.codes === 'object') ? app.codes : {};
   h += '<div style="background:rgba(8,145,178,.04);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:12px 14px;margin-bottom:14px">';
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:#0e7490;font-weight:700;margin-bottom:4px;letter-spacing:1px">🏷 AGENT CODES (optional)</div>';
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-bottom:10px">Enter codes if this applicant has already been selling under them. They\'ll transfer to the agent record on approval, capturing any prior payroll rows.</div>';
   h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">';
   var codeFields = [
-    {key:'TruConnect', label:'TruConnect Code'},
-    {key:'GenMobile',  label:'Gen Mobile Code'},
-    {key:'Assurance',  label:'Assurance Code'}
+    {storageKey:'TruConnect', idSafe:'TruConnect', label:'TruConnect Code'},
+    {storageKey:'Gen Mobile', idSafe:'GenMobile',  label:'Gen Mobile Code'},
+    {storageKey:'Assurance',  idSafe:'Assurance',  label:'Assurance Code'}
   ];
   codeFields.forEach(function(cf){
-    var current = existingCodes[cf.key] || '';
+    var current = existingCodes[cf.storageKey] || '';
     h += '<div>';
     h += '<label style="display:block;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">'+escHtml(cf.label)+'</label>';
-    h += '<input type="text" id="ob-code-'+escHtml(cf.key)+'-'+app.id+'" value="'+escHtml(current)+'" placeholder="e.g. MMG12345" '+
+    h += '<input type="text" id="ob-code-'+escHtml(cf.idSafe)+'-'+app.id+'" value="'+escHtml(current)+'" placeholder="e.g. MMG12345" '+
          'style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:5px;font-family:monospace;font-size:.82rem;background:white">';
     h += '</div>';
   });
@@ -47371,23 +47398,30 @@ function _obShowApplicantBgPackage(applicantId){
 }
 
 // Calvin 2026-06-11 v2430: save agent codes entered in BG Check Package modal
+// Calvin 2026-06-11 v0230: storage keys must match payroll matcher's expectations
+// (ppMatchRowsToAgents reads agent.agentCodes[carrier] where carrier is
+// 'TruConnect' / 'Gen Mobile' / 'Assurance' — with the space).
 function _obSaveApplicantCodes(applicantId){
   var u = DB.current;
   if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
   var app = (APPLICANTS_PRE_BG||[]).find(function(a){return a && a.id === applicantId;});
   if(!app){ alert('Applicant not found.'); return; }
   if(!app.codes || typeof app.codes !== 'object') app.codes = {};
-  var carriers = ['TruConnect', 'GenMobile', 'Assurance'];
+  var fieldMap = [
+    {storageKey:'TruConnect', idSafe:'TruConnect'},
+    {storageKey:'Gen Mobile', idSafe:'GenMobile'},
+    {storageKey:'Assurance',  idSafe:'Assurance'}
+  ];
   var changes = 0;
-  carriers.forEach(function(c){
-    var el = document.getElementById('ob-code-'+c+'-'+applicantId);
+  fieldMap.forEach(function(fm){
+    var el = document.getElementById('ob-code-'+fm.idSafe+'-'+applicantId);
     if(!el) return;
     var newVal = (el.value || '').trim();
-    if(newVal === '' && app.codes[c] !== undefined){
-      delete app.codes[c];
+    if(newVal === '' && app.codes[fm.storageKey] !== undefined){
+      delete app.codes[fm.storageKey];
       changes++;
-    } else if(newVal !== '' && app.codes[c] !== newVal){
-      app.codes[c] = newVal;
+    } else if(newVal !== '' && app.codes[fm.storageKey] !== newVal){
+      app.codes[fm.storageKey] = newVal;
       changes++;
     }
   });
