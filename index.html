@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.0030';
+var BUILD_VERSION = '2026.06.11.0130';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -6259,14 +6259,27 @@ function gmCalculateWeek(weekRows){
     }
     var t = byTeam[teamId];
     t.rows.push(r);
-    if(r.isTribal) t.tribalCount++; else t.nladCount++;
-    if(r.hasEmail) t.emailCount++;
-    if(r.isBYOD)   t.byodCount++;
+    // ── Calvin 2026-06-11 v2430 CHARGEBACK-ONLY GUARD ──
+    // The bridge (ppComputeAgentCommissions) pushes ONE extra event per
+    // agent for their aggregate chargeback: {agentId, isTribal:false,
+    // chargebackCents}. Without this guard, that event was counted as an
+    // extra NLAD enrollment — inflating a.nlad by 1 for every agent with
+    // chargebacks. For an agent at exactly 30 NLAD with any chargeback,
+    // the inflation pushed them across the tier-1 cap and triggered the
+    // tier-2 retro rate ($9 → $11 on ALL enrollments), overpaying real
+    // money. Now we skip count++ for chargeback-only rows but still
+    // apply the chargeback amount to a.cb.
+    var isChargebackOnly = !!r._chargebackOnly;
     if(!t.agents[r.agentId]) t.agents[r.agentId] = {nlad:0,tribal:0,email:0,byod:0,cb:0};
     var a = t.agents[r.agentId];
-    if(r.isTribal) a.tribal++; else a.nlad++;
-    if(r.hasEmail) a.email++;
-    if(r.isBYOD)   a.byod++;
+    if(!isChargebackOnly){
+      if(r.isTribal) t.tribalCount++; else t.nladCount++;
+      if(r.hasEmail) t.emailCount++;
+      if(r.isBYOD)   t.byodCount++;
+      if(r.isTribal) a.tribal++; else a.nlad++;
+      if(r.hasEmail) a.email++;
+      if(r.isBYOD)   a.byod++;
+    }
     if(r.chargebackCents) a.cb += r.chargebackCents;
   });
 
@@ -8600,12 +8613,21 @@ function tcCalculateWeek(weekRows){
     }
     var t = byTeam[teamId];
     t.rows.push(r);
-    if(r.isTribal) t.tribalCount++; else t.nladCount++;
-    if(r.isPort)   t.portCount++;
+    // ── Calvin 2026-06-11 v2430 CHARGEBACK-ONLY GUARD ──
+    // Mirrors the GM engine fix: the bridge pushes one aggregate
+    // chargeback event per agent as {isTribal:false, chargebackCents}.
+    // Without this guard, that event was counted as an extra NLAD
+    // enrollment — inflating per-agent NLAD count by 1 for every agent
+    // with chargebacks. Tier-2 boundary inflation = real-money overpay.
+    var isChargebackOnly = !!r._chargebackOnly;
     if(!t.agents[r.agentId]) t.agents[r.agentId] = {nlad:0, tribal:0, ports:0, cb:0};
     var a = t.agents[r.agentId];
-    if(r.isTribal) a.tribal++; else a.nlad++;
-    if(r.isPort)   a.ports++;
+    if(!isChargebackOnly){
+      if(r.isTribal) t.tribalCount++; else t.nladCount++;
+      if(r.isPort)   t.portCount++;
+      if(r.isTribal) a.tribal++; else a.nlad++;
+      if(r.isPort)   a.ports++;
+    }
     if(r.chargebackCents) a.cb += r.chargebackCents;
   });
 
@@ -22831,7 +22853,7 @@ function approveApplicant(applicantId){
     marketManagerId:   app.marketManagerId || null,
     campaignManagerId: app.campaignManagerId || null,
     iboId:             app.iboId || null,
-    agentCodes: {},  // will be populated when codes are submitted to carriers
+    agentCodes: (app.codes && typeof app.codes === 'object') ? Object.assign({}, app.codes) : {},  // pre-populated from applicant.codes (added in BG Check Package modal)
     start: new Date().toISOString().slice(0,10),
     bgChecks: {},
     createdFromApplicantId: app.id,
@@ -37000,9 +37022,12 @@ function ppComputeAgentCommissions(parsed, carrier){
       var nladCount   = (act.Total || 0) - tribalCount;
       for(var i=0;i<tribalCount;i++){ events.push({ agentId:aid, isTribal:true }); }
       for(var j=0;j<nladCount;j++){   events.push({ agentId:aid, isTribal:false }); }
-      // Chargebacks accumulate against the agent
+      // ── Calvin 2026-06-11 v2430: CHARGEBACK-ONLY MARKER ──
+      // The engine now skips count++ for these rows so they don't inflate
+      // the NLAD enrollment count and push the agent across the tier-2
+      // boundary inappropriately.
       if(m.row.chargebackTotal){
-        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal });
+        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal, _chargebackOnly: true });
       }
     } else if(carrier === 'Gen Mobile'){
       // GM: activations has TRB (Tribal), other counts are NLAD variants.
@@ -37029,7 +37054,7 @@ function ppComputeAgentCommissions(parsed, carrier){
         });
       }
       if(m.row.chargebackTotal){
-        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal });
+        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal, _chargebackOnly: true });
       }
     } else if(carrier === 'Assurance'){
       // Assurance — engine path. If awCalculateWeek exists, use it.
@@ -37038,7 +37063,7 @@ function ppComputeAgentCommissions(parsed, carrier){
       // AW activations all NLAD-equivalent for now (no Tribal split column in AW)
       for(var n=0;n<awTotal;n++){ events.push({ agentId:aid, isTribal:false }); }
       if(m.row.chargebackTotal){
-        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal });
+        events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal, _chargebackOnly: true });
       }
     }
   });
@@ -38360,6 +38385,52 @@ function panelPayrollWeekDetail(){
       h += '</td>';
     }
     h += '</tr>';
+
+    // ── Calvin 2026-06-11 v2430: INLINE COMMISSION BREAKDOWN ──
+    // Show per-line items right below the agent so the office can see
+    // exactly how each agent's pay was computed (Personal NLAD $13 × 5,
+    // TL diff $4 × 5, etc). Matches the "individual line items each
+    // company has" Calvin wanted parity on between TC and GM.
+    // Collapsible <details> — expanded by default; office can collapse
+    // any agent's breakdown if the table gets too tall.
+    var brk = r.commissionBreakdown || [];
+    if(brk.length){
+      var colCount = 5 + activationKeys.length + (canViewOwnerPL(DB.current) ? 2 : 0);
+      h += '<tr style="background:rgba(0,53,148,.025);border-bottom:1px solid var(--border)">';
+      h += '<td colspan="'+colCount+'" style="padding:0">';
+      h += '<details open style="font-family:Barlow Condensed,sans-serif">';
+      h += '<summary style="padding:7px 14px 7px 32px;font-size:.68rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);cursor:pointer;font-weight:600">'+
+           '📋 Commission Breakdown · '+brk.length+' line item'+(brk.length===1?'':'s')+'</summary>';
+      h += '<div style="padding:6px 16px 14px 32px">';
+      h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+      h += '<thead><tr style="border-bottom:1px solid rgba(0,0,0,.08)">';
+      h += '<th style="text-align:left;padding:5px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);font-weight:700">Line item</th>';
+      h += '<th style="text-align:right;padding:5px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);font-weight:700">Count</th>';
+      h += '<th style="text-align:right;padding:5px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);font-weight:700">Rate</th>';
+      h += '<th style="text-align:right;padding:5px 8px;font-size:.62rem;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted);font-weight:700">Amount</th>';
+      h += '</tr></thead><tbody>';
+      var brkTotal = 0;
+      brk.forEach(function(line){
+        var amt = (typeof line.amount === 'number') ? line.amount : 0;
+        brkTotal += amt;
+        var isNeg = amt < 0;
+        var amtColor = isNeg ? '#991B1B' : (amt > 0 ? '#059669' : 'var(--muted)');
+        var amtPrefix = isNeg ? '−$' : '$';
+        h += '<tr style="border-bottom:1px solid rgba(0,0,0,.04)">';
+        h += '<td style="padding:5px 8px;font-size:.78rem;color:var(--brown)">'+escHtml(line.label||'—')+'</td>';
+        h += '<td style="padding:5px 8px;text-align:right;font-size:.76rem;color:var(--muted)">'+(line.count!=null && line.count!==0 ? line.count : '—')+'</td>';
+        h += '<td style="padding:5px 8px;text-align:right;font-size:.76rem;color:var(--muted)">'+(line.rate!=null && line.rate!==0 ? '$'+(Math.abs(line.rate)).toFixed(2) : '—')+'</td>';
+        h += '<td style="padding:5px 8px;text-align:right;font-size:.82rem;font-weight:700;color:'+amtColor+'">'+amtPrefix+(Math.abs(amt)).toFixed(2)+'</td>';
+        h += '</tr>';
+      });
+      h += '<tr style="border-top:1px solid rgba(0,0,0,.15)">';
+      h += '<td colspan="3" style="padding:6px 8px;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--brown);font-weight:700;text-align:right">Total commission</td>';
+      h += '<td style="padding:6px 8px;text-align:right;font-size:.92rem;font-weight:700;color:'+(brkTotal<0?'#991B1B':'#059669')+'">'+(brkTotal<0?'−':'')+'$'+Math.abs(brkTotal).toFixed(2)+'</td>';
+      h += '</tr>';
+      h += '</tbody></table></div>';
+      h += '</details>';
+      h += '</td></tr>';
+    }
   });
   h += '</tbody></table></div></div>';
 
@@ -47256,6 +47327,37 @@ function _obShowApplicantBgPackage(applicantId){
     h += '<div style="background:rgba(220,38,38,.04);border:1px solid rgba(220,38,38,.2);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-family:Barlow Condensed,sans-serif;font-size:.76rem;color:var(--brown)">⚠ No PII responses on file. Applicant has only signed the Authorization but not the PII Intake.</div>';
   }
 
+  // ── Calvin 2026-06-11 v2430 AGENT CODES ──
+  // Office can enter the applicant's existing carrier agent codes here so
+  // payroll rows already in the system (from before formal onboarding)
+  // automatically match to the new agent when this applicant is approved.
+  // Common scenario: agent has been selling under code "MMG12345" for
+  // weeks; once K-Anna approves, the new agent record carries that code
+  // and prior payroll lines stop being "unmatched."
+  var existingCodes = (app.codes && typeof app.codes === 'object') ? app.codes : {};
+  h += '<div style="background:rgba(8,145,178,.04);border:1px solid rgba(8,145,178,.2);border-radius:8px;padding:12px 14px;margin-bottom:14px">';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:#0e7490;font-weight:700;margin-bottom:4px;letter-spacing:1px">🏷 AGENT CODES (optional)</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-bottom:10px">Enter codes if this applicant has already been selling under them. They\'ll transfer to the agent record on approval, capturing any prior payroll rows.</div>';
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">';
+  var codeFields = [
+    {key:'TruConnect', label:'TruConnect Code'},
+    {key:'GenMobile',  label:'Gen Mobile Code'},
+    {key:'Assurance',  label:'Assurance Code'}
+  ];
+  codeFields.forEach(function(cf){
+    var current = existingCodes[cf.key] || '';
+    h += '<div>';
+    h += '<label style="display:block;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">'+escHtml(cf.label)+'</label>';
+    h += '<input type="text" id="ob-code-'+escHtml(cf.key)+'-'+app.id+'" value="'+escHtml(current)+'" placeholder="e.g. MMG12345" '+
+         'style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:5px;font-family:monospace;font-size:.82rem;background:white">';
+    h += '</div>';
+  });
+  h += '</div>';
+  h += '<button onclick="_obSaveApplicantCodes('+app.id+')" '+
+       'style="margin-top:10px;background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700">Save Codes</button>';
+  h += '<span id="ob-code-save-status-'+app.id+'" style="margin-left:10px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:#15803d"></span>';
+  h += '</div>';
+
   // Action buttons
   h += '<div style="display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid var(--border);padding-top:14px;margin-top:6px">';
   h += '<button onclick="document.getElementById(\'ob-bg-package-modal\').remove();_uiApproveApplicant('+app.id+')" style="background:#16a34a;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 18px;border-radius:5px;cursor:pointer;font-weight:700">✓ Approve — Create Account</button>';
@@ -47267,6 +47369,40 @@ function _obShowApplicantBgPackage(applicantId){
   bg.appendChild(box);
   document.body.appendChild(bg);
 }
+
+// Calvin 2026-06-11 v2430: save agent codes entered in BG Check Package modal
+function _obSaveApplicantCodes(applicantId){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var app = (APPLICANTS_PRE_BG||[]).find(function(a){return a && a.id === applicantId;});
+  if(!app){ alert('Applicant not found.'); return; }
+  if(!app.codes || typeof app.codes !== 'object') app.codes = {};
+  var carriers = ['TruConnect', 'GenMobile', 'Assurance'];
+  var changes = 0;
+  carriers.forEach(function(c){
+    var el = document.getElementById('ob-code-'+c+'-'+applicantId);
+    if(!el) return;
+    var newVal = (el.value || '').trim();
+    if(newVal === '' && app.codes[c] !== undefined){
+      delete app.codes[c];
+      changes++;
+    } else if(newVal !== '' && app.codes[c] !== newVal){
+      app.codes[c] = newVal;
+      changes++;
+    }
+  });
+  if(changes === 0){
+    var statusEl = document.getElementById('ob-code-save-status-'+applicantId);
+    if(statusEl){ statusEl.textContent = 'No changes'; statusEl.style.color = 'var(--muted)'; }
+    return;
+  }
+  saveApplicants();
+  var statusEl2 = document.getElementById('ob-code-save-status-'+applicantId);
+  if(statusEl2){ statusEl2.textContent = '✓ Saved'; statusEl2.style.color = '#15803d'; }
+  // Audit log
+  if(typeof console !== 'undefined') console.log('[applicant codes] saved for '+app.name, app.codes);
+}
+if(typeof window !== 'undefined') window._obSaveApplicantCodes = _obSaveApplicantCodes;
 
 function _obCopyApplicantBgPii(applicantId){
   var app = (APPLICANTS_PRE_BG||[]).find(function(a){return a && a.id === applicantId;});
