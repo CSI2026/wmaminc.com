@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.0330';
+var BUILD_VERSION = '2026.06.11.0430';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -22647,6 +22647,15 @@ function inviteApplicant(opts){
     marketManagerId:   opts.marketManagerId   || null,
     campaignManagerId: opts.campaignManagerId || null,
     iboId:             opts.iboId             || null,
+    // Calvin 2026-06-11 v0430: linkedAgentId points to a pre-existing pending
+    // agent record (created via _createPendingAgentRecord). On approval,
+    // approveApplicant updates THIS agent instead of creating a new one,
+    // so the team/CM placement set when the pending agent was created is
+    // preserved and prior payroll matches under that agent's codes are kept.
+    linkedAgentId:     opts.linkedAgentId || null,
+    // Pre-populated agent codes from the pending-agent flow. The existing
+    // BG Check Package modal can still edit these via _obSaveApplicantCodes.
+    codes:             (opts.codes && typeof opts.codes === 'object') ? Object.assign({}, opts.codes) : {},
     invitedAt:         new Date().toISOString(),
     invitedById:       u.id || null,
     invitedByName:     u.name || '',
@@ -22882,30 +22891,65 @@ function approveApplicant(applicantId){
   // Pull PII data into the agent record where useful
   var pii = (app.forms && app.forms.pii && app.forms.pii.responses) || {};
 
-  var newAgent = {
-    id: (function(){ var m=0; (DB.agents||[]).forEach(function(a){if(a&&a.id>m)m=a.id;}); return m+1; })(),
-    name: app.name,
-    role: 'Field Agent',
-    active: true,
-    email: app.email,
-    phone: app.phone || pii['bgi20'] || pii.phone || '',
-    username: username,
-    password: tempPw,
-    tempPasswordSet: true,
-    programs: [app.program],
-    program:  app.program,
-    teamLeaderId:      app.teamLeaderId || null,
-    marketManagerId:   app.marketManagerId || null,
-    campaignManagerId: app.campaignManagerId || null,
-    iboId:             app.iboId || null,
-    agentCodes: (app.codes && typeof app.codes === 'object') ? Object.assign({}, app.codes) : {},  // pre-populated from applicant.codes (added in BG Check Package modal)
-    start: new Date().toISOString().slice(0,10),
-    bgChecks: {},
-    createdFromApplicantId: app.id,
-    bgApprovedAt: new Date().toISOString(),
-    bgApprovedById: u.id || null,
-    bgApprovedByName: u.name || ''
-  };
+  // ── Calvin 2026-06-11 v0430: LINKED PENDING AGENT PATH ──
+  // If this applicant was created via the "Add Pending Agent" flow, the
+  // agent record already exists with team/CM placement and codes. Update
+  // it in place (don't create a new agent). This preserves any payroll
+  // rows already matched under this agent's codes during the pending phase.
+  var linkedAgent = null;
+  if(app.linkedAgentId){
+    linkedAgent = (DB.agents||[]).find(function(a){return a && a.id === app.linkedAgentId;});
+  }
+
+  var newAgent;
+  if(linkedAgent){
+    // UPDATE PATH: unlock the pending agent
+    linkedAgent.pendingAgent  = false;       // <-- unlocks login
+    linkedAgent.username      = username;
+    linkedAgent.password      = tempPw;
+    linkedAgent.tempPasswordSet = true;
+    if(!linkedAgent.email && app.email) linkedAgent.email = app.email;
+    if(!linkedAgent.phone) linkedAgent.phone = app.phone || pii['bgi20'] || pii.phone || '';
+    // Merge agent codes from app.codes (BG package modal may have edited them)
+    if(app.codes && typeof app.codes === 'object'){
+      linkedAgent.agentCodes = linkedAgent.agentCodes || {};
+      Object.keys(app.codes).forEach(function(k){
+        if(app.codes[k]) linkedAgent.agentCodes[k] = app.codes[k];
+      });
+    }
+    linkedAgent.bgChecks = linkedAgent.bgChecks || {};
+    linkedAgent.createdFromApplicantId = app.id;
+    linkedAgent.bgApprovedAt   = new Date().toISOString();
+    linkedAgent.bgApprovedById = u.id || null;
+    linkedAgent.bgApprovedByName = u.name || '';
+    newAgent = linkedAgent;
+  } else {
+    // CREATE PATH (original behavior — unchanged)
+    newAgent = {
+      id: (function(){ var m=0; (DB.agents||[]).forEach(function(a){if(a&&a.id>m)m=a.id;}); return m+1; })(),
+      name: app.name,
+      role: 'Field Agent',
+      active: true,
+      email: app.email,
+      phone: app.phone || pii['bgi20'] || pii.phone || '',
+      username: username,
+      password: tempPw,
+      tempPasswordSet: true,
+      programs: [app.program],
+      program:  app.program,
+      teamLeaderId:      app.teamLeaderId || null,
+      marketManagerId:   app.marketManagerId || null,
+      campaignManagerId: app.campaignManagerId || null,
+      iboId:             app.iboId || null,
+      agentCodes: (app.codes && typeof app.codes === 'object') ? Object.assign({}, app.codes) : {},  // pre-populated from applicant.codes (added in BG Check Package modal)
+      start: new Date().toISOString().slice(0,10),
+      bgChecks: {},
+      createdFromApplicantId: app.id,
+      bgApprovedAt: new Date().toISOString(),
+      bgApprovedById: u.id || null,
+      bgApprovedByName: u.name || ''
+    };
+  }
   // Auto-mark BG passed for all campaigns the applicant was set up for
   (app.campaigns || []).forEach(function(c){
     newAgent.bgChecks[c] = {
@@ -22965,7 +23009,12 @@ function approveApplicant(applicantId){
     try{ if(typeof saveAssignedDocs === 'function') saveAssignedDocs(newAgent.id); }catch(e){}
   }
 
-  DB.agents.push(newAgent);
+  // Calvin 2026-06-11 v0430: Only push if NEW agent (create path).
+  // In the linked-pending path, the agent record was already pushed when
+  // _createPendingAgentRecord ran; we just updated it in place above.
+  if(!linkedAgent){
+    DB.agents.push(newAgent);
+  }
 
   // Flip applicant status
   app.stage = 'approved';
@@ -31259,6 +31308,18 @@ function doLogin(){
   var errEl = document.getElementById('loginErr');
   var found = DB.agents.find(function(a){ return a.username.toLowerCase()===u && a.password===p && a.active; });
   if(!found){ if(errEl) errEl.style.display='block'; return; }
+  // ── Calvin 2026-06-11 v0430: PENDING AGENT LOGIN GUARD ──
+  // Pending agents (added via "Add Pending Agent" but not yet approved
+  // through the BG flow) are in DB.agents for payroll matching and team
+  // placement, but they cannot log in. Block here with a clear message
+  // so the office knows what's happening when an unapproved agent tries.
+  if(found.pendingAgent === true){
+    if(errEl){
+      errEl.textContent = 'Your account is pending approval. Please complete the onboarding forms sent to your email. Contact your office staff if you need a new invitation.';
+      errEl.style.display='block';
+    }
+    return;
+  }
   if(errEl) errEl.style.display='none';
   DB.current = found;
     normalizeAgentSales(DB.current);
@@ -47195,6 +47256,7 @@ function panelAgentsPending(){
   // (fixes the "I signed it but office still sees pending" issue)
   h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
   h += '<button onclick="_uiRefreshApplicantsPanel()" id="ap-refresh-btn" style="background:white;border:1.5px solid var(--blue);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">🔄 Refresh</button>';
+  h += '<button onclick="_uiShowAddPendingAgentModal()" style="background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">📥 Add Pending Agent</button>';
   h += '<button onclick="_openInviteApplicantModal()" class="btn-fire" style="padding:11px 22px;font-size:.78rem">📧 Invite New Applicant</button>';
   h += '</div>';
   h += '</div>';
@@ -47850,6 +47912,281 @@ function _invSubmit(){
     var box2 = document.getElementById('inv-error');
     if(box2){ box2.style.display = 'block'; box2.textContent = '⚠ ' + (e.message || e); }
   }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Calvin 2026-06-11 v0430: PENDING AGENT FEATURE
+//
+//  Lets the office add existing field agents to the system as "pending"
+//  before they've completed onboarding forms. Use case: agents who are
+//  already selling under known carrier codes but haven't been formally
+//  brought into the back-office. Once added as pending:
+//   - They appear in agent rosters (so team/CM placement is set)
+//   - Their agent codes resolve in payroll matching
+//   - They CANNOT log in until their applicant flow is approved
+//   - On approval, the pendingAgent flag drops and full access unlocks
+//
+//  Single flow: clicking "📥 Add Pending Agent" opens a modal that captures
+//  all the info needed (name, contact, team placement, agent codes,
+//  campaigns) and offers two actions:
+//   - "Save Pending Agent"    → creates agent record only (bulk-add path)
+//   - "Save + Send Invite"   → creates agent + invites them to onboard
+// ════════════════════════════════════════════════════════════════════
+
+// Creates a pending agent record in DB.agents. Returns the new agent
+// object. Does NOT send invites or create applicants — that's a separate
+// step so the office can bulk-add agents now, invite later.
+function _createPendingAgentRecord(opts){
+  opts = opts || {};
+  if(!opts.name || !opts.name.trim()) throw new Error('Name is required');
+  var u = DB.current || {};
+  var nextId = (function(){
+    var m = 0;
+    (DB.agents||[]).forEach(function(a){ if(a && a.id > m) m = a.id; });
+    return m + 1;
+  })();
+  // Calvin 2026-06-11: codes are stored under carrier-name keys
+  // (TruConnect / Gen Mobile / Assurance) to match ppMatchRowsToAgents.
+  var agentCodes = {};
+  if(opts.codeTC && opts.codeTC.trim())   agentCodes['TruConnect'] = opts.codeTC.trim();
+  if(opts.codeGM && opts.codeGM.trim())   agentCodes['Gen Mobile'] = opts.codeGM.trim();
+  if(opts.codeAW && opts.codeAW.trim())   agentCodes['Assurance']  = opts.codeAW.trim();
+
+  var newAgent = {
+    id:                nextId,
+    name:              opts.name.trim(),
+    role:              opts.role || 'Field Agent',
+    active:            true,
+    pendingAgent:      true,  // <-- the flag that blocks login + shows badge
+    email:             (opts.email || '').trim(),
+    phone:             (opts.phone || '').trim(),
+    username:          '',     // empty — set on approval
+    password:          '',     // empty — set on approval
+    tempPasswordSet:   false,
+    programs:          opts.program ? [opts.program] : [],
+    program:           opts.program || '',
+    campaigns:         Array.isArray(opts.campaigns) ? opts.campaigns : [],
+    teamLeaderId:      opts.teamLeaderId      || null,
+    marketManagerId:   opts.marketManagerId   || null,
+    campaignManagerId: opts.campaignManagerId || null,
+    iboId:             opts.iboId             || null,
+    agentCodes:        agentCodes,
+    start:             new Date().toISOString().slice(0,10),
+    bgChecks:          {},
+    createdAt:         new Date().toISOString(),
+    createdById:       u.id || null,
+    createdByName:     u.name || ''
+  };
+  DB.agents.push(newAgent);
+  if(typeof saveAgents === 'function') saveAgents();
+  return newAgent;
+}
+
+// Modal for office to enter a pending agent's info + optionally send invite
+function _uiShowAddPendingAgentModal(){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var ex = document.getElementById('add-pending-agent-modal');
+  if(ex) ex.remove();
+
+  var bg = document.createElement('div');
+  bg.id = 'add-pending-agent-modal';
+  bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100200;display:flex;align-items:center;justify-content:center;padding:20px';
+  bg.onclick = function(e){ if(e.target === bg) bg.remove(); };
+  var box = document.createElement('div');
+  box.style.cssText = 'background:white;border-radius:14px;max-width:720px;width:100%;max-height:calc(100vh - 40px);overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.4)';
+
+  function mgrOpts(role){
+    return (DB.agents||[]).filter(function(a){return a && a.active && a.role === role;})
+      .map(function(a){return '<option value="'+a.id+'">'+escHtml(a.name)+'</option>';}).join('');
+  }
+  function roleOpts(){
+    var roles = ['Field Agent','Team Leader','Market Manager','Campaign Manager','IBO'];
+    return roles.map(function(r){
+      var sel = (r === 'Field Agent') ? ' selected' : '';
+      return '<option value="'+r+'"'+sel+'>'+r+'</option>';
+    }).join('');
+  }
+  var lifelineCamps = ['TruConnect','Gen Mobile','Assurance','Excess'];
+
+  var h = '';
+  h += '<div style="background:linear-gradient(135deg,#0e7490,#0891b2);color:white;padding:18px 22px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">';
+  h += '<div style="flex:1;min-width:240px"><div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px">📥 Add Pending Agent</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;opacity:.95;margin-top:2px">For existing field agents already selling under known codes. Creates a pending profile with team/CM placement and codes — they can\'t log in until they complete onboarding forms and you approve them.</div></div>';
+  h += '<button onclick="document.getElementById(\'add-pending-agent-modal\').remove()" style="background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.4);color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;padding:6px 12px;border-radius:5px;cursor:pointer">Close ×</button>';
+  h += '</div>';
+
+  h += '<div style="padding:22px 24px">';
+
+  // BASIC INFO
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted);font-weight:700;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px">Basic info</div>';
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px 14px">';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">FULL NAME *</label><input id="pa-name" type="text" placeholder="First Last" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box"></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">EMAIL <span style="font-weight:400;color:var(--muted)">(required if sending invite)</span></label><input id="pa-email" type="email" placeholder="name@example.com" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box"></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">PHONE</label><input id="pa-phone" type="tel" placeholder="(555) 555-5555" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box"></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">ROLE</label><select id="pa-role" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box;background:white">'+roleOpts()+'</select></div>';
+  h += '</div>';
+
+  // TEAM PLACEMENT
+  h += '<div style="margin-top:18px;font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted);font-weight:700;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px">Team placement</div>';
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px 14px">';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">TEAM LEADER</label><select id="pa-tl" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box;background:white"><option value="">-- None --</option>'+mgrOpts('Team Leader')+'</select></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">MARKET MANAGER</label><select id="pa-mm" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box;background:white"><option value="">-- None --</option>'+mgrOpts('Market Manager')+'</select></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">CAMPAIGN MANAGER</label><select id="pa-cm" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box;background:white"><option value="">-- None --</option>'+mgrOpts('Campaign Manager')+'</select></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">IBO</label><select id="pa-ibo" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box;background:white"><option value="">-- None --</option>'+mgrOpts('IBO')+'</select></div>';
+  h += '</div>';
+
+  // PROGRAM + CAMPAIGNS
+  h += '<div style="margin-top:18px;font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted);font-weight:700;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px">Program & campaigns</div>';
+  h += '<div style="display:grid;grid-template-columns:1fr 2fr;gap:12px 14px">';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">PROGRAM</label><select id="pa-program" style="width:100%;padding:9px 12px;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box;background:white"><option value="Lifeline" selected>Lifeline</option><option value="Internet">Internet</option><option value="ACA">ACA</option></select></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">CAMPAIGNS</label><div style="padding:8px 12px;background:rgba(0,53,148,.04);border:1px solid var(--border);border-radius:6px;display:flex;gap:14px;flex-wrap:wrap">';
+  lifelineCamps.forEach(function(c){
+    h += '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" class="pa-camp" value="'+escHtml(c)+'" checked style="width:15px;height:15px"> '+escHtml(c)+'</label>';
+  });
+  h += '</div></div></div>';
+
+  // AGENT CODES
+  h += '<div style="margin-top:18px;font-family:Barlow Condensed,sans-serif;font-size:.68rem;color:var(--muted);font-weight:700;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px">Agent codes <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional — fills carrier codes the agent has been selling under)</span></div>';
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px 14px">';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">TRUCONNECT</label><input id="pa-code-tc" type="text" placeholder="e.g. MMG12345" style="width:100%;padding:9px 12px;font-family:monospace;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box"></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">GEN MOBILE</label><input id="pa-code-gm" type="text" placeholder="e.g. MMG12345" style="width:100%;padding:9px 12px;font-family:monospace;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box"></div>';
+  h += '<div><label style="display:block;font-size:.72rem;color:var(--muted);font-weight:700;margin-bottom:4px">ASSURANCE</label><input id="pa-code-aw" type="text" placeholder="e.g. MMG12345" style="width:100%;padding:9px 12px;font-family:monospace;font-size:14px;border:1px solid var(--border);border-radius:6px;box-sizing:border-box"></div>';
+  h += '</div>';
+
+  // ERROR DISPLAY
+  h += '<div id="pa-error" style="display:none;background:#fef2f2;border:1px solid #dc2626;color:#7f1d1d;padding:10px 14px;border-radius:6px;margin-top:14px;font-size:13px"></div>';
+  h += '<div id="pa-success" style="display:none;background:#f0fdf4;border:1px solid #16a34a;color:#14532d;padding:10px 14px;border-radius:6px;margin-top:14px;font-size:13px"></div>';
+
+  // ACTION BUTTONS
+  h += '<div style="margin-top:22px;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">';
+  h += '<button onclick="document.getElementById(\'add-pending-agent-modal\').remove()" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 18px;border-radius:5px;cursor:pointer">Cancel</button>';
+  h += '<button onclick="_submitPendingAgent(false)" style="background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 18px;border-radius:5px;cursor:pointer;font-weight:700">📥 Save Pending Agent</button>';
+  h += '<button onclick="_submitPendingAgent(true)" class="btn-fire" style="padding:11px 22px;font-size:.78rem">📥 Save + Send Onboarding Invite</button>';
+  h += '</div>';
+
+  h += '</div>';
+  box.innerHTML = h;
+  bg.appendChild(box);
+  document.body.appendChild(bg);
+}
+
+// Handler invoked from the modal. sendInvite=true also creates an applicant
+// and sends the onboarding email; sendInvite=false only creates the agent.
+function _submitPendingAgent(sendInvite){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var errEl = document.getElementById('pa-error');
+  var okEl  = document.getElementById('pa-success');
+  function showErr(msg){
+    if(errEl){ errEl.textContent = msg; errEl.style.display = 'block'; }
+    if(okEl)  okEl.style.display = 'none';
+  }
+  function showOk(msg){
+    if(okEl){ okEl.textContent = msg; okEl.style.display = 'block'; }
+    if(errEl) errEl.style.display = 'none';
+  }
+  if(errEl) errEl.style.display = 'none';
+  if(okEl)  okEl.style.display = 'none';
+
+  var name    = ((document.getElementById('pa-name')||{}).value || '').trim();
+  var email   = ((document.getElementById('pa-email')||{}).value || '').trim();
+  var phone   = ((document.getElementById('pa-phone')||{}).value || '').trim();
+  var role    = ((document.getElementById('pa-role')||{}).value || 'Field Agent').trim();
+  var tlId    = parseInt((document.getElementById('pa-tl')||{}).value, 10) || null;
+  var mmId    = parseInt((document.getElementById('pa-mm')||{}).value, 10) || null;
+  var cmId    = parseInt((document.getElementById('pa-cm')||{}).value, 10) || null;
+  var iboId   = parseInt((document.getElementById('pa-ibo')||{}).value, 10) || null;
+  var program = ((document.getElementById('pa-program')||{}).value || 'Lifeline').trim();
+  var codeTC  = ((document.getElementById('pa-code-tc')||{}).value || '').trim();
+  var codeGM  = ((document.getElementById('pa-code-gm')||{}).value || '').trim();
+  var codeAW  = ((document.getElementById('pa-code-aw')||{}).value || '').trim();
+
+  var campaigns = [];
+  var cbs = document.querySelectorAll('.pa-camp');
+  for(var i=0;i<cbs.length;i++){ if(cbs[i].checked) campaigns.push(cbs[i].value); }
+
+  if(!name){ showErr('Name is required.'); return; }
+  if(sendInvite && !email){ showErr('Email is required to send an onboarding invite.'); return; }
+  if(sendInvite && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){ showErr('Please enter a valid email address.'); return; }
+
+  // Check for duplicate by name+email
+  var dupe = (DB.agents||[]).find(function(a){
+    if(!a) return false;
+    if(a.name === name && email && a.email === email.toLowerCase()) return true;
+    return false;
+  });
+  if(dupe){
+    showErr('An agent already exists with this name + email ('+dupe.name+', id #'+dupe.id+'). Edit that agent instead of creating a duplicate.');
+    return;
+  }
+
+  // 1. Create the pending agent record
+  var newAgent;
+  try{
+    newAgent = _createPendingAgentRecord({
+      name: name, email: email, phone: phone, role: role,
+      teamLeaderId: tlId, marketManagerId: mmId, campaignManagerId: cmId, iboId: iboId,
+      program: program, campaigns: campaigns,
+      codeTC: codeTC, codeGM: codeGM, codeAW: codeAW
+    });
+  }catch(e){
+    showErr('Failed to create pending agent: '+e.message);
+    return;
+  }
+
+  // 2. If not sending invite, we're done
+  if(!sendInvite){
+    showOk('✓ Pending agent created (#'+newAgent.id+'). You can send the onboarding invite later from the Agents Pending list.');
+    setTimeout(function(){
+      var m = document.getElementById('add-pending-agent-modal');
+      if(m) m.remove();
+      if(typeof gotoPanel === 'function') gotoPanel('agents-pending');
+    }, 1500);
+    return;
+  }
+
+  // 3. Send onboarding invite — creates the linked applicant
+  try{
+    var saveResult = inviteApplicant({
+      name: name, email: email, phone: phone,
+      program: program, campaigns: campaigns,
+      teamLeaderId: tlId, marketManagerId: mmId, campaignManagerId: cmId, iboId: iboId,
+      linkedAgentId: newAgent.id,
+      codes: newAgent.agentCodes
+    });
+    if(saveResult && typeof saveResult.then === 'function'){
+      saveResult.then(function(r){
+        if(r && r.ok === false){
+          showErr('Pending agent created but invite send failed: '+(r.error||'unknown error')+'. You can resend the invite later.');
+          return;
+        }
+        showOk('✓ Pending agent created (#'+newAgent.id+') and onboarding invite sent to '+email+'.');
+        setTimeout(function(){
+          var m = document.getElementById('add-pending-agent-modal');
+          if(m) m.remove();
+          if(typeof gotoPanel === 'function') gotoPanel('agents-pending');
+        }, 1800);
+      }).catch(function(e){
+        showErr('Pending agent created but invite send failed: '+(e && e.message ? e.message : String(e))+'. You can resend the invite later.');
+      });
+    } else {
+      showOk('✓ Pending agent created (#'+newAgent.id+') and onboarding invite sent.');
+      setTimeout(function(){
+        var m = document.getElementById('add-pending-agent-modal');
+        if(m) m.remove();
+        if(typeof gotoPanel === 'function') gotoPanel('agents-pending');
+      }, 1800);
+    }
+  }catch(e){
+    showErr('Pending agent created but invite failed: '+e.message+'. You can resend the invite later.');
+  }
+}
+
+if(typeof window !== 'undefined'){
+  window._uiShowAddPendingAgentModal = _uiShowAddPendingAgentModal;
+  window._submitPendingAgent = _submitPendingAgent;
+  window._createPendingAgentRecord = _createPendingAgentRecord;
 }
 
 if(typeof window !== 'undefined'){
