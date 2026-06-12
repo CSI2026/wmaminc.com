@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.0930';
+var BUILD_VERSION = '2026.06.11.1030';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -17993,7 +17993,7 @@ async function syncPullFreshAgent(agentId){
       awModel:       a.aw_model || 'none',
       reportsTo:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).reportsTo; }catch(e){ return safeJSON(a.reports_to, {}); } })(),
       // Calvin 2026-06-11 v0730: extract piggybacked meta from reports_to._meta
-      pendingAgent:  (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.pendingAgent === true; }catch(e){ return false; } })(),
+      pendingAgent:  (function(){ try{ return _detectPendingAgent(a); }catch(e){ return false; } })(),
       iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
       campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
       createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
@@ -18058,7 +18058,7 @@ async function syncPullFreshAllAgents(){
         tcModel:       a.tc_model || 'none',
         awModel:       a.aw_model || 'none',
         reportsTo:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).reportsTo; }catch(e){ return safeJSON(a.reports_to, {}); } })(),
-        pendingAgent:  (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.pendingAgent === true; }catch(e){ return false; } })(),
+        pendingAgent:  (function(){ try{ return _detectPendingAgent(a); }catch(e){ return false; } })(),
         iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
         campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
         createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
@@ -19501,7 +19501,7 @@ async function loadFromSupabase(){
           // Per-campaign reporting chain. Map of {campaignName: parentAgentId | null}.
           reportsTo:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).reportsTo; }catch(e){ return safeJSON(a.reports_to, {}); } })(),
           // Calvin 2026-06-11 v0730: piggybacked meta fields from reports_to._meta
-          pendingAgent:  (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.pendingAgent === true; }catch(e){ return false; } })(),
+          pendingAgent:  (function(){ try{ return _detectPendingAgent(a); }catch(e){ return false; } })(),
           iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
           campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
           createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
@@ -20062,6 +20062,34 @@ function _unpackAgentReportsTo(rawReportsTo){
 }
 if(typeof window !== 'undefined') window._unpackAgentReportsTo = _unpackAgentReportsTo;
 
+// ── Calvin 2026-06-11 v1030: ROBUST PENDING DETECTOR ──
+// Reads pendingAgent from THREE sources (any one is enough):
+//   1. reports_to._meta.pendingAgent (primary, set by _buildAgentRow)
+//   2. depts._meta.pendingAgent (redundant safety net for legacy fallback)
+//   3. username ending with ".pending" or matching ".pending.N" pattern
+// This survives schema/coercion edge cases that previously dropped the flag.
+function _detectPendingAgent(serverRow){
+  if(!serverRow) return false;
+  // 1. reports_to._meta
+  try {
+    var rtu = _unpackAgentReportsTo(serverRow.reports_to);
+    if(rtu && rtu.meta && rtu.meta.pendingAgent === true) return true;
+  } catch(e){}
+  // 2. depts._meta
+  try {
+    var d = serverRow.depts;
+    if(typeof d === 'string'){ try{ d = JSON.parse(d); }catch(e){ d = {}; } }
+    if(d && typeof d === 'object' && d._meta && d._meta.pendingAgent === true) return true;
+  } catch(e){}
+  // 3. username .pending suffix (last-resort signal — set by _createPendingAgentRecord)
+  try {
+    var u = String(serverRow.username || '');
+    if(/\.pending(\.\d+)?$/.test(u)) return true;
+  } catch(e){}
+  return false;
+}
+if(typeof window !== 'undefined') window._detectPendingAgent = _detectPendingAgent;
+
 function _buildAgentRow(agent){
   // ── Calvin 2026-06-11 v0730: PIGGYBACK META FIELDS ──
   // pendingAgent, iboId, campaigns, and other fields lack dedicated Supabase
@@ -20087,6 +20115,22 @@ function _buildAgentRow(agent){
   } else {
     delete packedReportsTo._meta;
   }
+  // ── Calvin 2026-06-11 v1030: REDUNDANT pendingAgent in depts ──
+  // The legacy save fallback strips reports_to entirely (or used to).
+  // Some schemas may also coerce JSONB → text on the reports_to column,
+  // destroying _meta. depts is ALWAYS JSON.stringify'd via _buildAgentRow
+  // → robust regardless of column type. Pack pendingAgent here too as
+  // a safety net. Hydration reads pendingAgent from EITHER source.
+  var packedDepts = Object.assign({}, agent.depts || {});
+  if(agent.pendingAgent === true){
+    packedDepts._meta = Object.assign({}, packedDepts._meta || {}, { pendingAgent: true });
+  } else if(packedDepts._meta && packedDepts._meta.pendingAgent){
+    // Clear pendingAgent flag if it's no longer set (e.g., after approval)
+    var dm = Object.assign({}, packedDepts._meta);
+    delete dm.pendingAgent;
+    if(Object.keys(dm).length) packedDepts._meta = dm;
+    else delete packedDepts._meta;
+  }
   return {
     id: agent.id, name: agent.name, username: agent.username, password: agent.password,
     role: agent.role, email: agent.email||'',
@@ -20107,7 +20151,7 @@ function _buildAgentRow(agent){
     phone:        agent.phone||'',
     address:      agent.address||'',
     category:       agent.category || null,
-    depts:          JSON.stringify(agent.depts || {}),
+    depts:          JSON.stringify(packedDepts),
     office_manager: agent.officeManager === true,
     can_distribute_inventory: agent.canDistributeInventory === true,
     can_transfer_without_approval: agent.canTransferWithoutApproval === true,
@@ -20155,7 +20199,16 @@ async function saveAgentToSupabase(agent){
       delete legacy.tribal_locked_rate;
       delete legacy.ibo_markets; delete legacy.cm_model;
       delete legacy.tc_model; delete legacy.aw_model;
-      delete legacy.reports_to; delete legacy.address;
+      // ── Calvin 2026-06-11 v1030: DO NOT STRIP reports_to ──
+      // The legacy fallback used to strip reports_to as a "newer column"
+      // assumed not to exist on old schemas. But reports_to now carries
+      // the pendingAgent flag in _meta — stripping it silently destroyed
+      // pending status on any save that fell back. Calvin caught this in
+      // production: agents saved but pending flag disappeared.
+      // If the schema truly lacks reports_to, the legacy upsert will fail
+      // with a clear error rather than silently lose data.
+      // delete legacy.reports_to;  ← REMOVED
+      delete legacy.address;
       // Calvin 2026-06-04: bypass fields are new — strip if schema is older.
       // Local + localStorage still hold the flag so the Owner's session
       // still works; only cross-device sync would lose it until schema updated.
@@ -20164,6 +20217,21 @@ async function saveAgentToSupabase(agent){
       delete legacy.bypass_onboarding_gate_at;
       var res2 = await supaClient.from('agents').upsert(legacy, { onConflict: 'id' }).select().single();
       if(res2 && res2.error){
+        // ── Calvin 2026-06-11 v1030: last-ditch retry with reports_to STRINGIFIED ──
+        // Some Postgres schemas have reports_to as text, not jsonb. If the
+        // JSONB-as-object upsert fails, try sending reports_to as a string.
+        if(/reports_to/i.test(String(res2.error.message||res2.error))){
+          console.warn('[saveAgent] retrying with reports_to stringified');
+          var legacy3 = Object.assign({}, legacy);
+          legacy3.reports_to = JSON.stringify(legacy.reports_to || {});
+          var res3 = await supaClient.from('agents').upsert(legacy3, { onConflict: 'id' }).select().single();
+          if(res3 && !res3.error){
+            console.log('[saveAgent] ✓ saved via stringified-reports_to fallback');
+            var stringOk = { ok: true, data: res3.data, viaStringified: true };
+            window._lastAgentSaveResult = stringOk;
+            return stringOk;
+          }
+        }
         var failResult = { ok: false, error: (res2.error.message || res2.error || res.error.message || 'Unknown error'), code: res2.error.code || res.error.code };
         window._lastAgentSaveResult = failResult;
         console.error('[saveAgent] ✗ legacy fallback ALSO failed for agent #'+agent.id+':', failResult.error);
@@ -20236,7 +20304,7 @@ function _mergeServerAgentIntoLocal(serverRow){
     awModel:     serverRow.aw_model || 'none',
     reportsTo:   (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).reportsTo; }catch(e){ return safeJSONLocal(serverRow.reports_to, {}); } })(),
     // Calvin 2026-06-11 v0730: piggybacked meta fields from reports_to._meta
-    pendingAgent:(function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.pendingAgent === true; }catch(e){ return false; } })(),
+    pendingAgent:(function(){ try{ return _detectPendingAgent(serverRow); }catch(e){ return false; } })(),
     iboId:       (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
     campaigns:   (function(){ try{ var m = _unpackAgentReportsTo(serverRow.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
     createdAt:   (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
