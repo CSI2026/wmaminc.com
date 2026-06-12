@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.0430';
+var BUILD_VERSION = '2026.06.11.0530';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -47256,6 +47256,7 @@ function panelAgentsPending(){
   // (fixes the "I signed it but office still sees pending" issue)
   h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
   h += '<button onclick="_uiRefreshApplicantsPanel()" id="ap-refresh-btn" style="background:white;border:1.5px solid var(--blue);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">🔄 Refresh</button>';
+  h += '<button onclick="_uiPromoteAllExistingApplicants()" style="background:white;border:1.5px solid #0891b2;color:#0891b2;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700" title="Create pending agent records for all existing applicants who don\'t have one yet — so their codes match payroll while waiting for approval">📥 Place All in Roster</button>';
   h += '<button onclick="_uiShowAddPendingAgentModal()" style="background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">📥 Add Pending Agent</button>';
   h += '<button onclick="_openInviteApplicantModal()" class="btn-fire" style="padding:11px 22px;font-size:.78rem">📧 Invite New Applicant</button>';
   h += '</div>';
@@ -47461,6 +47462,17 @@ function _renderApplicantCard(app){
 
   // Action buttons (vary by stage)
   h += '<div style="display:flex;gap:6px;flex-wrap:wrap">';
+  // ── Calvin 2026-06-11 v0530: PLACE-IN-ROSTER BUTTON ──
+  // Show "📥 Place in Roster" on every active applicant that doesn't have
+  // a linked pending agent yet. Once placed, show a small "✓ In Roster" tag
+  // instead of the button.
+  if(app.stage !== 'approved' && app.stage !== 'rejected' && app.stage !== 'cancelled'){
+    if(app.linkedAgentId){
+      h += '<span style="display:inline-flex;align-items:center;gap:6px;background:rgba(8,145,178,.1);border:1px solid rgba(8,145,178,.35);color:#0e7490;font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 12px;border-radius:5px;font-weight:700" title="Pending agent #'+app.linkedAgentId+' placed in roster">✓ In Roster #'+app.linkedAgentId+'</span>';
+    } else {
+      h += '<button onclick="_uiPromoteApplicant('+app.id+')" style="background:white;border:1px solid #0891b2;color:#0891b2;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700" title="Create a pending agent record so this applicant\'s codes match payroll while waiting for approval">📥 Place in Roster</button>';
+    }
+  }
   if(app.stage === 'awaiting-esign'){
     h += '<button onclick="if(confirm(\'Resend the invitation email to '+escHtml(app.name).replace(/'/g,"\\'")+'?\'))resendApplicantInvitation('+app.id+');gotoPanel(\'agents-pending\')" style="background:white;border:1px solid #f59e0b;color:#b45309;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">↻ Resend Email</button>';
     h += '<button onclick="if(confirm(\'Cancel this invitation permanently? '+escHtml(app.name).replace(/'/g,"\\'")+' will need a fresh invitation to try again.\'))_cancelApplicant('+app.id+');gotoPanel(\'agents-pending\')" style="background:white;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer">Cancel</button>';
@@ -48187,6 +48199,147 @@ if(typeof window !== 'undefined'){
   window._uiShowAddPendingAgentModal = _uiShowAddPendingAgentModal;
   window._submitPendingAgent = _submitPendingAgent;
   window._createPendingAgentRecord = _createPendingAgentRecord;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Calvin 2026-06-11 v0530: BACKFILL EXISTING APPLICANTS
+//
+//  Existing applicants in APPLICANTS_PRE_BG (invited before v0430) have
+//  team/CM placement and possibly agent codes, but no linked pending
+//  agent record. That means their payroll rows won't match while they
+//  wait for approval. These functions create the pending agent record
+//  retroactively, link it, and preserve everything from the invite.
+// ════════════════════════════════════════════════════════════════════
+
+// Promote a single existing applicant to a pending agent. Idempotent:
+// if applicant already has linkedAgentId, returns the existing agent.
+// Returns the agent record on success, throws on error.
+function _promoteApplicantToPendingAgent(applicantId){
+  var u = DB.current || {};
+  if(!isOfficeRole(u)) throw new Error('Office staff only.');
+  var app = (APPLICANTS_PRE_BG||[]).find(function(a){return a && a.id === applicantId;});
+  if(!app) throw new Error('Applicant #'+applicantId+' not found');
+
+  // Already promoted? Return the existing linked agent.
+  if(app.linkedAgentId){
+    var existing = (DB.agents||[]).find(function(a){return a && a.id === app.linkedAgentId;});
+    if(existing) return existing;
+    // Linked but agent record missing (data corruption) — fall through and recreate
+  }
+
+  // Don't promote applicants that have already been approved or rejected
+  if(app.stage === 'approved' || app.stage === 'rejected' || app.stage === 'cancelled'){
+    throw new Error('Cannot place applicant in stage "'+app.stage+'"');
+  }
+
+  // Pull codes from app.codes (may have been entered via BG Check Package modal)
+  var codes = (app.codes && typeof app.codes === 'object') ? app.codes : {};
+
+  var newAgent = _createPendingAgentRecord({
+    name:              app.name,
+    email:             app.email,
+    phone:             app.phone,
+    role:              'Field Agent',
+    teamLeaderId:      app.teamLeaderId,
+    marketManagerId:   app.marketManagerId,
+    campaignManagerId: app.campaignManagerId,
+    iboId:             app.iboId,
+    program:           app.program,
+    campaigns:         app.campaigns,
+    codeTC:            codes['TruConnect'] || '',
+    codeGM:            codes['Gen Mobile'] || '',
+    codeAW:            codes['Assurance']  || ''
+  });
+
+  // Link the applicant to the new agent
+  app.linkedAgentId = newAgent.id;
+  if(typeof saveApplicants === 'function') saveApplicants();
+
+  return newAgent;
+}
+
+// Bulk-promote all existing applicants that don't yet have a linked agent.
+// Returns { promoted: N, skipped: N, errors: [{applicantId, message}] }.
+function _promoteAllExistingApplicants(){
+  var u = DB.current || {};
+  if(!isOfficeRole(u)) throw new Error('Office staff only.');
+  var promoted = 0, skipped = 0;
+  var errors = [];
+  (APPLICANTS_PRE_BG||[]).slice().forEach(function(app){
+    if(!app) return;
+    if(app.linkedAgentId){ skipped++; return; }
+    if(app.stage === 'approved' || app.stage === 'rejected' || app.stage === 'cancelled'){
+      skipped++; return;
+    }
+    try{
+      _promoteApplicantToPendingAgent(app.id);
+      promoted++;
+    }catch(e){
+      errors.push({applicantId: app.id, name: app.name, message: e.message});
+    }
+  });
+  return { promoted: promoted, skipped: skipped, errors: errors };
+}
+
+// UI handler for the bulk action — confirms before running, shows summary.
+function _uiPromoteAllExistingApplicants(){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var unpromoted = (APPLICANTS_PRE_BG||[]).filter(function(a){
+    return a && !a.linkedAgentId && a.stage !== 'approved' && a.stage !== 'rejected' && a.stage !== 'cancelled';
+  });
+  if(unpromoted.length === 0){
+    alert('All existing applicants are already placed in the roster.');
+    return;
+  }
+  var names = unpromoted.slice(0, 8).map(function(a){return a.name;}).join('\n  • ');
+  var more = unpromoted.length > 8 ? '\n  ...and '+(unpromoted.length-8)+' more' : '';
+  if(!confirm('Place '+unpromoted.length+' existing applicant'+(unpromoted.length===1?'':'s')+' in the roster as pending agents?\n\n  • '+names+more+'\n\nEach will get a pending agent record with their existing team/CM placement and any codes already entered. They still cannot log in until you approve them via the BG flow.')){
+    return;
+  }
+  var result;
+  try{
+    result = _promoteAllExistingApplicants();
+  }catch(e){
+    alert('Bulk promote failed: '+e.message);
+    return;
+  }
+  var msg = '✓ Placed '+result.promoted+' applicant'+(result.promoted===1?'':'s')+' in the roster.';
+  if(result.skipped) msg += '\n('+result.skipped+' skipped — already placed or in final stage)';
+  if(result.errors.length){
+    msg += '\n\n⚠ '+result.errors.length+' error'+(result.errors.length===1?'':'s')+':';
+    result.errors.slice(0, 5).forEach(function(e){
+      msg += '\n  • '+e.name+': '+e.message;
+    });
+  }
+  alert(msg);
+  if(typeof gotoPanel === 'function') gotoPanel('agents-pending');
+}
+
+// UI handler for per-applicant placement
+function _uiPromoteApplicant(applicantId){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var app = (APPLICANTS_PRE_BG||[]).find(function(a){return a && a.id === applicantId;});
+  if(!app){ alert('Applicant not found.'); return; }
+  if(app.linkedAgentId){
+    alert('Already placed — pending agent #'+app.linkedAgentId);
+    return;
+  }
+  try{
+    var newAgent = _promoteApplicantToPendingAgent(applicantId);
+    alert('✓ '+app.name+' placed in roster as pending agent #'+newAgent.id+'.\n\nThey now match payroll rows under their codes. They still cannot log in until you approve them.');
+    if(typeof gotoPanel === 'function') gotoPanel('agents-pending');
+  }catch(e){
+    alert('Failed to place '+app.name+': '+e.message);
+  }
+}
+
+if(typeof window !== 'undefined'){
+  window._promoteApplicantToPendingAgent = _promoteApplicantToPendingAgent;
+  window._promoteAllExistingApplicants = _promoteAllExistingApplicants;
+  window._uiPromoteAllExistingApplicants = _uiPromoteAllExistingApplicants;
+  window._uiPromoteApplicant = _uiPromoteApplicant;
 }
 
 if(typeof window !== 'undefined'){
