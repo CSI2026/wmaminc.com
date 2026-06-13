@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.12.2230';
+var BUILD_VERSION = '2026.06.13.1900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -17661,6 +17661,81 @@ function invDashSetStatusFilter(value){
 //  sold      = activated + sold devices held by my-scope
 //  total     = available + sold
 // ════════════════════════════════════════════════════════════════════════
+// ── Calvin 2026-06-13: PER-CAMPAIGN, DATA-PROOF SCOREBOARD INVENTORY ──
+// The scoreboard's AVAILABLE panel must show a manager's ENTIRE organization's
+// devices, broken out PER CAMPAIGN (e.g. Gen Mobile 400, TruConnect 300) — not
+// just their personal holdings, and not dependent on complete reports_to links.
+// Strategy: "market expansion." First seed the markets where the manager
+// clearly has a footprint (devices they hold / manage / handed down / their
+// profile markets / their reports_to org). Then count EVERY non-deleted device
+// in those (campaign, market) pairs — so devices held by region agents whose
+// reporting links are incomplete still roll up. CM/IBO also get the unassigned
+// pool. Returns { campaign: {available, sold, total}, ... }.
+function scoreboardInventoryByCampaign(user){
+  var out = {};
+  if(!user) return out;
+  var pool = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools() : [];
+  if(!pool.length) return out;
+
+  var seeAll = (typeof isOwner==='function' && isOwner(user)) || user.role==='admin'
+    || (typeof isInventory==='function' && isInventory(user))
+    || (typeof agentHasDeptAccess==='function' && agentHasDeptAccess(user,'inv-dashboard'));
+  var isMgr = (user.role==='Campaign Manager'||user.role==='IBO'||user.role==='Market Manager'||user.role==='Team Leader');
+  var includeUnassigned = (user.role==='Campaign Manager'||user.role==='IBO');
+
+  var orgIds = (typeof agentIdsInMyOrgEffective==='function') ? agentIdsInMyOrgEffective(user) : [user.id];
+  var orgSet = orgIds.reduce(function(m,id){ m[id]=true; return m; }, {});
+  var myProfileMarkets = (typeof mmMarkets==='function') ? mmMarkets(user) : [];
+
+  function campOf(d){ return d.campaign || d.carrier || 'Other'; }
+
+  // ── Pass 1: seed the (campaign -> markets) this manager clearly touches ──
+  var seedMarkets = {};
+  function addSeed(camp, mkt){ if(!camp||!mkt) return; if(!seedMarkets[camp]) seedMarkets[camp]={}; seedMarkets[camp][mkt]=true; }
+  if(!seeAll && isMgr){
+    pool.forEach(function(d){
+      if(!d || d.status==='deleted') return;
+      var holderId = d.holderId || d.assignedTo || null;
+      var seed = false;
+      if(holderId && orgSet[holderId]) seed = true;
+      if(!seed && (d.mmId===user.id || d.cmId===user.id)) seed = true;
+      if(!seed && Array.isArray(d.chainOfCustody)){
+        for(var i=0;i<d.chainOfCustody.length;i++){ if(d.chainOfCustody[i] && d.chainOfCustody[i].fromId===user.id){ seed=true; break; } }
+      }
+      if(!seed && d.market && myProfileMarkets.indexOf(d.market)>=0) seed = true;
+      if(seed) addSeed(campOf(d), d.market);
+    });
+  }
+
+  function inScope(d){
+    if(seeAll) return true;
+    var camp = campOf(d);
+    var holderId = d.holderId || d.assignedTo || null;
+    if(holderId && orgSet[holderId]) return true;
+    if(!holderId && includeUnassigned) return true;
+    if(isMgr){
+      if(d.mmId===user.id || d.cmId===user.id) return true;
+      if(Array.isArray(d.chainOfCustody)){
+        for(var i=0;i<d.chainOfCustody.length;i++){ if(d.chainOfCustody[i] && d.chainOfCustody[i].fromId===user.id) return true; }
+      }
+      if(d.market && seedMarkets[camp] && seedMarkets[camp][d.market]) return true; // market expansion
+    }
+    return false;
+  }
+
+  // ── Pass 2: count per campaign ──
+  pool.forEach(function(d){
+    if(!d || d.status==='deleted') return;
+    if(!inScope(d)) return;
+    var camp = campOf(d);
+    if(!out[camp]) out[camp] = {available:0, sold:0, total:0};
+    var isSold = (d.status==='sold' || d.status==='activated' || d.soldAt);
+    out[camp].total++;
+    if(isSold) out[camp].sold++; else out[camp].available++;
+  });
+  return out;
+}
+
 function scoreboardInventory(user){
   var out = {available:0, sold:0, total:0};
   if(!user) return out;
@@ -35311,24 +35386,43 @@ function panelBO(){
       // This replaces the older _invForUser-based numbers which over-counted
       // for managers (everything visible) and under-counted when the user
       // wasn't "coded" on the campaign.
-      var _sb = (function(){
-        try { return scoreboardInventory(u); }
-        catch(e){ console.warn('[panelBO] scoreboardInventory failed:', e); return {available:0, sold:0, total:0}; }
+      // ── Calvin 2026-06-13: per-campaign, org-wide (data-proof) inventory. ──
+      // Shows each campaign's available total separately (Gen Mobile, TruConnect…)
+      // for the manager's ENTIRE organization, not just personal holdings.
+      var _sbByCamp = (function(){
+        try { return scoreboardInventoryByCampaign(u); }
+        catch(e){ console.warn('[panelBO] scoreboardInventoryByCampaign failed:', e); return {}; }
       })();
-      var soldCount      = _sb.sold;
-      var availableCount = _sb.available;
-      var sbTotal        = _sb.total;
+      var _campKeys = Object.keys(_sbByCamp).sort();
+      var availableCount = 0, soldCount = 0, sbTotal = 0;
+      _campKeys.forEach(function(c){
+        availableCount += _sbByCamp[c].available;
+        soldCount      += _sbByCamp[c].sold;
+        sbTotal        += _sbByCamp[c].total;
+      });
 
-      // Has Lifeline — show inventory
-      html += '<div style="'+lblSt+'">AVAILABLE</div>';
-      html += '<div style="margin:0 auto 3px">'+sbLED(availableCount,44,80,6)+'</div>';
-
-      // Sold/Activated breakdown row — this is what the master dashboard was missing
-      if(soldCount > 0 || sbTotal > 0){
-        html += '<div style="display:flex;justify-content:center;gap:14px;margin-bottom:8px;font-family:Oswald,Arial,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase">';
-        html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">TOTAL</div><div style="color:#fff;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+sbTotal+'</div></div>';
-        html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">SOLD</div><div style="color:#5fdc8c;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+soldCount+'</div></div>';
-        html += '</div>';
+      if(_campKeys.length <= 1){
+        // Single campaign (or none) — keep the original big-LED look.
+        html += '<div style="'+lblSt+'">AVAILABLE</div>';
+        html += '<div style="margin:0 auto 3px">'+sbLED(availableCount,44,80,6)+'</div>';
+        if(soldCount > 0 || sbTotal > 0){
+          html += '<div style="display:flex;justify-content:center;gap:14px;margin-bottom:8px;font-family:Oswald,Arial,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase">';
+          html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">TOTAL</div><div style="color:#fff;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+sbTotal+'</div></div>';
+          html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">SOLD</div><div style="color:#5fdc8c;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+soldCount+'</div></div>';
+          html += '</div>';
+        }
+      } else {
+        // Multiple campaigns — show EACH campaign's available total separately.
+        _campKeys.forEach(function(c){
+          var rec = _sbByCamp[c];
+          html += '<div style="margin-bottom:9px">';
+          html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.56rem;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:'+themeBlue+';margin-bottom:2px">'+c+'</div>';
+          html += '<div style="margin:0 auto 2px">'+sbLED(rec.available,30,54,5)+'</div>';
+          html += '<div style="display:flex;justify-content:center;gap:12px;font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase">';
+          html += '<span style="color:rgba(255,255,255,.4)">Total <strong style="color:#fff">'+rec.total+'</strong></span>';
+          html += '<span style="color:rgba(255,255,255,.4)">Sold <strong style="color:#5fdc8c">'+rec.sold+'</strong></span>';
+          html += '</div></div>';
+        });
       }
 
       html += '<div style="'+divSt+'"></div>';
