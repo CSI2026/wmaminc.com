@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.12.1830';
+var BUILD_VERSION = '2026.06.12.2030';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -30067,6 +30067,35 @@ function ownerInvDeleteApplyPasted(){
 
 // Find which selected device ids are currently in a pending transfer.
 // Returns array of {id, imei, transferId, fromName, toName, status}
+// ── Calvin 2026-06-12: Owner force-cancel of blocking transfers ──
+// Used only by the Owner override path in ownerInvDeleteCommit (after isOwner
+// + ownerForce are both confirmed). Marks each pending transfer that holds a
+// to-be-deleted device as cancelled — auditable + additive (the record is kept
+// with a chain note), so the devices are unlocked for hard delete.
+function ownerInvForceCancelBlockingTransfers(blocked){
+  if(!Array.isArray(blocked) || !blocked.length) return 0;
+  var transfers = ownerInvTransferPool(OWNER_INV_DELETE.campaign);
+  if(!transfers.length) return 0;
+  var ids = {};
+  blocked.forEach(function(b){ if(b && b.transferId!=null) ids[String(b.transferId)] = true; });
+  var u = DB.current, now = new Date().toISOString(), n = 0;
+  transfers.forEach(function(t){
+    if(!t || !ids[String(t.id)]) return;
+    if(t.status === 'cancelled' || t.status === 'cancelled-owner-force') return;
+    t.status = 'cancelled-owner-force';
+    t.cancelledBy = u && u.id; t.cancelledByName = u && u.name; t.cancelledAt = now;
+    t.cancelReason = 'Owner force-delete override (inventory cleanup)';
+    if(!Array.isArray(t.history)) t.history = [];
+    t.history.push({type:'cancelled-owner-force', at:now, by:u&&u.name, byId:u&&u.id});
+    n++;
+  });
+  if(n){
+    if(typeof saveInventory === 'function'){ try{ saveInventory(); }catch(e){} }
+    if(typeof saveToStorage === 'function'){ try{ saveToStorage(); }catch(e){} }
+  }
+  return n;
+}
+
 function ownerInvFindBlockedByTransfer(){
   var blocked = [];
   var transfers = ownerInvTransferPool(OWNER_INV_DELETE.campaign);
@@ -30122,16 +30151,24 @@ async function ownerInvDeleteCommit(){
   // Pre-flight: block on pending transfers
   var blocked = (typeof ownerInvFindBlockedByTransfer === 'function') ? ownerInvFindBlockedByTransfer() : [];
   if(blocked.length){
-    var msg = '🛑 '+blocked.length+' selected IMEI(s) are in pending transfers and cannot be deleted:\n\n';
-    blocked.slice(0,10).forEach(function(b){
-      msg += '  • '+b.imei+' (transfer '+b.fromName+' → '+b.toName+', status: '+b.status+')\n';
-    });
-    if(blocked.length>10) msg += '  … and '+(blocked.length-10)+' more\n';
-    msg += '\nClear those transfers first (Inventory → Pending Transfers), then return here.';
-    alert(msg);
-    OWNER_INV_DELETE.feedback = '🛑 '+blocked.length+' IMEI(s) blocked by pending transfers — see alert above.';
-    gotoPanel('owner-inv-delete');
-    return;
+    var _ownerForcing = isOwner(u) && OWNER_INV_DELETE.ownerForce === true;
+    if(!_ownerForcing){
+      var msg = '🛑 '+blocked.length+' selected IMEI(s) are in pending transfers and cannot be deleted:\n\n';
+      blocked.slice(0,10).forEach(function(b){
+        msg += '  • '+b.imei+' (transfer '+b.fromName+' → '+b.toName+', status: '+b.status+')\n';
+      });
+      if(blocked.length>10) msg += '  … and '+(blocked.length-10)+' more\n';
+      msg += '\nClear those transfers first (Inventory → Pending Transfers), then return here.\n\n(Owner tip: tick "Owner override" above to force-delete and auto-cancel these transfers.)';
+      alert(msg);
+      OWNER_INV_DELETE.feedback = '🛑 '+blocked.length+' IMEI(s) blocked by pending transfers — see alert above.';
+      gotoPanel('owner-inv-delete');
+      return;
+    }
+    // Owner override engaged: cancel the blocking transfers (auditable) so the
+    // devices are no longer locked, then fall through to the actual delete.
+    var _cancelledCount = (typeof ownerInvForceCancelBlockingTransfers === 'function')
+      ? ownerInvForceCancelBlockingTransfers(blocked) : 0;
+    console.log('[ownerInvDeleteCommit] OWNER OVERRIDE — cancelled '+_cancelledCount+' blocking transfer(s) for '+blocked.length+' IMEI(s)');
   }
 
   // ── Calvin 2026-05-18 — PATH A pre-save conflict check ──
@@ -30412,6 +30449,12 @@ function panelOwnerInvDelete(){
        + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;color:var(--red);letter-spacing:2px;margin-bottom:6px">⚠ '+selectedCount+' DEVICE'+(selectedCount===1?'':'S')+' WILL BE PERMANENTLY DELETED</div>'
        + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.76rem;color:var(--brown);line-height:1.5">From: <strong>'+s.campaign+'</strong> · No backup will be kept · This action cannot be reversed</div>'
        + '</div>';
+    if(typeof isOwner==='function' && isOwner(DB.current)){
+      h += '<label style="display:flex;align-items:center;gap:8px;background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.3);border-radius:6px;padding:9px 12px;margin-bottom:12px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:#6d28d9;cursor:pointer">';
+      h += '<input type="checkbox" id="ownerInvForceChk"'+((OWNER_INV_DELETE.ownerForce)?' checked':'')+' onchange="OWNER_INV_DELETE.ownerForce=this.checked" style="width:16px;height:16px;cursor:pointer">';
+      h += '<span>🔓 <strong>Owner override</strong> — force-delete even if devices are in a pending transfer (also cancels those transfers). For testing / cleanup.</span>';
+      h += '</label>';
+    }
     h += '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">';
     h += '<label style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px">Type <strong style="color:var(--red);letter-spacing:2px">DELETE</strong> to confirm:</label>';
     h += '<input type="text" id="ownerInvDelConfirm" placeholder="DELETE" autocomplete="off" '
@@ -33925,7 +33968,8 @@ function gotoPanel(id, params){
   //     my-profile, onboard-sign) → let them through, NO modal re-show.
   //     Those panels exist specifically for them to sign their docs.
   try{
-    if(typeof isOnboardingLocked === 'function' && DB && DB.current && isOnboardingLocked(DB.current)){
+    if(typeof isOnboardingLocked === 'function' && DB && DB.current && isOnboardingLocked(DB.current)
+       && !(typeof _ownerViewAsOnbBypassActive === 'function' && _ownerViewAsOnbBypassActive())){
       var lockoutAllowed = ['my-documents','notifications','my-profile','onboard-sign'];
       var wasRedirected = false;
       if(lockoutAllowed.indexOf(id) < 0){
@@ -36311,6 +36355,7 @@ function startImpersonation(agentId){
 }
 function returnToOwnerView(){
   if(!IMPERSONATING) return;
+  if(typeof window !== 'undefined') window._ownerViewAsBypassOnboarding = false; // clear test bypass
   var originalUser=IMPERSONATING; IMPERSONATING=null; DB.current=originalUser;
   if(typeof applyPersonalTheme === 'function') applyPersonalTheme();
   var banner=document.getElementById('imp-banner'); if(banner) banner.remove();
@@ -50118,6 +50163,35 @@ if(typeof window !== 'undefined'){
   window._showLockoutDiag = _showLockoutDiag;
 }
 
+// ── Calvin 2026-06-12: Owner view-as bypass for the onboarding / BG lockout ──
+// When the OWNER is impersonating ("View As Agent") to TEST the system, the
+// BG-sign lockout would otherwise trap them in the agent's signing flow. This
+// lets the owner click through the lockout for the rest of that view-as
+// session. Strictly scoped: only active when IMPERSONATING is an Owner. Resets
+// automatically when impersonation ends (returnToOwnerView). Real agents and
+// non-owner impersonators are NEVER affected — their gate is untouched.
+function _isOwnerViewAsSession(){
+  return (typeof IMPERSONATING !== 'undefined' && IMPERSONATING
+          && typeof isOwner === 'function' && isOwner(IMPERSONATING));
+}
+function _ownerViewAsOnbBypassActive(){
+  return _isOwnerViewAsSession()
+      && (typeof window !== 'undefined') && window._ownerViewAsBypassOnboarding === true;
+}
+function _onbLockoutOwnerBypass(){
+  if(!_isOwnerViewAsSession()) return; // safety — only owners-in-view-as
+  if(typeof window !== 'undefined') window._ownerViewAsBypassOnboarding = true;
+  var el = document.getElementById('onb-lockout-modal-bg');
+  if(el) el.remove();
+  if(typeof cdFlash === 'function') cdFlash('🔓 Owner override — onboarding gate bypassed for this view-as session');
+  if(typeof gotoPanel === 'function') gotoPanel('bo');
+}
+if(typeof window !== 'undefined'){
+  window._isOwnerViewAsSession = _isOwnerViewAsSession;
+  window._ownerViewAsOnbBypassActive = _ownerViewAsOnbBypassActive;
+  window._onbLockoutOwnerBypass = _onbLockoutOwnerBypass;
+}
+
 function _showOnboardingLockoutModal(agent){
   if(document.getElementById('onb-lockout-modal-bg')) return;  // don't double-show
   // ── Calvin 2026-06-04 MOBILE FIX ──
@@ -50174,6 +50248,9 @@ function _showOnboardingLockoutModal(agent){
   } else {
     // No action — pending state, just informational. Sign out button only.
     html += '<button onclick="_onbLockoutSignOut()" style="background:transparent;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 24px;border-radius:6px;cursor:pointer;width:100%">Sign Out</button>';
+  }
+  if(typeof _isOwnerViewAsSession === 'function' && _isOwnerViewAsSession()){
+    html += '<button onclick="_onbLockoutOwnerBypass()" style="margin-top:10px;background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1.5px;text-transform:uppercase;padding:11px 24px;border-radius:6px;cursor:pointer;font-weight:700;width:100%">🔓 Owner Override — Continue Without Signing (testing)</button>';
   }
   html += '</div>';
   box.innerHTML = html;
@@ -51620,7 +51697,8 @@ function submitAssignedDoc(formId){
       // where they saw the dashboard render between sign-submit and
       // gotoPanel redirect.
       var stillLocked = false;
-      try{ stillLocked = (typeof isOnboardingLocked === 'function') && isOnboardingLocked(DB.current); }catch(e){}
+      try{ stillLocked = (typeof isOnboardingLocked === 'function') && isOnboardingLocked(DB.current)
+             && !(typeof _ownerViewAsOnbBypassActive === 'function' && _ownerViewAsOnbBypassActive()); }catch(e){}
       if(stillLocked){
         // Skip the success alert — the modal IS the feedback. Drop straight to my-documents
         // and render the modal on top.
