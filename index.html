@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.14.2030';
+var BUILD_VERSION = '2026.06.14.2230';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -17081,6 +17081,21 @@ function commitShipment(parsed, opts){
     });
   });
   try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){ console.warn('[commitShipment] save failed:', e); }
+  // First notification — "Inventory Shipped – Action Required" (in transit).
+  // Addressed TO the manager receiving the inventory; upline CC'd.
+  try{
+    var toR = _shipToRecipient(manager);
+    var ccR = _shipCcRecipients(manager);
+    var em = _shipShippedEmail(ship, manager);
+    if(typeof brevoSend === 'function' && toR.length){
+      brevoSend({ to: toR, cc: ccR, subject: em.subject, htmlContent: em.html });
+    }
+    if(typeof pushNotification === 'function'){
+      var chain = (typeof reportingChainFor==='function') ? reportingChainFor(manager) : {};
+      var ids = [manager.id, chain.teamLeaderId, chain.marketManagerId, chain.campaignManagerId, chain.iboId].filter(Boolean);
+      ids.forEach(function(id){ try{ pushNotification({ toIds:[id], title:'📦 Inventory Shipped — Action Required', body: ship.deviceCount+' device(s) in '+ship.cartons.length+' carton(s) are in transit to '+_shipCleanMarket(ship.market)+'. Pick up within 2 business days of arrival.', type:'inventory-shipped', icon:'box' }); }catch(e){} });
+    }
+  }catch(e){ console.warn('[commitShipment] shipped notify failed:', e); }
   return { ok:true, shipment:ship };
 }
 
@@ -17107,13 +17122,13 @@ function markShipmentArrived(shipmentId){
       }); }catch(e){}
     });
   }
-  // Email (profile emails only)
-  if(typeof brevoSend === 'function' && recips.length){
-    var html = '<div style="font-family:Arial,sans-serif"><h2>📦 Your inventory has arrived</h2>'
-      + '<p>'+ship.deviceCount+' device(s) across '+ship.cartons.length+' carton(s) for <strong>'+(manager?manager.name:'')+'</strong> ('+ship.market+') have arrived at the store and are ready for pickup.</p>'
-      + '<p>When you pick them up, open the <strong>Inventory Pickup Form</strong> in the back office and enter the carton numbers (or IMEIs) you received. You will sign one receipt-invoice that confirms what you took and your responsibility for it.</p>'
-      + '<p>Cartons: '+ship.cartons.join(', ')+'</p></div>';
-    try{ brevoSend({ to: recips.map(function(r){return {email:r.email, name:r.name};}), subject: 'Inventory Arrived — Ready for Pickup ('+ship.market+')', htmlContent: html }); }catch(e){ console.warn('[markShipmentArrived] email failed:', e); }
+  // Email (profile emails only) — second notification, "Arrived – Ready for Pickup".
+  // Addressed TO the manager receiving the inventory; upline CC'd.
+  var toR = _shipToRecipient(manager);
+  var ccR = _shipCcRecipients(manager);
+  if(typeof brevoSend === 'function' && toR.length){
+    var em = _shipArrivedEmail(ship, manager);
+    try{ brevoSend({ to: toR, cc: ccR, subject: em.subject, htmlContent: em.html }); }catch(e){ console.warn('[markShipmentArrived] email failed:', e); }
   }
   try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
   return { ok:true, shipment:ship, notified: recips.length };
@@ -17173,7 +17188,7 @@ function panelShipments(){
       var statusColor = s.status==='in-route' ? '#d97706' : (s.status==='arrived' ? '#003594' : (s.status==='complete' ? '#15803d' : '#6b7280'));
       h += '<tr style="border-bottom:1px solid var(--sand)">';
       h += '<td style="padding:8px 10px;font-weight:600">'+escHtml(s.managerName)+'</td>';
-      h += '<td style="padding:8px 10px">'+escHtml(s.market||'—')+'</td>';
+      h += '<td style="padding:8px 10px">'+escHtml(_shipCleanMarket(s.market)||'—')+'</td>';
       h += '<td style="padding:8px 10px">'+s.cartons.length+'</td>';
       h += '<td style="padding:8px 10px">'+s.deviceCount+'</td>';
       h += '<td style="padding:8px 10px">$'+(s.totalCost||0).toFixed(2)+'</td>';
@@ -17254,6 +17269,99 @@ function _shipDelete(shipmentId){
   if(!res.ok){ alert('Error: '+res.error); return; }
   alert('✓ Deleted. Removed '+res.removed+' in-route device(s).');
   if(typeof gotoPanel==='function') gotoPanel('shipments');
+}
+
+// Strip internal prefixes like "MMG CIR" from the corp market/team string.
+// "MMG CIR San Antonio TX" → "San Antonio TX".
+function _shipCleanMarket(raw){
+  if(!raw) return '';
+  return String(raw).replace(/\bMMG\s*CIR\b/ig, '').replace(/\s{2,}/g, ' ').trim();
+}
+// Name of the manager/IBO directly above the recipient (CM or IBO), or '' if top.
+function _shipUplineName(manager){
+  if(!manager) return '';
+  var chain = (typeof reportingChainFor === 'function') ? reportingChainFor(manager) : {};
+  var upId = chain.campaignManagerId || chain.iboId || chain.marketManagerId || null;
+  if(!upId || upId === manager.id) return '';
+  var a = (DB.agents||[]).find(function(x){ return x.id === upId; });
+  return a ? a.name : '';
+}
+function _shipEmailWrap(title, inner, accent){
+  return '<div style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;max-width:640px;margin:0 auto;font-size:14px;line-height:1.55">'
+    + '<div style="background:'+(accent||'#003594')+';color:#fff;padding:16px 22px;border-radius:8px 8px 0 0;font-size:17px;font-weight:bold;letter-spacing:.3px">'+title+'</div>'
+    + '<div style="border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px;padding:22px 24px">'+inner+'</div>'
+    + '<div style="color:#9ca3af;font-size:11px;padding:10px 4px">WMAMinc. Inventory Operations · This is an automated notification.</div></div>';
+}
+function _shipDetailsList(ship, qtyLabel){
+  var market = _shipCleanMarket(ship.market);
+  return '<table style="border-collapse:collapse;margin:4px 0 4px;font-size:14px"><tbody>'
+    + '<tr><td style="padding:3px 14px 3px 0;color:#6b7280">Market</td><td style="padding:3px 0;font-weight:600">'+escHtml(market)+'</td></tr>'
+    + '<tr><td style="padding:3px 14px 3px 0;color:#6b7280">Campaign</td><td style="padding:3px 0;font-weight:600">'+escHtml(ship.campaign||'')+'</td></tr>'
+    + '<tr><td style="padding:3px 14px 3px 0;color:#6b7280">'+(qtyLabel||'Quantity')+'</td><td style="padding:3px 0;font-weight:600">'+ship.deviceCount+' Devices</td></tr>'
+    + '<tr><td style="padding:3px 14px 3px 0;color:#6b7280;vertical-align:top">Cartons</td><td style="padding:3px 0;font-weight:600">'+(ship.cartons||[]).map(escHtml).join(', ')+'</td></tr>'
+    + '</tbody></table>';
+}
+// First email — sent when the shipment is uploaded (in transit).
+function _shipShippedEmail(ship, manager){
+  var market = _shipCleanMarket(ship.market);
+  var camp = ship.campaign || 'This';
+  var inner = '<p style="margin:0 0 12px">Hello '+(manager?escHtml(manager.name):'')+',</p>'
+    + '<p style="margin:0 0 14px">Your inventory order has been shipped and is currently <strong>in transit</strong> to support production in the <strong>'+escHtml(market)+'</strong> market.</p>'
+    + '<div style="font-weight:bold;color:#003594;margin:16px 0 4px">Shipment Details</div>'
+    + _shipDetailsList(ship, 'Quantity Shipped')
+    + '<div style="font-weight:bold;color:#003594;margin:18px 0 6px">Important Reminders</div>'
+    + '<ul style="margin:0;padding-left:18px">'
+    + '<li>Inventory must be picked up within <strong>two (2) business days</strong> of arrival notification.</li>'
+    + '<li>You will receive a second email from the office confirming the inventory has arrived and is ready for pickup.</li>'
+    + '<li>'+escHtml(camp)+' inventory begins aging from the moment it is shipped, making timely pickup and activation critical.</li>'
+    + '<li>Delays in pickup create unnecessary production loss and may result in inventory expiration and company charges.</li>'
+    + '<li>Managers are expected to actively manage inventory, production, and distribution to ensure devices are deployed immediately.</li>'
+    + '<li>Please be prepared to begin activating inventory as soon as it is received.</li>'
+    + '</ul>';
+  return { subject:'Inventory Shipped – Action Required ('+market+')', html:_shipEmailWrap('Inventory Shipped – Action Required', inner) };
+}
+// Second email — sent when the office marks the shipment arrived.
+function _shipArrivedEmail(ship, manager){
+  var market = _shipCleanMarket(ship.market);
+  var inner = '<p style="margin:0 0 12px">Hello '+(manager?escHtml(manager.name):'')+',</p>'
+    + '<p style="margin:0 0 14px">The inventory for the <strong>'+escHtml(market)+'</strong> market has <strong>arrived and is ready for pickup</strong> at the store location. Please arrange to pick it up right away.</p>'
+    + '<div style="background:#fff4e5;border:1px solid #f0b27a;border-radius:8px;padding:12px 16px;margin:14px 0">'
+    + '<div style="font-weight:bold;color:#b45309;margin-bottom:4px">⏱ The Activation Clock Has Started</div>'
+    + '<p style="margin:0">From this notification, these devices are aging toward their expiration dates. Pick them up and begin activating <strong>immediately</strong>. Any device not activated before it expires is charged back to the company as a loss — timely activation is how we prevent that.</p></div>'
+    + '<div style="background:#eaf2ff;border:1px solid #98bdf0;border-radius:8px;padding:12px 16px;margin:14px 0">'
+    + '<div style="font-weight:bold;color:#003594;margin-bottom:4px">📦 First In, First Out (FIFO)</div>'
+    + '<p style="margin:0">Always activate your <strong>oldest inventory first</strong>. Work through devices in the order they were received so nothing sits on the shelf and expires. New arrivals go to the back of the line.</p></div>'
+    + '<div style="font-weight:bold;color:#003594;margin:16px 0 4px">Shipment Details</div>'
+    + _shipDetailsList(ship, 'Quantity Ready')
+    + '<div style="font-weight:bold;color:#003594;margin:18px 0 6px">What To Do Now</div>'
+    + '<ul style="margin:0;padding-left:18px">'
+    + '<li>Pick up the inventory within <strong>two (2) business days</strong> of this notification.</li>'
+    + '<li>In the back office, open the <strong>Inventory Pickup Form</strong> and enter the carton numbers (or IMEIs) you actually received.</li>'
+    + '<li>Sign the receipt-invoice — one signature confirms exactly what you picked up and your responsibility for those devices. Anything missing is noted automatically.</li>'
+    + '<li>Begin activating immediately, oldest first (FIFO), to keep every device ahead of its expiration.</li>'
+    + '</ul>';
+  return { subject:'Inventory Arrived – Ready for Pickup ('+market+')', html:_shipEmailWrap('Inventory Arrived – Ready for Pickup', inner, '#15803d') };
+}
+
+// Primary recipient (the manager receiving the inventory) — the email "To".
+function _shipToRecipient(manager){
+  if(manager && manager.email && /@/.test(manager.email)) return [{ email:manager.email, name:manager.name }];
+  return [];
+}
+// Upline only (CM / IBO / MM / TL above the recipient) — the email "CC".
+function _shipCcRecipients(manager){
+  var out = [], seen = {};
+  if(manager) seen[manager.id] = 1; // never CC the recipient themselves
+  var chain = (typeof reportingChainFor==='function') ? reportingChainFor(manager) : {};
+  ['teamLeaderId','marketManagerId','campaignManagerId','iboId'].forEach(function(k){
+    var id = chain[k];
+    if(id && !seen[id]){
+      seen[id] = 1;
+      var a = (DB.agents||[]).find(function(x){ return x.id===id; });
+      if(a && a.email && /@/.test(a.email)) out.push({ email:a.email, name:a.name });
+    }
+  });
+  return out;
 }
 
 function _devHiddenUntilSigned(d){
