@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.13.1900';
+var BUILD_VERSION = '2026.06.13.2030';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -47649,6 +47649,7 @@ function panelAgentsPending(){
   h += '<button onclick="_uiRefreshApplicantsPanel()" id="ap-refresh-btn" style="background:white;border:1.5px solid var(--blue);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">🔄 Refresh</button>';
   h += '<button onclick="_uiPromoteAllExistingApplicants()" style="background:white;border:1.5px solid #0891b2;color:#0891b2;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700" title="Create pending agent records for all existing applicants who don\'t have one yet — so their codes match payroll while waiting for approval">📥 Place All in Roster</button>';
   h += '<button onclick="_uiRepairPendingFlags()" id="ap-repair-btn" style="background:white;border:1.5px solid #b45309;color:#b45309;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700" title="Re-save every pending agent to the cloud. Use this if a pending agent shows on one device but not another, or is missing under Manage → Agents.">🔧 Repair Pending</button>';
+  h += '<button onclick="_uiShowLinkRepairPreview()" id="ap-linkrepair-btn" style="background:white;border:1.5px solid #7c3aed;color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700" title="Find agents missing their manager links and set them (CM/MM/TL) so inventory and payroll roll up. Shows a preview before writing anything.">🔗 Repair Links</button>';
   h += '<button onclick="_uiShowAddPendingAgentModal()" style="background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;font-weight:700">📥 Add Pending Agent</button>';
   h += '<button onclick="_openInviteApplicantModal()" class="btn-fire" style="padding:11px 22px;font-size:.78rem">📧 Invite New Applicant</button>';
   h += '</div>';
@@ -48685,11 +48686,169 @@ async function _uiRepairPendingFlags(){
   try{ if(typeof gotoPanel === 'function') gotoPanel('agents-pending'); }catch(e){}
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  OPTION 2 (Calvin 2026-06-13): AGENT → MANAGER LINK REPAIR + PREVENTION
+//  The reporting-chain engine (agentIdsInMyOrgEffective / reportingChainFor)
+//  walks campaignManagerId → marketManagerId → teamLeaderId. When those link
+//  fields are blank, a manager's org rollup (inventory, payroll, permissions)
+//  silently misses their downline. This shared inference engine:
+//   - REPAIR: fills missing links on existing agents (with a preview first).
+//   - PREVENTION: fills any links left blank when an agent is placed.
+//  Inference is layered + conservative + transparent (each proposal carries a
+//  reason). Payroll-critical links are NEVER guessed when ambiguous — those are
+//  flagged for manual assignment instead.
+// ════════════════════════════════════════════════════════════════════════
+function _inferAgentLinks(agent){
+  var result = { teamLeaderId:null, marketManagerId:null, campaignManagerId:null, sources:{} };
+  if(!agent) return result;
+  var role = agent.role;
+  if(role === 'Campaign Manager' || role === 'IBO' || role === 'owner') return result; // top of tree
+
+  function propose(field, val, reason){
+    if(val == null || val === agent.id) return;
+    if(result[field]) return;     // already proposed this pass
+    if(agent[field]) return;      // explicit value already set — never overwrite
+    result[field] = val; result.sources[field] = reason;
+  }
+
+  // ── Layer 1: team-based (the existing, trusted chain resolver) ──
+  var chain = (typeof reportingChainFor === 'function') ? reportingChainFor(agent) : {};
+  propose('teamLeaderId',      chain.teamLeaderId,      'team');
+  propose('marketManagerId',   chain.marketManagerId,   'team');
+  propose('campaignManagerId', chain.campaignManagerId, 'team');
+
+  // ── Layer 2: market-based (agent's market → owning MM → that MM's CM) ──
+  var aMarkets = (typeof mmMarkets === 'function') ? mmMarkets(agent) : [];
+  if(!aMarkets.length && agent.market) aMarkets = [agent.market];
+  if(aMarkets.length && (role==='Field Agent' || role==='Team Leader' || isSalesRole(agent))){
+    if(!agent.marketManagerId && !result.marketManagerId){
+      var mmOwner = (DB.agents||[]).find(function(a){
+        return a && a.active && a.role==='Market Manager' && a.id!==agent.id
+          && ((typeof mmMarkets==='function'?mmMarkets(a):[])||[]).some(function(m){ return aMarkets.indexOf(m)>=0; });
+      });
+      if(mmOwner){
+        propose('marketManagerId', mmOwner.id, 'market \''+aMarkets[0]+'\'');
+        if(mmOwner.campaignManagerId) propose('campaignManagerId', mmOwner.campaignManagerId, 'via MM '+mmOwner.name);
+      }
+    }
+  }
+
+  // ── Layer 3: lone-CM fallback for campaignManagerId (only when unambiguous) ──
+  if(!agent.campaignManagerId && !result.campaignManagerId
+     && (role==='Field Agent' || role==='Team Leader' || role==='Market Manager' || isSalesRole(agent))){
+    var cms = (DB.agents||[]).filter(function(a){ return a && a.active && a.role==='Campaign Manager'; });
+    if(cms.length === 1) propose('campaignManagerId', cms[0].id, 'only active CM');
+    // 2+ CMs → ambiguous → leave blank for manual (never guess payroll links)
+  }
+  return result;
+}
+
+// Prevention hook: fill any STILL-MISSING links on an agent after placement.
+// Returns the number of fields filled. Used by the placement/creation paths.
+function _autofillAgentLinks(agent){
+  if(!agent) return 0;
+  var inf = _inferAgentLinks(agent);
+  var n = 0;
+  ['teamLeaderId','marketManagerId','campaignManagerId'].forEach(function(f){
+    if(!agent[f] && inf[f]){ agent[f] = inf[f]; n++; }
+  });
+  return n;
+}
+
+// Build the repair preview rows for every agent who is missing a link we can fill.
+function _buildLinkRepairRows(){
+  var rows = [];
+  (DB.agents||[]).forEach(function(a){
+    if(!a || !a.active) return;
+    if(a.role==='Campaign Manager' || a.role==='IBO' || a.role==='owner') return;
+    if(a.role==='admin' || a.role==='HR' || a.role==='Inventory' || a.role==='Payroll' || a.role==='Onboarding') return;
+    var needsCM = (!a.campaignManagerId);
+    var needsMM = (a.role==='Field Agent' || a.role==='Team Leader' || isSalesRole(a)) && !a.marketManagerId;
+    var needsTL = (a.role==='Field Agent' || isSalesRole(a)) && !a.teamLeaderId && !a.marketManagerId;
+    if(!needsCM && !needsMM && !needsTL) return; // fully linked already
+    var inf = _inferAgentLinks(a);
+    var willFill = (inf.teamLeaderId||inf.marketManagerId||inf.campaignManagerId);
+    rows.push({ agent:a, inf:inf, willFill: !!willFill });
+  });
+  return rows;
+}
+
+function _nameOf(id){ var a=(DB.agents||[]).find(function(x){return x.id===id;}); return a?a.name:('#'+id); }
+
+function _uiShowLinkRepairPreview(){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var rows = _buildLinkRepairRows();
+  var fillable = rows.filter(function(r){return r.willFill;});
+  var manual   = rows.filter(function(r){return !r.willFill;});
+  var bg = document.createElement('div');
+  bg.id = 'link-repair-modal';
+  bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100200;display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto';
+  var h = '<div style="background:white;max-width:860px;width:100%;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.3);font-family:Barlow Condensed,sans-serif">';
+  h += '<div style="padding:20px 24px;border-bottom:1px solid #e5e7eb"><div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;letter-spacing:1px;color:#1f2937">🔗 Repair Agent → Manager Links</div>';
+  h += '<div style="font-size:.82rem;color:#6b7280;margin-top:4px">Preview below. Nothing is written until you click Apply. Only blank links are filled — existing links are never changed.</div></div>';
+  if(!rows.length){
+    h += '<div style="padding:30px;text-align:center;color:#059669;font-size:1rem">✓ Every active agent already has their manager links set. Nothing to repair.</div>';
+  } else {
+    if(fillable.length){
+      h += '<div style="padding:14px 24px 4px;font-size:.9rem;font-weight:700;color:#1f2937">Will set links for '+fillable.length+' agent'+(fillable.length===1?'':'s')+':</div>';
+      h += '<div style="padding:0 24px 8px;overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:.78rem">';
+      h += '<tr style="text-align:left;color:#6b7280;border-bottom:1px solid #e5e7eb"><th style="padding:6px 8px">Agent</th><th style="padding:6px 8px">Role</th><th style="padding:6px 8px">Will set</th></tr>';
+      fillable.forEach(function(r){
+        var parts = [];
+        if(r.inf.campaignManagerId) parts.push('CM → '+_nameOf(r.inf.campaignManagerId)+' <span style="color:#9ca3af">('+r.inf.sources.campaignManagerId+')</span>');
+        if(r.inf.marketManagerId)   parts.push('MM → '+_nameOf(r.inf.marketManagerId)+' <span style="color:#9ca3af">('+r.inf.sources.marketManagerId+')</span>');
+        if(r.inf.teamLeaderId)      parts.push('TL → '+_nameOf(r.inf.teamLeaderId)+' <span style="color:#9ca3af">('+r.inf.sources.teamLeaderId+')</span>');
+        h += '<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:6px 8px;font-weight:600">'+r.agent.name+'</td><td style="padding:6px 8px;color:#6b7280">'+(r.agent.role||'')+'</td><td style="padding:6px 8px">'+parts.join('<br>')+'</td></tr>';
+      });
+      h += '</table></div>';
+    }
+    if(manual.length){
+      h += '<div style="padding:14px 24px 4px;font-size:.9rem;font-weight:700;color:#b45309">⚠️ '+manual.length+' agent'+(manual.length===1?'':'s')+' can\'t be auto-inferred — assign manually via Place / Edit Placement:</div>';
+      h += '<div style="padding:0 24px 8px;font-size:.78rem;color:#6b7280">'+manual.map(function(r){return r.agent.name+' ('+(r.agent.role||'')+')';}).join(', ')+'</div>';
+    }
+  }
+  h += '<div style="padding:16px 24px;border-top:1px solid #e5e7eb;display:flex;gap:10px;justify-content:flex-end">';
+  h += '<button onclick="document.getElementById(\'link-repair-modal\').remove()" style="background:#f3f4f6;border:1px solid #d1d5db;color:#374151;padding:10px 18px;border-radius:6px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1px;text-transform:uppercase">Cancel</button>';
+  if(fillable.length){
+    h += '<button onclick="_applyLinkRepair()" style="background:#7c3aed;border:none;color:white;padding:10px 22px;border-radius:6px;cursor:pointer;font-weight:700;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:1px;text-transform:uppercase">Apply — set '+fillable.length+' agent'+(fillable.length===1?'':'s')+'</button>';
+  }
+  h += '</div></div>';
+  bg.innerHTML = h;
+  document.body.appendChild(bg);
+}
+
+async function _applyLinkRepair(){
+  var u = DB.current;
+  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
+  var rows = _buildLinkRepairRows().filter(function(r){return r.willFill;});
+  if(!rows.length){ alert('Nothing to apply.'); return; }
+  var modal = document.getElementById('link-repair-modal'); if(modal) modal.remove();
+  var ok=0, fail=0, failNames=[];
+  for(var i=0;i<rows.length;i++){
+    var a = rows[i].agent;
+    var filled = _autofillAgentLinks(a); // writes only blank fields
+    if(!filled) continue;
+    try{
+      var r = await saveAgentToSupabase(a);
+      if(r && r.ok) ok++; else { fail++; failNames.push(a.name); }
+    }catch(e){ fail++; failNames.push(a.name); }
+  }
+  try{ saveToStorage(); }catch(e){}
+  if(fail===0){ alert('✓ Linked '+ok+' agent'+(ok===1?'':'s')+' to their managers. Their inventory and payroll now roll up correctly.\n\nRun the preview again — newly-linked managers may now let more agents auto-infer.'); }
+  else { alert('Linked '+ok+', but '+fail+' failed to save: '+failNames.join(', ')+'. Try again in a moment.'); }
+  if(typeof gotoPanel === 'function') gotoPanel('agents-pending');
+}
+
 if(typeof window !== 'undefined'){
   window._uiShowAddPendingAgentModal = _uiShowAddPendingAgentModal;
   window._submitPendingAgent = _submitPendingAgent;
   window._createPendingAgentRecord = _createPendingAgentRecord;
   window._uiRepairPendingFlags = _uiRepairPendingFlags;
+  window._inferAgentLinks = _inferAgentLinks;
+  window._autofillAgentLinks = _autofillAgentLinks;
+  window._uiShowLinkRepairPreview = _uiShowLinkRepairPreview;
+  window._applyLinkRepair = _applyLinkRepair;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -48977,6 +49136,14 @@ function _submitPlacementModal(){
     if(codeAW) app.codes['Assurance']  = codeAW; else delete app.codes['Assurance'];
     try{
       var newAgent = _promoteApplicantToPendingAgent(targetId);
+      // Calvin 2026-06-13 (Option 2): fill any manager links left blank, then
+      // persist so the new agent rolls up to their managers immediately.
+      if(newAgent && typeof _autofillAgentLinks === 'function'){
+        try{
+          var _filled = _autofillAgentLinks(newAgent);
+          if(_filled && typeof saveAgentToSupabase === 'function'){ saveAgentToSupabase(newAgent); }
+        }catch(e){}
+      }
       if(typeof saveApplicants === 'function') saveApplicants();
       document.getElementById('placement-modal').remove();
       alert('✓ '+app.name+' placed in roster as pending agent #'+newAgent.id+'.');
@@ -49005,6 +49172,9 @@ function _submitPlacementModal(){
       linkedApp.codes             = Object.assign({}, agent.agentCodes);
       if(typeof saveApplicants === 'function') saveApplicants();
     }
+    // Calvin 2026-06-13 (Option 2): auto-fill any manager links left blank in
+    // the placement dropdowns, so no agent is ever saved unlinked.
+    if(typeof _autofillAgentLinks === 'function'){ try{ _autofillAgentLinks(agent); }catch(e){} }
     // ── Calvin 2026-06-11 v0730 PERSISTENCE FIX (edit path) ──
     // Save to localStorage AND Supabase so other users see the update.
     try{ saveToStorage(); }catch(e){ console.warn('[placementEdit] saveToStorage failed:', e); }
