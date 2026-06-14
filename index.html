@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.14.2400';
+var BUILD_VERSION = '2026.06.14.2500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -17199,6 +17199,9 @@ function panelShipments(){
       } else if(s.arrivedAt){
         h += '<span style="color:var(--muted);font-size:.72rem">Arrived '+new Date(s.arrivedAt).toLocaleDateString()+'</span>';
       }
+      if(s.pickupInvoiceHtml){
+        h += ' <button onclick="_shipViewReceipt(\''+s.id+'\')" title="View the signed pickup invoice" style="background:white;border:1px solid #003594;color:#003594;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;padding:6px 10px;border-radius:5px;cursor:pointer;margin-left:6px">📄 View Invoice</button>';
+      }
       h += ' <button onclick="_shipDelete(\''+s.id+'\')" title="Delete this shipment (testing)" style="background:white;border:1px solid #cc0000;color:#cc0000;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;padding:6px 10px;border-radius:5px;cursor:pointer;margin-left:6px">🗑 Delete</button>';
       h += '</td></tr>';
     });
@@ -17316,12 +17319,10 @@ function panelShipmentPickup(){
       h += '</div></div>';
     });
     h += '<div id="ship-pickup-summary-'+s.id+'" style="background:var(--offwhite);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:12px 0;font-family:Barlow Condensed,sans-serif;font-size:.86rem">Select cartons or IMEIs to build your receipt.</div>';
-    h += '<div style="background:white;border:1.5px solid #15803d;border-radius:8px;padding:14px 16px">';
-    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--brown);line-height:1.5;margin-bottom:10px"><strong>Receipt &amp; Responsibility:</strong> By typing my name and signing below, I confirm I have <strong>physically received</strong> the devices I checked above, and I accept <strong>full responsibility</strong> for them. I understand any device unaccounted for may be deducted from my commission at the listed cost, and that any device not checked is recorded as <strong>missing</strong>. This single signature serves as both my receipt confirmation and my acceptance of responsibility.</div>';
-    h += '<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">';
-    h += '<input id="ship-pickup-sig-'+s.id+'" type="text" placeholder="Type your full name to sign" style="flex:1;min-width:200px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.9rem">';
-    h += '<button onclick="_shipPickupSubmit(\''+s.id+'\')" class="btn-fire" style="font-size:.78rem;padding:11px 20px">✍ Sign &amp; Accept Inventory →</button>';
-    h += '</div></div>';
+    h += '<div style="background:white;border:1.5px solid #15803d;border-radius:8px;padding:14px 16px;text-align:center">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.5;margin-bottom:10px">Review the full itemized invoice — every device, cost, and expiration date — then sign it. Nothing is committed until you execute the invoice.</div>';
+    h += '<button onclick="_shipShowInvoiceModal(\''+s.id+'\')" class="btn-fire" style="font-size:.82rem;padding:12px 24px">📄 Review &amp; Sign Invoice →</button>';
+    h += '</div>';
     h += '</div></div>';
   });
   return h;
@@ -17355,20 +17356,187 @@ function _shipPickupRecompute(shipmentId){
   }
 }
 function _shipPickupSubmit(shipmentId){
+  // Routed through the invoice: gather selection, then open the invoice to review & sign.
+  _shipShowInvoiceModal(shipmentId);
+}
+var _shipPendingInvoice = {};
+function _shipShowInvoiceModal(shipmentId){
+  if(typeof document==='undefined') return;
   var checked = document.querySelectorAll('.ship-imei[data-shipment="'+shipmentId+'"]:checked');
   var imeis = Array.prototype.map.call(checked, function(cb){ return cb.getAttribute('data-imei'); });
-  var sig = (document.getElementById('ship-pickup-sig-'+shipmentId)||{}).value || '';
-  if(!sig.trim()){ alert('Type your full name to sign the receipt.'); return; }
-  if(!imeis.length){ alert('Select the cartons or IMEIs you picked up.'); return; }
-  var v = shipPickupVerify(shipmentId, imeis);
-  var msg = 'You are signing for '+v.receivedCount+' device(s) — total $'+v.total.toFixed(2)+'.';
-  if(v.missingCount) msg += '\n\n'+v.missingCount+' device(s) were NOT checked and will be flagged MISSING and noted on your receipt.';
-  msg += '\n\nBy signing you confirm physical receipt and accept full responsibility. Continue?';
+  if(!imeis.length){ alert('Select the cartons or IMEIs you picked up before reviewing the invoice.'); return; }
+  var ship=(SHIPMENTS||[]).find(function(s){ return s.id===shipmentId; });
+  var manager=(DB.agents||[]).find(function(a){ return a.id===(ship&&ship.managerId); }) || DB.current;
+  var v=shipPickupVerify(shipmentId, imeis);
+  var inv=_shipBuildInvoice(ship, v.received, v.missing, manager);
+  _shipPendingInvoice[shipmentId]={ imeis:imeis, invoice:inv };
+  var ex=document.getElementById('ship-inv-modal-bg'); if(ex) ex.remove();
+  var bg=document.createElement('div');
+  bg.id='ship-inv-modal-bg';
+  bg.style.cssText='position:fixed;inset:0;background:rgba(15,23,42,.7);z-index:100150;display:flex;align-items:flex-start;justify-content:center;padding:18px;overflow-y:auto';
+  var wrap=document.createElement('div');
+  wrap.style.cssText='background:white;border-radius:12px;max-width:820px;width:100%;box-shadow:0 18px 56px rgba(0,0,0,.45);margin:auto;overflow:hidden';
+  var topbar='<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 18px;background:#003594;color:white">'
+    +'<div style="font-family:Bebas Neue,sans-serif;letter-spacing:1px">Review &amp; Sign Your Pickup Invoice</div>'
+    +'<button onclick="var b=document.getElementById(\'ship-inv-modal-bg\');if(b)b.remove()" style="background:rgba(255,255,255,.18);border:none;color:white;border-radius:6px;padding:6px 12px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.78rem">← Back to selection</button></div>';
+  wrap.innerHTML=topbar+'<div id="ship-inv-doc" style="max-height:calc(92vh - 52px);overflow-y:auto">'+_shipInvoiceHtml(inv, null, shipmentId)+'</div>';
+  bg.appendChild(wrap); document.body.appendChild(bg);
+}
+function _shipSignInvoice(shipmentId){
+  var pend=_shipPendingInvoice[shipmentId];
+  if(!pend){ alert('Please re-open the invoice and try again.'); return; }
+  var sig=(document.getElementById('ship-inv-sig-'+shipmentId)||{}).value||'';
+  if(!sig.trim()){ alert('Type your full legal name to sign the invoice.'); return; }
+  var v=shipPickupVerify(shipmentId, pend.imeis);
+  var msg='You are executing this invoice for '+v.receivedCount+' device(s) — total $'+v.total.toFixed(2)+'.';
+  if(v.missingCount) msg+='\n\n'+v.missingCount+' device(s) will be recorded MISSING on this receipt.';
+  msg+='\n\nThis is a binding signature. Continue?';
   if(!confirm(msg)) return;
-  var res = shipPickupCommit(shipmentId, imeis, sig.trim());
+  var res=shipPickupCommit(shipmentId, pend.imeis, sig.trim(), pend.invoice);
   if(!res.ok){ alert('Error: '+res.error); return; }
-  alert('✓ Receipt signed. '+res.received+' device(s) are now in your inventory and scoreboard'+(res.missing?(' · '+res.missing+' flagged missing'):'')+'.');
-  if(typeof gotoPanel==='function') gotoPanel('shipment-pickup');
+  var doc=document.getElementById('ship-inv-doc');
+  if(doc){
+    doc.innerHTML=_shipInvoiceHtml(pend.invoice, {name:sig.trim(), at:new Date().toISOString()}, shipmentId)
+      +'<div style="text-align:center;padding:14px"><button onclick="_shipPrintInvoice()" style="background:#003594;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.8rem;letter-spacing:1px;padding:10px 20px;border-radius:6px;cursor:pointer">🖨 Print / Save PDF</button> <button onclick="var b=document.getElementById(\'ship-inv-modal-bg\');if(b)b.remove();if(typeof gotoPanel===\'function\')gotoPanel(\'shipment-pickup\')" style="background:#15803d;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.8rem;letter-spacing:1px;padding:10px 20px;border-radius:6px;cursor:pointer;margin-left:8px">✓ Done</button></div>';
+  }
+  delete _shipPendingInvoice[shipmentId];
+}
+function _shipPrintInvoice(){
+  var doc=document.getElementById('ship-inv-doc'); if(!doc) return;
+  var w=window.open('','_blank'); if(!w){ alert('Allow pop-ups to print or save the invoice.'); return; }
+  w.document.write('<html><head><title>WMAMinc Pickup Invoice</title></head><body style="margin:0">'+doc.innerHTML+'</body></html>');
+  w.document.close(); w.focus(); setTimeout(function(){ try{ w.print(); }catch(e){} },350);
+}
+if(typeof window!=='undefined'){ window._shipShowInvoiceModal=_shipShowInvoiceModal; window._shipSignInvoice=_shipSignInvoice; window._shipPrintInvoice=_shipPrintInvoice; }
+function _shipViewReceipt(shipmentId){
+  var ship=(SHIPMENTS||[]).find(function(s){ return s.id===shipmentId; });
+  if(!ship || !ship.pickupInvoiceHtml){ alert('No signed invoice is on file for this shipment yet.'); return; }
+  var ex=document.getElementById('ship-inv-modal-bg'); if(ex) ex.remove();
+  var bg=document.createElement('div'); bg.id='ship-inv-modal-bg';
+  bg.style.cssText='position:fixed;inset:0;background:rgba(15,23,42,.7);z-index:100150;display:flex;align-items:flex-start;justify-content:center;padding:18px;overflow-y:auto';
+  var wrap=document.createElement('div');
+  wrap.style.cssText='background:white;border-radius:12px;max-width:820px;width:100%;box-shadow:0 18px 56px rgba(0,0,0,.45);margin:auto;overflow:hidden';
+  wrap.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 18px;background:#003594;color:white"><div style="font-family:Bebas Neue,sans-serif;letter-spacing:1px">Signed Pickup Invoice · '+escHtml(ship.pickupReceiptNo||'')+'</div><button onclick="var b=document.getElementById(\'ship-inv-modal-bg\');if(b)b.remove()" style="background:rgba(255,255,255,.18);border:none;color:white;border-radius:6px;padding:6px 12px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.78rem">Close</button></div>'
+    +'<div id="ship-inv-doc" style="max-height:calc(92vh - 52px);overflow-y:auto">'+ship.pickupInvoiceHtml+'<div style="text-align:center;padding:14px"><button onclick="_shipPrintInvoice()" style="background:#003594;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.8rem;letter-spacing:1px;padding:10px 20px;border-radius:6px;cursor:pointer">🖨 Print / Save PDF</button></div></div>';
+  bg.appendChild(wrap); document.body.appendChild(bg);
+}
+if(typeof window!=='undefined'){ window._shipViewReceipt=_shipViewReceipt; }
+
+// ══════════════════════════════════════════════════════════════════════
+//  PICKUP INVOICE (Calvin 2026-06-14): court-room-ready signed instrument.
+//  The manager reviews a fully itemized invoice — every device, its type,
+//  unit cost, activation deadline (expiration), grouped totals, grand total,
+//  and binding terms — and signs THAT document. The signed invoice is stored
+//  on the shipment and stamped onto each device for the permanent record.
+// ══════════════════════════════════════════════════════════════════════
+function _shipFmtDate(iso){
+  if(!iso) return '—';
+  var m=String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(!m) return iso;
+  var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][parseInt(m[2],10)-1]||m[2];
+  return mo+' '+parseInt(m[3],10)+', '+m[1];
+}
+function _shipFmtDateTime(iso){
+  if(!iso) return '—';
+  var d=new Date(iso); if(isNaN(d.getTime())) return iso;
+  return _shipFmtDate(iso)+' at '+d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+}
+function _shipReceiptNo(ship){
+  return 'WMAM-PU-'+String(ship.id).replace(/[^A-Za-z0-9]/g,'').toUpperCase()+'-'+new Date().toISOString().slice(0,10).replace(/-/g,'')+'-'+String(Date.now()).slice(-4);
+}
+function _shipBuildInvoice(ship, received, missing, manager){
+  var items=received.map(function(d,i){
+    return { n:i+1, imei:d.imei, sim:(d.sim?(d.simRaw||d.sim):'') , model:d.model||'', devType:d.devType||'',
+             isSim:!!d.sim, cost:parseFloat(d.devCost)||0, carton:d.carton, expiry:d.dueDate||'' };
+  });
+  var groups={};
+  received.forEach(function(d){ var k=d.devType||'Device'; groups[k]=groups[k]||{count:0,total:0,unit:parseFloat(d.devCost)||0}; groups[k].count++; groups[k].total+=parseFloat(d.devCost)||0; });
+  var total=items.reduce(function(s,it){ return s+it.cost; },0);
+  var exps=received.map(function(d){ return d.dueDate; }).filter(Boolean).sort();
+  var missItems=(missing||[]).map(function(d){ return {imei:d.imei,carton:d.carton,model:d.model||'',cost:parseFloat(d.devCost)||0}; });
+  return {
+    receiptNo:_shipReceiptNo(ship), issuedAt:new Date().toISOString(),
+    campaign:ship.campaign||'Gen Mobile', market:_shipCleanMarket(ship.market),
+    releasedBy:'WMAMinc. Corporate / Inventory Department',
+    receivedByName:manager.name, receivedByRole:manager.role||'', receivedById:manager.id,
+    items:items, groups:groups, total:total, count:items.length,
+    earliestExpiry:(exps[0]||''), missing:missItems,
+    missingTotal:missItems.reduce(function(s,d){ return s+d.cost; },0)
+  };
+}
+function _shipInvoiceHtml(inv, signed, shipmentId){
+  var rows=inv.items.map(function(it){
+    return '<tr>'
+      +'<td style="text-align:center;color:#6b7280">'+it.n+'</td>'
+      +'<td style="font-family:monospace">'+escHtml(it.imei)+'</td>'
+      +'<td>'+escHtml(it.model||'—')+'</td>'
+      +'<td>'+escHtml(it.devType||'—')+'</td>'
+      +'<td style="font-family:monospace;font-size:.86em;color:#6b7280">'+escHtml(it.sim||(it.isSim?'(SIM)':'—'))+'</td>'
+      +'<td style="text-align:right;font-weight:600">'+_shipFmtDate(it.expiry)+'</td>'
+      +'<td style="text-align:right;font-weight:600">$'+it.cost.toFixed(2)+'</td>'
+      +'</tr>';
+  }).join('');
+  var groupRows=Object.keys(inv.groups).map(function(k){ var g=inv.groups[k];
+    return '<tr><td>'+escHtml(k)+'</td><td style="text-align:center">'+g.count+'</td><td style="text-align:right">$'+g.unit.toFixed(2)+'</td><td style="text-align:right;font-weight:600">$'+g.total.toFixed(2)+'</td></tr>';
+  }).join('');
+  var missBlock='';
+  if(inv.missing && inv.missing.length){
+    var mrows=inv.missing.map(function(d){ return '<tr><td style="font-family:monospace">'+escHtml(d.imei)+'</td><td style="font-family:monospace">'+escHtml(d.carton)+'</td><td>'+escHtml(d.model)+'</td><td style="text-align:right">$'+d.cost.toFixed(2)+'</td></tr>'; }).join('');
+    missBlock='<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1px;color:#cc0000;margin:18px 0 6px">Devices NOT Received — Flagged Missing</div>'
+      +'<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#fdecea;text-align:left"><th style="padding:6px 8px">IMEI</th><th style="padding:6px 8px">Carton</th><th style="padding:6px 8px">Model</th><th style="padding:6px 8px;text-align:right">Unit Cost</th></tr></thead><tbody>'+mrows+'</tbody></table>'
+      +'<div style="font-size:12px;color:#7a0000;margin-top:6px;line-height:1.5">The recipient affirms the device(s) above were <strong>not physically received</strong> at pickup. They remain the releasing party\'s responsibility to reconcile and are recorded as missing as of the execution date below. Total value flagged missing: <strong>$'+inv.missingTotal.toFixed(2)+'</strong>.</div>';
+  }
+  var sigArea;
+  if(signed){
+    sigArea='<div style="display:flex;flex-wrap:wrap;gap:24px;align-items:flex-end">'
+      +'<div style="flex:1;min-width:220px"><div style="font-family:\'Brush Script MT\',\'Segoe Script\',cursive;font-size:1.9rem;color:#111;border-bottom:2px solid #111;padding-bottom:2px">'+escHtml(signed.name)+'</div><div style="font-size:11px;color:#6b7280;margin-top:4px;text-transform:uppercase;letter-spacing:1px">Electronically signed · '+escHtml(inv.receivedByRole||'')+'</div></div>'
+      +'<div style="font-size:12px;color:#374151;line-height:1.7"><div><strong>Printed name:</strong> '+escHtml(inv.receivedByName)+'</div><div><strong>Date &amp; time:</strong> '+_shipFmtDateTime(signed.at)+'</div><div><strong>Receipt No.:</strong> '+escHtml(inv.receiptNo)+'</div></div>'
+      +'</div>'
+      +'<div style="font-size:11px;color:#9ca3af;margin-top:10px">Electronically executed within the WMAMinc back-office. This record constitutes the recipient\'s binding signature.</div>';
+  } else {
+    sigArea='<div style="font-size:12px;color:#374151;margin-bottom:10px"><strong>Printed name:</strong> '+escHtml(inv.receivedByName)+' ('+escHtml(inv.receivedByRole||'')+') · <strong>Receipt No.:</strong> '+escHtml(inv.receiptNo)+'</div>'
+      +'<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">'
+      +'<input id="ship-inv-sig-'+shipmentId+'" type="text" placeholder="Type your full legal name to sign" style="flex:1;min-width:240px;padding:11px 14px;border:1.5px solid #111;border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:1rem">'
+      +'<button onclick="_shipSignInvoice(\''+shipmentId+'\')" class="btn-fire" style="font-size:.8rem;padding:12px 22px">✍ Sign &amp; Execute Invoice →</button>'
+      +'</div><div style="font-size:11px;color:#6b7280;margin-top:8px">By typing your name and executing, you confirm you have reviewed every line item, cost, and expiration above.</div>';
+  }
+  return ''
+    + '<div style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;background:white;padding:28px 30px;max-width:760px;margin:0 auto;line-height:1.5">'
+    + '<div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #003594;padding-bottom:14px;margin-bottom:16px;flex-wrap:wrap;gap:10px">'
+    +   '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.7rem;letter-spacing:1px;color:#003594">WMAMinc.</div><div style="font-size:12px;color:#6b7280">Inventory Operations</div></div>'
+    +   '<div style="text-align:right"><div style="font-family:Bebas Neue,sans-serif;font-size:1.25rem;letter-spacing:1px">Inventory Pickup Receipt &amp; Responsibility Invoice</div><div style="font-size:12px;color:#6b7280">Receipt No. <strong>'+escHtml(inv.receiptNo)+'</strong></div><div style="font-size:12px;color:#6b7280">Issued '+_shipFmtDate(inv.issuedAt)+'</div></div>'
+    + '</div>'
+    + '<table style="width:100%;font-size:13px;margin-bottom:16px"><tbody>'
+    +   '<tr><td style="padding:2px 10px 2px 0;color:#6b7280;width:130px">Campaign</td><td style="font-weight:600">'+escHtml(inv.campaign)+'</td><td style="padding:2px 10px 2px 0;color:#6b7280;width:130px">Released by</td><td>'+escHtml(inv.releasedBy)+'</td></tr>'
+    +   '<tr><td style="padding:2px 10px 2px 0;color:#6b7280">Market</td><td style="font-weight:600">'+escHtml(inv.market)+'</td><td style="padding:2px 10px 2px 0;color:#6b7280">Received by</td><td style="font-weight:600">'+escHtml(inv.receivedByName)+' ('+escHtml(inv.receivedByRole||'')+')</td></tr>'
+    + '</tbody></table>'
+    + '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1px;color:#003594;margin:6px 0 6px">Itemized Devices Received</div>'
+    + '<table style="width:100%;border-collapse:collapse;font-size:12.5px"><thead><tr style="background:#eef3fb;text-align:left">'
+    +   '<th style="padding:6px 8px;text-align:center">#</th><th style="padding:6px 8px">IMEI</th><th style="padding:6px 8px">Model</th><th style="padding:6px 8px">Type</th><th style="padding:6px 8px">SIM / ICCID</th><th style="padding:6px 8px;text-align:right">Activation Deadline</th><th style="padding:6px 8px;text-align:right">Unit Cost</th>'
+    + '</tr></thead><tbody>'+rows+'</tbody></table>'
+    + '<div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:16px">'
+    +   '<div style="flex:1;min-width:260px"><div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1px;color:#003594;margin-bottom:4px">Summary by Device Type</div>'
+    +     '<table style="width:100%;border-collapse:collapse;font-size:12.5px"><thead><tr style="text-align:left;color:#6b7280"><th style="padding:4px 8px">Type</th><th style="padding:4px 8px;text-align:center">Qty</th><th style="padding:4px 8px;text-align:right">Unit</th><th style="padding:4px 8px;text-align:right">Line Total</th></tr></thead><tbody>'+groupRows+'</tbody></table></div>'
+    +   '<div style="min-width:220px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:12px 16px;align-self:flex-start">'
+    +     '<div style="display:flex;justify-content:space-between;font-size:13px;padding:2px 0"><span style="color:#6b7280">Total devices</span><strong>'+inv.count+'</strong></div>'
+    +     '<div style="display:flex;justify-content:space-between;font-size:13px;padding:2px 0"><span style="color:#6b7280">SIMs</span><span>Included · $0.00</span></div>'
+    +     '<div style="display:flex;justify-content:space-between;font-size:13px;padding:2px 0;border-top:1px solid #e5e7eb;margin-top:6px;padding-top:8px"><span style="color:#6b7280">Earliest expiration</span><strong>'+_shipFmtDate(inv.earliestExpiry)+'</strong></div>'
+    +     '<div style="display:flex;justify-content:space-between;font-size:1.05rem;padding:6px 0 0;font-weight:800;color:#003594"><span>TOTAL INVOICE</span><span>$'+inv.total.toFixed(2)+'</span></div>'
+    +   '</div>'
+    + '</div>'
+    + missBlock
+    + '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1px;color:#003594;margin:18px 0 6px">Terms &amp; Acceptance of Responsibility</div>'
+    + '<ol style="font-size:12px;color:#374151;line-height:1.6;margin:0;padding-left:18px">'
+    +   '<li><strong>Receipt of goods.</strong> The recipient confirms physical receipt of each device listed in the Itemized Devices table above.</li>'
+    +   '<li><strong>Acceptance of responsibility.</strong> The recipient accepts full financial responsibility for every device received. Any device not activated, sold, returned, or otherwise accounted for on or before its stated Activation Deadline may be charged to the recipient and/or deducted from the recipient\'s commissions at the Unit Cost listed above.</li>'
+    +   '<li><strong>Activation deadline &amp; FIFO.</strong> The activation clock begins at the execution date/time of this receipt. Devices must be activated First In, First Out (oldest inventory first). The binding deadline for the earliest device in this receipt is <strong>'+_shipFmtDate(inv.earliestExpiry)+'</strong>.</li>'
+    +   '<li><strong>Missing devices.</strong> Any device listed under "Devices NOT Received" is affirmed by the recipient as not physically received and remains the releasing party\'s responsibility to reconcile.</li>'
+    +   '<li><strong>Single-signature instrument.</strong> The recipient\'s signature below serves as BOTH confirmation of receipt AND acceptance of the responsibilities and charges described herein. No separate acceptance is required.</li>'
+    +   '<li><strong>Review acknowledgment.</strong> The recipient acknowledges they reviewed the full itemized list, unit costs, and expiration dates above prior to signing.</li>'
+    + '</ol>'
+    + '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1px;color:#003594;margin:20px 0 8px">Recipient Signature</div>'
+    + sigArea
+    + '</div>';
 }
 
 // ── Stage 3: blocking lock-screen alert for Makenzie / Inventory / Owner ──
@@ -17564,7 +17732,7 @@ function _shipToGmDevice(d, manager, nowIso, signature){
 }
 
 // Commit the pickup. One signature = receipt + responsibility.
-function shipPickupCommit(shipmentId, receivedImeis, signature){
+function shipPickupCommit(shipmentId, receivedImeis, signature, invoiceObj){
   var ship = (SHIPMENTS||[]).find(function(s){ return s.id===shipmentId; });
   if(!ship) return { ok:false, error:'Shipment not found' };
   var manager = (DB.agents||[]).find(function(a){ return a.id===ship.managerId; });
@@ -17573,10 +17741,11 @@ function shipPickupCommit(shipmentId, receivedImeis, signature){
   var v = shipPickupVerify(shipmentId, receivedImeis);
   if(!v.receivedCount) return { ok:false, error:'Select at least one carton or IMEI you picked up.' };
   var nowIso = new Date().toISOString();
+  var receiptNo = (invoiceObj && invoiceObj.receiptNo) || '';
 
   // Move received devices into live inventory; remove from the shipped pool.
   var receivedSet = {};
-  v.received.forEach(function(d){ receivedSet[d.id] = true; GM_INVENTORY.push(_shipToGmDevice(d, manager, nowIso, signature)); });
+  v.received.forEach(function(d){ receivedSet[d.id] = true; var gd=_shipToGmDevice(d, manager, nowIso, signature); gd.pickupReceiptNo=receiptNo; GM_INVENTORY.push(gd); });
   v.missing.forEach(function(d){ d.status = 'missing'; });
   SHIPPED_INVENTORY = SHIPPED_INVENTORY.filter(function(d){ return !receivedSet[d.id]; });
 
@@ -17588,6 +17757,15 @@ function shipPickupCommit(shipmentId, receivedImeis, signature){
   ship.pickupMissingCount  = v.missingCount;
   ship.pickupTotal         = v.total;
   ship.missingDevices      = v.missing.map(function(d){ return { imei:d.imei, carton:d.carton, devCost:d.devCost, model:d.model }; });
+
+  // Store the executed invoice as the permanent record.
+  if(invoiceObj){
+    invoiceObj.signedBy = String(signature).trim();
+    invoiceObj.signedAt = nowIso;
+    ship.pickupInvoice = invoiceObj;
+    ship.pickupReceiptNo = invoiceObj.receiptNo;
+    try{ ship.pickupInvoiceHtml = _shipInvoiceHtml(invoiceObj, {name:invoiceObj.signedBy, at:nowIso}, ship.id); }catch(e){}
+  }
 
   // ── Stage 3: a short pickup raises a missing-inventory alert to Makenzie. ──
   if(v.missingCount){
