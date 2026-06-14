@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.14.1500';
+var BUILD_VERSION = '2026.06.14.1730';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -12274,6 +12274,30 @@ var PICKUP_NEXT_ID = 1;
 var DISCREPANCY_NEXT_ID = 1;
 
 // ══════════════════════════════════════════════════════════════
+//  SHIPPED INVENTORY (Calvin 2026-06-14) — corp→store→manager pickup
+//  Devices that corporate has shipped to a store for an MM/CM/IBO to
+//  physically pick up. They live in their OWN array (NOT in
+//  unionAllInventoryPools), so they are invisible to every count / view /
+//  scoreboard by construction until the manager picks them up, verifies the
+//  cartons/IMEIs, and signs the combined receipt-invoice. Only blank
+//  "Assigned Agent" rows from the corp file are recorded here (a filled
+//  assignee means it was already picked up). On signed pickup, matched
+//  devices MOVE into the live campaign pool (GM_INVENTORY) and the normal
+//  rules apply. Missing cartons/IMEIs stay flagged here for follow-up.
+//
+//  SHIPMENTS: one record per uploaded shipment file.
+//    {id, campaign, market, managerId, managerName, uploadedBy, uploadedAt,
+//     status:'in-route'|'arrived'|'partial'|'complete',
+//     arrivedAt, arrivedBy, cartons:[boxNum,...], deviceCount, totalCost}
+//  SHIPPED_INVENTORY: one record per shipped device (blank-assignee rows).
+//    {id, shipmentId, campaign, carton, imei, sim(bool), simRaw, model, sku,
+//     devType, purchaseCost, dueDate(corp expiry), market, managerId,
+//     soNumber, status:'in-route'|'picked-up'|'missing', pickedUpAt}
+var SHIPMENTS = [];
+var SHIPPED_INVENTORY = [];
+var SHIPMENT_NEXT_ID = 1;
+
+// ══════════════════════════════════════════════════════════════
 //  SHIP A6 — TRAINING SCHEDULE + TRAINING COMPLETE
 //
 //  Replaces two JotForms:
@@ -13560,6 +13584,9 @@ function saveInventory(){
     localStorage.setItem('wmam_inv_requests',  JSON.stringify(INVENTORY_REQUESTS));
     localStorage.setItem('wmam_inv_nextid',    String(INV_NEXT_ID));
     localStorage.setItem('wmam_gm_inventory',  JSON.stringify(GM_INVENTORY));
+    localStorage.setItem('wmam_shipments',         JSON.stringify(SHIPMENTS));
+    localStorage.setItem('wmam_shipped_inventory', JSON.stringify(SHIPPED_INVENTORY));
+    localStorage.setItem('wmam_shipment_nextid',   String(SHIPMENT_NEXT_ID));
     localStorage.setItem('wmam_gm_activations',JSON.stringify(GM_ACTIVATIONS));
     localStorage.setItem('wmam_gm_transfers',  JSON.stringify(GM_TRANSFERS));
     localStorage.setItem('wmam_inv_markets',   JSON.stringify(INV_MARKETS));
@@ -13654,6 +13681,9 @@ function saveInventory(){
     pushKey('inv_requests',   INVENTORY_REQUESTS);
     pushKey('inv_nextid',     INV_NEXT_ID);
     pushKey('gm_inventory',   GM_INVENTORY);
+    pushKey('shipments',         SHIPMENTS);
+    pushKey('shipped_inventory', SHIPPED_INVENTORY);
+    pushKey('shipment_nextid',   SHIPMENT_NEXT_ID);
     pushKey('gm_activations', GM_ACTIVATIONS);
     pushKey('gm_transfers',   GM_TRANSFERS);
     pushKey('inv_markets',    INV_MARKETS);
@@ -13708,6 +13738,9 @@ function loadInventory(){
     var r=localStorage.getItem('wmam_inv_requests');  if(r) INVENTORY_REQUESTS=JSON.parse(r);
     var n=localStorage.getItem('wmam_inv_nextid');    if(n) INV_NEXT_ID=parseInt(n)||1;
     var gmi=localStorage.getItem('wmam_gm_inventory');  if(gmi) GM_INVENTORY=JSON.parse(gmi)||[];
+    var shp=localStorage.getItem('wmam_shipments');         if(shp) SHIPMENTS=JSON.parse(shp)||[];
+    var shi=localStorage.getItem('wmam_shipped_inventory'); if(shi) SHIPPED_INVENTORY=JSON.parse(shi)||[];
+    var shn=localStorage.getItem('wmam_shipment_nextid');   if(shn) SHIPMENT_NEXT_ID=parseInt(shn)||1;
     var gma=localStorage.getItem('wmam_gm_activations');if(gma) GM_ACTIVATIONS=JSON.parse(gma)||[];
     var gmt=localStorage.getItem('wmam_gm_transfers');  if(gmt) GM_TRANSFERS=JSON.parse(gmt)||[];
     var mkt=localStorage.getItem('wmam_inv_markets');   if(mkt) INV_MARKETS=JSON.parse(mkt)||{};
@@ -16868,6 +16901,324 @@ function agentIdsInMyOrgEffective(user){
 // see-all paths, and the recipient still sees it in the Signature-Required
 // prompt (which reads the transfer record, not the device list) — so signing
 // still works. This single predicate is the gate used everywhere.
+// ══════════════════════════════════════════════════════════════════════
+//  SHIPPED INVENTORY — STAGE 1 (Calvin 2026-06-14)
+//  Makenzie/Inv Dept uploads a corp shipment file. We record ONLY rows whose
+//  "Assigned Agent" is blank (still in-route). Devices are grouped by carton
+//  (Box #) and stored in SHIPPED_INVENTORY (invisible to the manager until
+//  pickup). Cost = Purchase Cost column; Gen Mobile SIM cards are free ($0).
+//  An "Arrived" action notifies the destination manager + upline by email
+//  (profile email) and in the back office.
+// ══════════════════════════════════════════════════════════════════════
+
+// "$40" / "40" / "" → number (0 if blank/unparseable)
+function _shipParseCost(s){
+  if(s == null) return 0;
+  var n = parseFloat(String(s).replace(/[^0-9.\-]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+// Gen Mobile SIM cards are free. Detect a SIM-only product by type/model/sku.
+function _shipIsSim(devType, model, sku){
+  var hay = ((devType||'')+' '+(model||'')+' '+(sku||'')).toLowerCase();
+  return /\bsim\b|sim card|sim kit|sim only/.test(hay);
+}
+// Minimal CSV line splitter (handles quoted fields + commas inside quotes).
+function _shipSplitCsvLine(line){
+  var out = [], cur = '', inQ = false;
+  for(var i=0;i<line.length;i++){
+    var c = line[i];
+    if(c === '"'){ if(inQ && line[i+1] === '"'){ cur += '"'; i++; } else inQ = !inQ; }
+    else if(c === ',' && !inQ){ out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out.map(function(x){ return x.replace(/\r$/,'').trim(); });
+}
+// Convert MM-DD-YYYY (the corp Due Date format) → YYYY-MM-DD; passthrough others.
+function _shipNormDate(s){
+  if(!s) return '';
+  s = String(s).trim();
+  var m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+  if(m){ return m[3]+'-'+('0'+m[1]).slice(-2)+'-'+('0'+m[2]).slice(-2); }
+  var m2 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if(m2){ return m2[3]+'-'+('0'+m2[1]).slice(-2)+'-'+('0'+m2[2]).slice(-2); }
+  return s;
+}
+
+// Parse a corp shipment CSV → ONLY blank-assignee rows, normalized.
+// Returns { devices:[...], cartons:{box:count}, totalCost, skippedAssigned }.
+function parseShipmentCsv(text, campaign){
+  var lines = String(text||'').split('\n').filter(function(l){ return l.replace(/\r$/,'').trim().length; });
+  if(!lines.length) return { devices:[], cartons:{}, totalCost:0, skippedAssigned:0, error:'Empty file' };
+  var header = _shipSplitCsvLine(lines[0]);
+  function col(name){
+    var t = name.toLowerCase();
+    for(var i=0;i<header.length;i++){ if(header[i].toLowerCase().replace(/\s+/g,' ').trim() === t) return i; }
+    return -1;
+  }
+  var iAssigned = col('assigned agent');
+  var iBox      = col('box #');
+  var iType     = col('dev. type');
+  var iModel    = col('model name');
+  var iSku      = col('sku');
+  var iImei     = col('imei');
+  var iSim      = col('sim');
+  var iPurch    = col('purchase cost');
+  var iDue      = col('due date');
+  var iTeam     = col('current team');
+  var iSo       = col('so number');
+  if(iImei < 0) return { devices:[], cartons:{}, totalCost:0, skippedAssigned:0, error:'No IMEI column found' };
+
+  var devices = [], cartons = {}, totalCost = 0, skippedAssigned = 0;
+  for(var r=1;r<lines.length;r++){
+    var f = _shipSplitCsvLine(lines[r]);
+    var assignee = iAssigned>=0 ? (f[iAssigned]||'').trim() : '';
+    if(assignee){ skippedAssigned++; continue; } // already picked up → skip per spec
+    var imei = (f[iImei]||'').trim();
+    if(!imei) continue;
+    var devType = iType>=0 ? f[iType] : '';
+    var model   = iModel>=0 ? f[iModel] : '';
+    var sku     = iSku>=0 ? f[iSku] : '';
+    var isSim   = _shipIsSim(devType, model, sku);
+    var cost    = isSim ? 0 : _shipParseCost(iPurch>=0 ? f[iPurch] : 0);
+    var box     = (iBox>=0 ? (f[iBox]||'') : '').trim() || 'NO-CARTON';
+    devices.push({
+      imei: imei,
+      sim: isSim,
+      simRaw: iSim>=0 ? (f[iSim]||'').trim() : '',
+      model: model, sku: sku, devType: devType,
+      purchaseCost: cost,
+      dueDate: _shipNormDate(iDue>=0 ? f[iDue] : ''),
+      carton: box,
+      market: iTeam>=0 ? (f[iTeam]||'').trim() : '',
+      soNumber: iSo>=0 ? (f[iSo]||'').trim() : '',
+      campaign: campaign || 'Gen Mobile'
+    });
+    cartons[box] = (cartons[box]||0) + 1;
+    totalCost += cost;
+  }
+  return { devices:devices, cartons:cartons, totalCost:totalCost, skippedAssigned:skippedAssigned, error:null };
+}
+
+// Try to resolve the destination manager for a market string (best-effort).
+// Matches an active MM/CM/IBO whose markets include the market (case-insensitive,
+// substring tolerant). Returns the agent or null. Makenzie can always override
+// by selecting the manager explicitly at upload.
+function resolveManagerForMarket(market){
+  if(!market) return null;
+  var mk = String(market).toLowerCase();
+  var roles = {'Market Manager':1,'Campaign Manager':2,'IBO':3};
+  var cands = (DB.agents||[]).filter(function(a){ return a && a.active && roles[a.role]; });
+  // exact market membership first
+  for(var i=0;i<cands.length;i++){
+    var ms = (typeof mmMarkets==='function' ? mmMarkets(cands[i]) : (cands[i].markets||[]));
+    for(var j=0;j<ms.length;j++){
+      var m = String(ms[j]||'').toLowerCase();
+      if(m && (m===mk || mk.indexOf(m)>=0 || m.indexOf(mk)>=0)) return cands[i];
+    }
+  }
+  return null;
+}
+
+// Email + back-office recipients for a manager and their upline (valid emails only).
+function _shipUplineRecipients(manager){
+  var out = [], seen = {};
+  function add(a){ if(a && a.id && !seen[a.id]){ seen[a.id]=1; if(a.email && /@/.test(a.email)) out.push({id:a.id, email:a.email, name:a.name}); } }
+  add(manager);
+  var chain = (typeof reportingChainFor==='function') ? reportingChainFor(manager) : {};
+  ['teamLeaderId','marketManagerId','campaignManagerId','iboId'].forEach(function(k){
+    if(chain[k]){ var a=(DB.agents||[]).find(function(x){return x.id===chain[k];}); add(a); }
+  });
+  return out;
+}
+
+// Commit a parsed shipment: create the SHIPMENT record + SHIPPED_INVENTORY rows.
+function commitShipment(parsed, opts){
+  opts = opts || {};
+  var manager = (DB.agents||[]).find(function(a){ return a.id === opts.managerId; });
+  if(!manager) return { ok:false, error:'No destination manager selected' };
+  if(!parsed || !parsed.devices || !parsed.devices.length) return { ok:false, error:'No in-route devices to record' };
+  var shipmentId = 'SHIP-' + (SHIPMENT_NEXT_ID++);
+  var ship = {
+    id: shipmentId,
+    campaign: opts.campaign || 'Gen Mobile',
+    market: opts.market || (parsed.devices[0] && parsed.devices[0].market) || '',
+    managerId: manager.id,
+    managerName: manager.name,
+    uploadedBy: (DB.current && DB.current.name) || 'Inventory',
+    uploadedAt: new Date().toISOString(),
+    status: 'in-route',
+    arrivedAt: null, arrivedBy: null,
+    cartons: Object.keys(parsed.cartons),
+    deviceCount: parsed.devices.length,
+    totalCost: parsed.totalCost
+  };
+  SHIPMENTS.push(ship);
+  parsed.devices.forEach(function(d){
+    SHIPPED_INVENTORY.push({
+      id: shipmentId + '-' + d.imei,
+      shipmentId: shipmentId,
+      campaign: d.campaign,
+      carton: d.carton,
+      imei: d.imei, sim: d.sim, simRaw: d.simRaw,
+      model: d.model, sku: d.sku, devType: d.devType,
+      purchaseCost: d.purchaseCost,
+      dueDate: d.dueDate,
+      market: d.market || ship.market,
+      managerId: manager.id,
+      soNumber: d.soNumber,
+      status: 'in-route',
+      pickedUpAt: null
+    });
+  });
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){ console.warn('[commitShipment] save failed:', e); }
+  return { ok:true, shipment:ship };
+}
+
+// "Arrived" action — notify manager + upline (email + back office).
+function markShipmentArrived(shipmentId){
+  var ship = SHIPMENTS.find(function(s){ return s.id === shipmentId; });
+  if(!ship) return { ok:false, error:'Shipment not found' };
+  ship.status = 'arrived';
+  ship.arrivedAt = new Date().toISOString();
+  ship.arrivedBy = (DB.current && DB.current.name) || 'Inventory';
+  var manager = (DB.agents||[]).find(function(a){ return a.id === ship.managerId; });
+  // Back-office notifications to manager + upline
+  var recips = _shipUplineRecipients(manager);
+  if(typeof pushNotification === 'function'){
+    var chain = (typeof reportingChainFor==='function') ? reportingChainFor(manager) : {};
+    var ids = [manager && manager.id, chain.teamLeaderId, chain.marketManagerId, chain.campaignManagerId, chain.iboId].filter(Boolean);
+    ids.forEach(function(id){
+      try{ pushNotification({
+        toIds: [id],
+        title: '📦 Inventory Arrived — Ready for Pickup',
+        body: ship.deviceCount + ' device(s) in ' + ship.cartons.length + ' carton(s) for ' + (manager?manager.name:'your market') + ' have arrived at the store. Use the Inventory Pickup Form to confirm what you picked up.',
+        type: 'inventory-arrived',
+        icon: 'box'
+      }); }catch(e){}
+    });
+  }
+  // Email (profile emails only)
+  if(typeof brevoSend === 'function' && recips.length){
+    var html = '<div style="font-family:Arial,sans-serif"><h2>📦 Your inventory has arrived</h2>'
+      + '<p>'+ship.deviceCount+' device(s) across '+ship.cartons.length+' carton(s) for <strong>'+(manager?manager.name:'')+'</strong> ('+ship.market+') have arrived at the store and are ready for pickup.</p>'
+      + '<p>When you pick them up, open the <strong>Inventory Pickup Form</strong> in the back office and enter the carton numbers (or IMEIs) you received. You will sign one receipt-invoice that confirms what you took and your responsibility for it.</p>'
+      + '<p>Cartons: '+ship.cartons.join(', ')+'</p></div>';
+    try{ brevoSend({ to: recips.map(function(r){return {email:r.email, name:r.name};}), subject: 'Inventory Arrived — Ready for Pickup ('+ship.market+')', htmlContent: html }); }catch(e){ console.warn('[markShipmentArrived] email failed:', e); }
+  }
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  return { ok:true, shipment:ship, notified: recips.length };
+}
+
+// ── Makenzie / Inv Dept: Shipped Inventory panel (upload + arrived) ──
+function _shipCanManage(u){
+  return u && (isOwner(u) || u.role==='admin' || (typeof isInventory==='function' && isInventory(u))
+    || u.username==='makenzie.gibson' || u.username==='k-anna' || u.username==='k.anna');
+}
+function panelShipments(){
+  var u = DB.current;
+  if(!_shipCanManage(u)) return '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Inventory Dept / Office only.</div>';
+  var mgrs = (DB.agents||[]).filter(function(a){ return a && a.active && (a.role==='Market Manager'||a.role==='Campaign Manager'||a.role==='IBO'); })
+    .sort(function(a,b){ return (a.name||'').localeCompare(b.name||''); });
+  var h = '';
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head" style="border-left:4px solid #003594"><div class="bo-card-title">📦 Shipped Inventory — Upload</div></div>';
+  h += '<div style="padding:16px 18px;font-family:Barlow Condensed,sans-serif">';
+  h += '<p style="color:var(--muted);font-size:.82rem;margin:0 0 14px;line-height:1.5">Upload a corporate shipment file. Only rows with a <strong>blank "Assigned Agent"</strong> (still in-route) are recorded. Devices are grouped by carton (Box #) and stay <strong>invisible to the manager</strong> until they pick them up and sign the receipt. Cost uses the <strong>Purchase Cost</strong> column; Gen Mobile SIM cards are free.</p>';
+  h += '<div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end">';
+  h += '<div><label style="display:block;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Campaign</label>'
+     + '<select id="ship-campaign" style="padding:9px 12px;border:1px solid var(--border);border-radius:6px;font-family:Barlow Condensed,sans-serif"><option>Gen Mobile</option></select></div>';
+  h += '<div><label style="display:block;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Destination Manager (MM / CM / IBO)</label>'
+     + '<select id="ship-manager" style="padding:9px 12px;border:1px solid var(--border);border-radius:6px;font-family:Barlow Condensed,sans-serif;min-width:220px"><option value="">— select —</option>'
+     + mgrs.map(function(m){ return '<option value="'+m.id+'">'+escHtml(m.name)+' ('+m.role+')</option>'; }).join('') + '</select></div>';
+  h += '<div><label style="display:block;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Shipment File (.csv)</label>'
+     + '<input type="file" id="ship-file" accept=".csv" onchange="_shipHandleFile(this)" style="font-family:Barlow Condensed,sans-serif"></div>';
+  h += '</div>';
+  h += '<div id="ship-preview" style="margin-top:16px"></div>';
+  h += '</div></div>';
+
+  // Existing shipments
+  h += '<div class="bo-card"><div class="bo-card-head" style="border-left:4px solid #15803d"><div class="bo-card-title">🚚 Shipments</div></div><div style="padding:14px 18px">';
+  if(!SHIPMENTS.length){
+    h += '<div style="color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.85rem">No shipments yet.</div>';
+  } else {
+    h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.8rem">';
+    h += '<thead><tr style="background:var(--cream);text-align:left"><th style="padding:8px 10px">Manager</th><th style="padding:8px 10px">Market</th><th style="padding:8px 10px">Cartons</th><th style="padding:8px 10px">Devices</th><th style="padding:8px 10px">Value</th><th style="padding:8px 10px">Status</th><th style="padding:8px 10px">Action</th></tr></thead><tbody>';
+    SHIPMENTS.slice().reverse().forEach(function(s){
+      var statusColor = s.status==='in-route' ? '#d97706' : (s.status==='arrived' ? '#003594' : (s.status==='complete' ? '#15803d' : '#6b7280'));
+      h += '<tr style="border-bottom:1px solid var(--sand)">';
+      h += '<td style="padding:8px 10px;font-weight:600">'+escHtml(s.managerName)+'</td>';
+      h += '<td style="padding:8px 10px">'+escHtml(s.market||'—')+'</td>';
+      h += '<td style="padding:8px 10px">'+s.cartons.length+'</td>';
+      h += '<td style="padding:8px 10px">'+s.deviceCount+'</td>';
+      h += '<td style="padding:8px 10px">$'+(s.totalCost||0).toFixed(2)+'</td>';
+      h += '<td style="padding:8px 10px"><span style="color:'+statusColor+';font-weight:700;text-transform:uppercase;font-size:.7rem;letter-spacing:1px">'+s.status+'</span></td>';
+      h += '<td style="padding:8px 10px">';
+      if(s.status==='in-route'){
+        h += '<button onclick="_shipArrived(\''+s.id+'\')" style="background:#003594;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1px;text-transform:uppercase;padding:7px 14px;border-radius:5px;cursor:pointer;font-weight:700">✈ Mark Arrived</button>';
+      } else if(s.arrivedAt){
+        h += '<span style="color:var(--muted);font-size:.72rem">Arrived '+new Date(s.arrivedAt).toLocaleDateString()+'</span>';
+      }
+      h += '</td></tr>';
+    });
+    h += '</tbody></table></div>';
+  }
+  h += '</div></div>';
+  return h;
+}
+function _shipHandleFile(input){
+  var file = input && input.files && input.files[0];
+  if(!file){ return; }
+  var campaign = (document.getElementById('ship-campaign')||{}).value || 'Gen Mobile';
+  var reader = new FileReader();
+  reader.onload = function(e){
+    var parsed = parseShipmentCsv(e.target.result, campaign);
+    window._shipPendingParsed = parsed;
+    var prev = document.getElementById('ship-preview');
+    if(!prev) return;
+    if(parsed.error){ prev.innerHTML = '<div style="color:#cc0000;font-family:Barlow Condensed,sans-serif">⚠ '+escHtml(parsed.error)+'</div>'; return; }
+    var cartonKeys = Object.keys(parsed.cartons);
+    var ph = '<div style="background:var(--offwhite);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:Barlow Condensed,sans-serif">';
+    ph += '<div style="font-size:.95rem;font-weight:700;margin-bottom:8px">Preview</div>';
+    ph += '<div style="display:flex;flex-wrap:wrap;gap:18px;font-size:.84rem;margin-bottom:10px">';
+    ph += '<div><span style="color:var(--muted)">In-route devices (blank assignee):</span> <strong>'+parsed.devices.length+'</strong></div>';
+    ph += '<div><span style="color:var(--muted)">Cartons:</span> <strong>'+cartonKeys.length+'</strong></div>';
+    ph += '<div><span style="color:var(--muted)">Total value (Purchase Cost):</span> <strong>$'+parsed.totalCost.toFixed(2)+'</strong></div>';
+    ph += '<div><span style="color:var(--muted)">Skipped (already assigned):</span> <strong>'+parsed.skippedAssigned+'</strong></div>';
+    ph += '</div>';
+    if(parsed.devices.length){
+      ph += '<div style="font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:2px;margin-bottom:4px">Cartons</div>';
+      ph += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px">'
+          + cartonKeys.map(function(c){ return '<span style="background:white;border:1px solid var(--border);border-radius:100px;padding:3px 10px;font-size:.72rem"><span style="font-family:monospace">'+escHtml(c)+'</span> · '+parsed.cartons[c]+'</span>'; }).join('') + '</div>';
+      ph += '<button onclick="_shipDoCommit()" class="btn-fire" style="font-size:.74rem;padding:11px 18px">✅ Record Shipment — '+parsed.devices.length+' devices in '+cartonKeys.length+' cartons →</button>';
+    } else {
+      ph += '<div style="color:#d97706">No in-route rows found (every row already has an Assigned Agent).</div>';
+    }
+    ph += '</div>';
+    prev.innerHTML = ph;
+  };
+  reader.readAsText(file);
+}
+function _shipDoCommit(){
+  var parsed = window._shipPendingParsed;
+  if(!parsed || !parsed.devices || !parsed.devices.length){ alert('Nothing to record — upload a file first.'); return; }
+  var managerId = parseInt((document.getElementById('ship-manager')||{}).value, 10);
+  if(!managerId){ alert('Select the destination manager (MM / CM / IBO) first.'); return; }
+  var campaign = (document.getElementById('ship-campaign')||{}).value || 'Gen Mobile';
+  var market = (parsed.devices[0] && parsed.devices[0].market) || '';
+  var res = commitShipment(parsed, { managerId:managerId, campaign:campaign, market:market });
+  if(!res.ok){ alert('Could not record: '+res.error); return; }
+  window._shipPendingParsed = null;
+  alert('✓ Shipment recorded: '+res.shipment.deviceCount+' devices in '+res.shipment.cartons.length+' cartons for '+res.shipment.managerName+'. They stay invisible until pickup. Click "Mark Arrived" when ready to notify them.');
+  if(typeof gotoPanel==='function') gotoPanel('shipments');
+}
+function _shipArrived(shipmentId){
+  if(!confirm('Mark this shipment as ARRIVED and notify the manager + upline by email and in the back office?')) return;
+  var res = markShipmentArrived(shipmentId);
+  if(!res.ok){ alert('Error: '+res.error); return; }
+  alert('✓ Marked arrived. Notified '+res.notified+' recipient(s) by email + back office.');
+  if(typeof gotoPanel==='function') gotoPanel('shipments');
+}
+
 function _devHiddenUntilSigned(d){
   return !!(d && d.acceptancePending === true);
 }
@@ -19941,6 +20292,9 @@ async function loadFromSupabase(){
         if(s.key==='gm_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_INVENTORY        = v;}catch(e){console.warn('[load] gm_inventory:',e);} }
         if(s.key==='gm_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_ACTIVATIONS      = v;}catch(e){} }
         if(s.key==='gm_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_TRANSFERS        = v;}catch(e){} }
+        if(s.key==='shipments'         && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) SHIPMENTS          = v;}catch(e){console.warn('[load] shipments:',e);} }
+        if(s.key==='shipped_inventory' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) SHIPPED_INVENTORY  = v;}catch(e){console.warn('[load] shipped_inventory:',e);} }
+        if(s.key==='shipment_nextid'   && s.value){ try{var v=JSON.parse(s.value); if(typeof v==='number') SHIPMENT_NEXT_ID = v;}catch(e){} }
         if(s.key==='inv_markets'    && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object') INV_MARKETS = v;}catch(e){} }
         if(s.key==='inv_upsell_pct' && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object') INV_UPSELL_REQUIREMENTS = v;}catch(e){} }
         if(s.key==='aw_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_INVENTORY        = v;}catch(e){} }
@@ -34321,6 +34675,7 @@ function gotoPanel(id, params){
     'store':panelStore,
     'store-edit':panelStoreEdit,
     'inventory-pickup':panelInventoryPickup,
+    'shipments':panelShipments,
     'pickup-confirmations':panelPickupConfirmations,
     'discrepancy-tickets':panelDiscrepancyTickets,
     'direct-deposit':panelDirectDeposit,
@@ -43982,6 +44337,12 @@ function panelInvDashboard(){
 
   var h = '';
   h += panelHeader('📊 All Inventory (All Campaigns)');
+
+  if(typeof _shipCanManage === 'function' && _shipCanManage(u)){
+    var _inRoute = (typeof SHIPMENTS !== 'undefined') ? SHIPMENTS.filter(function(s){return s.status==='in-route';}).length : 0;
+    h += '<div onclick="gotoPanel(\'shipments\')" style="background:linear-gradient(135deg,rgba(0,53,148,.08),rgba(0,53,148,.03));border:1px solid rgba(0,53,148,.3);border-radius:10px;padding:14px 18px;margin-bottom:18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;cursor:pointer">';
+    h += '<div style="font-size:1.6rem">📦</div><div style="flex:1"><div style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;letter-spacing:1px;color:#003594">Shipped Inventory — Upload &amp; Pickup</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">Upload corp shipments, mark arrived, track cartons'+(_inRoute?' · '+_inRoute+' in route':'')+'</div></div><div style="font-family:Barlow Condensed,sans-serif;color:#003594;font-size:.72rem;letter-spacing:2px;text-transform:uppercase">Open →</div></div>';
+  }
 
   // ── Calvin 2026-05-13: My Markets rollup link ──
   // For TL/MM/CM/IBO and Inventory/Owner — quick jump to their markets
