@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.14.3600';
+var BUILD_VERSION = '2026.06.14.3900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15175,7 +15175,13 @@ function gmResolveUploadRecipient(csvName, marketName){
     if(mm) return { agent: mm, source: 'market-mm', market: marketName };
   }
 
-  // Last resort — unassigned
+  // Calvin 2026-06-14: route to the MARKET'S manager only. The resolver above
+  // already handles every legitimate case — market MM, the market's CM (incl.
+  // dual-role CMs like Brandon/Tanita/Juan who run their own local market and
+  // are set as that market's mmId/cmId), and the region/cmModel match. We do
+  // NOT dump an orphaned market on the first campaign CM found — that was the
+  // Waco→Brandon bug. A market with no manager at all stays unassigned for Inv
+  // Dept to route (every real market has someone assigned).
   return { agent: null, source: 'unassigned', market: marketName };
 }
 
@@ -45952,9 +45958,35 @@ function panelDistribute(){
 
   // Pull pipeline + my held devices
   var pipeline = inventoryPipelineBreakdown(u);
-  var myDevices = devicesHeldBy(u.id, null);
-  // Calvin 2026-06-14: soonest-to-expire first so the most urgent devices are
-  // distributed before the rest (FIFO by expiration); no-expiry devices last.
+  // Calvin 2026-06-14: distribute from the manager's AVAILABLE pool — the
+  // unassigned stock + org-held devices that aren't sold/activated — so the
+  // expiring devices you actually need to move are the ones shown (the old list
+  // showed activated/sold devices that can't be transferred). Agents still see
+  // only their own. Soonest-to-expire first (FIFO); no-expiry devices last.
+  var myDevices = (function(){
+    var pool = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools()
+             : (Array.isArray(INVENTORY_DEVICES)?INVENTORY_DEVICES.slice():[]);
+    var seeAll = (typeof isOwner==='function' && isOwner(u)) || u.role==='admin'
+              || (typeof isInventory==='function' && isInventory(u))
+              || (typeof agentHasDeptAccess==='function' && agentHasDeptAccess(u,'inv-dashboard'));
+    var includeUnassigned=false, scopeSet=null;
+    if(!seeAll){
+      var ids;
+      if(u.role==='Campaign Manager'||u.role==='IBO'){ ids=(typeof agentIdsInMyOrgEffective==='function')?agentIdsInMyOrgEffective(u):[u.id]; includeUnassigned=true; }
+      else if(u.role==='Market Manager'||u.role==='Team Leader'){ ids=(typeof agentIdsInMyOrgEffective==='function')?agentIdsInMyOrgEffective(u):[u.id]; }
+      else { ids=[u.id]; }
+      scopeSet=ids.reduce(function(m,id){ m[id]=true; return m; },{});
+    }
+    return pool.filter(function(d){
+      if(!d) return false;
+      if(d.status==='sold'||d.status==='activated'||d.soldAt||d.status==='deleted') return false; // transferable only
+      var holderId = d.holderId||d.assignedTo||null;
+      if(seeAll) return true;
+      if(holderId && scopeSet && scopeSet[holderId]) return true;
+      if(!holderId && includeUnassigned) return true; // manager's unassigned pool
+      return false;
+    });
+  })();
   myDevices.sort(function(a,b){
     var x=invDaysRemaining(a.expiryDate, a.assignedDate||a.assignedAt);
     var y=invDaysRemaining(b.expiryDate, b.assignedDate||b.assignedAt);
@@ -46034,11 +46066,11 @@ function panelDistribute(){
   // LEFT: Devices I'm holding, with checkboxes
   h += '<div class="bo-card">';
   h += '<div class="bo-card-head" style="border-left:4px solid #003594">';
-  h += '<div class="bo-card-title">I\'m Holding ('+myDevices.length+')</div>';
+  h += '<div class="bo-card-title">Available to Distribute ('+myDevices.length+')</div>';
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;color:var(--muted);letter-spacing:1px">Pick devices, then send to a target →</div>';
   h += '</div>';
   if(!myDevices.length){
-    h += '<div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:6px">📭</div>You are not holding any devices to distribute.</div>';
+    h += '<div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:6px">📭</div>No available inventory to distribute right now.</div>';
   } else {
     h += '<div style="padding:10px 16px;background:rgba(0,53,148,.04);border-bottom:1px solid var(--sand);display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
     h += '<input type="checkbox" id="invDistAllCb" onchange="invDistToggleAll(this)" style="cursor:pointer">';
@@ -46046,18 +46078,36 @@ function panelDistribute(){
     h += '<span style="margin-left:auto;font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--blue)" id="invDistSelCount">0</span>';
     h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">selected</span>';
     h += '</div>';
+    // Calvin 2026-06-14: Gen Mobile carton assignment (managers only). GM ships
+    // in cartons (boxNumber) of bulk IMEIs; picking a carton checks every device
+    // in that box at once so a manager can assign the whole carton to one person.
+    var _isMgrDist = (u.role==='Campaign Manager'||u.role==='IBO'||u.role==='Market Manager'||u.role==='Team Leader'||u.role==='admin'||(typeof isOwner==='function'&&isOwner(u)));
+    var _cartonMap = {};
+    myDevices.forEach(function(d){ var camp=(d.campaign||d.carrier); if(camp==='Gen Mobile' && d.boxNumber){ _cartonMap[d.boxNumber]=(_cartonMap[d.boxNumber]||0)+1; } });
+    var _cartonKeys = Object.keys(_cartonMap).sort(function(a,b){return String(a).localeCompare(String(b),undefined,{numeric:true});});
+    if(_isMgrDist && _cartonKeys.length){
+      h += '<div style="padding:9px 16px;background:rgba(124,58,237,.06);border-bottom:1px solid var(--sand);display:flex;align-items:center;gap:9px;flex-wrap:wrap">';
+      h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;color:#7c3aed;font-weight:700">📦 Assign by carton</span>';
+      h += '<select id="invDistCartonSel" onchange="invDistSelectCarton(this.value)" style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;padding:6px 9px;border:1px solid var(--sand);border-radius:5px;cursor:pointer">';
+      h += '<option value="">Select an entire carton…</option>';
+      _cartonKeys.forEach(function(b){ h += '<option value="'+b+'">Carton '+b+' — '+_cartonMap[b]+' device'+(_cartonMap[b]===1?'':'s')+'</option>'; });
+      h += '</select>';
+      h += '<span style="font-family:Barlow Condensed,sans-serif;font-size:.64rem;color:var(--muted)">checks every IMEI in the carton — then click a target to assign the whole box</span>';
+      h += '</div>';
+    }
     h += '<div style="max-height:480px;overflow-y:auto"><table style="width:100%"><thead><tr>'
-      + '<th style="width:30px"></th><th>IMEI</th><th>Campaign</th><th>Status</th><th>Days Left</th>'
+      + '<th style="width:30px"></th><th>IMEI</th><th>Campaign</th><th>Carton</th><th>Expires</th><th>Days Left</th>'
       + '</tr></thead><tbody>';
     myDevices.forEach(function(d){
       var days = invDaysRemaining(d.expiryDate, d.assignedDate || d.assignedAt);
       var rowBg = days!==null && days<=5 ? 'rgba(204,0,0,.05)' : (days!==null && days<=10 ? 'rgba(217,119,6,.05)' : '');
       var dayColor = days===null?'var(--muted)':(days<0?'#CC0000':(days<=5?'#CC0000':(days<=10?'#D97706':'#059669')));
       h += '<tr style="background:'+rowBg+'">'
-        + '<td><input type="checkbox" class="inv-dist-row-cb" data-id="'+d.id+'" onchange="invDistToggleSelect(this)" style="cursor:pointer"></td>'
+        + '<td><input type="checkbox" class="inv-dist-row-cb" data-id="'+d.id+'" data-carton="'+(d.boxNumber||'')+'" onchange="invDistToggleSelect(this)" style="cursor:pointer"></td>'
         + '<td style="font-family:monospace;font-size:.76rem">'+(d.imei||'\u2014')+'</td>'
         + '<td style="font-size:.75rem">'+(d.campaign||d.carrier||'\u2014')+'</td>'
-        + '<td style="font-size:.75rem">'+d.status+'</td>'
+        + '<td style="font-size:.74rem;color:#7c3aed;font-weight:600">'+(d.boxNumber||'\u2014')+'</td>'
+        + '<td style="font-size:.72rem;color:var(--brown)">'+(d.expiryDate||'\u2014')+'</td>'
         + '<td style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:'+dayColor+'">'+(days===null?'—':days)+'</td>'
         + '</tr>';
     });
@@ -46110,6 +46160,18 @@ function invDistToggleSelect(cb){
   if(cb.checked) window._invDistSelected[id] = true;
   else delete window._invDistSelected[id];
   invDistUpdateCount();
+}
+// Calvin 2026-06-14: pick an entire Gen Mobile carton — checks every IMEI in
+// that box so the manager can assign the whole carton to one person at once.
+function invDistSelectCarton(box){
+  if(!box) return;
+  document.querySelectorAll('.inv-dist-row-cb').forEach(function(cb){
+    if(cb.getAttribute('data-carton')===String(box) && !cb.checked){
+      cb.checked = true;
+      invDistToggleSelect(cb);
+    }
+  });
+  var sel=document.getElementById('invDistCartonSel'); if(sel) sel.value=''; // reset for reuse
 }
 function invDistToggleAll(masterCb){
   document.querySelectorAll('.inv-dist-row-cb').forEach(function(c){
@@ -54341,6 +54403,17 @@ function gmProcessInventoryUpload(){
     }
 
     if(nd.length){
+      // Calvin 2026-06-14: by default EVERY upload generates the legal acceptance
+      // invoice + signature request for the recipient (MM, or CM fallback). Owner
+      // and admins (K-Anna, Makenzie) get an override to skip it for a given upload
+      // — same idea as the form-signature bypass. Field/managers never see it.
+      var _canSkipInv = (typeof isOwner==='function' && isOwner(DB.current)) || (DB.current && DB.current.role==='admin');
+      if(_canSkipInv){
+        html += '<label style="display:flex;align-items:flex-start;gap:9px;margin-bottom:10px;padding:9px 12px;background:rgba(204,0,0,.05);border:1px solid rgba(204,0,0,.22);border-radius:6px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);cursor:pointer;line-height:1.45">';
+        html += '<input type="checkbox" id="gmInvSkipInvoice" style="cursor:pointer;margin-top:2px">';
+        html += '<span><strong style="color:#CC0000">Override —</strong> skip the acceptance invoice for THIS upload (no signature required). Owner/admin only; intended for testing. Leave unchecked and every device gets the real signature-required invoice.</span>';
+        html += '</label>';
+      }
       html += '<button onclick="gmConfirmInventoryUpload(\''+batchId+'\')" class="btn-fire" style="width:100%;justify-content:center;font-size:.72rem;padding:12px">✅ Confirm — Add '+nd.length+' Devices to System →</button>';
       // Store pending devices temporarily
       window._gmPendingBatch = {batchId:batchId, devices:nd, flagged:flagged};
@@ -54355,6 +54428,14 @@ function gmConfirmInventoryUpload(batchId){
   if(!pending||pending.batchId!==batchId){ alert('Session expired. Please re-upload the file.'); return; }
   pending.devices.forEach(function(d){ GM_INVENTORY.push(d); });
 
+  // ── Calvin 2026-06-14: invoice override (owner/admin only) ──
+  // Read the skip checkbox BEFORE the preview is re-rendered. Re-check the
+  // permission here too — never trust the checkbox alone — so only Owner or an
+  // admin can actually suppress the legal acceptance invoice.
+  var _canSkipInv = (typeof isOwner==='function' && isOwner(DB.current)) || (DB.current && DB.current.role==='admin');
+  var _skipCb = document.getElementById('gmInvSkipInvoice');
+  var _skipInvoice = !!(_canSkipInv && _skipCb && _skipCb.checked);
+
   // ── Calvin 2026-06-04: every recipient gets an acceptance-signature transfer ──
   // The parser auto-assigns each device to a recipient (MM-of-market → CM fallback).
   // We use the generic invCreateAcceptanceTransfersForUpload helper which:
@@ -54365,7 +54446,12 @@ function gmConfirmInventoryUpload(batchId){
   //   • Notifies each recipient that they have inventory to sign for
   //   • Saves inventory + transfers atomically
   // Same helper is used by every carrier's upload — keeps the rules uniform.
-  var acceptanceResult = invCreateAcceptanceTransfersForUpload('Gen Mobile', pending.devices, DB.current);
+  var acceptanceResult = _skipInvoice
+    ? {transfersCreated:0, recipientCount:0, byRecipient:{}, skipped:true}
+    : invCreateAcceptanceTransfersForUpload('Gen Mobile', pending.devices, DB.current);
+  if(_skipInvoice){
+    console.warn('[upload] ⚠ acceptance invoice SKIPPED by override — user='+(DB.current&&DB.current.name)+' ('+(DB.current&&DB.current.role)+'), '+pending.devices.length+' device(s)');
+  }
 
   // Build the summary view (unchanged from before, kept for backwards
   // compatibility with the upload-preview UI)
@@ -54412,6 +54498,13 @@ function gmConfirmInventoryUpload(batchId){
   }
   if(unassignedCount > 0){
     extra += '<div style="margin-top:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#D97706">⚠ '+unassignedCount+' device(s) could not be auto-assigned (no MM or CM found for their market). Assign manually from the dashboard.</div>';
+  }
+  // Calvin 2026-06-14: make the invoice outcome explicit on every upload.
+  if(_skipInvoice){
+    extra += '<div style="margin-top:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#CC0000"><strong>⚠ Acceptance invoice SKIPPED</strong> for this upload (owner/admin override). No signature was requested.</div>';
+  } else {
+    var _recips = (acceptanceResult && acceptanceResult.transfersCreated) || 0;
+    extra += '<div style="margin-top:6px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#003594">📝 Legal acceptance invoice created — '+_recips+' recipient'+(_recips===1?'':'s')+' must sign before these devices can move onward.</div>';
   }
   if(preview) preview.innerHTML = '<div style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);border-radius:6px;padding:12px 16px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#059669">✓ '+pending.devices.length+' devices added to Gen Mobile inventory.'+extra+'</div>';
   cdFlash(pending.devices.length+' devices uploaded');
