@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.14.3100';
+var BUILD_VERSION = '2026.06.14.3200';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -18871,57 +18871,6 @@ function scoreboardInventoryByCampaign(user){
     if(isSold) out[camp].sold++; else out[camp].available++;
   });
   return out;
-}
-
-// ════════════════════════════════════════════════════════════════════════
-//  DATE-WINDOWED SOLD (Calvin 2026-06-14): production counted by SALE DATE.
-//  The scoreboard's weekly/monthly "sold" must come from the real sold/
-//  activated records, windowed by their activation/sale date — so this week
-//  counts ONLY this week's activations and older ones roll into the month
-//  total (never double-counted). Gen Mobile reads GM_ACTIVATIONS (Activation
-//  Date); every Lifeline campaign uses the identical pattern once its dated
-//  sold report is uploaded. Week boundary matches getWeekKey (Sun-start;
-//  Mon-start for TruConnect) so it lines up with comp/payroll weeks.
-// ════════════════════════════════════════════════════════════════════════
-function _actISODate(s){
-  if(!s) return '';
-  s=String(s).trim();
-  var m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if(m) return m[1]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[3]).slice(-2);
-  var m2=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/); if(m2) return m2[3]+'-'+('0'+m2[1]).slice(-2)+'-'+('0'+m2[2]).slice(-2);
-  var d=new Date(s); if(!isNaN(d.getTime())) return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-  return '';
-}
-function _periodWindowISO(period, carrier, refDate){
-  var now = refDate ? new Date(refDate) : new Date();
-  if(period==='week'){
-    var ws=getWeekKey(now, carrier||'');
-    var we=new Date(ws+'T00:00:00'); we.setDate(we.getDate()+6);
-    var weStr=we.getFullYear()+'-'+String(we.getMonth()+1).padStart(2,'0')+'-'+String(we.getDate()).padStart(2,'0');
-    return {start:ws, end:weStr, kind:'week'};
-  }
-  var mk=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
-  return {month:mk, kind:'month'};
-}
-function _activationInWindow(iso, win){
-  if(!iso) return false;
-  if(win.kind==='month') return iso.slice(0,7)===win.month;
-  return iso>=win.start && iso<=win.end;
-}
-// Count Gen Mobile activations in a date window for a set of agent ids (null = all in view).
-function gmSoldCount(scopeIds, period, opts){
-  opts=opts||{};
-  var set = scopeIds ? scopeIds.reduce(function(m,id){ m[id]=true; return m; },{}) : null;
-  var win = _periodWindowISO(period, opts.carrier||'', opts.refDate);
-  var n=0;
-  (typeof GM_ACTIVATIONS!=='undefined'?GM_ACTIVATIONS:[]).forEach(function(a){
-    if(!a) return;
-    if(opts.excludeChargebacks && a.isChargeback) return;
-    var iso=_actISODate(a.activationDate); if(!iso) return;
-    if(!_activationInWindow(iso, win)) return;
-    if(set && !(a.agentId!=null && set[a.agentId])) return;
-    n++;
-  });
-  return n;
 }
 
 function scoreboardInventory(user){
@@ -36202,25 +36151,15 @@ function panelBO(){
     }
     var teamLabel = u.role==='Team Leader' ? 'TEAM' : 'MARKET';
 
-    // Calvin 2026-06-14: for campaigns with dated sold records (Gen Mobile now,
-    // every Lifeline campaign once uploaded), source production from the real
-    // activations windowed by sale date; otherwise fall back to monthlySales.
-    function _dateWindowedSold(prog, scopeIds, period){
-      var p=String(prog||'').toLowerCase().replace(/\s+/g,'');
-      if((p==='genmobile'||p==='gm') && typeof gmSoldCount==='function'){
-        return gmSoldCount(scopeIds, period, {carrier:u.carrier||''});
-      }
-      return null; // no dated source yet → caller uses legacy monthlySales
-    }
-    var _myTeamIds = myTeamAgents.map(function(a){ return a.id; });
-
-    function teamSalesForProg(prog, period){
-      period = period || 'month';
-      var dw = _dateWindowedSold(prog, _myTeamIds, period);
-      if(dw!==null) return dw;
-      // legacy monthlySales path (monthly only; weekly was already an approximation)
+    function teamSalesForProg(prog){
+      // Calvin 2026-06-14: the GM/Lifeline activation upload writes monthlySales
+      // entries under program 'Lifeline' (all Lifeline carriers aggregate there).
+      // So when the scoreboard's prog is a Lifeline carrier (Gen Mobile, etc.),
+      // read against 'Lifeline' or the data is never found (showed 0).
+      var readProg = (typeof isLifelineCarrier==='function' && isLifelineCarrier(prog)) ? 'Lifeline' : prog;
+      // Uses unified agentProgSales — handles legacy u.sales correctly
       return myTeamAgents.reduce(function(s,a){
-        return s + agentProgSales(a, prog, thisMonth);
+        return s + agentProgSales(a, readProg, thisMonth);
       },0);
     }
 
@@ -36395,20 +36334,21 @@ function panelBO(){
     var thisWeekKey= getWeekKey(now2, u.carrier||'');          // week-start date string
 
     function salesForProg(prog, period){
-      // Calvin 2026-06-14: dated activation source first (Gen Mobile etc.)
-      var dw = _dateWindowedSold(prog, [u.id], (period==='week'?'week':'month'));
-      if(dw!==null) return dw;
+      // Calvin 2026-06-14: Lifeline carriers (Gen Mobile, etc.) are stored in
+      // monthlySales under program 'Lifeline' by the activation upload. Read
+      // against 'Lifeline' so the date-bucketed week/month counts are found.
+      var readProg = (typeof isLifelineCarrier==='function' && isLifelineCarrier(prog)) ? 'Lifeline' : prog;
       // Uses unified agentProgSales helper — handles legacy u.sales fallback automatically
       if(period==='week'){
         // Weekly: read from weekSales entries for this week key
         if(!u.monthlySales || !u.monthlySales.length) return 0;
         return u.monthlySales.reduce(function(sum,m){
-          if(m.program!==prog || m.month!==thisMonth) return sum;
+          if(m.program!==readProg || m.month!==thisMonth) return sum;
           return sum + ((m.weekSales&&m.weekSales[thisWeekKey])||0);
         },0);
       }
       // Monthly: use unified helper that handles legacy data
-      return agentProgSales(u, prog, thisMonth);
+      return agentProgSales(u, readProg, thisMonth);
     }
 
     function salesForProgWeek(prog){ return salesForProg(prog,'week'); }
@@ -36670,7 +36610,7 @@ function panelBO(){
       var wg = progGoal(sbProgs[0],'week');
       var singleWSales = salesForProgWeek(sbProgs[0]);
       if(showTeamSplit){
-        var tWSales = teamSalesForProg(sbProgs[0], 'week');
+        var tWSales = teamSalesForProg(sbProgs[0]); // weekly team approx
         html += teamSplitPanel(singleWSales, tWSales, progColor(sbProgs[0]), wg);
       } else {
         html += '<div style="'+lblSt+'">(Goal '+wg+')</div>';
@@ -36685,7 +36625,7 @@ function panelBO(){
         var pct  = wg>0?Math.min(100,Math.round((wSales/wg)*100)):0;
         var wRule= weekRuleForProg(prog);
         if(showTeamSplit){
-          var tWSales = teamSalesForProg(prog, 'week');
+          var tWSales = teamSalesForProg(prog);
           html += '<div style="border-radius:5px;padding:5px 8px;margin-bottom:4px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
             +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:2px">'+prog+' · G:'+wg+'</div>'
             +teamSplitPanel(wSales,tWSales,col,wg)
