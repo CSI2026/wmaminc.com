@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.14.3200';
+var BUILD_VERSION = '2026.06.14.3300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -18871,6 +18871,45 @@ function scoreboardInventoryByCampaign(user){
     if(isSold) out[camp].sold++; else out[camp].available++;
   });
   return out;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  GEN MOBILE PRODUCTION COUNT (Calvin 2026-06-14): monthly/weekly sales for
+//  the scoreboard, read from the SAME activation records the CM team rollup
+//  uses (non-chargeback, counted by agentId) so the production columns match
+//  the team table — just windowed by activation date. monthly = this calendar
+//  month; weekly = this week (Sun–Sat for GM, Mon-start for TruConnect via
+//  getWeekKey). scopeIds=null counts everyone; otherwise only those agent ids.
+// ════════════════════════════════════════════════════════════════════════
+function _gmProdISO(s){
+  if(!s) return '';
+  s=String(s).trim();
+  var m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if(m) return m[1]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[3]).slice(-2);
+  var m2=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/); if(m2) return m2[3]+'-'+('0'+m2[1]).slice(-2)+'-'+('0'+m2[2]).slice(-2);
+  var d=new Date(s); if(!isNaN(d.getTime())) return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  return '';
+}
+function gmProductionCount(scopeIds, period, carrier, refDate){
+  if(typeof GM_ACTIVATIONS==='undefined' || !GM_ACTIVATIONS || !GM_ACTIVATIONS.length) return 0;
+  var set = scopeIds ? scopeIds.reduce(function(m,id){ m[id]=true; return m; },{}) : null;
+  var now=refDate?new Date(refDate):new Date(), inWin;
+  if(period==='week'){
+    var ws=(typeof getWeekKey==='function')?getWeekKey(now,carrier||''):now.toISOString().slice(0,10);
+    var we=new Date(ws+'T00:00:00'); we.setDate(we.getDate()+6);
+    var weStr=we.getFullYear()+'-'+String(we.getMonth()+1).padStart(2,'0')+'-'+String(we.getDate()).padStart(2,'0');
+    inWin=function(iso){ return iso>=ws && iso<=weStr; };
+  } else {
+    var mk=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
+    inWin=function(iso){ return iso.slice(0,7)===mk; };
+  }
+  var n=0;
+  GM_ACTIVATIONS.forEach(function(a){
+    if(!a || a.isChargeback || !a.agentId) return;   // mirror the team rollup
+    if(set && !set[a.agentId]) return;
+    var iso=_gmProdISO(a.activationDate); if(!iso || !inWin(iso)) return;
+    n++;
+  });
+  return n;
 }
 
 function scoreboardInventory(user){
@@ -36151,11 +36190,15 @@ function panelBO(){
     }
     var teamLabel = u.role==='Team Leader' ? 'TEAM' : 'MARKET';
 
-    function teamSalesForProg(prog){
-      // Calvin 2026-06-14: the GM/Lifeline activation upload writes monthlySales
-      // entries under program 'Lifeline' (all Lifeline carriers aggregate there).
-      // So when the scoreboard's prog is a Lifeline carrier (Gen Mobile, etc.),
-      // read against 'Lifeline' or the data is never found (showed 0).
+    var _myTeamIds = myTeamAgents.map(function(a){ return a.id; });
+    function teamSalesForProg(prog, period){
+      period = period || 'month';
+      var pl = String(prog||'').toLowerCase();
+      // Gen Mobile: count real activations (non-chargeback) by date window — same
+      // source as the team rollup — so MARKET TOTAL matches the team table.
+      if((pl==='gen mobile'||pl==='genmobile') && typeof gmProductionCount==='function'){
+        return gmProductionCount(_myTeamIds, period, u.carrier||'');
+      }
       var readProg = (typeof isLifelineCarrier==='function' && isLifelineCarrier(prog)) ? 'Lifeline' : prog;
       // Uses unified agentProgSales — handles legacy u.sales correctly
       return myTeamAgents.reduce(function(s,a){
@@ -36334,7 +36377,13 @@ function panelBO(){
     var thisWeekKey= getWeekKey(now2, u.carrier||'');          // week-start date string
 
     function salesForProg(prog, period){
-      // Calvin 2026-06-14: Lifeline carriers (Gen Mobile, etc.) are stored in
+      var pl = String(prog||'').toLowerCase();
+      // Gen Mobile: personal sales = my non-chargeback activations in the window
+      // (same source as the team rollup), so MY SALES matches reality.
+      if((pl==='gen mobile'||pl==='genmobile') && typeof gmProductionCount==='function'){
+        return gmProductionCount([u.id], (period==='week'?'week':'month'), u.carrier||'');
+      }
+      // Lifeline carriers (Gen Mobile, etc.) are stored in
       // monthlySales under program 'Lifeline' by the activation upload. Read
       // against 'Lifeline' so the date-bucketed week/month counts are found.
       var readProg = (typeof isLifelineCarrier==='function' && isLifelineCarrier(prog)) ? 'Lifeline' : prog;
@@ -36610,7 +36659,7 @@ function panelBO(){
       var wg = progGoal(sbProgs[0],'week');
       var singleWSales = salesForProgWeek(sbProgs[0]);
       if(showTeamSplit){
-        var tWSales = teamSalesForProg(sbProgs[0]); // weekly team approx
+        var tWSales = teamSalesForProg(sbProgs[0], 'week');
         html += teamSplitPanel(singleWSales, tWSales, progColor(sbProgs[0]), wg);
       } else {
         html += '<div style="'+lblSt+'">(Goal '+wg+')</div>';
@@ -36625,7 +36674,7 @@ function panelBO(){
         var pct  = wg>0?Math.min(100,Math.round((wSales/wg)*100)):0;
         var wRule= weekRuleForProg(prog);
         if(showTeamSplit){
-          var tWSales = teamSalesForProg(prog);
+          var tWSales = teamSalesForProg(prog, 'week');
           html += '<div style="border-radius:5px;padding:5px 8px;margin-bottom:4px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
             +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:2px">'+prog+' · G:'+wg+'</div>'
             +teamSplitPanel(wSales,tWSales,col,wg)
