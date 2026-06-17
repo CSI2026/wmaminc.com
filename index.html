@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.17.4600';
+var BUILD_VERSION = '2026.06.17.4800';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -12787,6 +12787,13 @@ function canAccess(u, area){
     case 'sold-reports':
       return isOwner(u) || isInventory(u) || isOnboarding(u);
 
+    // ── All Sold Devices archive (Calvin 2026-06-17) ──
+    // Office (Owner/Inventory/Onboarding) see EVERY device; CM/MM/TL/IBO see
+    // their downline (the panel itself scopes). Field agents do NOT get it.
+    case 'sold-archive':
+      return isInventory(u) || isOnboarding(u) || isMgr || isTL || isIBOCategory(u)
+          || hasGrant('inv-dashboard');
+
     // ── Ship B: Points engine ──
     // Every active agent sees their own balance + history.
     // team-points: any active agent (panel internally filters to self+team).
@@ -18865,7 +18872,16 @@ function _gmProdISO(s){
   var d=new Date(s); if(!isNaN(d.getTime())) return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
   return '';
 }
-function gmProductionCount(scopeIds, period, carrier, refDate){
+function _normMkt(s){
+  // Normalize a market name so a LIFELINE_TEAM ("Team Dallas TX B") matches the
+  // market string stored on an activation ("Dallas B"): drop "team", drop 2-letter
+  // state codes, drop non-alphanumerics. Calvin 2026-06-17.
+  if(!s) return '';
+  var states={tx:1,la:1,pa:1,ok:1,ca:1,az:1,nm:1,co:1,ar:1,ks:1,mo:1,fl:1,ga:1,nc:1,sc:1,va:1,tn:1,al:1,ms:1,ky:1,nv:1,ut:1,wa:1,nj:1,ny:1,oh:1,mi:1};
+  return String(s).toLowerCase().replace(/^team\s+/,'').split(/[^a-z0-9]+/).filter(function(t){ return t && !states[t]; }).join('');
+}
+
+function gmProductionCount(scopeIds, period, carrier, refDate, marketNorm){
   if(typeof GM_ACTIVATIONS==='undefined' || !GM_ACTIVATIONS || !GM_ACTIVATIONS.length) return 0;
   var set = scopeIds ? scopeIds.reduce(function(m,id){ m[id]=true; return m; },{}) : null;
   var now=refDate?new Date(refDate):new Date(), inWin;
@@ -18882,6 +18898,7 @@ function gmProductionCount(scopeIds, period, carrier, refDate){
   GM_ACTIVATIONS.forEach(function(a){
     if(!a || a.isChargeback || !a.agentId) return;   // mirror the team rollup
     if(set && !set[a.agentId]) return;
+    if(marketNorm && _normMkt(a.market)!==marketNorm) return;  // optional market filter (ground-truth market totals)
     var iso=_gmProdISO(a.activationDate); if(!iso || !inWin(iso)) return;
     n++;
   });
@@ -33546,6 +33563,7 @@ function buildNav(u){
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>'
       +boDropBtn('imei-search','🔍 IMEI / SIM Search')
       +boDropBtn('sold-reports','💵 Sold Reports')
+      +boDropBtn('sold-archive','🏷️ All Sold Devices')
       +(canAccess(u,'gm-pricelist') ? boDropBtn('gm-pricelist','💲 GM Pricelist') : '')
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
     activeCampaigns().forEach(function(c){
@@ -33562,6 +33580,12 @@ function buildNav(u){
     var campaignNavItems = '';
     if(typeof isSalesRole === 'function' && isSalesRole(u)){
       campaignNavItems += boDropBtn('inv-my-inventory','📱 My Inventory & Transfer Tool');
+      campaignNavItems += '<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
+    }
+    // Calvin 2026-06-17: CM/MM/TL/IBO get the All Sold Devices archive (their
+    // downline, incl. their own numbers). Field agents do not (gate handles it).
+    if(canAccess(u,'sold-archive')){
+      campaignNavItems += boDropBtn('sold-archive','🏷️ All Sold Devices');
       campaignNavItems += '<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
     }
     activeCampaigns().forEach(function(c){
@@ -35367,6 +35391,7 @@ function gotoPanel(id, params){
     'ex-inventory':'Excess Telecom Inventory','ex-upload':'Excess Upload','ex-transfers':'Excess Transfers',
     'inv-export':'Export to Excel','inv-my-inventory':'My Inventory',
     'inv-distribute':'Distribute Inventory',
+    'sold-archive':'All Sold Devices',
     'inv-request':'Inventory Request','inv-audit':'Inventory Audit',
     'supply-mgmt':'Supply Management','pending-transfers':'Pending Transfers',
     'agent-codes':'Agent Codes','goal-settings':'Goals & Minimums',
@@ -35395,6 +35420,7 @@ function gotoPanel(id, params){
     'inv-transfer':panelInvTransfer,'inv-requests':panelInvRequests,
     'inv-export':panelInvExport,'inv-my-inventory':panelMyInventory,
     'inv-distribute':panelDistribute,
+    'sold-archive':panelSoldArchive,
     'inv-hub':panelInvHub,
     'my-markets':panelMyMarkets,'market-breakdown':panelMarketBreakdown,
     'repair-bare-saved':panelRepairBareSaved,
@@ -36746,9 +36772,15 @@ function panelBO(){
       LIFELINE_TEAMS.forEach(function(t){ if((t.members||[]).indexOf(u.id)>=0) _mineMkt[t.id]=true; });
       var mktRanks = LIFELINE_TEAMS.filter(function(t){ return t.active!==false && (t.members||[]).length; }).map(function(t){
         var mem = (t.members||[]).map(function(id){ return DB.agents.find(function(a){return a.id===id && a.active;}); }).filter(Boolean);
+        // Calvin 2026-06-17: count market production from the ACTIVATIONS' own
+        // market field (ground truth) — not the team's member list — so EVERY sale
+        // in the market counts, including the CM/MM's personal sales (they aren't
+        // listed as team members). This keeps Market Rankings in sync with the
+        // roster: a sale visible in "My Team This Week" also lands in its market.
+        var _nrm = _normMkt(t.name);
         return { id:t.id, name:t.name, n:mem.length, mine:!!_mineMkt[t.id],
-          wk: mem.reduce(function(s,a){ return s + _agentPeriodSales(a,'week'); },0),
-          mo: mem.reduce(function(s,a){ return s + _agentPeriodSales(a,'month'); },0) };
+          wk: gmProductionCount(null,'week', u.carrier||'', null, _nrm),
+          mo: gmProductionCount(null,'month',u.carrier||'', null, _nrm) };
       });
       if(mktRanks.length){
         var _moRank = {};
@@ -37362,7 +37394,11 @@ function panelBO(){
       // SOLD is tucked into a small collapsible section below.
       function _isSoldDev(d){ return d.status==='sold' || d.status==='activated' || !!d.soldAt; }
       var availDevs = bulletproofDevices.filter(function(d){ return d.status!=='deleted' && !_isSoldDev(d); });
-      var soldDevs  = bulletproofDevices.filter(function(d){ return d.status!=='deleted' &&  _isSoldDev(d); });
+      // Calvin 2026-06-17: the dashboard Sold list shows THIS MONTH only (by
+      // soldAt). The full history lives in the All Sold Devices archive.
+      var _curYM=(function(){var n=new Date();return n.getFullYear()+'-'+String(n.getMonth()+1).padStart(2,'0');})();
+      var soldDevsAll = bulletproofDevices.filter(function(d){ return d.status!=='deleted' &&  _isSoldDev(d); });
+      var soldDevs    = soldDevsAll.filter(function(d){ return String(d.soldAt||'').slice(0,7)===_curYM; });
       function _dleft(d){ return (typeof invDaysRemaining==='function') ? invDaysRemaining(d.expiryDate, d.assignedDate) : null; }
       availDevs.sort(function(a,b){ var x=_dleft(a), y=_dleft(b); if(x===null&&y===null) return 0; if(x===null) return 1; if(y===null) return -1; return x-y; });
       function _devRow(d, hiddenClass){
@@ -37424,13 +37460,20 @@ function panelBO(){
       if(availDevs.length) html += _devTable(availDevs, 40, {mode:'nav', panel:_invManagePanel});
       else html += '<div style="padding:20px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.85rem">No available inventory on hand \u2014 all of it is sold/activated.</div>';
       html += '</div></div>';
-      // ── SOLD / ACTIVATED (collapsible, OPEN by default — same header style, sold tag) ──
-      if(soldDevs.length){
+      // ── SOLD / ACTIVATED — THIS MONTH (full history in the archive) ──
+      if(soldDevsAll.length){
+        var _soldArchiveBtn = (typeof canAccess==='function' && canAccess(u,'sold-archive'))
+          ? '<button onclick="event.stopPropagation();gotoPanel(\'sold-archive\')" style="background:none;border:1px solid var(--border);color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;padding:5px 12px;border-radius:100px;cursor:pointer">\ud83c\udff7\ufe0f All Sold Devices \u2192</button>'
+          : '';
         html += '<div class="bo-card" style="margin-bottom:20px">';
         html += '<div class="bo-card-head" style="border-left:4px solid var(--muted);cursor:pointer" onclick="(function(){var b=document.getElementById(\'sold-dev-body\');var a=document.getElementById(\'sold-dev-caret\');if(b){var open=b.style.display!==\'none\';b.style.display=open?\'none\':\'block\';if(a)a.textContent=open?\'\u25b8\':\'\u25be\';}})()">';
-        html += '<div style="display:flex;align-items:center;gap:9px"><span id="sold-dev-caret" style="color:var(--muted);font-size:.85rem">\u25be</span><div class="bo-card-title">\ud83c\udff7\ufe0f Sold / Activated ('+soldDevs.length+')</div></div>';
+        html += '<div style="display:flex;align-items:center;gap:9px"><span id="sold-dev-caret" style="color:var(--muted);font-size:.85rem">\u25be</span><div class="bo-card-title">\ud83c\udff7\ufe0f Sold / Activated This Month ('+soldDevs.length+')</div></div>';
+        html += _soldArchiveBtn;
         html += '</div>';
-        html += '<div id="sold-dev-body">'+_devTable(soldDevs, 50, {mode:'expand', id:'sold'})+'</div>';
+        html += '<div id="sold-dev-body">';
+        if(soldDevs.length) html += _devTable(soldDevs, 50, {mode:'expand', id:'sold'});
+        else html += '<div style="padding:20px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif;font-size:.85rem">No devices sold yet this month. Earlier months are in the All Sold Devices archive.</div>';
+        html += '</div>';
         html += '</div>';
       }
     }
@@ -38024,6 +38067,7 @@ function panelOwner(){
   // Inventory dropdown → pick campaign → Transfers tab inside.
   var invActions = [
     {panel:'inv-dashboard',     icon:'📦', label:'All Inventory'},
+    {panel:'sold-archive',      icon:'🏷️', label:'All Sold Devices'},
     {panel:'inv-requests',      icon:'🛒', label:'Requests'},
     {panel:'pending-transfers', icon:'⏳', label:'Pending Transfers'},
     {panel:'supply-mgmt',       icon:'🗄️', label:'Supply Mgmt'},
@@ -46578,6 +46622,124 @@ function postToChannel(chId){
     reader.onload = function(e){ doPost(e.target.result); };
     reader.readAsDataURL(photoEl.files[0]);
   } else { doPost(null); }
+}
+
+// ══════════════════════════════════════════════
+//  ALL SOLD DEVICES — ARCHIVE  (Calvin 2026-06-17)
+//  Office (Owner / Inventory / Onboarding) see EVERY sold/activated device.
+//  Managers (CM / MM / TL / IBO) see their downline — including their own
+//  personal numbers. Filed like folders: Campaign → Year (this year first) →
+//  Month (all months) → device list WITH IMEI. Kept permanently so a sold
+//  device can be looked up later if a carrier dispute shows it as expired.
+// ══════════════════════════════════════════════
+function _soldArchiveScope(u){
+  // null = see everything (office); otherwise a {id:true} set of the downline.
+  var seeAll = isOwner(u) || isInventory(u) || isOnboarding(u)
+    || (typeof agentHasDeptAccess==='function' && agentHasDeptAccess(u,'inv-dashboard'));
+  if(seeAll) return null;
+  var ids = (typeof agentIdsInMyOrgEffective==='function') ? agentIdsInMyOrgEffective(u) : [u.id];
+  return ids.reduce(function(m,id){ m[id]=true; return m; },{});
+}
+function _soldArchiveDevices(u){
+  var pool = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools()
+           : (Array.isArray(INVENTORY_DEVICES)?INVENTORY_DEVICES.slice():[]);
+  var scope = _soldArchiveScope(u);
+  return pool.filter(function(d){
+    if(!d || d.status==='deleted') return false;
+    if(!(d.status==='sold' || d.status==='activated' || d.soldAt)) return false;
+    if(scope){
+      var h = d.holderId || d.assignedTo || d.soldByAgentId || null;
+      if(!h || !scope[h]) return false;
+    }
+    return true;
+  });
+}
+function _soldArchiveTree(devs){
+  // campaign -> year('YYYY'|'Undated') -> monthNum('01'..'12'|'00') -> [devices]
+  var tree = {};
+  devs.forEach(function(d){
+    var camp = String(d.campaign||d.carrier||'Unknown').trim() || 'Unknown';
+    var dt = String(d.soldAt||'');
+    var dated = /^\d{4}-\d{2}/.test(dt);
+    var year = dated ? dt.slice(0,4) : 'Undated';
+    var mNum = dated ? dt.slice(5,7) : '00';
+    (tree[camp] = tree[camp]||{});
+    (tree[camp][year] = tree[camp][year]||{});
+    (tree[camp][year][mNum] = tree[camp][year][mNum]||[]).push(d);
+  });
+  return tree;
+}
+function _soldArchiveCount(o){
+  var n=0; Object.keys(o).forEach(function(k){ var v=o[k]; if(Array.isArray(v)) n+=v.length; else n+=_soldArchiveCount(v); }); return n;
+}
+function _soldArchiveHolderName(d){
+  var hid = d.holderId || d.assignedTo || d.soldByAgentId || null;
+  if(!hid) return '<span style="color:#d97706">Unassigned</span>';
+  if(d.assignedToName) return d.assignedToName;
+  if(d.soldByAgentName) return d.soldByAgentName;
+  var ag = (DB.agents||[]).find(function(a){return a.id===hid;});
+  return ag ? ag.name : ('#'+hid);
+}
+function _soldArchiveTable(devs){
+  devs = devs.slice().sort(function(a,b){ return String(b.soldAt||'').localeCompare(String(a.soldAt||'')); });
+  var h='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+  h+='<thead><tr style="background:var(--cream);border-bottom:2px solid var(--sand)">';
+  ['IMEI','Campaign','Market','Holder','Sold','Expires'].forEach(function(c){ h+='<th style="padding:8px 12px;text-align:left;font-size:.64rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">'+c+'</th>'; });
+  h+='</tr></thead><tbody>';
+  devs.forEach(function(d){
+    h+='<tr style="border-bottom:1px solid var(--sand)">'
+      +'<td style="padding:7px 12px;font-family:monospace;font-size:.72rem;color:var(--brown)">'+(d.imei||d.id||'\u2014')+'</td>'
+      +'<td style="padding:7px 12px;font-size:.76rem;color:var(--brown)">'+(d.campaign||d.carrier||'\u2014')+'</td>'
+      +'<td style="padding:7px 12px;font-size:.76rem;color:var(--brown)">'+(d.market||'\u2014')+'</td>'
+      +'<td style="padding:7px 12px;font-size:.76rem;color:var(--brown)">'+_soldArchiveHolderName(d)+'</td>'
+      +'<td style="padding:7px 12px;font-size:.76rem;color:var(--brown)">'+(String(d.soldAt||'').slice(0,10)||'\u2014')+'</td>'
+      +'<td style="padding:7px 12px;font-size:.76rem;color:var(--brown)">'+(d.expiryDate||'\u2014')+'</td>'
+      +'</tr>';
+  });
+  h+='</tbody></table></div>';
+  return h;
+}
+function panelSoldArchive(){
+  var u = DB.current;
+  var html = panelHeader('\ud83c\udff7\ufe0f All Sold Devices');
+  var seeAll = _soldArchiveScope(u)===null;
+  var devs = _soldArchiveDevices(u);
+
+  html += '<div class="bo-card" style="margin-bottom:14px"><div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.9rem;color:var(--brown);line-height:1.55">';
+  html += seeAll
+    ? 'Permanent archive of <strong>every sold / activated device</strong>, filed by campaign \u2192 year \u2192 month. Kept for reference if a sold device is ever disputed or shows as expired.'
+    : 'Your downline\u2019s sold / activated devices (including your own personal numbers), filed by campaign \u2192 year \u2192 month.';
+  html += ' <strong>'+devs.length+'</strong> device'+(devs.length===1?'':'s')+' on record.';
+  html += '</div></div>';
+
+  if(!devs.length){
+    html += '<div class="bo-card"><div style="padding:32px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No sold devices on record yet.</div></div>';
+    return html;
+  }
+
+  var MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  var tree=_soldArchiveTree(devs);
+  var dStyle='margin-bottom:8px;border:1px solid var(--sand);border-radius:8px;overflow:hidden';
+  Object.keys(tree).sort().forEach(function(camp){
+    html += '<details style="'+dStyle+'"><summary style="cursor:pointer;padding:13px 16px;background:var(--cream);font-family:Bebas Neue,sans-serif;font-size:1.05rem;letter-spacing:1px;color:var(--brown)">\ud83d\udcc1 '+camp+' <span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">('+_soldArchiveCount(tree[camp])+')</span></summary>';
+    html += '<div style="padding:8px 10px 10px 16px">';
+    var years=Object.keys(tree[camp]).sort(function(a,b){ if(a==='Undated')return 1; if(b==='Undated')return -1; return b.localeCompare(a); });
+    years.forEach(function(yr){
+      html += '<details style="margin:6px 0;border-left:3px solid var(--blue);border-radius:4px;background:rgba(0,53,148,.02)"><summary style="cursor:pointer;padding:9px 14px;font-family:Oswald,sans-serif;font-weight:700;letter-spacing:1px;color:var(--blue)">\ud83d\udcc5 '+yr+' <span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);font-weight:400">('+_soldArchiveCount(tree[camp][yr])+')</span></summary>';
+      html += '<div style="padding:4px 6px 8px 14px">';
+      var months=Object.keys(tree[camp][yr]).sort(function(a,b){ return b.localeCompare(a); });
+      months.forEach(function(mn){
+        var devsM=tree[camp][yr][mn];
+        var mName = mn==='00' ? 'Undated' : MONTHS[parseInt(mn,10)-1];
+        html += '<details style="margin:5px 0"><summary style="cursor:pointer;padding:7px 12px;font-family:Barlow Condensed,sans-serif;font-weight:700;font-size:.92rem;color:var(--brown)">\ud83d\uddd3\ufe0f '+mName+' <span style="font-size:.72rem;color:var(--muted);font-weight:400">('+devsM.length+')</span></summary>';
+        html += '<div style="padding:4px 0 10px 4px">'+_soldArchiveTable(devsM)+'</div>';
+        html += '</details>';
+      });
+      html += '</div></details>';
+    });
+    html += '</div></details>';
+  });
+  return html;
 }
 
 // ══════════════════════════════════════════════
