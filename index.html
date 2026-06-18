@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.17.5400';
+var BUILD_VERSION = '2026.06.17.5500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -7637,30 +7637,51 @@ function payrollBuildWeeklyRollup(periodEnd){
           grossCents: 0,
           chargebackCents: 0,
           carryoverAppliedCents: 0,
-          netCents: 0
+          netCents: 0,
+          _authNet: 0   // sum of each line's authoritative net (anchors the deposit)
         };
       }
       var a = result.agents[aid];
-      var lineGross = row.grossCents || 0;
-      var lineCb    = row.chargebackTotal || 0;
+      // ── Surface deductions (Calvin 2026-06-18) ──
+      // When the deduction cascade ran at commit it stored the pre-deduction
+      // commission in grossCommissionCents and the final payout in grossCents,
+      // leaving chargebackTotal at 0 — so the old rollup showed $0 deductions.
+      // The robust deduction = commission − net (captures EVERY deduction type:
+      // 14-day cancels, TC/device deductions, GM chargebacks) and always ties:
+      // gross − deductions = net. Net is anchored to the cascade's authoritative
+      // figure, so every agent's deposit is byte-identical to before.
+      var cascade = (typeof row.grossCommissionCents === 'number');
+      var lineGross, lineCb, lineNet;
+      if(cascade){
+        lineGross = row.grossCommissionCents || 0;          // commission earned
+        lineNet   = row.grossCents || 0;                    // authoritative net paid
+        lineCb    = Math.max(0, lineGross - lineNet);       // total deductions
+      } else {
+        lineGross = row.grossCents || 0;
+        lineCb    = Math.abs(row.chargebackTotal || 0);     // parser stores upsell CBs as negative
+        lineNet   = lineGross - lineCb;
+      }
       a.lines.push({
         carrier:        w.carrier,
         weekId:         w.id,
         grossCents:     lineGross,
         chargebackCents: lineCb,
+        netCents:       lineNet,
         kind:           'carrier-line'
       });
       a.grossCents += lineGross;
       a.chargebackCents += lineCb;
+      a._authNet += lineNet;
     });
   });
   // Second pass — apply carryover debt as a negative line per agent
   Object.keys(result.agents).forEach(function(aid){
     var a = result.agents[aid];
+    var authNet = a._authNet || 0;
     var debtBalance = (PAYROLL_DEBT_LEDGER && PAYROLL_DEBT_LEDGER[aid]) ? (PAYROLL_DEBT_LEDGER[aid].balanceCents || 0) : 0;
     if(debtBalance > 0){
-      // We can only apply what gross-minus-chargebacks can cover
-      var availableForCarryover = Math.max(0, a.grossCents - a.chargebackCents);
+      // We can only apply what the authoritative net can cover
+      var availableForCarryover = Math.max(0, authNet);
       var applied = Math.min(debtBalance, availableForCarryover);
       if(applied > 0){
         a.carryoverAppliedCents = applied;
@@ -7669,12 +7690,14 @@ function payrollBuildWeeklyRollup(periodEnd){
           weekId:     null,
           grossCents: -applied,
           chargebackCents: 0,
+          netCents:   -applied,
           kind:       'carryover'
         });
       }
     }
-    a.netCents = a.grossCents - a.chargebackCents - a.carryoverAppliedCents;
+    a.netCents = authNet - a.carryoverAppliedCents;
     if(a.netCents < 0) a.netCents = 0; // never negative deposit; remainder stays in debt ledger
+    delete a._authNet;
     result.totals.grossCents += a.grossCents;
     result.totals.chargebackCents += a.chargebackCents;
     result.totals.carryoverAppliedCents += a.carryoverAppliedCents;
@@ -46932,7 +46955,7 @@ function _payStubRender(a, ag, periodEnd){
     var bd=(row && Array.isArray(row.commissionBreakdown)) ? row.commissionBreakdown : [];
     var cbCents=(L.chargebackCents||0);
     var cbCount=(row && Array.isArray(row.chargebacks)) ? row.chargebacks.length : 0;
-    var net=(L.grossCents||0)-cbCents;
+    var net=(typeof L.netCents==='number')?L.netCents:((L.grossCents||0)-cbCents);
     var prog=_payStubProgram(L.carrier);
     h+='<tbody>';
     h+='<tr><td colspan="3" style="background:var(--cream);border-top:2px solid var(--blue);padding:9px 26px">'
