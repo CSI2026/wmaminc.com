@@ -3413,7 +3413,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.1130';
+var BUILD_VERSION = '2026.06.11.1230';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -11311,6 +11311,49 @@ function saveAssignedDocs(agentIdHint){
   // Always update localStorage immediately so the current user's UI is correct
   try{ localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); }catch(e){}
 
+  // ── Calvin 2026-06-11 v1130: REDUNDANT WRITE TO AGENT RECORD ──
+  // The app_settings writes below have been returning 401 in production
+  // (Supabase RLS or JWT issue on that table). Tanita signed → save died
+  // → next reload she had to sign again. agents-table writes work fine.
+  // Mirror the per-agent signed-doc data onto agent.signedDocs and save
+  // via the agents-table path. _buildAgentRow packs it into both
+  // reports_to._meta.signedDocs AND depts._meta.signedDocs for redundancy.
+  // Hydration on next load reads from EITHER source.
+  try {
+    if(agentIdHint != null){
+      var agent = DB.agents.find(function(a){return a.id === agentIdHint;});
+      if(agent){
+        agent.signedDocs = ASSIGNED_DOC_STATUS[agentIdHint] || {};
+        // Fire-and-forget; the await happens below in the queue if needed.
+        if(typeof saveAgentToSupabase === 'function'){
+          saveAgentToSupabase(agent).then(function(r){
+            if(r && r.ok){
+              console.log('[saveAssignedDocs] ✓ mirrored signedDocs to agents table for agent '+agentIdHint);
+            } else {
+              console.warn('[saveAssignedDocs] agents-table mirror returned not-ok for agent '+agentIdHint, r && r.error);
+            }
+          }).catch(function(e){
+            console.warn('[saveAssignedDocs] agents-table mirror threw for agent '+agentIdHint+':', e);
+          });
+        }
+      }
+    } else {
+      // Bulk: iterate all agents that have signed docs
+      DB.agents.forEach(function(a){
+        if(ASSIGNED_DOC_STATUS[a.id] && Object.keys(ASSIGNED_DOC_STATUS[a.id]).length){
+          a.signedDocs = ASSIGNED_DOC_STATUS[a.id];
+          if(typeof saveAgentToSupabase === 'function'){
+            saveAgentToSupabase(a).catch(function(e){
+              console.warn('[saveAssignedDocs] bulk mirror threw for agent '+a.id+':', e);
+            });
+          }
+        }
+      });
+    }
+  } catch(mirrorErr){
+    console.warn('[saveAssignedDocs] agents-table mirror failed (non-fatal):', mirrorErr);
+  }
+
   // ── Calvin 2026-06-08 ARCHITECTURAL FIX — per-agent cloud keys ──
   // PREVIOUS BUG: this function used to UPSERT the entire ASSIGNED_DOC_STATUS
   // blob (every agent's records) to a single Supabase row. When two
@@ -17994,6 +18037,7 @@ async function syncPullFreshAgent(agentId){
       reportsTo:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).reportsTo; }catch(e){ return safeJSON(a.reports_to, {}); } })(),
       // Calvin 2026-06-11 v0730: extract piggybacked meta from reports_to._meta
       pendingAgent:  (function(){ try{ return _detectPendingAgent(a); }catch(e){ return false; } })(),
+      signedDocs:    (function(){ try{ return _unpackSignedDocs(a); }catch(e){ return {}; } })(),
       iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
       campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
       createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
@@ -18059,6 +18103,7 @@ async function syncPullFreshAllAgents(){
         awModel:       a.aw_model || 'none',
         reportsTo:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).reportsTo; }catch(e){ return safeJSON(a.reports_to, {}); } })(),
         pendingAgent:  (function(){ try{ return _detectPendingAgent(a); }catch(e){ return false; } })(),
+      signedDocs:    (function(){ try{ return _unpackSignedDocs(a); }catch(e){ return {}; } })(),
         iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
         campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
         createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
@@ -19502,6 +19547,7 @@ async function loadFromSupabase(){
           reportsTo:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).reportsTo; }catch(e){ return safeJSON(a.reports_to, {}); } })(),
           // Calvin 2026-06-11 v0730: piggybacked meta fields from reports_to._meta
           pendingAgent:  (function(){ try{ return _detectPendingAgent(a); }catch(e){ return false; } })(),
+      signedDocs:    (function(){ try{ return _unpackSignedDocs(a); }catch(e){ return {}; } })(),
           iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
           campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
           createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
@@ -19516,6 +19562,24 @@ async function loadFromSupabase(){
       // Server is truth. Replace local agents.
       DB.agents = supaList;
       console.log('[loadFromSupabase] loaded '+supaList.length+' agents from Supabase');
+      // ── Calvin 2026-06-11 v1130: bulk sync signed-doc data from each
+      // hydrated agent into ASSIGNED_DOC_STATUS. This is the recovery
+      // path that protects against app_settings-table 401 errors: signed
+      // docs persisted onto the agent record reappear in the doc gate
+      // immediately, no re-signing required.
+      try {
+        var syncedAgents = 0;
+        DB.agents.forEach(function(a){
+          if(a && a.signedDocs && Object.keys(a.signedDocs).length){
+            _syncAgentSignedDocsIntoStatus(a);
+            syncedAgents++;
+          }
+        });
+        if(syncedAgents){
+          try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
+          console.log('[loadFromSupabase] ✓ synced signedDocs from '+syncedAgents+' agent record(s) into ASSIGNED_DOC_STATUS');
+        }
+      } catch(syncErr){ console.warn('[loadFromSupabase] signedDocs sync failed:', syncErr); }
       // Auto-derive .category/.depts for every legacy record we just loaded.
       if(typeof migrateAllAgentCategories==='function') migrateAllAgentCategories();
       DB.nextId = Math.max.apply(null, DB.agents.map(function(a){return a.id;})) + 1;
@@ -19544,6 +19608,78 @@ async function loadFromSupabase(){
         }
       } catch(e) {
         console.warn('[migrate-tanita] failed safely:', e);
+      }
+
+      // ── Calvin 2026-06-11 v1230: TANITA BG-CONTRACT BYPASS ──
+      // Per Calvin's direction: Tanita has signed BG documents multiple times
+      // but the app_settings 401 bug kept losing them. He's manually sending
+      // her the BG packet for offline signing — stop prompting her in-app.
+      // Mark both built-in BG forms as signed with an unmistakable "MANUAL
+      // BYPASS" marker so audit trail shows this was not an e-signature.
+      // Idempotent: if either form is already marked bypassed or signed,
+      // re-running is a no-op. Mirrors via the v1230 signedDocs path on the
+      // agents table so it survives reload without depending on app_settings.
+      try {
+        var tanitaBp = DB.agents.find(function(a){ return a.id === 2; });
+        if(tanitaBp){
+          var bgFormIds = ['builtin-bg-authorization', 'builtin-bg-pii-intake'];
+          var nowIso = new Date().toISOString();
+          var bypassRecord = {
+            signed: true,
+            signedAt: nowIso,
+            signature: 'MANUAL BYPASS — sent for offline signing',
+            assignedAt: tanitaBp.start || nowIso,
+            assignedBy: { id: 1, name: 'Calvin Williams (Owner)' },
+            scope: 'individual',
+            required: true,
+            responses: {},
+            // Audit fields so this is clearly NOT an e-signature
+            _bypass: true,
+            _bypassReason: 'BG contract to be sent and signed offline',
+            _bypassBy: 'Calvin Williams (Owner)',
+            _bypassAt: nowIso
+          };
+          var changedAny = false;
+          if(!ASSIGNED_DOC_STATUS[2]) ASSIGNED_DOC_STATUS[2] = {};
+          bgFormIds.forEach(function(fid){
+            var existing = ASSIGNED_DOC_STATUS[2][fid];
+            if(existing && existing.signed === true){
+              // Already signed (real signature or prior bypass) — skip
+              return;
+            }
+            // Either no entry at all, or assigned-but-not-signed — write the bypass
+            var record = Object.assign({}, bypassRecord);
+            // Preserve assignedAt/assignedBy if they exist
+            if(existing){
+              if(existing.assignedAt) record.assignedAt = existing.assignedAt;
+              if(existing.assignedBy) record.assignedBy = existing.assignedBy;
+              if(typeof existing.required === 'boolean') record.required = existing.required;
+              if(existing.scope) record.scope = existing.scope;
+            }
+            ASSIGNED_DOC_STATUS[2][fid] = record;
+            changedAny = true;
+          });
+          if(changedAny){
+            // Mirror onto agent record via the v1230 redundant path so it
+            // survives reload without needing the app_settings table.
+            tanitaBp.signedDocs = Object.assign({}, tanitaBp.signedDocs || {}, ASSIGNED_DOC_STATUS[2]);
+            console.log('[bypass-tanita-bg] ✓ Marked builtin-bg-authorization + builtin-bg-pii-intake as MANUAL BYPASS for Tanita Flowers (id 2)');
+            try { localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); } catch(e){}
+            if(typeof saveAgentToSupabase === 'function'){
+              saveAgentToSupabase(tanitaBp).then(function(r){
+                if(r && r.ok){
+                  console.log('[bypass-tanita-bg] ✓ persisted to agents table (cloud)');
+                } else {
+                  console.warn('[bypass-tanita-bg] cloud persist returned not-ok:', r && r.error);
+                }
+              }).catch(function(e){
+                console.warn('[bypass-tanita-bg] cloud persist threw (data still in localStorage):', e);
+              });
+            }
+          }
+        }
+      } catch(e){
+        console.warn('[bypass-tanita-bg] failed safely:', e);
       }
 
       // ── ONE-TIME ROLE MIGRATION: MAKENZIE GIBSON (id 3) ──
@@ -20090,6 +20226,62 @@ function _detectPendingAgent(serverRow){
 }
 if(typeof window !== 'undefined') window._detectPendingAgent = _detectPendingAgent;
 
+// ── Calvin 2026-06-11 v1130: SIGNED-DOC UNPACKER ──
+// Pulls agent.signedDocs from the redundant write paths in saved agent rows.
+//   1. reports_to._meta.signedDocs (primary)
+//   2. depts._meta.signedDocs (redundancy)
+// Returns the agent-level form-keyed object {[formId]: {signed, signedAt, ...}}
+// or an empty object if no signed-doc data is on the row.
+function _unpackSignedDocs(serverRow){
+  if(!serverRow) return {};
+  // 1. reports_to._meta.signedDocs
+  try {
+    var rtu = _unpackAgentReportsTo(serverRow.reports_to);
+    if(rtu && rtu.meta && rtu.meta.signedDocs && typeof rtu.meta.signedDocs === 'object'){
+      return rtu.meta.signedDocs;
+    }
+  } catch(e){}
+  // 2. depts._meta.signedDocs
+  try {
+    var d = serverRow.depts;
+    if(typeof d === 'string'){ try{ d = JSON.parse(d); }catch(e){ d = {}; } }
+    if(d && typeof d === 'object' && d._meta && d._meta.signedDocs && typeof d._meta.signedDocs === 'object'){
+      return d._meta.signedDocs;
+    }
+  } catch(e){}
+  return {};
+}
+if(typeof window !== 'undefined') window._unpackSignedDocs = _unpackSignedDocs;
+
+// ── Calvin 2026-06-11 v1130: SYNC AGENT.signedDocs → ASSIGNED_DOC_STATUS ──
+// After hydration, the agent record's signedDocs is the recovery source.
+// Merge it into ASSIGNED_DOC_STATUS using the SAME signed-wins rule used
+// throughout the codebase, so a sign on Device A persisted to the cloud
+// via the agent record will appear on Device B's reload.
+function _syncAgentSignedDocsIntoStatus(agent){
+  if(!agent || agent.id == null) return;
+  var src = agent.signedDocs || {};
+  if(!src || typeof src !== 'object') return;
+  var keys = Object.keys(src);
+  if(!keys.length) return;
+  if(!ASSIGNED_DOC_STATUS[agent.id]) ASSIGNED_DOC_STATUS[agent.id] = {};
+  keys.forEach(function(formId){
+    var cloud = src[formId];
+    var local = ASSIGNED_DOC_STATUS[agent.id][formId];
+    if(cloud && cloud.signed === true){
+      // Cloud has a signed copy — accept it (signed always wins, regardless
+      // of what local has).
+      ASSIGNED_DOC_STATUS[agent.id][formId] = cloud;
+    } else if(!local || !local.signed){
+      // Neither side is signed — take cloud as base (no signature lost).
+      ASSIGNED_DOC_STATUS[agent.id][formId] = cloud;
+    }
+    // else: local is signed, cloud is not — keep local; next save will push
+    // local signature back into agent.signedDocs and out to the cloud.
+  });
+}
+if(typeof window !== 'undefined') window._syncAgentSignedDocsIntoStatus = _syncAgentSignedDocsIntoStatus;
+
 function _buildAgentRow(agent){
   // ── Calvin 2026-06-11 v0730: PIGGYBACK META FIELDS ──
   // pendingAgent, iboId, campaigns, and other fields lack dedicated Supabase
@@ -20110,6 +20302,15 @@ function _buildAgentRow(agent){
   if(agent.createdAt) meta.createdAt = agent.createdAt;
   if(agent.createdById) meta.createdById = agent.createdById;
   if(agent.createdByName) meta.createdByName = agent.createdByName;
+  // ── Calvin 2026-06-11 v1130: SIGNED-DOC PERSISTENCE ──
+  // app_settings table writes returning 401 in production → every signature
+  // save dies → Tanita re-prompted to sign on every reload. agents-table
+  // writes work fine. Mirror signedDocs here so they survive regardless.
+  if(agent.signedDocs && typeof agent.signedDocs === 'object' && Object.keys(agent.signedDocs).length){
+    meta.signedDocs = agent.signedDocs;
+  } else {
+    delete meta.signedDocs;
+  }
   if(Object.keys(meta).length){
     packedReportsTo._meta = meta;
   } else {
@@ -20121,16 +20322,19 @@ function _buildAgentRow(agent){
   // destroying _meta. depts is ALWAYS JSON.stringify'd via _buildAgentRow
   // → robust regardless of column type. Pack pendingAgent here too as
   // a safety net. Hydration reads pendingAgent from EITHER source.
+  // v1130 adds signedDocs to the same depts._meta redundancy.
   var packedDepts = Object.assign({}, agent.depts || {});
-  if(agent.pendingAgent === true){
-    packedDepts._meta = Object.assign({}, packedDepts._meta || {}, { pendingAgent: true });
-  } else if(packedDepts._meta && packedDepts._meta.pendingAgent){
-    // Clear pendingAgent flag if it's no longer set (e.g., after approval)
-    var dm = Object.assign({}, packedDepts._meta);
-    delete dm.pendingAgent;
-    if(Object.keys(dm).length) packedDepts._meta = dm;
-    else delete packedDepts._meta;
+  var dMeta = (packedDepts._meta && typeof packedDepts._meta === 'object')
+              ? Object.assign({}, packedDepts._meta) : {};
+  if(agent.pendingAgent === true) dMeta.pendingAgent = true;
+  else delete dMeta.pendingAgent;
+  if(agent.signedDocs && typeof agent.signedDocs === 'object' && Object.keys(agent.signedDocs).length){
+    dMeta.signedDocs = agent.signedDocs;
+  } else {
+    delete dMeta.signedDocs;
   }
+  if(Object.keys(dMeta).length) packedDepts._meta = dMeta;
+  else delete packedDepts._meta;
   return {
     id: agent.id, name: agent.name, username: agent.username, password: agent.password,
     role: agent.role, email: agent.email||'',
@@ -20305,6 +20509,7 @@ function _mergeServerAgentIntoLocal(serverRow){
     reportsTo:   (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).reportsTo; }catch(e){ return safeJSONLocal(serverRow.reports_to, {}); } })(),
     // Calvin 2026-06-11 v0730: piggybacked meta fields from reports_to._meta
     pendingAgent:(function(){ try{ return _detectPendingAgent(serverRow); }catch(e){ return false; } })(),
+    signedDocs:(function(){ try{ return _unpackSignedDocs(serverRow); }catch(e){ return {}; } })(),
     iboId:       (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
     campaigns:   (function(){ try{ var m = _unpackAgentReportsTo(serverRow.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
     createdAt:   (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
@@ -20318,6 +20523,10 @@ function _mergeServerAgentIntoLocal(serverRow){
   var idx = DB.agents.findIndex(function(a){ return a && a.id === mapped.id; });
   if(idx >= 0) DB.agents[idx] = mapped;
   else DB.agents.push(mapped);
+  // ── Calvin 2026-06-11 v1130: sync any signed-doc data from the cloud-
+  // saved agent record into ASSIGNED_DOC_STATUS so the doc gates use the
+  // latest signed state immediately on hydration/merge.
+  try { if(typeof _syncAgentSignedDocsIntoStatus === 'function') _syncAgentSignedDocsIntoStatus(mapped); } catch(syncErr){}
   saveToStorage();
 }
 
