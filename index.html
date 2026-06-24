@@ -3437,7 +3437,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.2230';
+var BUILD_VERSION = '2026.06.11.2330';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -55386,9 +55386,19 @@ if(typeof window !== 'undefined') window._aiVisionExtractFromImage = _aiVisionEx
 function _decodeDartPhotoHybrid(imgEl, progressCb){
   var imgW = imgEl.naturalWidth || imgEl.width || 0;
   var midX = imgW / 2;
+  // ── Calvin 2026-06-11 v2330: strict mode skips Tesseract ──
+  // Tesseract has no positions (everything is side='unknown') and
+  // tends to mistake stray digits for IMEIs. In strict IMEI1-only mode
+  // (the default), running it inflates the candidate count with noise
+  // that the user can't act on anyway because unknown-side entries
+  // are hidden. Skip the fallback unless captureImei2 is on or we're
+  // in SIM mode.
+  var strictMode = (_dartScannerState.mode === 'phone') && !_dartScannerState.captureImei2;
   var barcodesP = _decodeMultipleBarcodesFromImage(imgEl).catch(function(){ return []; });
   var aiP = _aiVisionExtractFromImage(imgEl, progressCb);
-  var ocrFallbackP = _ocrImageForNumbers(imgEl).catch(function(){ return []; });
+  var ocrFallbackP = strictMode
+    ? Promise.resolve([])
+    : _ocrImageForNumbers(imgEl).catch(function(){ return []; });
   return Promise.all([barcodesP, aiP, ocrFallbackP]).then(function(results){
     var barcodes = results[0] || [];
     var ai       = results[1] || [];
@@ -56098,6 +56108,38 @@ function _renderDartPhotoReview(detected, dataUrl){
   window._dartPhotoLastDataUrl = dataUrl;
   window._dartPhotoLastDetected = detected;
 
+  // ── Calvin 2026-06-11 v2330: STRICT IMEI1-ONLY FILTERING ──
+  // Calvin: "the AI scan should only be tracking the 20 IMEI 1's and no
+  // other number unless we select IMEI 2's as well. The total number of
+  // phones per box is 20 max."
+  // - When captureImei2 is OFF (default): hide every right-side and
+  //   every position-unknown detection. Only left-column 15-digit
+  //   Luhn-valid IMEIs survive the filter.
+  // - When captureImei2 is ON: show both columns, default-check both.
+  // - SIM mode (mode='sim') is unaffected — no left/right concept.
+  var captureBoth = !!_dartScannerState.captureImei2;
+  var hiddenIMEI2 = [];
+  var hiddenOther = [];
+  if(mode === 'phone' && !captureBoth){
+    var visible = [];
+    detected.forEach(function(d){
+      if(d.side === 'left'){
+        // Strict Luhn gate for the visible list — only true 15-digit
+        // IMEIs pass. 14/16/17-digit OCR noise gets bucketed.
+        if(d.text.length === 15 && _isValidImeiLuhn(d.text)){
+          visible.push(d);
+        } else {
+          hiddenOther.push(d);
+        }
+      } else if(d.side === 'right'){
+        hiddenIMEI2.push(d);
+      } else {
+        hiddenOther.push(d);
+      }
+    });
+    detected = visible;
+  }
+
   // Classify each detection
   function classify(d){
     var n = d.text;
@@ -56151,14 +56193,47 @@ function _renderDartPhotoReview(detected, dataUrl){
     else if(d.side === 'right') counts.right++;
     else                         counts.unknown++;
   });
-  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;color:#059669;letter-spacing:1.5px;margin-bottom:4px">'+detected.length+' '+(mode==='sim'?'ICCID':'IMEI')+' candidate'+(detected.length===1?'':'s')+' found</div>';
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;color:#059669;letter-spacing:1.5px;margin-bottom:4px">'
+       + (mode === 'phone' && !captureBoth
+          ? detected.length + ' IMEI1 ready to save (max 20 per box)'
+          : detected.length + ' ' + (mode==='sim'?'ICCID':'IMEI') + ' candidate' + (detected.length===1?'':'s') + ' found'
+         )
+       + '</div>';
+  // ── v2330: Calvin's hard cap warning ──
+  // "The total number of phones per box is 20 max."
+  if(mode === 'phone' && !captureBoth && detected.length > 20){
+    html += '<div style="background:rgba(217,119,6,.1);border:2px solid rgba(217,119,6,.5);border-radius:6px;padding:10px 14px;margin-bottom:10px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#92400e;font-weight:700">'
+         + '⚠ '+detected.length+' IMEI1s detected — a box holds 20 max. Verify each before saving. Likely causes: photo includes more than one box, or AI misread some numbers (Luhn caught no duplicates).'
+         + '</div>';
+  }
+  if(mode === 'phone' && !captureBoth && detected.length === 0){
+    html += '<div style="background:rgba(217,119,6,.1);border:2px solid rgba(217,119,6,.5);border-radius:6px;padding:10px 14px;margin-bottom:10px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:#92400e">'
+         + '⚠ AI found no valid IMEI1s on the left column. Hidden: '+hiddenIMEI2.length+' right-column entries, '+hiddenOther.length+' other entries (suspect length / failed Luhn / position unknown). Tap "Show hidden detections" below to review them.'
+         + '</div>';
+  }
   html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:6px">'
        + (counts.both?'✅ '+counts.both+' confirmed by 2+ sources · ':'')
        + (counts.ai?'🤖 '+counts.ai+' AI vision · ':'')
        + (counts.barcode?'📷 '+counts.barcode+' barcode · ':'')
        + (counts.ocr?'🔤 '+counts.ocr+' OCR · ':'')
-       + counts.valid+' high-confidence, '+counts.suspect+' need review'
+       + 'all Luhn-validated 15-digit IMEIs'
        + '</div>';
+  // v2330: hidden-detections expander (only in strict mode)
+  if(mode === 'phone' && !captureBoth && (hiddenIMEI2.length + hiddenOther.length) > 0){
+    html += '<details style="margin-bottom:10px"><summary style="cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);user-select:none">'
+         + 'Show '+(hiddenIMEI2.length+hiddenOther.length)+' hidden detections '
+         + '(' + hiddenIMEI2.length + ' IMEI2 / right-column · ' + hiddenOther.length + ' suspect length or position)'
+         + '</summary>';
+    html += '<div style="background:rgba(120,120,120,.06);border:1px solid var(--border);border-radius:5px;padding:8px;margin-top:6px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:.78rem">';
+    hiddenIMEI2.concat(hiddenOther).forEach(function(d){
+      var sideTag = (d.side === 'right' ? '▶ IMEI2' : (d.side === 'left' ? '◀ L' : '? pos'));
+      html += '<div style="padding:4px 8px;border-bottom:1px solid rgba(0,0,0,.05);color:var(--muted)">'
+            + sideTag+' &middot; '+d.text+' &middot; '+d.text.length+' digits'+'</div>';
+    });
+    html += '</div>';
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-top:6px">Hidden by design — IMEI2 doesn\'t count for inventory, suspect entries shouldn\'t auto-commit. Use the "+ Also capture IMEI 2" toggle at the top of the panel if you want them included.</div>';
+    html += '</details>';
+  }
   // v2030: column split readout
   if(mode === 'phone' && (counts.left + counts.right + counts.unknown) > 0){
     html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:#0e7490;margin-bottom:10px;background:rgba(14,116,144,.06);border:1px solid rgba(14,116,144,.2);border-radius:5px;padding:6px 10px">'
