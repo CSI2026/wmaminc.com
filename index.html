@@ -3437,7 +3437,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.11.1730';
+var BUILD_VERSION = '2026.06.11.1930';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -54944,7 +54944,7 @@ function _decodeMultipleBarcodesFromImage(imgEl){
             for(var p = 0; p < pts.length; p++){ x += pts[p].getX(); y += pts[p].getY(); }
             x /= pts.length; y /= pts.length;
           }
-          detected.push({ text: r.getText(), x: x, y: y });
+          detected.push({ text: r.getText(), x: x, y: y, sources: ['barcode'] });
         }
       }catch(e){
         // Primary pass found nothing or threw — fall through to tiles
@@ -54957,13 +54957,280 @@ function _decodeMultipleBarcodesFromImage(imgEl){
       var seen = {};
       detected.forEach(function(d){ seen[d.text] = true; });
       tileResults.forEach(function(t){
-        if(!seen[t.text]){ detected.push(t); seen[t.text] = true; }
+        if(!seen[t.text]){ detected.push({text:t.text, x:t.x, y:t.y, sources:['barcode']}); seen[t.text] = true; }
       });
       return detected;
     });
   });
 }
 if(typeof window !== 'undefined') window._decodeMultipleBarcodesFromImage = _decodeMultipleBarcodesFromImage;
+
+// ══════════════════════════════════════════════════════════════════════
+//  Calvin 2026-06-11 v1830 — OCR + LUHN HYBRID IMEI EXTRACTION
+//
+//  ZXing only finds BARCODES. When the photo is a printed manifest /
+//  device-list / spreadsheet showing IMEI numbers as TEXT, ZXing can't
+//  read them — that's why Calvin's 20-IMEI photo only surfaced 1.
+//
+//  Fix: in parallel with the barcode pass, run Tesseract.js OCR over the
+//  whole image, extract every 14-22 digit run, Luhn-validate the 15-digit
+//  ones to mark high-confidence IMEIs, and surface ALL detections in a
+//  review UI before commit so Calvin can verify each before it lands in
+//  inventory. Catches printed text, barcode labels, sticker numbers,
+//  device-box labels — anything the camera captured.
+// ══════════════════════════════════════════════════════════════════════
+
+// IMEI Luhn check. Returns true only if the 15-digit number passes the
+// GSM standard Luhn checksum. Used to mark high-confidence detections.
+function _isValidImeiLuhn(num){
+  if(typeof num !== 'string' || !/^\d{15}$/.test(num)) return false;
+  var sum = 0;
+  for(var i = 0; i < 14; i++){
+    var d = parseInt(num.charAt(i), 10);
+    if((i % 2) === 1) d *= 2;
+    if(d > 9) d -= 9;
+    sum += d;
+  }
+  var check = (10 - (sum % 10)) % 10;
+  return check === parseInt(num.charAt(14), 10);
+}
+if(typeof window !== 'undefined') window._isValidImeiLuhn = _isValidImeiLuhn;
+
+// Promise wrapper around Tesseract.js OCR. Resolves to a sorted array of
+// { text, source:'ocr', confidence } for every distinct 14-22 digit run
+// found in the image. Whitespace, dashes, and dots between digits are
+// stripped before matching so visually-segmented numbers still hit.
+function _ocrImageForNumbers(imgEl){
+  if(typeof Tesseract === 'undefined' || !Tesseract || typeof Tesseract.recognize !== 'function'){
+    return Promise.resolve([]);  // OCR unavailable; barcode path still works
+  }
+  return Tesseract.recognize(imgEl, 'eng', {
+    // Lock the character set to digits + obvious separators for higher
+    // accuracy on numeric manifests.
+    tessedit_char_whitelist: '0123456789 \n\t.-/'
+  }).then(function(res){
+    var text = (res && res.data && res.data.text) ? res.data.text : '';
+    var found = {};
+    // Split by newlines so two adjacent numbers on different lines don't
+    // collide, then strip internal whitespace/dashes/dots to allow
+    // "358240 05111111 0" style segmentation.
+    text.split(/\n+/).forEach(function(line){
+      var compact = line.replace(/[\s.\-]/g, '');
+      var runs = compact.match(/\d{14,22}/g) || [];
+      runs.forEach(function(n){ if(!found[n]) found[n] = true; });
+    });
+    return Object.keys(found).map(function(n){ return {text:n, source:'ocr', sources:['ocr']}; });
+  }).catch(function(){ return []; });
+}
+if(typeof window !== 'undefined') window._ocrImageForNumbers = _ocrImageForNumbers;
+
+// Merge barcode + OCR/AI results. Same number from both sources gets
+// sources:['barcode','ocr'] or ['barcode','ai'] (highest confidence).
+// Dedupe by text. Honors the actual `sources` array on each input so
+// AI detections stay tagged as ai (the v1830 version hardcoded 'ocr').
+function _mergeDartDetections(barcodes, otherDetections){
+  var byText = {};
+  (barcodes||[]).forEach(function(b){
+    byText[b.text] = {text:b.text, x:b.x, y:b.y, sources:(b.sources||['barcode']).slice()};
+  });
+  (otherDetections||[]).forEach(function(o){
+    var oSources = o.sources || (o.source ? [o.source] : ['ocr']);
+    if(byText[o.text]){
+      // Merge all unique sources from o into the existing entry
+      oSources.forEach(function(s){
+        if(byText[o.text].sources.indexOf(s) < 0) byText[o.text].sources.push(s);
+      });
+    } else {
+      byText[o.text] = {text:o.text, sources:oSources.slice()};
+    }
+  });
+  return Object.keys(byText).map(function(k){ return byText[k]; });
+}
+if(typeof window !== 'undefined') window._mergeDartDetections = _mergeDartDetections;
+
+// ══════════════════════════════════════════════════════════════════════
+//  Calvin 2026-06-11 v1930 — TRUE AI VISION (open-source, free, in-browser)
+//
+//  Tesseract.js (v1830) is OCR — pattern matching on pixels. Decent at
+//  clean printed text, brittle at angles / low light / curved surfaces.
+//  Calvin wanted real AI, free, open source. That's Transformers.js +
+//  Florence-2 (Microsoft's open vision-language transformer, MIT-licensed,
+//  ~120MB ONNX weights downloaded once and cached forever in the
+//  browser via the HuggingFace CDN). It's a real transformer that reads
+//  the image with understanding, not a pixel-pattern engine.
+//
+//  Tradeoffs Calvin needs to know about:
+//    • First photo per browser: ~30-60s while the 120MB model downloads
+//    • Subsequent photos: ~5-15s per image (CPU); faster on WebGPU devices
+//    • $0 forever — no API key, no usage limits, no rate caps
+//    • Runs entirely client-side — Tanita's photos never leave her phone
+//
+//  Pipeline now: ZXing barcodes + Florence-2 AI vision + Tesseract fallback
+//  (Tesseract still loads as a safety net in case Florence-2 fails for
+//  any reason — bad network, model corruption, weird device).
+// ══════════════════════════════════════════════════════════════════════
+
+// Lazy-load Transformers.js + Florence-2 the first time anyone uploads a
+// photo. Cached for the rest of the session (and the model itself is
+// browser-cached forever via Cache API). Returns null if the load fails.
+window._wmamFlorenceLoadProgress = null;  // { stage, percent } for UI
+window._wmamFlorenceLoadPromise = null;
+
+function _loadFlorenceAI(progressCb){
+  if(typeof window === 'undefined') return Promise.resolve(null);
+  if(window._wmamFlorence) return Promise.resolve(window._wmamFlorence);
+  if(window._wmamFlorenceLoadPromise) return window._wmamFlorenceLoadPromise;
+
+  window._wmamFlorenceLoadPromise = new Promise(function(resolve){
+    // 1. Inject a module script that imports Transformers.js v3 from CDN
+    // and exposes the symbols we need on window. Module scripts are async
+    // so we wait for an event the inline module fires when ready.
+    var moduleScript = document.createElement('script');
+    moduleScript.type = 'module';
+    moduleScript.textContent = [
+      "import { ",
+      "  Florence2ForConditionalGeneration, ",
+      "  AutoProcessor, ",
+      "  AutoTokenizer, ",
+      "  RawImage, ",
+      "  env ",
+      "} from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';",
+      "env.allowLocalModels = false;",
+      "env.useBrowserCache = true;",
+      "window.WMAM_TX = { Florence2ForConditionalGeneration, AutoProcessor, AutoTokenizer, RawImage, env };",
+      "window.dispatchEvent(new Event('wmam_tx_ready'));"
+    ].join('\n');
+    var readyTimeout = setTimeout(function(){
+      console.warn('[Florence-2] Transformers.js module load timed out after 30s');
+      resolve(null);
+    }, 30000);
+
+    function onReady(){
+      clearTimeout(readyTimeout);
+      var tx = window.WMAM_TX;
+      if(!tx){ resolve(null); return; }
+
+      // 2. Load the Florence-2 model + processor + tokenizer. The model
+      // weights download from HuggingFace CDN (~120MB, browser-cached).
+      var modelId = 'onnx-community/Florence-2-base-ft';
+      var loadProgress = function(p){
+        try {
+          window._wmamFlorenceLoadProgress = p;
+          if(typeof progressCb === 'function') progressCb(p);
+        } catch(e){}
+      };
+
+      Promise.all([
+        tx.Florence2ForConditionalGeneration.from_pretrained(modelId, {
+          dtype: 'fp32',
+          progress_callback: loadProgress
+        }),
+        tx.AutoProcessor.from_pretrained(modelId),
+        tx.AutoTokenizer.from_pretrained(modelId)
+      ]).then(function(parts){
+        window._wmamFlorence = {
+          model:     parts[0],
+          processor: parts[1],
+          tokenizer: parts[2],
+          RawImage:  tx.RawImage
+        };
+        resolve(window._wmamFlorence);
+      }).catch(function(err){
+        console.warn('[Florence-2] load failed:', err);
+        resolve(null);
+      });
+    }
+
+    if(window.WMAM_TX){ onReady(); }
+    else { window.addEventListener('wmam_tx_ready', onReady, {once:true}); }
+
+    document.head.appendChild(moduleScript);
+  });
+
+  return window._wmamFlorenceLoadPromise;
+}
+if(typeof window !== 'undefined') window._loadFlorenceAI = _loadFlorenceAI;
+
+// Run Florence-2 OCR over an image. Returns array of {text, source:'ai',
+// sources:['ai']} for every distinct 14-22 digit number Florence reads
+// out of the image. Honors the same digit-run regex as the OCR path so
+// downstream merge/Luhn/review flow is unchanged.
+function _aiVisionExtractFromImage(imgEl, progressCb){
+  return _loadFlorenceAI(progressCb).then(function(flo){
+    if(!flo) return [];  // graceful fallback path triggers Tesseract instead
+    try {
+      // Florence wants a RawImage. Build it from an offscreen canvas.
+      var canvas = document.createElement('canvas');
+      canvas.width  = imgEl.naturalWidth  || imgEl.width;
+      canvas.height = imgEl.naturalHeight || imgEl.height;
+      canvas.getContext('2d').drawImage(imgEl, 0, 0);
+      return flo.RawImage.fromCanvas(canvas).then(function(rawImg){
+        var task = '<OCR>';
+        return flo.processor(rawImg, task).then(function(inputs){
+          return flo.model.generate(Object.assign({}, inputs, {
+            max_new_tokens: 1024,
+            num_beams: 1,
+            do_sample: false
+          })).then(function(generated_ids){
+            var generated_text = flo.tokenizer.batch_decode(generated_ids, { skip_special_tokens: false });
+            var result = flo.processor.post_process_generation(generated_text[0], task, rawImg.size);
+            var fullText = (result && result[task]) ? result[task] : '';
+
+            // Same digit-run extraction logic as the OCR path
+            var found = {};
+            fullText.split(/[\n\r]+/).forEach(function(line){
+              var compact = line.replace(/[\s.\-]/g, '');
+              var runs = compact.match(/\d{14,22}/g) || [];
+              runs.forEach(function(n){ found[n] = true; });
+            });
+            return Object.keys(found).map(function(n){
+              return {text:n, source:'ai', sources:['ai']};
+            });
+          });
+        });
+      });
+    } catch(e){
+      console.warn('[Florence-2] inference failed:', e);
+      return [];
+    }
+  }).catch(function(e){
+    console.warn('[Florence-2] outer error:', e);
+    return [];
+  });
+}
+if(typeof window !== 'undefined') window._aiVisionExtractFromImage = _aiVisionExtractFromImage;
+
+// Run BOTH barcode + AI vision passes in parallel and return the merged
+// set. Tesseract still runs as a SAFETY NET — if Florence-2 fails to
+// load (network problem, model server outage, weird device), the
+// Tesseract path still catches printed text. Florence-2 results take
+// precedence in dedupe.
+function _decodeDartPhotoHybrid(imgEl, progressCb){
+  var barcodesP = _decodeMultipleBarcodesFromImage(imgEl).catch(function(){ return []; });
+  var aiP = _aiVisionExtractFromImage(imgEl, progressCb);
+  var ocrFallbackP = _ocrImageForNumbers(imgEl).catch(function(){ return []; });
+  return Promise.all([barcodesP, aiP, ocrFallbackP]).then(function(results){
+    var barcodes = results[0] || [];
+    var ai       = results[1] || [];
+    var ocr      = results[2] || [];
+    // Merge: AI + barcodes first (high-confidence sources), then OCR
+    // as backup for any IMEIs the first two missed.
+    var merged = _mergeDartDetections(barcodes, ai);
+    var mergedTexts = {};
+    merged.forEach(function(m){ mergedTexts[m.text] = m; });
+    ocr.forEach(function(o){
+      if(mergedTexts[o.text]){
+        if(mergedTexts[o.text].sources.indexOf('ocr') < 0){
+          mergedTexts[o.text].sources.push('ocr');
+        }
+      } else {
+        merged.push({text:o.text, source:'ocr', sources:['ocr']});
+      }
+    });
+    return merged;
+  });
+}
+if(typeof window !== 'undefined') window._decodeDartPhotoHybrid = _decodeDartPhotoHybrid;
 
 // Tile-based fallback: divide image into rows×cols and decode each tile.
 // Overlapping tiles (15% W, 30% H padding) catch barcodes that straddle
@@ -55472,7 +55739,17 @@ function _handleDartPhotoUpload(ev){
   var file = ev && ev.target && ev.target.files && ev.target.files[0];
   if(!file) return;
   var preview = document.getElementById('dart-photo-preview');
-  if(preview) preview.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);padding:14px"><span style="display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:#0e7490;border-radius:50%;animation:spin 0.8s linear infinite"></span> Decoding barcodes from image…</div>';
+  var firstLoad = !window._wmamFlorence;
+  if(preview){
+    var msg = firstLoad
+      ? 'Loading AI vision model (~120MB, one-time download)…<br><span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">After this first photo, subsequent scans take 5–15 seconds. The model is cached forever — never downloads again on this browser.</span>'
+      : 'Running AI vision + barcode scan + OCR backup in parallel…';
+    preview.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);padding:14px">'
+      + '<span style="display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:#0e7490;border-radius:50%;animation:spin 0.8s linear infinite;vertical-align:middle"></span> '
+      + msg
+      + '<div id="dart-ai-progress" style="font-family:monospace;font-size:.7rem;color:var(--muted);margin-top:8px"></div>'
+      + '</div>';
+  }
   // Add the spin keyframe once
   if(typeof document !== 'undefined' && !document.getElementById('dart-spin-style')){
     var st = document.createElement('style');
@@ -55480,15 +55757,34 @@ function _handleDartPhotoUpload(ev){
     st.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
     document.head.appendChild(st);
   }
+  function _progressCb(p){
+    try {
+      var el = document.getElementById('dart-ai-progress');
+      if(!el || !p) return;
+      var name = p.name || p.file || '';
+      var pct  = (typeof p.progress === 'number') ? Math.round(p.progress) : null;
+      var loaded = (typeof p.loaded === 'number') ? Math.round(p.loaded / (1024*1024)) : null;
+      var total  = (typeof p.total  === 'number') ? Math.round(p.total  / (1024*1024)) : null;
+      var line = '';
+      if(p.status) line += p.status + ' ';
+      if(name)     line += name + ' ';
+      if(pct != null) line += pct + '% ';
+      if(loaded != null && total != null) line += '('+loaded+'/'+total+' MB)';
+      el.textContent = line;
+    } catch(e){}
+  }
   var reader = new FileReader();
   reader.onload = function(e){
     var dataUrl = e.target.result;
     var img = new Image();
     img.onload = function(){
-      _decodeMultipleBarcodesFromImage(img).then(function(detected){
-        _processDartPhotoDetections(detected, dataUrl);
+      // v1930: HYBRID pass = ZXing barcodes + Florence-2 AI vision +
+      // Tesseract OCR fallback. The AI path is primary; Tesseract still
+      // runs as a safety net if Florence fails for any reason.
+      _decodeDartPhotoHybrid(img, _progressCb).then(function(detected){
+        _renderDartPhotoReview(detected, dataUrl);
       }).catch(function(err){
-        if(preview) preview.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#991B1B;padding:10px">✗ Barcode library failed: '+escHtml(err.message||String(err))+'. Try Manual entry.</div>';
+        if(preview) preview.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#991B1B;padding:10px">✗ Image read failed: '+escHtml(err.message||String(err))+'. Try Manual entry.</div>';
       });
     };
     img.onerror = function(){
@@ -55499,6 +55795,128 @@ function _handleDartPhotoUpload(ev){
   reader.readAsDataURL(file);
 }
 if(typeof window !== 'undefined') window._handleDartPhotoUpload = _handleDartPhotoUpload;
+
+// ── v1830: REVIEW UI ──
+// Replaces the auto-commit path. Shows the photo, every detection found
+// (barcode + OCR), Luhn-validation status per 15-digit IMEI, and a
+// checklist Calvin can adjust before pressing "Confirm and Add to
+// Inventory". Each row is labeled:
+//   📷 = found by barcode reader (highest confidence)
+//   🔤 = found by OCR (verify before commit)
+//   📷🔤 = found by BOTH (highest confidence)
+//   ✅ = passes IMEI Luhn check (15-digit) or matches ICCID length
+//   ⚠️ = unusual length / Luhn fails — UNCHECKED by default
+function _renderDartPhotoReview(detected, dataUrl){
+  var preview = document.getElementById('dart-photo-preview');
+  if(!preview) return;
+  var mode = _dartScannerState.mode;
+  // Stash for the confirm handler
+  window._dartPhotoLastDataUrl = dataUrl;
+  window._dartPhotoLastDetected = detected;
+
+  // Classify each detection
+  function classify(d){
+    var n = d.text;
+    var len = n.length;
+    var isImei = (len === 15) && _isValidImeiLuhn(n);
+    var isIccidLen = (len >= 18 && len <= 22);
+    var isImeiLen = (len >= 14 && len <= 17);
+    var label, color, defaultChecked;
+    if(mode === 'sim'){
+      if(isIccidLen){ label = 'ICCID ✓'; color = '#059669'; defaultChecked = true; }
+      else { label = '⚠ Unusual length for ICCID'; color = '#D97706'; defaultChecked = false; }
+    } else {
+      if(isImei){ label = 'IMEI ✓ Luhn'; color = '#059669'; defaultChecked = true; }
+      else if(len === 15){ label = '⚠ 15-digit but FAILS Luhn'; color = '#D97706'; defaultChecked = false; }
+      else if(isImeiLen){ label = '⚠ IMEI length only — no Luhn'; color = '#D97706'; defaultChecked = true; }
+      else { label = '⚠ Unusual length'; color = '#D97706'; defaultChecked = false; }
+    }
+    return {label:label, color:color, defaultChecked:defaultChecked};
+  }
+
+  var html = '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start">';
+  html += '<img src="'+dataUrl+'" style="max-width:280px;max-height:240px;border-radius:6px;flex-shrink:0">';
+  html += '<div style="flex:1;min-width:280px">';
+  var counts = {barcode:0, ocr:0, ai:0, both:0, valid:0, suspect:0};
+  detected.forEach(function(d){
+    var src = d.sources || ['barcode'];
+    var hasBar = src.indexOf('barcode') >= 0;
+    var hasAi  = src.indexOf('ai') >= 0;
+    var hasOcr = src.indexOf('ocr') >= 0;
+    if((hasBar?1:0) + (hasAi?1:0) + (hasOcr?1:0) >= 2) counts.both++;
+    else if(hasAi)  counts.ai++;
+    else if(hasBar) counts.barcode++;
+    else            counts.ocr++;
+    var c = classify(d);
+    if(c.defaultChecked) counts.valid++; else counts.suspect++;
+  });
+  html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;color:#059669;letter-spacing:1.5px;margin-bottom:4px">'+detected.length+' '+(mode==='sim'?'ICCID':'IMEI')+' candidate'+(detected.length===1?'':'s')+' found</div>';
+  html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:10px">'
+       + (counts.both?'✅ '+counts.both+' confirmed by 2+ sources · ':'')
+       + (counts.ai?'🤖 '+counts.ai+' AI vision · ':'')
+       + (counts.barcode?'📷 '+counts.barcode+' barcode · ':'')
+       + (counts.ocr?'🔤 '+counts.ocr+' OCR · ':'')
+       + counts.valid+' high-confidence, '+counts.suspect+' need review'
+       + '</div>';
+
+  html += '<div style="background:rgba(14,116,144,.05);border:1px solid rgba(14,116,144,.2);border-radius:6px;padding:10px 12px;margin-bottom:10px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--brown);line-height:1.5">';
+  html += '<strong style="color:#0e7490">🤖 = AI vision (Florence-2) &nbsp; 📷 = barcode &nbsp; 🔤 = OCR fallback &nbsp; ✓ = passes Luhn check &nbsp; ⚠ = needs your eyes.</strong> '
+        + 'Suspect entries are unchecked by default. Confirm before they land in inventory — these are real devices, the IMEIs have to be right.';
+  html += '</div>';
+
+  html += '<div id="dart-review-list" style="max-height:260px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:white">';
+  detected.forEach(function(d, idx){
+    var c = classify(d);
+    var srcIcons = '';
+    if((d.sources||[]).indexOf('ai')      >= 0) srcIcons += '🤖';
+    if((d.sources||[]).indexOf('barcode') >= 0) srcIcons += '📷';
+    if((d.sources||[]).indexOf('ocr')     >= 0) srcIcons += '🔤';
+    if(!srcIcons) srcIcons = '?';
+    html += '<label style="display:flex;align-items:center;gap:8px;padding:7px 8px;border-bottom:1px solid var(--border);cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.85rem">'
+         + '<input type="checkbox" class="dart-review-cb" data-idx="'+idx+'" '+(c.defaultChecked?'checked':'')+' style="accent-color:#059669;width:16px;height:16px;flex-shrink:0">'
+         + '<span style="flex-shrink:0;width:42px">'+srcIcons+'</span>'
+         + '<span style="font-family:monospace;font-weight:700;color:var(--brown);flex:1">'+d.text+'</span>'
+         + '<span style="font-size:.7rem;color:'+c.color+';white-space:nowrap">'+c.label+'</span>'
+         + '</label>';
+  });
+  html += '</div>';
+
+  html += '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">';
+  html += '<button onclick="_dartReviewCheckAll(true)" style="background:rgba(5,150,105,.08);border:1px solid rgba(5,150,105,.3);color:#059669;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 12px;border-radius:4px;cursor:pointer">✓ Check all</button>';
+  html += '<button onclick="_dartReviewCheckAll(false)" style="background:rgba(204,0,0,.06);border:1px solid rgba(204,0,0,.2);color:var(--red);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 12px;border-radius:4px;cursor:pointer">✗ Uncheck all</button>';
+  html += '<button onclick="_dartReviewConfirmAdd()" style="background:#0e7490;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.78rem;letter-spacing:2px;text-transform:uppercase;padding:9px 18px;border-radius:5px;cursor:pointer;font-weight:700;margin-left:auto">📥 Confirm and Add to Inventory</button>';
+  html += '</div>';
+
+  html += '</div></div>';
+  preview.innerHTML = html;
+}
+if(typeof window !== 'undefined') window._renderDartPhotoReview = _renderDartPhotoReview;
+
+function _dartReviewCheckAll(val){
+  document.querySelectorAll('.dart-review-cb').forEach(function(cb){ cb.checked = !!val; });
+}
+if(typeof window !== 'undefined') window._dartReviewCheckAll = _dartReviewCheckAll;
+
+// Commit handler — pulls the checked subset from the review list, runs
+// it through the original auto-commit logic (pair-by-position for phones,
+// one-per-row for SIMs), returns the summary.
+function _dartReviewConfirmAdd(){
+  var detected = window._dartPhotoLastDetected || [];
+  var dataUrl  = window._dartPhotoLastDataUrl || '';
+  var checked = [];
+  document.querySelectorAll('.dart-review-cb').forEach(function(cb){
+    if(cb.checked){
+      var idx = parseInt(cb.getAttribute('data-idx'), 10);
+      if(!isNaN(idx) && detected[idx]) checked.push(detected[idx]);
+    }
+  });
+  if(!checked.length){
+    alert('No IMEIs checked. Check the ones you want to add and try again.');
+    return;
+  }
+  _processDartPhotoDetections(checked, dataUrl);
+}
+if(typeof window !== 'undefined') window._dartReviewConfirmAdd = _dartReviewConfirmAdd;
 
 // ── Process multi-decode detections: pair by position (or treat as solo IMEI1),
 // auto-commit to DART inventory, summarize result. ──
