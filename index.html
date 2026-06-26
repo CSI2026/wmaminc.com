@@ -3451,7 +3451,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.25.2300';
+var BUILD_VERSION = '2026.06.26.1200';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -56107,6 +56107,89 @@ function _setDartScannerMode(mode){
 }
 if(typeof window !== 'undefined') window._setDartScannerMode = _setDartScannerMode;
 
+// ══ Calvin 2026-06-26: DART AI Camera now uses Claude Vision ══
+// Replaces the in-browser Florence-2/OCR pipeline (which could not reliably
+// read a 20-row IMEI label) with a call to the scan-dart-box Supabase Edge
+// Function, mirroring the energy-bill scanner. The function reads every IMEI1
+// (ignores IMEI2) and returns them; we review then commit via _commitDartScan
+// (which auto-assigns to the picker's market). No 15-digit/Luhn filtering —
+// full number stored as printed (14 or 15 digits), per Calvin's rule.
+async function _dartVisionDecode(dataUrl){
+  var preview = document.getElementById('dart-photo-preview');
+  function _err(t){ if(preview) preview.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:#991B1B;padding:12px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px">✗ '+t+'</div>'; }
+  var m = /^data:([^;]+);base64,(.*)$/.exec(dataUrl || '');
+  if(!m){ _err('Could not read the captured image. Try again.'); return; }
+  var mediaType = m[1], b64 = m[2];
+  var base = (typeof SUPA_URL !== 'undefined' && SUPA_URL) ? SUPA_URL.replace(/\/$/,'') : '';
+  if(!base){ _err('Supabase URL not configured.'); return; }
+  var url = base + '/functions/v1/scan-dart-box';
+  var key = (typeof _edgeApiKey === 'function') ? _edgeApiKey() : null;
+  if(preview){
+    if(typeof document!=='undefined' && !document.getElementById('dart-spin-style')){ var st=document.createElement('style'); st.id='dart-spin-style'; st.textContent='@keyframes spin{to{transform:rotate(360deg)}}'; document.head.appendChild(st); }
+    preview.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);padding:14px"><span style="display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:#0e7490;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle"></span> Reading the label with AI…</div>';
+  }
+  try {
+    var resp = await fetch(url, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+(key||''),'apikey':key||''},
+      body: JSON.stringify({ image:b64, mediaType:mediaType, mode:(_dartScannerState.mode||'phone'), captureImei2: !!_dartScannerState.captureImei2 })
+    });
+    if(!resp.ok){ var t=''; try{ t=await resp.text(); }catch(e){} throw new Error('service returned '+resp.status+(t?(' — '+t.slice(0,160)):'')); }
+    var data = await resp.json();
+    var list = (data && (data.imei1s || data.codes || data.imeis)) || [];
+    if(!Array.isArray(list) || !list.length){ _err('No IMEI numbers found in that photo. Fill the frame with the label and try again, or use Barcode / Manual Paste.'); return; }
+    _renderDartVisionReview(list, dataUrl);
+  } catch(e){
+    _err('AI read failed: '+escHtml(e.message||String(e))+'.<br><span style="color:var(--muted);font-size:.72rem">If it says the function was not found, the DART Vision service still needs deploying to Supabase. Barcode and Manual Paste work now.</span>');
+  }
+}
+if(typeof window !== 'undefined') window._dartVisionDecode = _dartVisionDecode;
+
+function _renderDartVisionReview(list, dataUrl){
+  var preview = document.getElementById('dart-photo-preview');
+  if(!preview) return;
+  var isSim = (_dartScannerState.mode === 'sim');
+  var seen={}, items=[];
+  list.forEach(function(raw){ var n=String(raw==null?'':raw).replace(/\D/g,''); if(n && !seen[n]){ seen[n]=1; items.push(n); } });
+  if(!items.length){ preview.innerHTML='<div style="padding:12px;color:#991B1B">No valid numbers read.</div>'; return; }
+  var rows = items.map(function(n,i){
+    return '<label style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid #eef1f6;font-family:monospace;font-size:.92rem;cursor:pointer">'
+      +'<input type="checkbox" class="dart-vis-chk" data-imei="'+n+'" checked>'
+      +'<span style="color:#9aa7bd;font-size:.78rem;min-width:20px">'+(i+1)+'</span>'
+      +'<span style="font-weight:600;letter-spacing:.5px">'+n+'</span>'
+      +'<span style="margin-left:auto;font-size:.6rem;color:#0e7490;font-weight:700;letter-spacing:.08em">'+(isSim?'ICCID':'IMEI1')+'</span></label>';
+  }).join('');
+  preview.innerHTML =
+    '<div style="border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-top:6px">'
+    +'<div style="background:#e9f8f0;border-bottom:1px solid #bce8d2;padding:12px 14px;font-family:Bebas Neue,sans-serif;font-size:1.25rem;letter-spacing:1px;color:#1aa260">'+items.length+' '+(isSim?'ICCID':'IMEI1')+(items.length===1?'':'s')+' found — review &amp; save</div>'
+    +'<div style="max-height:300px;overflow-y:auto">'+rows+'</div>'
+    +'<div style="padding:12px 14px;display:flex;gap:10px;border-top:1px solid var(--border)">'
+    +'<button onclick="_saveDartVisionReview()" class="btn-fire" style="flex:1;padding:13px;font-size:.8rem">✓ Save Checked To DART Inventory</button>'
+    +'<button onclick="var p=document.getElementById(\'dart-photo-preview\');if(p)p.innerHTML=\'\';" style="padding:11px 18px;background:white;border:1.5px solid var(--border);color:var(--muted);border-radius:6px;cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;font-weight:700">Cancel</button>'
+    +'</div></div>';
+}
+if(typeof window !== 'undefined') window._renderDartVisionReview = _renderDartVisionReview;
+
+function _saveDartVisionReview(){
+  var chks = document.querySelectorAll('.dart-vis-chk');
+  var okN=0, skipN=0;
+  var mode = (_dartScannerState.mode === 'sim') ? 'sim' : 'phone';
+  Array.prototype.forEach.call(chks, function(c){
+    if(!c.checked) return;
+    var imei = c.getAttribute('data-imei');
+    var result = _commitDartScan(imei, mode, 'ai-photo');
+    if(result && result.ok){
+      okN++;
+      _dartScannerState.recent.unshift({ ts:new Date().toISOString(), code:(result.device.imei || result.device.sim), imei2:null, type:mode, method:'ai-photo', deviceId:result.device.id });
+    } else { skipN++; }
+  });
+  if(_dartScannerState.recent.length > 50) _dartScannerState.recent.length = 50;
+  var preview = document.getElementById('dart-photo-preview');
+  if(preview) preview.innerHTML = '<div style="padding:14px;font-family:Barlow Condensed,sans-serif;color:#059669;font-size:.9rem">✓ Saved '+okN+' device'+(okN===1?'':'s')+' to DART inventory'+(skipN?(' · '+skipN+' skipped (already in inventory or invalid)'):'')+'.</div>';
+  try{ if(typeof _refreshDartScannerStatus==='function') _refreshDartScannerStatus('✓ AI photo: saved '+okN+' device'+(okN===1?'':'s')+'.', '#059669'); }catch(e){}
+}
+if(typeof window !== 'undefined') window._saveDartVisionReview = _saveDartVisionReview;
+
 function _setDartScannerMethod(method){
   _dartScannerState.method = method;
   _stopDartScanner();  // always reset between method switches
@@ -56135,7 +56218,7 @@ function _setDartScannerMethod(method){
         '<div style="background:linear-gradient(135deg,#0e7490,#0891b2);border-radius:10px;padding:18px;color:white;margin-bottom:14px">'
       +   '<div style="text-align:center;margin-bottom:10px">'
       +     '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px">AI Camera Capture</div>'
-      +     '<div style="font-family:Barlow Condensed,sans-serif;font-size:.76rem;opacity:.92;max-width:480px;margin:4px auto 0">Line up the box-label IMEI grid in the frame, then press Capture. Florence-2 reads every <strong>IMEI 1</strong> (left column) and IMEI 2 is auto-filtered out.</div>'
+      +     '<div style="font-family:Barlow Condensed,sans-serif;font-size:.76rem;opacity:.92;max-width:480px;margin:4px auto 0">Line up the box-label IMEI grid in the frame, then press Capture. AI reads every <strong>IMEI 1</strong> (left column) and IMEI 2 is auto-filtered out.</div>'
       +   '</div>'
       +   '<div style="position:relative;background:#000;border-radius:8px;overflow:hidden;aspect-ratio:4/3;max-width:560px;margin:0 auto 12px">'
       +     '<video id="dart-ai-video" playsinline muted autoplay style="width:100%;height:100%;object-fit:cover"></video>'
@@ -56425,9 +56508,7 @@ function _handleDartPhotoUpload(ev){
       // v1930: HYBRID pass = ZXing barcodes + Florence-2 AI vision +
       // Tesseract OCR fallback. The AI path is primary; Tesseract still
       // runs as a safety net if Florence fails for any reason.
-      _decodeDartPhotoHybrid(img, _progressCb).then(function(detected){
-        _renderDartPhotoReview(detected, dataUrl);
-      }).catch(function(err){
+      _dartVisionDecode(dataUrl).catch(function(err){
         if(preview) preview.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#991B1B;padding:10px">✗ Image read failed: '+escHtml(err.message||String(err))+'. Try Manual entry.</div>';
       });
     };
@@ -56544,9 +56625,7 @@ function _captureDartAiPhoto(){
   }
   var img = new Image();
   img.onload = function(){
-    _decodeDartPhotoHybrid(img, _progressCb).then(function(detected){
-      _renderDartPhotoReview(detected, dataUrl);
-    }).catch(function(err){
+    _dartVisionDecode(dataUrl).catch(function(err){
       if(preview) preview.innerHTML = '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#991B1B;padding:10px">✗ Image read failed: '+escHtml(err.message||String(err))+'. Try Manual entry.</div>';
     });
   };
