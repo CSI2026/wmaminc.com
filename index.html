@@ -3451,7 +3451,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.27.2200';
+var BUILD_VERSION = '2026.06.27.2330';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -58089,6 +58089,16 @@ async function _carrierInvHandlePaste(campaign, mode){
     return;
   }
 
+  // ── Calvin 2026-06-27: Assurance Wireless SALES — dedicated agency-code
+  // report parser (the standard branch has no AW activations handler).
+  if((up === 'ASSURANCE WIRELESS' || up === 'ASSURANCE') && mode === 'sales'){
+    var ares = awProcessSalesText(text);
+    alert(ares.summary);
+    ta.value = '';
+    if(typeof gotoPanel === 'function') gotoPanel(route);
+    return;
+  }
+
   // ── Standard carrier branch (GM / TC / AW / ET) — paste routed
   // through the carrier's existing inventory or activations parser.
   // Build a synthetic File-like Blob so existing parsers work unchanged
@@ -58282,6 +58292,124 @@ function dartSalesPickFile(){
 }
 if(typeof window!=='undefined') window.dartSalesPickFile = dartSalesPickFile;
 
+// ════════════════════════════════════════════════════════════════════════
+//  ASSURANCE WIRELESS SALES UPLOAD  (Calvin 2026-06-27)
+//
+//  Parses the AW "Agency Code Detail" report. A SALE is a row where
+//  Approved = 'Y' and it is NOT Removed/Canceled and NOT Deactivated. The
+//  agent is matched STRICTLY by the AgencyCodeDetail value (e.g. "MMGC9CQ")
+//  against the profile's agentCodes['Assurance Wireless'] (or 'Assurance') —
+//  no name guessing (the report has no agent name). Dates are MM/DD/YYYY.
+//  Deduped by device serial (ESN) so re-uploading is safe; the matching AW
+//  inventory device is flipped to sold. Recorded via the unified engine as
+//  campaign='Assurance Wireless' / program='Lifeline'.
+// ════════════════════════════════════════════════════════════════════════
+function awProcessSalesText(csvText){
+  var result={added:0, dupes:0, skipped:0, unmatched:[], byAgent:{}, summary:''};
+  if(!csvText || !String(csvText).trim()){ result.summary='No CSV content.'; return result; }
+  var rows=_dartParseCSVRows(String(csvText).trim());
+  if(rows.length<2){ result.summary='No data rows found.'; return result; }
+  var header=rows[0].map(function(h){ return String(h).trim().toLowerCase(); });
+  function col(n){ return header.indexOf(String(n).toLowerCase()); }
+  var ciCode=col('AgencyCodeDetail'), ciApproved=col('Approved'), ciRemoved=col('Removed/Canceled'),
+      ciDeact=col('DeactivatedDate'), ciDate=col('AppCreatedDate'), ciEsn=col('ESN');
+  if(ciCode<0 || ciApproved<0){ result.summary='Not an Assurance agency-code report (missing AgencyCodeDetail / Approved).'; return result; }
+
+  // Dedup: every AW device serial already recorded.
+  var seen={};
+  (DB.agents||[]).forEach(function(a){
+    (a.monthlySales||[]).forEach(function(m){
+      if((m.campaign||'')==='Assurance Wireless' && Array.isArray(m.entries)){
+        m.entries.forEach(function(e){ if(e && e.imei) seen[String(e.imei).replace(/\D/g,'')]=true; });
+      }
+    });
+  });
+
+  function _awNorm(s){ return String(s||'').toLowerCase().replace(/\s+/g,'').trim(); }
+  function findAgent(code){
+    var c=_awNorm(code); if(!c) return null;
+    return (DB.agents||[]).find(function(x){
+      if(!x || !x.agentCodes) return false;
+      var k=x.agentCodes['Assurance Wireless'] || x.agentCodes['Assurance'];
+      return k && _awNorm(k)===c;
+    }) || null;
+  }
+  function _mdy(s){ // MM/DD/YYYY -> YYYY-MM-DD
+    var m=String(s||'').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if(m) return m[3]+'-'+('0'+m[1]).slice(-2)+'-'+('0'+m[2]).slice(-2);
+    if(/^\d{4}-\d{2}-\d{2}/.test(String(s||''))) return String(s).slice(0,10);
+    return new Date().toISOString().slice(0,10);
+  }
+
+  for(var r=1;r<rows.length;r++){
+    var row=rows[r]; if(!row || !row.length) continue;
+    if(String(ciApproved>=0?row[ciApproved]:'').trim().toUpperCase()!=='Y'){ result.skipped++; continue; }   // only approved
+    if(ciRemoved>=0 && String(row[ciRemoved]||'').trim()){ result.skipped++; continue; }                      // removed/canceled
+    if(ciDeact>=0   && String(row[ciDeact]||'').trim()){   result.skipped++; continue; }                      // deactivated
+    var esn=String(ciEsn>=0?row[ciEsn]:'').replace(/\D/g,'');
+    if(!esn){ result.skipped++; continue; }                                                                   // approved but no device serial
+    if(seen[esn]){ result.dupes++; continue; }
+    var code=ciCode>=0?row[ciCode]:'';
+    var agent=findAgent(code);
+    if(!agent){
+      var lbl=String(code||'').trim()||'?';
+      if(result.unmatched.indexOf(lbl)<0) result.unmatched.push(lbl);
+      seen[esn]=true; continue;
+    }
+    var date=_mdy(ciDate>=0?row[ciDate]:'');
+    recordSale({agentId:agent.id, campaign:'Assurance Wireless', program:'Lifeline', date:date, imei:esn, source:'aw-sales-upload', deferSave:true});
+    // Flip a matching AW inventory device to sold
+    try{
+      var pools=[ (typeof AW_INVENTORY!=='undefined'&&Array.isArray(AW_INVENTORY))?AW_INVENTORY:null,
+                  (typeof INVENTORY_DEVICES!=='undefined'&&Array.isArray(INVENTORY_DEVICES))?INVENTORY_DEVICES:null ];
+      for(var pi=0;pi<pools.length;pi++){ if(!pools[pi]) continue;
+        var dev=pools[pi].find(function(d){ return d && String(d.imei||'').replace(/\D/g,'')===esn; });
+        if(dev && dev.status!=='sold' && dev.status!=='activated'){
+          dev._statusBeforeSold=dev.status; dev.status='sold'; dev.soldAt=date; dev.soldByAgentId=agent.id; dev.soldByAgentName=agent.name;
+          if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody=[];
+          dev.chainOfCustody.push({type:'sold', at:date, by:agent.name, byId:agent.id, source:'aw-sales-upload'});
+          break;
+        }
+      }
+    }catch(e){}
+    seen[esn]=true;
+    result.added++;
+    result.byAgent[agent.name]=(result.byAgent[agent.name]||0)+1;
+  }
+
+  try{ if(typeof saveToStorage==='function') saveToStorage(); }catch(e){}
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  try{ Object.keys(result.byAgent).forEach(function(nm){ var a=(DB.agents||[]).find(function(x){return x&&x.name===nm;}); if(a&&typeof saveAgentToSupabase==='function'){var p=saveAgentToSupabase(a);if(p&&typeof p.catch==='function')p.catch(function(){});} }); }catch(e){}
+
+  var parts=[result.added+' sale'+(result.added===1?'':'s')+' recorded'];
+  if(result.dupes) parts.push(result.dupes+' duplicate'+(result.dupes===1?'':'s')+' skipped');
+  if(result.unmatched.length) parts.push(result.unmatched.length+' unmatched code'+(result.unmatched.length===1?'':'s')+' ('+result.unmatched.slice(0,5).join(', ')+')');
+  var byA=Object.keys(result.byAgent).map(function(n){ return n+': '+result.byAgent[n]; }).join(' · ');
+  result.summary='Assurance Sales — '+parts.join(', ')+(byA?('\n'+byA):'');
+  return result;
+}
+if(typeof window!=='undefined') window.awProcessSalesText = awProcessSalesText;
+
+function awSalesPickFile(){
+  var input=document.createElement('input');
+  input.type='file'; input.accept='.csv,text/csv'; input.style.display='none';
+  input.onchange=function(){
+    var f=input.files && input.files[0];
+    if(!f){ try{document.body.removeChild(input);}catch(_){ } return; }
+    var reader=new FileReader();
+    reader.onload=function(){
+      try{ var res=awProcessSalesText(String(reader.result||'')); alert(res.summary); if(typeof gotoPanel==='function') gotoPanel('aw-inv2'); }
+      catch(e){ alert('Assurance sales parse error: '+e.message); }
+      try{ document.body.removeChild(input); }catch(_){ }
+    };
+    reader.onerror=function(){ alert('Could not read the file.'); try{document.body.removeChild(input);}catch(_){ } };
+    reader.readAsText(f);
+  };
+  document.body.appendChild(input);
+  input.click();
+}
+if(typeof window!=='undefined') window.awSalesPickFile = awSalesPickFile;
+
 // Direct routing to existing -upload panels (preserves all current
 // parser logic) when user prefers the original file-only flow.
 function _carrierInvOpenUploadPanel(campaign, mode){
@@ -58289,7 +58417,14 @@ function _carrierInvOpenUploadPanel(campaign, mode){
   var route = '';
   if(up === 'GEN MOBILE')         route = 'gm-upload';
   else if(up === 'TRUCONNECT')    route = (mode === 'sales') ? 'tc-activations' : 'tc-upload';
-  else if(up === 'ASSURANCE WIRELESS' || up === 'ASSURANCE') route = 'aw-upload';
+  else if(up === 'ASSURANCE WIRELESS' || up === 'ASSURANCE'){
+    if(mode === 'sales'){
+      if(typeof awSalesPickFile === 'function'){ awSalesPickFile(); return; }
+      alert('Assurance sales uploader not loaded — refresh and try again.');
+      return;
+    }
+    route = 'aw-upload';
+  }
   else if(up === 'EXCESS TELECOM' || up === 'EXCESS')        route = 'ex-upload';
   else if(up === 'DART'){
     // Calvin 2026-06-11 v3030: DART has no CSV inventory format yet.
