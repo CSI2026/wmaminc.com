@@ -3451,7 +3451,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.27.1430';
+var BUILD_VERSION = '2026.06.27.1700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -11883,20 +11883,122 @@ function onboardingPropagate(agentId, milestone, ctx){
 
   if(typeof pushNotification === 'function'){
     ids.forEach(function(id){
+      // Role-aware deep-link: people-managers (TL/MM/CM) can't open the
+      // office-only onboarding-actions board — send them to their own
+      // Pending Agents panel instead.
+      var rcp = DB.agents.find(function(x){ return x && x.id === id; });
+      var deepPanel = (rcp && typeof isOfficeRole === 'function' && isOfficeRole(rcp)) ? 'onboarding-actions' : 'pending-agents';
       pushNotification({toIds:[id], toRoles:[], icon:spec.icon, title:spec.title, body:spec.body,
-                        panel:'onboarding-actions', priority:spec.priority, eventType:'onboarding.'+milestone});
+                        panel:deepPanel, priority:spec.priority, eventType:'onboarding.'+milestone});
     });
-    // Re-ping the agent only on 'coded' (other agent-facing pings already
-    // exist in the packet/contract flows; don't double-notify the signer).
-    if(milestone === 'coded'){
-      pushNotification({toIds:[agent.id], toRoles:[], icon:'🔑', title:'You\u2019re coded'+camp+'!',
-                        body:'Your agent code is set — you now have full portal access.',
-                        panel:'my-documents', priority:'high', eventType:'onboarding.coded'});
+  }
+
+  // ── On 'coded': email the whole management set too (the agent already gets
+  // their rich welcome email from onboardingEnterAgentCode). Device campaigns
+  // (GM/TC/AW/ET/DART) tell managers the agent can now ACCEPT INVENTORY.
+  if(milestone === 'coded' && typeof brevoSend === 'function'){
+    var devCamp = (typeof _campaignHasDeviceInventory === 'function') && _campaignHasDeviceInventory(ctx.campaignName);
+    var mgrRecips = ids.map(function(id){ return DB.agents.find(function(x){return x&&x.id===id;}); })
+                       .filter(function(a){ return a && a.email && /@/.test(a.email); })
+                       .map(function(a){ return { email:a.email, name:a.name }; });
+    if(mgrRecips.length){
+      var invLine = devCamp
+        ? '<p style="font-size:14px;color:#333;line-height:1.6;margin:0 0 14px">'+_escapeHtml(agent.name)+' can now <strong>accept device inventory</strong> for '+_escapeHtml(ctx.campaignName||'this campaign')+'. Assign or transfer devices to them as needed.</p>'
+        : '<p style="font-size:14px;color:#333;line-height:1.6;margin:0 0 14px">'+_escapeHtml(agent.name)+' is now fully active for '+_escapeHtml(ctx.campaignName||'this campaign')+'.</p>';
+      var mgrHtml = '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:white">'
+        + '<div style="background:#003594;padding:22px;text-align:center"><h1 style="color:white;margin:0;letter-spacing:1.5px;font-size:20px">🔑 AGENT CODED</h1></div>'
+        + '<div style="padding:26px;background:#f8f9fa">'
+        + '<p style="font-size:16px;color:#003594;font-weight:700;margin:0 0 12px">'+_escapeHtml(agent.name)+' is now coded'+(ctx.campaignName?(' for '+_escapeHtml(ctx.campaignName)):'')+'.</p>'
+        + invLine
+        + '<p style="font-size:13px;color:#888;margin:0">They now have full portal access and appear as active on your team.</p>'
+        + '</div></div>';
+      try{
+        brevoSend({ to:mgrRecips, subject:'🔑 '+agent.name+' is now coded'+(ctx.campaignName?(' — '+ctx.campaignName):''), htmlContent:mgrHtml })
+          .catch(function(e){ console.warn('[onboardingPropagate] manager coded email failed:', e); });
+      }catch(e){ console.warn('[onboardingPropagate] manager coded email threw:', e); }
     }
   }
   return entry;
 }
 if(typeof window !== 'undefined') window.onboardingPropagate = onboardingPropagate;
+
+// ── Calvin 2026-06-27: device-inventory campaign check. Lifeline carriers
+// that ship physical devices (IMEI-tracked) — GM, TC, AW, ET, DART. Energy/
+// fiber/Chuzo/Astound/ACA do not carry device inventory.
+function _campaignHasDeviceInventory(name){
+  if(!name) return false;
+  return /gen\s*mobile|truconnect|assurance|excess|dart/i.test(String(name));
+}
+if(typeof window !== 'undefined') window._campaignHasDeviceInventory = _campaignHasDeviceInventory;
+
+// ── Calvin 2026-06-27: is this agent still mid-onboarding (pending)? Active,
+// and showing onboarding activity, but not yet fully coded for every campaign
+// they're being onboarded into. Reads every available signal defensively.
+function _isAgentPendingOnboarding(agent){
+  if(!agent || agent.active === false) return false;
+  if(agent.pendingAgent === true) return true;
+  var hasTimeline = Array.isArray(agent.onboardingTimeline) && agent.onboardingTimeline.length;
+  var lastCoded = hasTimeline && agent.onboardingTimeline[agent.onboardingTimeline.length-1].milestone === 'coded';
+  // Contract model in progress?
+  try{
+    if(typeof AGENT_ONBOARDING_STATUS !== 'undefined' && AGENT_ONBOARDING_STATUS[agent.id]){
+      var st = AGENT_ONBOARDING_STATUS[agent.id];
+      if(Object.keys(st).some(function(c){ return st[c] && st[c].allComplete !== true; })) return true;
+    }
+  }catch(e){}
+  // Packet model with an incomplete/complete-but-uncoded assignment?
+  try{
+    if(typeof ONBOARD_ASSIGNMENTS !== 'undefined' && Array.isArray(ONBOARD_ASSIGNMENTS)){
+      if(ONBOARD_ASSIGNMENTS.some(function(a){ return a && a.agentId === agent.id && a.status !== 'complete'; })) return true;
+    }
+  }catch(e){}
+  // BG in progress?
+  try{ if(agent.bgChecks && Object.keys(agent.bgChecks).some(function(c){ return agent.bgChecks[c] && agent.bgChecks[c].status === 'pending'; })) return true; }catch(e){}
+  // Has onboarding history but isn't coded yet for anything
+  var codedCount = agent.agentCodes ? Object.keys(agent.agentCodes).filter(function(c){ return agent.agentCodes[c] && String(agent.agentCodes[c]).trim(); }).length : 0;
+  if(hasTimeline && !lastCoded && codedCount === 0) return true;
+  return false;
+}
+if(typeof window !== 'undefined') window._isAgentPendingOnboarding = _isAgentPendingOnboarding;
+
+// ── Calvin 2026-06-27: compact onboarding-progress snapshot for one agent,
+// used by the manager-facing Pending Agents panel. All sources optional.
+function _agentOnboardingSnapshot(agent){
+  var snap = { docsSigned:0, docsTotal:0, bg:{}, codedCampaigns:[], steps:[] };
+  if(!agent) return snap;
+  // Packet docs (ASSIGNED_DOC_STATUS) — the onboarding documents
+  try{
+    if(typeof ASSIGNED_DOC_STATUS !== 'undefined' && ASSIGNED_DOC_STATUS[agent.id]){
+      var docs = ASSIGNED_DOC_STATUS[agent.id];
+      Object.keys(docs).forEach(function(fid){
+        snap.docsTotal++;
+        if(docs[fid] && docs[fid].signed === true) snap.docsSigned++;
+      });
+    }
+  }catch(e){}
+  // Contract steps (AGENT_ONBOARDING_STATUS) — fold into the same counters
+  try{
+    if(typeof AGENT_ONBOARDING_STATUS !== 'undefined' && AGENT_ONBOARDING_STATUS[agent.id]){
+      var cst = AGENT_ONBOARDING_STATUS[agent.id];
+      Object.keys(cst).forEach(function(camp){
+        var s = cst[camp]; if(!s || !s.steps) return;
+        Object.keys(s.steps).forEach(function(k){
+          var step = s.steps[k];
+          snap.docsTotal++;
+          if(step && (step.signed === true || step.submitted === true)) snap.docsSigned++;
+        });
+      });
+    }
+  }catch(e){}
+  // BG status per campaign
+  try{ if(agent.bgChecks){ Object.keys(agent.bgChecks).forEach(function(c){ snap.bg[c] = (agent.bgChecks[c]||{}).status || 'none'; }); } }catch(e){}
+  // Coded campaigns
+  try{ if(agent.agentCodes){ snap.codedCampaigns = Object.keys(agent.agentCodes).filter(function(c){ return agent.agentCodes[c] && String(agent.agentCodes[c]).trim(); }); } }catch(e){}
+  // Recent timeline (last 6)
+  if(Array.isArray(agent.onboardingTimeline)) snap.steps = agent.onboardingTimeline.slice(-6);
+  return snap;
+}
+if(typeof window !== 'undefined') window._agentOnboardingSnapshot = _agentOnboardingSnapshot;
 
 // ── Calvin 2026-06-27: notifyOnboardingProgress now DELEGATES to the unified
 // choke point above. Signature is unchanged so all existing callers keep
@@ -12133,10 +12235,12 @@ function onboardingEnterAgentCode(agentId,campaignName,code){
     panel:'bo', priority:'high',
     eventType:'onboarding.agent_coded', skipEmail:true
   });
-  var notifyIds=[];
-  if(agent.marketManagerId){var mm=DB.agents.find(function(a){return a.id===agent.marketManagerId;});if(mm&&mm.active)notifyIds.push(mm.id);}
-  if(agent.teamLeaderId){var tl=DB.agents.find(function(a){return a.id===agent.teamLeaderId;});if(tl&&tl.active&&notifyIds.indexOf(tl.id)<0)notifyIds.push(tl.id);}
-  notifyIds.forEach(function(id){pushNotification({toIds:[id],toRoles:[],icon:'🔑',title:agent.name+' is now coded — '+campaignName,body:agent.name+' has been assigned their agent code for '+campaignName+'. Reach out and welcome them to the team!',panel:'agent-master',priority:'high'});});
+  // Calvin 2026-06-27: route the coded event through the unified choke point.
+  // This notifies the FULL upline (TL + MM + CM + Onboarding + Owner), emails
+  // the managers (with device-inventory wording for GM/TC/AW/ET/DART), writes
+  // the durable timeline marker, and updates the Pending Agents board. The
+  // agent's own "You're Coded" notification + welcome email already fired above.
+  try { if(typeof onboardingPropagate === 'function') onboardingPropagate(agentId, 'coded', {campaignName:campaignName}); } catch(e){}
   if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
   CHANNEL_MSGS['national'].unshift({id:channelMsgNextId++,from:'Onboarding',role:'Onboarding',init:'OB',time:new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),type:'recognition',text:'🔑 AGENT CODED — '+agent.name+' is now active for '+campaignName+'! Welcome to the team.',photo:null});
 
@@ -13042,6 +13146,7 @@ function canAccess(u, area){
     case 'bg-check-queue':   return isOfficeRole(u);
     case 'bg-fail-invoices': return isOfficeRole(u);
     case 'onboarding-actions': return isOfficeRole(u);
+    case 'pending-agents':     return isOfficeRole(u) || (u && ['Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(u.role) >= 0);
     case 'meeting-hosts':    return false;
 
     // ── AGENT MANAGEMENT ── Onboarding Dept is the designated gatekeeper.
@@ -22832,10 +22937,10 @@ function bgSubmit(agentId, campaign){
   // Persist
   try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
   try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
+  // Calvin 2026-06-27: tell the upline + office the BG is in for review.
+  try { if(typeof onboardingPropagate === 'function') onboardingPropagate(agentId, 'bg-signed', {campaignName:campaign}); } catch(e){}
   return true;
 }
-
-// Decide a BG check (passed or failed). reason/notes optional. Returns the
 // updated entry. Fires the appropriate email.
 // allowFlip: if false, refuses to flip an already-decided check unless
 // transitioning from 'pending' to a decision. Defaults true (with audit).
@@ -22902,10 +23007,16 @@ function bgDecide(agentId, campaign, newStatus, opts){
   try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
   try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
 
+  // Calvin 2026-06-27: propagate the BG decision to the upline + office +
+  // durable marker + board (skip on a no-op reversal to the same status).
+  try {
+    if(typeof onboardingPropagate === 'function' && oldStatus !== newStatus){
+      onboardingPropagate(agentId, newStatus === 'passed' ? 'bg-passed' : 'bg-failed', {campaignName:campaign, note:opts.reason||null});
+    }
+  } catch(e){}
+
   return entry;
 }
-
-// Mark-all helper: apply the same decision (pass or fail) to multiple
 // campaigns at once. Sends ONE email per decision-type listing all affected
 // campaigns, so the agent gets the cleanest possible message.
 function bgDecideMany(agentId, campaigns, newStatus, opts){
@@ -22949,6 +23060,14 @@ function bgDecideMany(agentId, campaigns, newStatus, opts){
   }
   try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
   try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
+  // Calvin 2026-06-27: propagate each decided campaign to the upline + office.
+  try {
+    if(typeof onboardingPropagate === 'function'){
+      changedCamps.forEach(function(camp){
+        onboardingPropagate(agentId, newStatus === 'passed' ? 'bg-passed' : 'bg-failed', {campaignName:camp, note:opts.reason||null});
+      });
+    }
+  } catch(e){}
   return changedCamps.length;
 }
 
@@ -33085,6 +33204,16 @@ function buildNav(u){
     h += boNavBtn('myteam','👥 My Team');
   }
 
+  // ── Calvin 2026-06-27: Pending Agents — manager-facing onboarding tracker.
+  // Visible to people-managers (TL/MM/CM/IBO) and office/owner. Badge shows
+  // how many of their agents are mid-onboarding right now.
+  var _isPeopleMgr = u && ['Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(u.role) >= 0;
+  if(_isPeopleMgr || isOffice){
+    var paCount = 0;
+    try{ paCount = (typeof pendingAgentsForViewer === 'function') ? pendingAgentsForViewer(u).length : 0; }catch(e){}
+    h += boNavBtnWithBadge('pending-agents','🕒 Pending Agents', paCount);
+  }
+
   // Team Rooms / Markets.
   // Inventory has GLOBAL visibility — they need to see every market,
   // including IBO markets, because they manage inventory everywhere.
@@ -34888,7 +35017,7 @@ function gotoPanel(id, params){
     'supply-mgmt':panelSupplyMgmt,'pending-transfers':panelPendingTransfers,
     'agent-codes':panelAgentCodes,'goal-settings':panelGoalSettings,
     'form-builder':panelFormBuilder,announce:panelAnnounce,
-    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'onboarding-actions':panelOnboardingActions,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,'bg-check-queue':panelBgCheckQueue,'bg-fail-invoices':panelBgFailInvoices,'agents-pending':panelAgentsPending,
+    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'onboarding-actions':panelOnboardingActions,'pending-agents':panelPendingAgents,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,'bg-check-queue':panelBgCheckQueue,'bg-fail-invoices':panelBgFailInvoices,'agents-pending':panelAgentsPending,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
     agents:panelAgents,'ll-teams':panelMarketsAdmin,
@@ -50026,7 +50155,7 @@ function computeObPendingActions(){
         ? ONBOARD_PACKAGES.find(function(p){ return p.id === asg.packageId; }) : null;
       rows.push({
         agent: a, agentId: a.id, agentName: a.name,
-        stage: 'packet-complete',
+        stage: 'codes-pending',
         stageLabel: '🔑 Packet Signed — Submit to Carrier',
         actionLabel: 'Signed the "'+(pkg ? pkg.name : 'onboarding')+'" packet. Submit to each carrier and enter the agent code they return.',
         campaigns: Array.isArray(a.campaigns) ? a.campaigns : [],
@@ -50122,6 +50251,108 @@ function panelOnboardingActions(){
   return h;
 }
 if(typeof window !== 'undefined') window.panelOnboardingActions = panelOnboardingActions;
+
+// ════════════════════════════════════════════════════════════════════════
+//  PENDING AGENTS — manager-facing onboarding tracker  (Calvin 2026-06-27)
+//
+//  Managers (TL/MM/CM/IBO) can't open the office-only onboarding-actions
+//  board, so they had no place to watch their pending agents — and the
+//  notifications had nowhere safe to deep-link them. This is that place.
+//  Each manager sees ONLY their own downline (via agentIdsInMyOrgEffective);
+//  the Owner + office see everyone. It updates live as agents sign docs,
+//  clear BG, and get coded.
+// ════════════════════════════════════════════════════════════════════════
+function _milestoneLabel(m){
+  return ({
+    'packet-sent':'Onboarding packet sent','doc-signed':'Signed a document',
+    'packet-complete':'Completed the document packet','contract-complete':'All contract docs signed',
+    'bg-signed':'Background check submitted','bg-passed':'Background check passed',
+    'bg-failed':'Background check failed','coded':'Coded & activated'
+  })[m] || (m || 'Update');
+}
+if(typeof window !== 'undefined') window._milestoneLabel = _milestoneLabel;
+
+function pendingAgentsForViewer(u){
+  if(!u || !Array.isArray(DB.agents)) return [];
+  var officeWide = (typeof isOfficeRole === 'function' && isOfficeRole(u)) || (typeof isOwner === 'function' && isOwner(u));
+  var scopeIds = null;
+  if(!officeWide && typeof agentIdsInMyOrgEffective === 'function'){
+    try{ scopeIds = {}; (agentIdsInMyOrgEffective(u) || []).forEach(function(id){ scopeIds[id] = true; }); }
+    catch(e){ scopeIds = null; }
+  }
+  return DB.agents.filter(function(a){
+    if(!a || a.active === false || a.id === u.id) return false;
+    if(!officeWide && (!scopeIds || !scopeIds[a.id])) return false;
+    return (typeof _isAgentPendingOnboarding === 'function') ? _isAgentPendingOnboarding(a) : false;
+  });
+}
+if(typeof window !== 'undefined') window.pendingAgentsForViewer = pendingAgentsForViewer;
+
+function panelPendingAgents(){
+  var u = DB.current;
+  var isMgr = u && ['Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(u.role) >= 0;
+  var officeWide = (typeof isOfficeRole === 'function' && isOfficeRole(u)) || (typeof isOwner === 'function' && isOwner(u));
+  if(!isMgr && !officeWide){
+    return panelHeader('🔒 Pending Agents') +
+      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Managers only.</div></div>';
+  }
+  var h = panelHeader('🕒 Pending Agents');
+  h += '<div style="background:rgba(8,145,178,.06);border:1px solid rgba(8,145,178,.3);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--brown);line-height:1.6">'
+     + '<strong>Your pending agents.</strong> Everyone on '+(officeWide?'the company':'your team')+' still completing onboarding. This updates automatically as each agent signs documents, clears their background check, and gets coded — and you get a notification at every step.</div>';
+
+  var list = pendingAgentsForViewer(u);
+  if(!list.length){
+    h += '<div class="bo-card"><div style="padding:60px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif"><div style="font-size:2rem;margin-bottom:12px">✅</div><div style="font-size:1rem">No pending agents right now. Everyone on your team is fully onboarded.</div></div></div>';
+    return h;
+  }
+  // Most-recent activity first
+  list.sort(function(a,b){
+    var ta = (a.onboardingTimeline && a.onboardingTimeline.length) ? a.onboardingTimeline[a.onboardingTimeline.length-1].at : '';
+    var tb = (b.onboardingTimeline && b.onboardingTimeline.length) ? b.onboardingTimeline[b.onboardingTimeline.length-1].at : '';
+    return String(tb||'').localeCompare(String(ta||''));
+  });
+
+  list.forEach(function(a){
+    var s = _agentOnboardingSnapshot(a);
+    var pct = s.docsTotal ? Math.round((s.docsSigned / s.docsTotal) * 100) : 0;
+    h += '<div class="bo-card" style="margin-bottom:14px;border-left:4px solid #0891b2"><div style="padding:14px 18px">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-weight:700;font-size:1rem;color:var(--brown)">'+escHtml(a.name)+'</div>';
+    if(a.campaigns && a.campaigns.length){
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">Campaigns: <strong>'+a.campaigns.map(escHtml).join(', ')+'</strong></div>';
+    }
+    h += '</div>';
+    // Document progress
+    h += '<div style="margin-top:10px">';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:4px">Documents signed: <strong>'+s.docsSigned+' / '+s.docsTotal+'</strong></div>';
+    h += '<div style="height:8px;background:var(--border);border-radius:100px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:#0891b2"></div></div>';
+    h += '</div>';
+    // BG + coded chips
+    var chips = '';
+    Object.keys(s.bg).forEach(function(c){
+      var st = s.bg[c];
+      var color = st==='passed'?'#16a34a':st==='failed'?'#dc2626':st==='pending'?'#d97706':'#6b7280';
+      chips += '<span style="display:inline-block;background:rgba(0,0,0,.04);border:1px solid '+color+';color:'+color+';font-family:Barlow Condensed,sans-serif;font-size:.66rem;padding:2px 8px;border-radius:100px;margin:2px 4px 0 0">BG '+escHtml(c)+': '+escHtml(st)+'</span>';
+    });
+    s.codedCampaigns.forEach(function(c){
+      chips += '<span style="display:inline-block;background:#16a34a;color:white;font-family:Barlow Condensed,sans-serif;font-size:.66rem;padding:2px 8px;border-radius:100px;margin:2px 4px 0 0">🔑 Coded: '+escHtml(c)+'</span>';
+    });
+    if(chips) h += '<div style="margin-top:8px">'+chips+'</div>';
+    // Recent timeline
+    if(s.steps && s.steps.length){
+      h += '<div style="margin-top:10px;border-top:1px dashed var(--border);padding-top:8px">';
+      h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Recent activity</div>';
+      s.steps.slice().reverse().forEach(function(e){
+        var when = e.at ? new Date(e.at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
+        h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--brown);margin:2px 0">• '+escHtml(_milestoneLabel(e.milestone))+(e.campaignName?(' — '+escHtml(e.campaignName)):'')+' <span style="color:var(--muted)">'+escHtml(when)+'</span></div>';
+      });
+      h += '</div>';
+    }
+    h += '</div></div>';
+  });
+  return h;
+}
+if(typeof window !== 'undefined') window.panelPendingAgents = panelPendingAgents;
 
 function bgDecideManyClick(agentId, newStatus){
   var rows = Array.prototype.slice.call(document.querySelectorAll('.bg-row-cb'));
