@@ -3451,7 +3451,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.26.1530';
+var BUILD_VERSION = '2026.06.27.1430';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -11783,15 +11783,130 @@ function sendOnboardingPacket(agentId,campaignName,contractType,customTiers){
   createOBTask(agentId,agent.name,campaignName,'pending-signatures','Onboarding Sent — '+agent.name+' / '+campaignName,'Contract type: '+contractType);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  UNIFIED ONBOARDING PROPAGATION  (Calvin 2026-06-27)
+//
+//  THE single choke point every onboarding milestone routes through, so a
+//  completion ALWAYS propagates the same way no matter which flow produced it
+//  — the packet flow (obSignDocument / ONBOARD_ASSIGNMENTS) or the contract
+//  flow (notifyOnboardingProgress / AGENT_ONBOARDING_STATUS).
+//
+//  Before this: the packet flow notified ONLY Owner+Onboarding (the agent's
+//  TL/MM/CM never heard about it), per-document completions were invisible to
+//  everyone, packet-flow agents never appeared on the onboarding-actions
+//  board, and completion state lived only in app_settings blobs that 401 in
+//  production. That is exactly why "it works for the agent but the manager
+//  never gets told / nobody can find it."
+//
+//  On every milestone it does three things, identically:
+//    1. DURABLE MARKER — appends to agent.onboardingTimeline[] and persists
+//       via saveAgentToSupabase (packed into reports_to._meta + depts._meta,
+//       the same survives-the-401 pattern as signedDocs). This is the source
+//       of truth that outlives the blob writes.
+//    2. CONSISTENT NOTIFY — agent's TL + MM + CM + Onboarding dept + Owner,
+//       deduped, active-only, EVERY time. (The agent themself already gets
+//       notified by the existing packet/contract flows + is live in the UI,
+//       so we only re-ping the agent on 'coded' to avoid double-notifying the
+//       person doing the work.)
+//    3. BOARD FEED — computeObPendingActions() (read by panelOnboardingActions)
+//       is the canonical queue; it now reads BOTH live models so every agent
+//       lands there regardless of flow.
+//
+//  milestone ∈ 'packet-sent' | 'doc-signed' | 'packet-complete' |
+//              'contract-complete' | 'bg-signed' | 'bg-passed' |
+//              'bg-failed' | 'coded'
+//  ctx = { campaignName, packageName, stepsComplete, stepsTotal, note }
+// ════════════════════════════════════════════════════════════════════════
+function onboardingPropagate(agentId, milestone, ctx){
+  ctx = ctx || {};
+  if(typeof DB === 'undefined' || !Array.isArray(DB.agents)) return null;
+  var agent = DB.agents.find(function(a){ return a && a.id === agentId; });
+  if(!agent){ console.warn('[onboardingPropagate] no agent #'+agentId); return null; }
+
+  var actor  = (typeof DB.current !== 'undefined' && DB.current) ? DB.current : null;
+  var nowIso = new Date().toISOString();
+
+  // ── 1. DURABLE MARKER ───────────────────────────────────────────────
+  if(!Array.isArray(agent.onboardingTimeline)) agent.onboardingTimeline = [];
+  var entry = {
+    milestone:     milestone,
+    campaignName:  ctx.campaignName || null,
+    packageName:   ctx.packageName  || null,
+    stepsComplete: (typeof ctx.stepsComplete === 'number') ? ctx.stepsComplete : null,
+    stepsTotal:    (typeof ctx.stepsTotal    === 'number') ? ctx.stepsTotal    : null,
+    note:          ctx.note || null,
+    at:            nowIso,
+    byId:          actor ? actor.id   : null,
+    byName:        actor ? actor.name : 'System'
+  };
+  agent.onboardingTimeline.push(entry);
+  // Keep the last 60 entries — full history without bloating the row.
+  if(agent.onboardingTimeline.length > 60) agent.onboardingTimeline = agent.onboardingTimeline.slice(-60);
+  // Persist durably (fire-and-forget). Rides on the agents table via
+  // reports_to._meta/depts._meta, so it survives the app_settings 401.
+  try{
+    if(typeof saveAgentToSupabase === 'function'){
+      var _p = saveAgentToSupabase(agent);
+      if(_p && typeof _p.catch === 'function') _p.catch(function(e){ console.warn('[onboardingPropagate] durable save failed:', e); });
+    } else if(typeof saveToStorage === 'function'){ saveToStorage(); }
+  }catch(e){ console.warn('[onboardingPropagate] save threw:', e); }
+
+  // ── 2. CONSISTENT NOTIFY ────────────────────────────────────────────
+  var camp = ctx.campaignName ? (' ('+ctx.campaignName+')') : '';
+  var pkg  = ctx.packageName || 'onboarding packet';
+  var stepStr = (typeof ctx.stepsComplete === 'number' && typeof ctx.stepsTotal === 'number')
+                ? (' ('+ctx.stepsComplete+'/'+ctx.stepsTotal+' complete)') : '';
+  var spec = ({
+    'packet-sent':       {icon:'📤', title:'Onboarding Sent — '+agent.name+camp, body:'Onboarding packet sent. Awaiting '+agent.name+'\u2019s signatures.', priority:'normal'},
+    'doc-signed':        {icon:'📝', title:agent.name+' — Document Signed'+camp, body:agent.name+' signed an onboarding document'+stepStr+'.', priority:'normal'},
+    'packet-complete':   {icon:'✅', title:'Packet Signed — '+agent.name, body:agent.name+' completed and signed every document in the "'+pkg+'" packet. Ready to be coded — submit to the carrier.', priority:'high'},
+    'contract-complete': {icon:'✅', title:agent.name+' — All Docs Signed'+camp, body:'All onboarding documents complete. Submit to the carrier and enter the agent code to activate portal access.', priority:'high'},
+    'bg-signed':         {icon:'🔥', title:'BG Forms Signed — '+agent.name+camp, body:agent.name+' signed their background-check forms. Download, submit to the vendor, then mark Pass/Fail.', priority:'high'},
+    'bg-passed':         {icon:'🟢', title:'BG Passed — '+agent.name+camp, body:agent.name+' passed their background check.', priority:'normal'},
+    'bg-failed':         {icon:'🔴', title:'BG Failed — '+agent.name+camp, body:agent.name+' did not pass their background check. Review required.', priority:'high'},
+    'coded':             {icon:'🔑', title:agent.name+' is now coded'+camp, body:agent.name+' has been assigned their agent code'+camp+'. Reach out and welcome them to the team!', priority:'high'}
+  })[milestone] || {icon:'📋', title:'Onboarding Update — '+agent.name+camp, body:(ctx.note||'Onboarding status updated.'), priority:'normal'};
+
+  // Recipient set: agent's managers (TL/MM/CM) + Onboarding dept + Owner.
+  var ids = [];
+  function add(id){
+    if(id == null) return;
+    var a = DB.agents.find(function(x){ return x && x.id === id; });
+    if(a && a.active && ids.indexOf(id) < 0) ids.push(id);
+  }
+  add(agent.teamLeaderId);
+  add(agent.marketManagerId);
+  add(agent.campaignManagerId);
+  DB.agents.forEach(function(a){
+    if(a && a.active && (isOwner(a) || (typeof isOnboarding === 'function' && isOnboarding(a)))) add(a.id);
+  });
+
+  if(typeof pushNotification === 'function'){
+    ids.forEach(function(id){
+      pushNotification({toIds:[id], toRoles:[], icon:spec.icon, title:spec.title, body:spec.body,
+                        panel:'onboarding-actions', priority:spec.priority, eventType:'onboarding.'+milestone});
+    });
+    // Re-ping the agent only on 'coded' (other agent-facing pings already
+    // exist in the packet/contract flows; don't double-notify the signer).
+    if(milestone === 'coded'){
+      pushNotification({toIds:[agent.id], toRoles:[], icon:'🔑', title:'You\u2019re coded'+camp+'!',
+                        body:'Your agent code is set — you now have full portal access.',
+                        panel:'my-documents', priority:'high', eventType:'onboarding.coded'});
+    }
+  }
+  return entry;
+}
+if(typeof window !== 'undefined') window.onboardingPropagate = onboardingPropagate;
+
+// ── Calvin 2026-06-27: notifyOnboardingProgress now DELEGATES to the unified
+// choke point above. Signature is unchanged so all existing callers keep
+// working — they now also notify the Campaign Manager, write the durable
+// agent-record marker, and feed the onboarding-actions board, identical to
+// the packet flow.
 function notifyOnboardingProgress(agent,campaignName,stepsComplete,stepsTotal,allDone){
-  var ids=[];
-  DB.agents.filter(function(a){return a.active&&(isOnboarding(a)||isOwner(a));}).forEach(function(a){if(ids.indexOf(a.id)<0)ids.push(a.id);});
-  if(agent.marketManagerId){var mm=DB.agents.find(function(a){return a.id===agent.marketManagerId;});if(mm&&mm.active&&ids.indexOf(mm.id)<0)ids.push(mm.id);}
-  if(agent.teamLeaderId){var tl=DB.agents.find(function(a){return a.id===agent.teamLeaderId;});if(tl&&tl.active&&ids.indexOf(tl.id)<0)ids.push(tl.id);}
-  var icon=allDone?'✅':stepsComplete===0?'📤':'📝';
-  var title=allDone?agent.name+' — All Docs Signed ('+campaignName+')':stepsComplete===0?'Onboarding Sent — '+agent.name+' ('+campaignName+')':agent.name+' — '+stepsComplete+'/3 Docs Signed ('+campaignName+')';
-  var body=allDone?'All 3 onboarding documents complete. Enter their agent code to activate portal access.':stepsComplete+' of '+stepsTotal+' documents completed.';
-  ids.forEach(function(id){pushNotification({toIds:[id],toRoles:[],icon:icon,title:title,body:body,panel:'onboarding',priority:allDone?'high':'normal'});});
+  if(!agent) return;
+  var milestone = allDone ? 'contract-complete' : (stepsComplete === 0 ? 'packet-sent' : 'doc-signed');
+  onboardingPropagate(agent.id, milestone, {campaignName:campaignName, stepsComplete:stepsComplete, stepsTotal:stepsTotal});
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -20562,6 +20677,24 @@ function _unpackSignedDocs(serverRow){
 }
 if(typeof window !== 'undefined') window._unpackSignedDocs = _unpackSignedDocs;
 
+// ── Calvin 2026-06-27: ONBOARDING-TIMELINE UNPACKER ──
+// Mirror of _unpackSignedDocs for agent.onboardingTimeline[]. Reads from the
+// redundant reports_to._meta (primary) / depts._meta (fallback) paths.
+function _unpackOnboardingTimeline(serverRow){
+  if(!serverRow) return [];
+  try {
+    var rtu = _unpackAgentReportsTo(serverRow.reports_to);
+    if(rtu && rtu.meta && Array.isArray(rtu.meta.onboardingTimeline)) return rtu.meta.onboardingTimeline;
+  } catch(e){}
+  try {
+    var d = serverRow.depts;
+    if(typeof d === 'string'){ try{ d = JSON.parse(d); }catch(e){ d = {}; } }
+    if(d && typeof d === 'object' && d._meta && Array.isArray(d._meta.onboardingTimeline)) return d._meta.onboardingTimeline;
+  } catch(e){}
+  return [];
+}
+if(typeof window !== 'undefined') window._unpackOnboardingTimeline = _unpackOnboardingTimeline;
+
 // ── Calvin 2026-06-11 v1530: WMAM CONFIG UNPACKER (Owner record only) ──
 // Reads Calvin's programs/campaigns config that was mirrored onto his
 // agent record by savePrograms(). Returns {programs, campaigns,
@@ -20643,7 +20776,15 @@ function _buildAgentRow(agent){
   } else {
     delete meta.signedDocs;
   }
-  // ── Calvin 2026-06-11 v1530: WMAM CONFIG REDUNDANCY ──
+  // ── Calvin 2026-06-27: ONBOARDING TIMELINE DURABLE MARKER ──
+  // Same survives-the-401 pattern as signedDocs. onboardingPropagate() writes
+  // every milestone here; the onboarding-actions board + agent profile read it
+  // back regardless of whether the app_settings blobs ever persisted.
+  if(Array.isArray(agent.onboardingTimeline) && agent.onboardingTimeline.length){
+    meta.onboardingTimeline = agent.onboardingTimeline;
+  } else {
+    delete meta.onboardingTimeline;
+  }
   // Owner-only piggyback. Only the Owner has wmamConfig set (programs/
   // campaigns). For other agents this is a no-op. Pack into both
   // reports_to._meta and depts._meta so the recovery path on the
@@ -20675,7 +20816,12 @@ function _buildAgentRow(agent){
   } else {
     delete dMeta.signedDocs;
   }
-  // v1530: redundant copy of wmamConfig (Owner only)
+  // Calvin 2026-06-27: redundant onboardingTimeline copy (same as signedDocs)
+  if(Array.isArray(agent.onboardingTimeline) && agent.onboardingTimeline.length){
+    dMeta.onboardingTimeline = agent.onboardingTimeline;
+  } else {
+    delete dMeta.onboardingTimeline;
+  }
   if(agent.role === 'owner' && agent.wmamConfig && typeof agent.wmamConfig === 'object'){
     dMeta.wmamConfig = agent.wmamConfig;
   } else {
@@ -20860,6 +21006,7 @@ function _mergeServerAgentIntoLocal(serverRow){
     // Calvin 2026-06-11 v0730: piggybacked meta fields from reports_to._meta
     pendingAgent:(function(){ try{ return _detectPendingAgent(serverRow); }catch(e){ return false; } })(),
     signedDocs:(function(){ try{ return _unpackSignedDocs(serverRow); }catch(e){ return {}; } })(),
+    onboardingTimeline:(function(){ try{ return _unpackOnboardingTimeline(serverRow); }catch(e){ return []; } })(),
     iboId:       (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
     campaigns:   (function(){ try{ var m = _unpackAgentReportsTo(serverRow.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
     createdAt:   (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
@@ -41618,43 +41765,25 @@ function obSignDocument(assignmentId, templateId){
     sigText: sig
   };
 
-  // If all docs signed, mark complete + notify
+  // ── Calvin 2026-06-27: route through the unified onboardingPropagate choke
+  // point. Previously the packet flow notified ONLY Owner+Onboarding (the
+  // agent's TL/MM/CM never heard), per-document signatures notified nobody,
+  // and packet-flow agents never reached the onboarding-actions board.
+  // Now every signature propagates to the full recipient set + durable
+  // agent-record marker + board, identical to the contract flow.
   var allSigned = (asg.templateIds||[]).every(function(tid){return !!asg.signatures[tid];});
+  var _pkg     = ONBOARD_PACKAGES.find(function(p){return p.id===asg.packageId;});
+  var _pkgName = _pkg ? _pkg.name : 'Onboarding Packet';
+  var _signedCount = (asg.templateIds||[]).filter(function(tid){return !!asg.signatures[tid];}).length;
+  var _totalCount  = (asg.templateIds||[]).length;
   if(allSigned){
     asg.status = 'complete';
     asg.completedAt = new Date().toISOString();
-
-    var pkg = ONBOARD_PACKAGES.find(function(p){return p.id===asg.packageId;});
-    var pkgName = pkg ? pkg.name : 'Onboarding Packet';
-
-    // Notify Owner
-    if(typeof pushNotification === 'function'){
-      try{
-        pushNotification({
-          toIds:[OWNER_ID], toRoles:[],
-          icon:'✅',
-          title:'Onboarding Packet Signed — '+u.name,
-          body:u.name+' has completed and signed every document in the "'+pkgName+'" packet. They are ready to be coded.',
-          panel:'onboard-tracking',
-          priority:'high'
-        });
-        // Notify any Onboarding dept staff too
-        DB.agents.forEach(function(staff){
-          if(!staff.active) return;
-          if(isOwner(staff)) return; // already notified
-          if(isOnboarding(staff) || isAdminRole(staff)){
-            pushNotification({
-              toIds:[staff.id], toRoles:[],
-              icon:'✅',
-              title:'Onboarding Complete — '+u.name,
-              body:u.name+' has signed the "'+pkgName+'" packet and is ready to code.',
-              panel:'onboard-tracking',
-              priority:'normal'
-            });
-          }
-        });
-      }catch(e){ console.warn('[obSignDocument] notify failed', e); }
-    }
+    try{ onboardingPropagate(asg.agentId, 'packet-complete', {packageName:_pkgName, stepsComplete:_signedCount, stepsTotal:_totalCount}); }
+    catch(e){ console.warn('[obSignDocument] propagate packet-complete failed', e); }
+  } else {
+    try{ onboardingPropagate(asg.agentId, 'doc-signed', {packageName:_pkgName, stepsComplete:_signedCount, stepsTotal:_totalCount}); }
+    catch(e){ console.warn('[obSignDocument] propagate doc-signed failed', e); }
   }
 
   saveOnboardData();
@@ -49874,6 +50003,38 @@ function computeObPendingActions(){
       }
     }
   });
+  // ── Calvin 2026-06-27: BRIDGE THE PACKET MODEL ONTO THE BOARD ──
+  // This queue historically read only the contract model
+  // (AGENT_ONBOARDING_STATUS), so agents onboarded via the packet flow
+  // (ONBOARD_ASSIGNMENTS / obSignDocument) never showed up here — the
+  // onboarding team had no single place to see them. Surface every completed
+  // packet whose agent isn't already represented and isn't yet coded, so the
+  // team sees EVERY agent in ONE board regardless of which flow produced them.
+  if(typeof ONBOARD_ASSIGNMENTS !== 'undefined' && Array.isArray(ONBOARD_ASSIGNMENTS)){
+    var _seen = {};
+    rows.forEach(function(r){ _seen[r.agentId] = true; });
+    ONBOARD_ASSIGNMENTS.forEach(function(asg){
+      if(!asg || asg.status !== 'complete') return;
+      var a = (DB.agents||[]).find(function(x){ return x && x.id === asg.agentId; });
+      if(!a || !a.active) return;
+      if(_seen[a.id]) return; // already represented via the contract model
+      var codedCount = a.agentCodes
+        ? Object.keys(a.agentCodes).filter(function(c){ return a.agentCodes[c] && String(a.agentCodes[c]).trim(); }).length
+        : 0;
+      if(codedCount > 0) return; // fully coded — nothing pending
+      var pkg = (typeof ONBOARD_PACKAGES !== 'undefined' && Array.isArray(ONBOARD_PACKAGES))
+        ? ONBOARD_PACKAGES.find(function(p){ return p.id === asg.packageId; }) : null;
+      rows.push({
+        agent: a, agentId: a.id, agentName: a.name,
+        stage: 'packet-complete',
+        stageLabel: '🔑 Packet Signed — Submit to Carrier',
+        actionLabel: 'Signed the "'+(pkg ? pkg.name : 'onboarding')+'" packet. Submit to each carrier and enter the agent code they return.',
+        campaigns: Array.isArray(a.campaigns) ? a.campaigns : [],
+        priority: 2
+      });
+      _seen[a.id] = true;
+    });
+  }
   // Highest priority first (1=urgent, 3=watch)
   rows.sort(function(x,y){return x.priority - y.priority;});
   return rows;
