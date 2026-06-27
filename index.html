@@ -3451,7 +3451,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.27.1700';
+var BUILD_VERSION = '2026.06.27.2200';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -16382,27 +16382,12 @@ function applyGMActivations(activations, uploadBatchId){
     //   (3) monthlySales[].entries[]          — date-stamped audit trail
     //   (4) agent.sales                       — top-level aggregate (leaderboard)
     if(act.agentId && act.commEligible){
-      var agent = DB.agents.find(function(a){return a.id===act.agentId;});
-      if(agent){
-        var month   = act.activationDate ? act.activationDate.slice(0,7) : new Date().toISOString().slice(0,7);
-        var weekKey = (typeof getWeekKey === 'function')
-                    ? getWeekKey(new Date(act.activationDate || Date.now()), '')
-                    : (act.activationDate || new Date().toISOString().slice(0,10));
-        var dateStr = act.activationDate || new Date().toISOString().slice(0,10);
-        if(!agent.monthlySales) agent.monthlySales=[];
-        var entry = agent.monthlySales.find(function(m){return m.month===month&&m.program==='Lifeline';});
-        if(!entry){
-          entry = {month:month, program:'Lifeline', sales:0, weekSales:{}, entries:[]};
-          agent.monthlySales.push(entry);
-        }
-        entry.sales = (entry.sales||0) + 1;
-        if(!entry.weekSales) entry.weekSales = {};
-        entry.weekSales[weekKey] = (entry.weekSales[weekKey]||0) + 1;
-        if(!entry.entries) entry.entries = [];
-        entry.entries.push({date:dateStr, count:1, imei:act.imei, tribal:!!act.tribal, source:'gm-activation-upload'});
-        // Top-level aggregate (leaderboard + dashboard read this)
-        agent.sales = (agent.sales || 0) + 1;
-      }
+      // Calvin 2026-06-27: route through the unified sales writer so GM sales
+      // are tagged with campaign + program and feed day/week/month + ranking
+      // identically to every other path. deferSave: bulk loop persists below.
+      recordSale({ agentId:act.agentId, campaign:'Gen Mobile', program:'Lifeline',
+                   date:act.activationDate, tribal:!!act.tribal, imei:act.imei,
+                   source:'gm-activation-upload', deferSave:true });
     }
   });
   saveInventory();
@@ -35786,10 +35771,11 @@ function panelBO(){
     var teamLabel = u.role==='Team Leader' ? 'TEAM' : 'MARKET';
 
     function teamSalesForProg(prog){
-      // Uses unified agentProgSales — handles legacy u.sales correctly
-      return myTeamAgents.reduce(function(s,a){
-        return s + agentProgSales(a, prog, thisMonth);
-      },0);
+      // Calvin 2026-06-27: this was summing the MONTH (agentProgSales thisMonth)
+      // but is used only in the WEEKLY panel — so team "weekly" actually showed
+      // the month. Now reads the real week total from the unified sales engine,
+      // using the same org scope as scoreboardInventory.
+      return salesRollupForUser(u, {program:prog, period:'week'}).team;
     }
 
     // Show team split only when agent is a leader AND has team members
@@ -35953,7 +35939,15 @@ function panelBO(){
       return aBases.some(function(bp){
         return myBaseProgs.indexOf(bp)>=0 && agentActiveForBase(a, bp);
       });
-    }).sort(function(a,b){return (b.sales||0)-(a.sales||0);});
+    }).sort(function(a,b){
+      // Calvin 2026-06-27: rank by THIS WEEK'S program sales (total across all
+      // campaigns in the program), not lifetime agent.sales. Top seller this
+      // week is #1. Tie-break on lifetime so it stays stable.
+      var rp = (myBaseProgs && myBaseProgs[0]) || 'Lifeline';
+      var bw = agentSalesCount(b,{program:rp,period:'week'});
+      var aw = agentSalesCount(a,{program:rp,period:'week'});
+      return (bw-aw) || ((b.sales||0)-(a.sales||0));
+    });
     var myOverallRank  = peerPool.findIndex(function(a){return a.id===u.id;})+1;
     var totalSalesAgents = peerPool.length;
     var rankProgLabel = myBaseProgs.join('/').toUpperCase();
@@ -35976,7 +35970,7 @@ function panelBO(){
       return agentProgSales(u, prog, thisMonth);
     }
 
-    function salesForProgWeek(prog){ return salesForProg(prog,'week'); }
+    function salesForProgWeek(prog){ return agentSalesCount(u, {program:prog, period:'week'}); }
 
     // YTD sales for rank — uses unified helper
     var mySales = agentYTDTotal(u);
@@ -58056,7 +58050,10 @@ async function _carrierInvHandlePaste(campaign, mode){
   var up = String(campaign).toUpperCase();
   if(up === 'DART'){
     if(mode === 'sales'){
-      alert('DART Sales upload format pending — Calvin will provide the first sales report shortly. Once received, this button will route through the standard activations parser.');
+      var dres = dartProcessSalesText(text);
+      alert(dres.summary);
+      ta.value = '';
+      if(typeof gotoPanel === 'function') gotoPanel(route);
       return;
     }
     // Inventory paste: parse digit runs, route to _commitDartScan
@@ -58137,6 +58134,154 @@ async function _carrierInvHandlePaste(campaign, mode){
 }
 if(typeof window !== 'undefined') window._carrierInvHandlePaste = _carrierInvHandlePaste;
 
+// ════════════════════════════════════════════════════════════════════════
+//  DART SALES UPLOAD  (Calvin 2026-06-27)
+//
+//  Parses the TLC/DART "Orders" report (one row per enrollment) and records
+//  each ACTIVE row as a sale through the unified sales engine (recordSale),
+//  tagged campaign='DART' / program='Lifeline', dated by "Date Completed".
+//  Agents are matched by their DART carrier code (Agent Account) first, then
+//  by name. Sales are deduped by IMEI against everything already recorded, so
+//  re-uploading the same day is safe. A matching DART inventory device (by
+//  IMEI) is flipped to 'sold' so available/sold stay in lockstep.
+//
+//  Columns: Agent Company Name, Customer Account, Agent Account, Customer
+//  Status, Date Completed, Disconnect Date, ESN, IMEI, First Call Date,
+//  First Name, Last Name, Parent Agent Name
+// ════════════════════════════════════════════════════════════════════════
+function _dartParseCSVRows(text){
+  var rows=[], row=[], cur='', inQ=false;
+  for(var i=0;i<text.length;i++){
+    var ch=text[i];
+    if(inQ){
+      if(ch==='"'){ if(text[i+1]==='"'){ cur+='"'; i++; } else inQ=false; }
+      else cur+=ch;
+    } else {
+      if(ch==='"') inQ=true;
+      else if(ch===','){ row.push(cur); cur=''; }
+      else if(ch==='\n' || ch==='\r'){
+        if(cur!=='' || row.length){ row.push(cur); rows.push(row); row=[]; cur=''; }
+        if(ch==='\r' && text[i+1]==='\n') i++;
+      } else cur+=ch;
+    }
+  }
+  if(cur!=='' || row.length){ row.push(cur); rows.push(row); }
+  return rows;
+}
+
+function dartProcessSalesText(csvText){
+  var result = {added:0, dupes:0, unmatched:[], byAgent:{}, summary:''};
+  if(!csvText || !String(csvText).trim()){ result.summary='No CSV content.'; return result; }
+  var rows = _dartParseCSVRows(String(csvText).trim());
+  if(rows.length < 2){ result.summary='No data rows found.'; return result; }
+  var header = rows[0].map(function(h){ return String(h).trim().toLowerCase(); });
+  function col(name){ return header.indexOf(String(name).toLowerCase()); }
+  var ciStatus=col('Customer Status'), ciDate=col('Date Completed'), ciImei=col('IMEI'),
+      ciAcct=col('Agent Account'), ciFirst=col('First Name'), ciLast=col('Last Name'),
+      ciCompany=col('Agent Company Name');
+  if(ciImei < 0){ result.summary='Not a DART orders report (no IMEI column).'; return result; }
+
+  // Dedup set: every DART IMEI already recorded anywhere.
+  var seen = {};
+  (DB.agents||[]).forEach(function(a){
+    (a.monthlySales||[]).forEach(function(m){
+      if((m.campaign||'')==='DART' && Array.isArray(m.entries)){
+        m.entries.forEach(function(e){ if(e && e.imei) seen[String(e.imei).replace(/\D/g,'')]=true; });
+      }
+    });
+  });
+
+  // The DART agent code is the Agent Company Name ("WMM-Agent Name", e.g.
+  // "WMM-Tanita Flowers") — the SAME string stored on the profile as
+  // agentCodes['DART'] and used on the payroll file. Match STRICTLY on that
+  // code: no agent-name fallback (a loose name match could mis-credit the
+  // wrong record and corrupt payroll). Case + WMM- prefix are normalized so
+  // the carrier's inconsistent casing ("Wmm-" vs "WMM-") still matches the
+  // right person; identity itself is never guessed. Unmatched rows are
+  // reported so the profile code can be corrected.
+  function _dartNorm(s){ return String(s||'').toLowerCase().replace(/\s+/g,' ').replace(/wmm\s*-\s*/,'wmm-').trim(); }
+  function findAgent(company){
+    var codeNorm = _dartNorm(company);
+    if(!codeNorm) return null;
+    return (DB.agents||[]).find(function(x){
+      return x && x.agentCodes && x.agentCodes['DART'] && _dartNorm(x.agentCodes['DART'])===codeNorm;
+    }) || null;
+  }
+
+  for(var r=1;r<rows.length;r++){
+    var row=rows[r]; if(!row || !row.length) continue;
+    var status=String(ciStatus>=0?row[ciStatus]:'Active').trim();
+    if(status && status.toLowerCase()!=='active') continue; // only active enrollments are sales
+    var imei=String(row[ciImei]||'').replace(/\D/g,'');
+    if(!imei) continue;
+    if(seen[imei]){ result.dupes++; continue; }
+    var date=String((ciDate>=0?row[ciDate]:'')||'').trim();
+    if(!/^\d{4}-\d{2}-\d{2}/.test(date)) date=new Date().toISOString().slice(0,10);
+    var company=ciCompany>=0?row[ciCompany]:'';
+    var agent=findAgent(company);
+    if(!agent){
+      var lbl=String(company||'').trim()||'?';
+      if(result.unmatched.indexOf(lbl)<0) result.unmatched.push(lbl);
+      seen[imei]=true; continue;
+    }
+    recordSale({agentId:agent.id, campaign:'DART', program:'Lifeline', date:date, imei:imei, source:'dart-sales-upload', deferSave:true});
+    // Flip a matching DART inventory device to sold (keeps available/sold in sync)
+    try{
+      if(typeof INVENTORY_DEVICES!=='undefined' && Array.isArray(INVENTORY_DEVICES)){
+        var dev=INVENTORY_DEVICES.find(function(d){ return d && String(d.imei||'').replace(/\D/g,'')===imei; });
+        if(dev && dev.status!=='sold' && dev.status!=='activated'){
+          dev._statusBeforeSold=dev.status; dev.status='sold'; dev.soldAt=date;
+          dev.soldByAgentId=agent.id; dev.soldByAgentName=agent.name;
+          if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody=[];
+          dev.chainOfCustody.push({type:'sold', at:date, by:agent.name, byId:agent.id, source:'dart-sales-upload'});
+        }
+      }
+    }catch(e){}
+    seen[imei]=true;
+    result.added++;
+    result.byAgent[agent.name]=(result.byAgent[agent.name]||0)+1;
+  }
+
+  // Persist once (recordSale ran with deferSave).
+  try{ if(typeof saveToStorage==='function') saveToStorage(); }catch(e){}
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  try{
+    Object.keys(result.byAgent).forEach(function(nm){
+      var a=(DB.agents||[]).find(function(x){ return x && x.name===nm; });
+      if(a && typeof saveAgentToSupabase==='function'){ var p=saveAgentToSupabase(a); if(p&&typeof p.catch==='function')p.catch(function(){}); }
+    });
+  }catch(e){}
+
+  var parts=[result.added+' sale'+(result.added===1?'':'s')+' recorded'];
+  if(result.dupes) parts.push(result.dupes+' duplicate'+(result.dupes===1?'':'s')+' skipped');
+  if(result.unmatched.length) parts.push(result.unmatched.length+' unmatched ('+result.unmatched.slice(0,5).join(', ')+(result.unmatched.length>5?'…':'')+')');
+  var byA=Object.keys(result.byAgent).map(function(n){ return n+': '+result.byAgent[n]; }).join(' · ');
+  result.summary='DART Sales — '+parts.join(', ')+(byA?('\n'+byA):'');
+  return result;
+}
+if(typeof window!=='undefined') window.dartProcessSalesText = dartProcessSalesText;
+
+// Native file picker for DART sales (used by the "Open Sales Upload" button).
+function dartSalesPickFile(){
+  var input=document.createElement('input');
+  input.type='file'; input.accept='.csv,text/csv'; input.style.display='none';
+  input.onchange=function(){
+    var f=input.files && input.files[0];
+    if(!f){ try{document.body.removeChild(input);}catch(_){ } return; }
+    var reader=new FileReader();
+    reader.onload=function(){
+      try{ var res=dartProcessSalesText(String(reader.result||'')); alert(res.summary); if(typeof gotoPanel==='function') gotoPanel('dart-inv2'); }
+      catch(e){ alert('DART sales parse error: '+e.message); }
+      try{ document.body.removeChild(input); }catch(_){ }
+    };
+    reader.onerror=function(){ alert('Could not read the file.'); try{document.body.removeChild(input);}catch(_){ } };
+    reader.readAsText(f);
+  };
+  document.body.appendChild(input);
+  input.click();
+}
+if(typeof window!=='undefined') window.dartSalesPickFile = dartSalesPickFile;
+
 // Direct routing to existing -upload panels (preserves all current
 // parser logic) when user prefers the original file-only flow.
 function _carrierInvOpenUploadPanel(campaign, mode){
@@ -58152,7 +58297,10 @@ function _carrierInvOpenUploadPanel(campaign, mode){
     // + Manual Paste), which is the canonical way to add DART devices.
     // Sales upload is a stub until Calvin sends the first sales report.
     if(mode === 'sales'){
-      alert('DART Sales upload format pending — Calvin will provide the first sales report shortly. Once received, this will route to the standard activations parser.');
+      // Calvin 2026-06-27: DART sales report now supported — open a file
+      // picker and route the CSV through dartProcessSalesText.
+      if(typeof dartSalesPickFile === 'function'){ dartSalesPickFile(); return; }
+      alert('DART sales uploader not loaded — refresh and try again.');
       return;
     }
     route = 'dart-scanner';
@@ -59020,35 +59168,12 @@ async function applyTCActivations(parseResult){
 
     // Bump agent stats (matched agents only). Mirrors applyGMActivations.
     if(act.agentId){
-      var agent = DB.agents.find(function(a){return a.id===act.agentId;});
-      if(agent){
-        var month   = (act.saleDate||nowISO).slice(0,7);
-        var weekKey = (typeof getWeekKey === 'function')
-                    ? getWeekKey(new Date(act.saleDate || Date.now()), '')
-                    : (act.saleDate || nowISO.slice(0,10));
-        var dateStr = act.saleDate || nowISO.slice(0,10);
-        if(!agent.monthlySales) agent.monthlySales = [];
-        var entry = agent.monthlySales.find(function(m){return m.month===month && m.program==='Lifeline';});
-        if(!entry){
-          entry = {month:month, program:'Lifeline', sales:0, weekSales:{}, entries:[]};
-          agent.monthlySales.push(entry);
-        }
-        entry.sales = (entry.sales||0) + 1;
-        if(!entry.weekSales) entry.weekSales = {};
-        entry.weekSales[weekKey] = (entry.weekSales[weekKey]||0) + 1;
-        if(!entry.entries) entry.entries = [];
-        entry.entries.push({
-          date:    dateStr,
-          count:   1,
-          imei:    act.imei,
-          tribal:  !!act.tribal,
-          order:   act.orderNumber,
-          planType:act.planType,
-          source:  'tc-activation-upload'
-        });
-        agent.sales = (agent.sales||0) + 1;
-        creditedSales++;
-      }
+      // Calvin 2026-06-27: unified sales writer (campaign=TruConnect). Returns
+      // the entry only when the agent was matched, preserving credited count.
+      var _tcEntry = recordSale({ agentId:act.agentId, campaign:'TruConnect', program:'Lifeline',
+                   date:act.saleDate, tribal:!!act.tribal, imei:act.imei,
+                   source:'tc-activation-upload', deferSave:true });
+      if(_tcEntry) creditedSales++;
     }
   });
 
@@ -61771,6 +61896,172 @@ function agentYTDTotal(agent){
   var byProg = agentYTDByProg(agent);
   return Object.values(byProg).reduce(function(s,v){return s+v;},0);
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  UNIFIED SALES ENGINE  (Calvin 2026-06-27)
+//
+//  ONE writer (recordSale) and ONE set of readers for every sales number in
+//  the back office, so available/sold and day/week/month never drift again.
+//
+//  Why: sales were recorded in 3+ places with inconsistent keys — the GM/TC
+//  activation uploads hardcoded program:'Lifeline', while invMarkAsSold keyed
+//  by carrier (and OMITTED DART, so DART sales fell into a phantom 'DART'
+//  bucket the dashboard never read) and never wrote the weekly bucket. Reads
+//  were per-panel and disagreed (team "weekly" actually showed the month).
+//
+//  Now every sale flows through recordSale, tagged with BOTH its campaign
+//  (Gen Mobile / TruConnect / Assurance / Excess / DART) AND its program
+//  (Lifeline). Per-campaign numbers filter by campaign; rankings sum every
+//  campaign in the program. Day/week granularity is derived from the
+//  date-stamped entries[] audit trail (immune to getWeekKey's per-carrier
+//  week boundary); month totals use the durable bucket.sales counter so
+//  legacy data is preserved.
+// ════════════════════════════════════════════════════════════════════════
+
+// Campaign → program. Lifeline carriers (device-bearing) roll up to Lifeline.
+function campaignProgram(campaign){
+  var c = String(campaign||'').toLowerCase();
+  if(/gen\s*mobile|truconnect|assurance|excess|dart/.test(c)) return 'Lifeline';
+  if(/chuzo|astound|all\s*connect|internet/.test(c))          return 'Internet';
+  if(/\baca\b/.test(c))                                        return 'ACA';
+  return campaign || 'Lifeline';
+}
+if(typeof window!=='undefined') window.campaignProgram = campaignProgram;
+
+// Consistent period boundaries for cross-campaign rollups + ranking. Sunday-
+// start week for EVERY program, independent of getWeekKey's per-carrier rule.
+function _salesWeekStart(d){
+  var x = new Date(new Date(d).toISOString().slice(0,10)+'T00:00:00Z');
+  x.setUTCDate(x.getUTCDate() - x.getUTCDay()); // back to Sunday
+  return x.toISOString().slice(0,10);
+}
+
+// ── THE WRITER — the single choke point every sale flows through. ──
+function recordSale(opts){
+  opts = opts || {};
+  if(typeof DB==='undefined' || !Array.isArray(DB.agents)) return null;
+  var agent = DB.agents.find(function(a){ return a && a.id === opts.agentId; });
+  if(!agent){ console.warn('[recordSale] no agent #'+opts.agentId); return null; }
+  var campaign = opts.campaign || '';
+  var program  = opts.program || campaignProgram(campaign);
+  var dateStr  = (opts.date && /^\d{4}-\d{2}-\d{2}/.test(String(opts.date))) ? String(opts.date).slice(0,10) : new Date().toISOString().slice(0,10);
+  var count    = (typeof opts.count==='number' && opts.count>0) ? opts.count : 1;
+  var month    = dateStr.slice(0,7);
+  var weekKey  = (typeof getWeekKey==='function') ? getWeekKey(new Date(dateStr), '') : _salesWeekStart(dateStr);
+
+  if(!Array.isArray(agent.monthlySales)) agent.monthlySales = [];
+  // Bucket keyed by month + program + campaign. (campaign added 2026-06-27;
+  // legacy buckets have no campaign and still sum into program totals.)
+  var bucket = agent.monthlySales.find(function(m){ return m && m.month===month && m.program===program && (m.campaign||'')===(campaign||''); });
+  if(!bucket){
+    bucket = {month:month, program:program, campaign:campaign||'', sales:0, weekSales:{}, daySales:{}, entries:[]};
+    agent.monthlySales.push(bucket);
+  }
+  if(!bucket.weekSales) bucket.weekSales = {};
+  if(!bucket.daySales)  bucket.daySales  = {};
+  if(!Array.isArray(bucket.entries)) bucket.entries = [];
+  bucket.sales = (bucket.sales||0) + count;
+  bucket.weekSales[weekKey] = (bucket.weekSales[weekKey]||0) + count;
+  bucket.daySales[dateStr]  = (bucket.daySales[dateStr]||0) + count;
+  bucket.entries.push({ date:dateStr, count:count, campaign:campaign||'', program:program, tribal:!!opts.tribal, imei:opts.imei||null, source:opts.source||'recordSale' });
+  agent.sales = (agent.sales||0) + count;
+
+  // Bulk callers (activation uploads) pass deferSave and persist once at the
+  // end of their loop, exactly as before. Single actions save immediately.
+  if(opts.deferSave) return bucket.entries[bucket.entries.length-1];
+  try{
+    if(typeof saveAgentToSupabase==='function'){ var p=saveAgentToSupabase(agent); if(p&&typeof p.catch==='function')p.catch(function(){}); }
+    else if(typeof saveToStorage==='function'){ saveToStorage(); }
+  }catch(e){ console.warn('[recordSale] save threw', e); }
+  return bucket.entries[bucket.entries.length-1];
+}
+if(typeof window!=='undefined') window.recordSale = recordSale;
+
+// ── THE READERS ──
+// Count one agent's sales, optionally filtered by campaign and/or program,
+// for a period ('day'|'week'|'month'|'all') relative to refDate (today).
+function agentSalesCount(agent, q){
+  q = q || {};
+  var period = q.period || 'month';
+  if(!agent || !Array.isArray(agent.monthlySales) || !agent.monthlySales.length){
+    // legacy fallback: only the lifetime total is available
+    if(period==='all' && !q.campaign && !q.program) return (agent && agent.sales) || 0;
+    return 0;
+  }
+  var ref = q.refDate ? new Date(q.refDate) : new Date();
+  var refMonth = ref.toISOString().slice(0,7);
+  var refWeek  = _salesWeekStart(ref);
+  var refDay   = ref.toISOString().slice(0,10);
+  var wantCampaign = q.campaign || null;
+  var wantProgram  = q.program  || null;
+  function matches(m){
+    if(!m) return false;
+    if(wantProgram  && m.program !== wantProgram) return false;
+    if(wantCampaign && (m.campaign||'') !== wantCampaign) return false;
+    return true;
+  }
+  if(period==='month'){
+    return agent.monthlySales.reduce(function(s,m){ return (matches(m)&&m.month===refMonth) ? s+(m.sales||0) : s; },0);
+  }
+  if(period==='all'){
+    return agent.monthlySales.reduce(function(s,m){ return matches(m) ? s+(m.sales||0) : s; },0);
+  }
+  // day / week — derive from entries[] (consistent boundary, carrier-agnostic)
+  var total = 0;
+  agent.monthlySales.forEach(function(m){
+    if(!matches(m) || !Array.isArray(m.entries)) return;
+    m.entries.forEach(function(e){
+      if(!e || !e.date) return;
+      if(period==='day'  && String(e.date).slice(0,10)!==refDay) return;
+      if(period==='week' && _salesWeekStart(e.date)!==refWeek)   return;
+      total += (e.count||1);
+    });
+  });
+  return total;
+}
+if(typeof window!=='undefined') window.agentSalesCount = agentSalesCount;
+
+// Personal + team rollup for a user, using the SAME org scope as
+// scoreboardInventory (agentIdsInMyOrgEffective). Returns {personal,team,total}.
+function salesRollupForUser(user, q){
+  q = q || {};
+  if(!user) return {personal:0, team:0, total:0};
+  var personal = agentSalesCount(user, q);
+  var team = 0;
+  if(typeof agentIdsInMyOrgEffective==='function'){
+    (agentIdsInMyOrgEffective(user) || []).forEach(function(id){
+      if(id===user.id) return;
+      var a = DB.agents.find(function(x){ return x && x.id===id; });
+      if(a) team += agentSalesCount(a, q);
+    });
+  }
+  return { personal:personal, team:team, total:personal+team };
+}
+if(typeof window!=='undefined') window.salesRollupForUser = salesRollupForUser;
+
+// ── RANKING — company-wide, by TOTAL program sales (all campaigns) for the
+// period. This is what makes "Jon's 12 GM + 40 TC + 10 DART = 62 this week →
+// #1 rep" work. Ties share a rank (standard competition ranking).
+function programRanking(program, period, refDate){
+  if(!Array.isArray(DB.agents)) return [];
+  var rows = DB.agents.filter(function(a){
+    return a && a.active && (typeof isSalesRole!=='function' || isSalesRole(a));
+  }).map(function(a){
+    return { agentId:a.id, name:a.name, total: agentSalesCount(a, {program:program, period:period, refDate:refDate}) };
+  });
+  rows.sort(function(x,y){ return (y.total - x.total) || String(x.name).localeCompare(String(y.name)); });
+  var rank=0, prev=null;
+  rows.forEach(function(r,i){ if(prev===null || r.total!==prev){ rank=i+1; prev=r.total; } r.rank=rank; });
+  return rows;
+}
+if(typeof window!=='undefined') window.programRanking = programRanking;
+
+function agentRankInProgram(agent, program, period, refDate){
+  var rows = programRanking(program, period, refDate);
+  var me = rows.find(function(r){ return r.agentId === (agent&&agent.id); });
+  return { rank: me?me.rank:0, total: me?me.total:0, peers: rows.length };
+}
+if(typeof window!=='undefined') window.agentRankInProgram = agentRankInProgram;
 
 // ────────────────────────────────────────────────────────────
 
@@ -71380,27 +71671,14 @@ function invMarkAsSold(opts){
     customerName: opts.customerName || ''
   });
   // ── Update agent counters ──
+  // Calvin 2026-06-27: route through the unified sales writer. This fixes the
+  // DART gap (the old local LIFELINE list omitted DART, dropping its sales
+  // into a phantom 'DART' bucket the dashboard never read), and it now writes
+  // the weekly + daily buckets and the campaign tag like every other path.
   if(opts.agentId){
-    var agent = (DB.agents||[]).find(function(a){ return a && a.id === opts.agentId; });
-    if(agent){
-      // 1. Rolling total (leaderboard reads this)
-      agent.sales = (agent.sales || 0) + 1;
-      // 2. Month bucket (monthly sales breakdowns)
-      if(!Array.isArray(agent.monthlySales)) agent.monthlySales = [];
-      var month = (opts.soldAt && /^\d{4}-\d{2}/.test(opts.soldAt))
-                  ? opts.soldAt.slice(0,7)
-                  : new Date().toISOString().slice(0,7);
-      // Bucket by month + program (Lifeline for the carriers we handle)
-      var carrier = opts.carrier || dev.campaign || '';
-      var LIFELINE = ['Gen Mobile','TruConnect','Assurance','Assurance Wireless','Excess','Excess Telecom'];
-      var program = LIFELINE.indexOf(carrier) >= 0 ? 'Lifeline' : (carrier || 'Other');
-      var bucket = agent.monthlySales.find(function(m){ return m && m.month === month && m.program === program; });
-      if(bucket){
-        bucket.sales = (bucket.sales || 0) + 1;
-      } else {
-        agent.monthlySales.push({month: month, program: program, sales: 1});
-      }
-    }
+    recordSale({ agentId:opts.agentId, campaign:(opts.carrier || dev.campaign || ''),
+                 date:(opts.soldAt && /^\d{4}-\d{2}-\d{2}/.test(opts.soldAt)) ? opts.soldAt : dev.soldAt,
+                 imei:dev.imei, source:(opts.source||'sold-report') });
   }
   return true;
 }
