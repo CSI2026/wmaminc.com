@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.28.1145';
+var BUILD_VERSION = '2026.06.28.1300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15691,9 +15691,13 @@ function gmResolveMarketMMOnly(marketName){
     if(!m || m.active === false) return false;
     return (m.name || '').toLowerCase().trim() === marketName.toLowerCase().trim();
   });
-  if(!marketRow) return null;
+  if(!marketRow){
+    // No exact row — still honor a profile direct-MM matched by tolerant name.
+    var _dmmByName = (typeof _directMmAgentForMarket==='function') ? _directMmAgentForMarket(null, marketName) : null;
+    return _dmmByName || null;
+  }
   // Calvin 2026-06-30: profile direct-MM override wins first.
-  var _dmm = (typeof _directMmAgentForMarket==='function') ? _directMmAgentForMarket(marketRow) : null;
+  var _dmm = (typeof _directMmAgentForMarket==='function') ? _directMmAgentForMarket(marketRow, marketName) : null;
   if(_dmm) return _dmm;
   // Check each program section for an MM, in priority order
   var sections = ['lifeline','internet','aca'];
@@ -15744,18 +15748,55 @@ function gmResolveMarketMMOnly(marketName){
 function _directMmMarketsOf(agent){
   return (agent && Array.isArray(agent.directMmMarkets)) ? agent.directMmMarkets : [];
 }
-function _directMmAgentForMarket(marketRow){
-  if(!marketRow) return null;
-  var mid = marketRow.id;
-  var mname = (marketRow.name||'').toLowerCase().trim();
+// Token-tolerant market-name comparison. "Dallas B" matches "Team Dallas TX B"
+// (every token of the shorter name appears in the longer), but NOT "Team Dallas
+// TX A" (the distinguishing token "b" is absent). Also true on no-space equality.
+function _marketTokenMatch(a, b){
+  function toks(s){ return String(s||'').toLowerCase().replace(/[^a-z0-9 ]/g,' ').split(/\s+/).filter(Boolean); }
+  var A=toks(a), B=toks(b);
+  if(!A.length || !B.length) return false;
+  if(A.join('') === B.join('')) return true;                 // "dallasb" === "dallasb"
+  var short = A.length<=B.length ? A : B;
+  var long  = A.length<=B.length ? B : A;
+  return short.every(function(t){ return long.indexOf(t) >= 0; });
+}
+if(typeof window!=='undefined') window._marketTokenMatch=_marketTokenMatch;
+
+// Resolve a market id/name (as stored in an agent's directMmMarkets) to its
+// display name via MARKETS, so we can token-compare it to the CSV market string.
+function _marketNameForRef(ref){
+  if(ref == null) return '';
+  if(typeof MARKETS === 'undefined' || !Array.isArray(MARKETS)) return String(ref);
+  var row = MARKETS.find(function(m){
+    if(!m) return false;
+    if(m.id === ref) return true;
+    return String(m.name||'').toLowerCase().trim() === String(ref).toLowerCase().trim();
+  });
+  return row ? (row.name||String(ref)) : String(ref);
+}
+
+// Find the agent who personally runs this market as direct MM. Matches by the
+// market ROW (id/name) when we have it AND by the raw CSV market string —
+// tolerant of "Dallas B" vs "Team Dallas TX B" — so routing works even when the
+// row resolver picked a sibling market or no row at all. Calvin 2026-06-30.
+function _directMmAgentForMarket(marketRow, rawName){
+  var rowId   = marketRow ? marketRow.id : null;
+  var rowName = marketRow ? (marketRow.name||'') : '';
+  var raw     = rawName ? String(rawName) : '';
+  if(rowId == null && !raw) return null;
   return (DB.agents||[]).find(function(a){
     if(!a || !a.active) return false;
     var list = _directMmMarketsOf(a);
     if(!list.length) return false;
-    // match by id OR by name (tolerant of id type drift)
     return list.some(function(v){
-      if(v === mid) return true;
-      return String(v).toLowerCase().trim() === mname && !!mname;
+      // 1) direct id match against the resolved row
+      if(rowId != null && v === rowId) return true;
+      // 2) token-tolerant name match: resolve the agent's stored market ref to a
+      //    name, then compare to both the resolved row name AND the raw CSV name.
+      var vName = _marketNameForRef(v);
+      if(rowName && _marketTokenMatch(vName, rowName)) return true;
+      if(raw && _marketTokenMatch(vName, raw)) return true;
+      return false;
     });
   }) || null;
 }
@@ -15816,10 +15857,43 @@ function resolveUploadRecipient(marketName, campaignKey){
     if(mc.candidates.some(function(c){ return c.replace(/[\s,]/g,'') === targetNoSpaces; })){ marketRow=mc.m; matchStrategy='no-spaces-commas'; }
   }
   // Tier 4 — substring (weakest; only when nothing stronger matched anywhere)
+  // Tier 4 — token-overlap (smarter than naive substring). Picks the row whose
+  // tokens cover ALL of the target's tokens, uniquely. Fixes "Dallas B" landing
+  // on "Team Dallas TX A" just because they share the city "Dallas".
+  if(!marketRow && target.length >= 3){
+    var tgtToks = target.replace(/[^a-z0-9 ]/g,' ').split(/\s+/).filter(Boolean);
+    if(tgtToks.length){
+      var best=null, bestScore=0, tie=false;
+      for(var i=0;i<marketCandidates.length;i++){
+        var mc=marketCandidates[i]; if(!mc) continue;
+        var rowToks={};
+        mc.candidates.forEach(function(c){ c.replace(/[^a-z0-9 ]/g,' ').split(/\s+/).filter(Boolean).forEach(function(t){ rowToks[t]=1; }); });
+        var score = tgtToks.filter(function(t){ return rowToks[t]; }).length;
+        if(score > bestScore){ bestScore=score; best=mc.m; tie=false; }
+        else if(score === bestScore && score>0){ tie=true; }
+      }
+      // Accept only a UNIQUE best that covers every target token (confident).
+      if(best && !tie && bestScore === tgtToks.length){ marketRow=best; matchStrategy='token-overlap'; }
+    }
+  }
+  // Tier 5 — naive substring (last resort)
   if(!marketRow && target.length >= 4){
     for(var i=0;i<marketCandidates.length && !marketRow;i++){
       var mc=marketCandidates[i]; if(!mc) continue;
       if(mc.candidates.some(function(c){ return c.indexOf(target) >= 0 || target.indexOf(c) >= 0; })){ marketRow=mc.m; matchStrategy='substring'; }
+    }
+  }
+
+  // ── Direct-MM safety net (Calvin 2026-06-30) ──
+  // Even if no MARKETS row matched the CSV string, an agent may have named this
+  // market on their profile (by token-tolerant name). Honor that before giving
+  // up — this is what makes "Dallas B" route to Brandon regardless of row drift.
+  if(!marketRow){
+    var _dmmRaw = _directMmAgentForMarket(null, marketName);
+    if(_dmmRaw){
+      debug.reason = 'matched-profile-direct-mm-by-name';
+      console.log('[resolveUploadRecipient] ✓ profile direct-MM (by name) '+_dmmRaw.name+' for '+marketName);
+      return {agent:_dmmRaw, source:'market-mm', debug:debug};
     }
   }
 
@@ -15892,7 +15966,7 @@ function resolveUploadRecipient(marketName, campaignKey){
   // ── Calvin 2026-06-30: profile-level direct-MM override wins first ──
   // If any agent's profile names this market as one they run directly as MM,
   // route to them regardless of role (a CM who runs their home market).
-  var _directMm = _directMmAgentForMarket(marketRow);
+  var _directMm = _directMmAgentForMarket(marketRow, marketName);
   if(_directMm){
     debug.reason = 'matched-profile-direct-mm';
     console.log('[resolveUploadRecipient] ✓ profile direct-MM '+_directMm.name+' for '+marketName);
