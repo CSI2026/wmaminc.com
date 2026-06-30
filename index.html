@@ -3451,7 +3451,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.28.0030';
+var BUILD_VERSION = '2026.06.28.0145';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -9456,6 +9456,236 @@ function awFormatBreakdown(perAgent){
   });
   out.sort(function(a,b){ return b.total - a.total; });
   return out;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  ASSURANCE PAY-FILE IMPORTER  (Calvin 2026-06-28)
+//  Reads the ASSURANCE section of the Gen Mobile / Assurance pay file and
+//  computes MM commission ($5 × commissionable Total per agency code) by
+//  feeding the existing awCalculateWeek engine — which resolves the single
+//  recipient (market MM, or CM-consolidated / IBO upline, else upline walk)
+//  and warns on no-MM markets. Deact / No-Usage / BE are INFORMATIONAL only:
+//  the pay file's Total is already NET of cancellations, so they never reduce
+//  pay. Agents earn $0 on AW (locked); only the resolved manager earns $5.
+// ════════════════════════════════════════════════════════════════════════
+function _awSplitRow(line){
+  if(line.indexOf('\t')>=0) return line.split('\t');
+  return line.split(/\s{2,}/);
+}
+function _awNormCode(s){ return String(s||'').toLowerCase().replace(/\s+/g,'').trim(); }
+function awFindAgentByCode(code){
+  var c=_awNormCode(code); if(!c) return null;
+  return DB.agents.find(function(x){
+    if(!x || !x.agentCodes) return false;
+    var k = x.agentCodes['Assurance Wireless'] || x.agentCodes['Assurance'];
+    return k && _awNormCode(k)===c;
+  }) || null;
+}
+function awParsePayFileAssurance(text){
+  var out = { period:'', rows:[], totalRow:null, found:false };
+  if(!text) return out;
+  var lines = String(text).replace(/\r/g,'').split('\n');
+  var i=0, n=lines.length;
+  for(; i<n; i++){
+    var L=lines[i].trim();
+    if(/^ASSURANCE\b/i.test(L)){
+      out.found=true;
+      var m=L.match(/\(([^)]+)\)/); if(m) out.period=m[1].trim();
+      break;
+    }
+  }
+  if(!out.found) return out;
+  i++;
+  while(i<n && !lines[i].trim()) i++;
+  if(i>=n) return out;
+  var header=_awSplitRow(lines[i]).map(function(h){ return String(h).trim().toLowerCase(); });
+  function col(pred){ for(var k=0;k<header.length;k++){ if(pred(header[k])) return k; } return -1; }
+  var ciAgent   = col(function(h){ return h==='agent'; });
+  var ciTotal   = col(function(h){ return h==='total'; });
+  var ciBE      = col(function(h){ return h==='be'; });
+  var ciNoUsage = col(function(h){ return h.indexOf('no usage')>=0 || h.indexOf('nousage')>=0; });
+  var ciDeact   = col(function(h){ return h.indexOf('deact')>=0; });
+  var ciNladPh  = col(function(h){ return h.indexOf('nlad phone')>=0; });
+  if(ciAgent<0 || ciTotal<0){ return out; }
+  i++;
+  for(; i<n && (out.rows.length<500); i++){
+    var raw=lines[i];
+    if(!raw.trim()) break;
+    var cells=_awSplitRow(raw);
+    if(cells.length<=ciTotal) break;
+    var num=function(idx){ var v=parseInt(String(cells[idx]||'0').replace(/[^0-9-]/g,''),10); return isNaN(v)?0:v; };
+    var code=String(cells[ciAgent]||'').trim();
+    var rec={ code:code, total:num(ciTotal), be:ciBE>=0?num(ciBE):0,
+              noUsage:ciNoUsage>=0?num(ciNoUsage):0, deact:ciDeact>=0?num(ciDeact):0,
+              nladPhone:ciNladPh>=0?num(ciNladPh):0 };
+    if(!code){ out.totalRow=rec; continue; }
+    out.rows.push(rec);
+  }
+  return out;
+}
+function awImportPayFileText(text){
+  var parsed=awParsePayFileAssurance(text);
+  var result={ period:parsed.period, found:parsed.found, byCode:[], unmatched:[],
+               recipients:[], enrollers:[], reconciliation:{}, warnings:[], totalRow:parsed.totalRow };
+  if(!parsed.found){ result.warnings.push('No ASSURANCE section found in the pasted pay file.'); return result; }
+  var weekRows=[]; var sumTotal=0, sumDeact=0, sumNoUsage=0, sumBE=0;
+  parsed.rows.forEach(function(r){
+    sumTotal+=r.total; sumDeact+=r.deact; sumNoUsage+=r.noUsage; sumBE+=r.be;
+    var agent=awFindAgentByCode(r.code);
+    var team=(agent && typeof gmAgentTeam==='function')?gmAgentTeam(agent.id):null;
+    result.byCode.push({ code:r.code, total:r.total, be:r.be, noUsage:r.noUsage, deact:r.deact,
+                         agentId:agent?agent.id:null, agentName:agent?agent.name:null,
+                         market:team?(team.name||team.city||('#'+team.id)):null });
+    if(!agent){ if(result.unmatched.indexOf(r.code)<0) result.unmatched.push(r.code); }
+    else { for(var k=0;k<r.total;k++) weekRows.push({ agentId:agent.id, isTribal:false }); }
+  });
+  var calc=(typeof awCalculateWeek==='function')?awCalculateWeek(weekRows):{perAgent:{},warnings:[]};
+  if(calc.warnings && calc.warnings.length) result.warnings=result.warnings.concat(calc.warnings);
+  var formatted=(typeof awFormatBreakdown==='function')?awFormatBreakdown(calc.perAgent):[];
+  result.recipients=formatted.filter(function(r){ return r.total>0; });
+  result.enrollers =formatted.filter(function(r){ return r.total===0; });
+  result.reconciliation={
+    commissionableTotal:sumTotal, deactTotal:sumDeact, noUsageTotal:sumNoUsage, beTotal:sumBE,
+    expectedMMPay: sumTotal*AW_RATES.perEnrollment,
+    actualMMPay: result.recipients.reduce(function(s,r){ return s+r.total; },0),
+    fileTotalRow: parsed.totalRow
+  };
+  return result;
+}
+if(typeof window!=='undefined'){
+  window.awParsePayFileAssurance=awParsePayFileAssurance;
+  window.awImportPayFileText=awImportPayFileText;
+  window.awFindAgentByCode=awFindAgentByCode;
+}
+
+// ── Assurance pay-file panel: upload + computed MM commissions ──
+function awPayFileSaveLast(text, result){
+  try{ localStorage.setItem('wmam_aw_payfile_last', JSON.stringify({ text:text, ts:Date.now(), period:result?result.period:'' })); }catch(e){}
+}
+function awPayFileLoadLast(){
+  try{ var raw=localStorage.getItem('wmam_aw_payfile_last'); return raw?JSON.parse(raw):null; }catch(e){ return null; }
+}
+function awPayFileRun(){
+  var ta=document.getElementById('awpf-input');
+  var text=ta?ta.value:'';
+  if(!text || !text.trim()){ alert('Paste the pay file text first (include the ASSURANCE section).'); return; }
+  var result=awImportPayFileText(text);
+  awPayFileSaveLast(text, result);
+  if(typeof window!=='undefined') window.__awpfResult=result;
+  if(typeof gotoPanel==='function') gotoPanel('aw-payfile');
+}
+function awPayFilePickFile(){
+  var input=document.createElement('input'); input.type='file'; input.accept='.txt,.csv,.tsv,text/plain'; input.style.display='none';
+  input.onchange=function(){
+    var f=input.files&&input.files[0]; if(!f){ try{document.body.removeChild(input);}catch(_){ } return; }
+    var rd=new FileReader();
+    rd.onload=function(){
+      var text=String(rd.result||''); var result=awImportPayFileText(text);
+      awPayFileSaveLast(text,result); if(typeof window!=='undefined') window.__awpfResult=result;
+      var ta=document.getElementById('awpf-input'); if(ta) ta.value=text;
+      if(typeof gotoPanel==='function') gotoPanel('aw-payfile');
+      try{document.body.removeChild(input);}catch(_){ }
+    };
+    rd.onerror=function(){ alert('Could not read the file.'); try{document.body.removeChild(input);}catch(_){ } };
+    rd.readAsText(f);
+  };
+  document.body.appendChild(input); input.click();
+}
+function panelAWPayFile(){
+  var u=DB.current;
+  var allowed = isOwner(u) || (typeof canAccess==='function' && canAccess(u,'payroll'));
+  var h = panelHeader('📑 Assurance Pay-File');
+  if(!allowed){
+    return h+'<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">This tool is restricted to the Owner and Payroll department.</div></div>';
+  }
+  h += '<div style="background:rgba(180,83,9,.06);border:1px solid rgba(180,83,9,.25);border-radius:10px;padding:14px 18px;margin-bottom:16px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);line-height:1.5">';
+  h += 'Paste the Gen Mobile / Assurance pay file below (the whole thing is fine — only the <strong>ASSURANCE</strong> section is read). Each market manager earns <strong>$5 per commissionable order</strong>. The file\'s <strong>Total</strong> is already net of cancellations, so <strong>Deact / No-Usage / BE</strong> are shown for reference only and never reduce pay. Agents earn $0 on Assurance.';
+  h += '</div>';
+  var last=awPayFileLoadLast();
+  h += '<textarea id="awpf-input" placeholder="Paste pay file text here…" style="width:100%;min-height:120px;font-family:monospace;font-size:.74rem;border:1px solid var(--border);border-radius:8px;padding:10px;box-sizing:border-box;resize:vertical">'+(last?escHtml(last.text):'')+'</textarea>';
+  h += '<div style="display:flex;gap:10px;margin:12px 0 20px">';
+  h += '<button onclick="awPayFileRun()" style="background:#b45309;border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:7px;cursor:pointer;font-weight:700">Parse Pay File</button>';
+  h += '<button onclick="awPayFilePickFile()" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:7px;cursor:pointer">Upload File</button>';
+  h += '</div>';
+
+  var R = (typeof window!=='undefined') ? window.__awpfResult : null;
+  if(!R){
+    h += '<div style="font-family:Barlow Condensed,sans-serif;color:var(--muted);font-size:.82rem">Parse a pay file to see the computed commissions.</div>';
+    return h;
+  }
+  if(!R.found){
+    h += '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:14px;color:#b91c1c;font-family:Barlow Condensed,sans-serif">⚠ No ASSURANCE section found. Make sure you pasted the section that starts with "ASSURANCE (dates)".</div>';
+    return h;
+  }
+  var rc=R.reconciliation;
+  // Summary cards
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px">';
+  function card(label,val,color){ return '<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;padding:14px 16px"><div style="font-family:Bebas Neue,sans-serif;font-size:1.7rem;color:'+(color||'var(--black)')+';line-height:1">'+val+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)">'+label+'</div></div>'; }
+  h += card('Period', R.period||'—');
+  h += card('Commissionable', rc.commissionableTotal);
+  h += card('MM Pay', '$'+rc.actualMMPay, '#059669');
+  h += card('Deactivations', rc.deactTotal, '#b45309');
+  h += card('No Usage', rc.noUsageTotal, '#b45309');
+  h += '</div>';
+
+  // Reconciliation note
+  var diff = rc.expectedMMPay - rc.actualMMPay;
+  if(diff>0){
+    h += '<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#92400e">⚠ Expected MM pay $'+rc.expectedMMPay+' but only $'+rc.actualMMPay+' is assigned — $'+diff+' is unassigned (unmatched codes or markets with no MM). See flags below.</div>';
+  } else {
+    h += '<div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#065f46">✓ Reconciled — $5 × '+rc.commissionableTotal+' commissionable orders = $'+rc.actualMMPay+' assigned to managers.</div>';
+  }
+
+  // Recipients (managers paid)
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:1.5px;color:var(--brown);margin:8px 4px">Manager Commissions</div>';
+  h += '<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:18px">';
+  if(R.recipients.length===0){
+    h += '<div style="padding:18px;color:var(--muted);font-family:Barlow Condensed,sans-serif">No managers resolved — check the flags below.</div>';
+  } else {
+    h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">';
+    h += '<tr style="background:var(--offwhite);font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)"><th style="text-align:left;padding:9px 14px">Manager</th><th style="text-align:right;padding:9px 14px">Orders</th><th style="text-align:right;padding:9px 14px">Pay</th></tr>';
+    R.recipients.forEach(function(r){
+      h += '<tr style="border-top:1px solid var(--border)"><td style="padding:9px 14px;font-weight:700">'+escHtml(r.agentName)+'</td><td style="padding:9px 14px;text-align:right">'+r.rows+'</td><td style="padding:9px 14px;text-align:right;font-weight:700;color:#059669">$'+r.total+'</td></tr>';
+    });
+    h += '</table>';
+  }
+  h += '</div>';
+
+  // Per-agency-code detail
+  h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:1.5px;color:var(--brown);margin:8px 4px">By Agency Code</div>';
+  h += '<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:18px;overflow-x:auto">';
+  h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+  h += '<tr style="background:var(--offwhite);font-size:.62rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted)"><th style="text-align:left;padding:8px 12px">Code</th><th style="text-align:left;padding:8px 12px">Agent</th><th style="text-align:left;padding:8px 12px">Market</th><th style="text-align:right;padding:8px 12px">Total</th><th style="text-align:right;padding:8px 12px">Deact</th><th style="text-align:right;padding:8px 12px">No Use</th><th style="text-align:right;padding:8px 12px">BE</th></tr>';
+  R.byCode.forEach(function(c){
+    var unmatched=!c.agentId;
+    h += '<tr style="border-top:1px solid var(--border);'+(unmatched?'background:#fef2f2;':'')+'">';
+    h += '<td style="padding:8px 12px;font-family:monospace">'+escHtml(c.code)+'</td>';
+    h += '<td style="padding:8px 12px">'+(c.agentName?escHtml(c.agentName):'<span style="color:#b91c1c">⚠ unmatched</span>')+'</td>';
+    h += '<td style="padding:8px 12px;color:var(--muted)">'+(c.market?escHtml(c.market):'—')+'</td>';
+    h += '<td style="padding:8px 12px;text-align:right;font-weight:700">'+c.total+'</td>';
+    h += '<td style="padding:8px 12px;text-align:right;color:#b45309">'+c.deact+'</td>';
+    h += '<td style="padding:8px 12px;text-align:right;color:#b45309">'+c.noUsage+'</td>';
+    h += '<td style="padding:8px 12px;text-align:right;color:var(--muted)">'+c.be+'</td>';
+    h += '</tr>';
+  });
+  h += '</table></div>';
+
+  // Flags
+  if(R.unmatched.length || R.warnings.length){
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:1.5px;color:#b91c1c;margin:8px 4px">Flags to Review</div>';
+    h += '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:#7f1d1d">';
+    if(R.unmatched.length){
+      h += '<div style="margin-bottom:8px"><strong>Unmatched agency codes ('+R.unmatched.length+'):</strong> '+R.unmatched.map(escHtml).join(', ')+'<br><span style="color:#92400e">Set each agent\'s Assurance code to match, then re-parse.</span></div>';
+    }
+    R.warnings.forEach(function(w){ h += '<div style="margin-bottom:6px">• '+escHtml(w)+'</div>'; });
+    h += '</div>';
+  }
+  return h;
+}
+if(typeof window!=='undefined'){
+  window.panelAWPayFile=panelAWPayFile;
+  window.awPayFileRun=awPayFileRun;
+  window.awPayFilePickFile=awPayFilePickFile;
 }
 
 // ── Services nested inside a campaign (for Chuzo and any future
@@ -35060,6 +35290,7 @@ function gotoPanel(id, params){
     'gm-pricelist':'GM Pricelist',
     'inv-hub':'Inventory Hub',
     'aw-inventory':'Assurance Wireless Inventory','aw-upload':'Assurance Upload','aw-transfers':'Assurance Transfers',
+    'aw-payfile':'Assurance Pay-File',
     'tc-inventory':'TruConnect Inventory','tc-upload':'TruConnect Upload','tc-transfers':'TruConnect Transfers','tc-activations':'TruConnect Activations',
     'pending-conflicts':'Pending Inventory Conflicts',
     'ex-inventory':'Excess Telecom Inventory','ex-upload':'Excess Upload','ex-transfers':'Excess Transfers',
@@ -35100,6 +35331,7 @@ function gotoPanel(id, params){
     'gm-inv2':function(){ return panelCarrierInventory('Gen Mobile'); },
     'tc-inv2':function(){ return panelCarrierInventory('TruConnect'); },
     'aw-inv2':function(){ return panelCarrierInventory('Assurance Wireless'); },
+    'aw-payfile':panelAWPayFile,
     'ex-inv2':function(){ return panelCarrierInventory('Excess Telecom'); },
     // Calvin 2026-06-11 v3030: DART joins the generic carrier panel —
     // identical layout to GM/TC/AW/ET, scanner is now its own tile.
@@ -40026,6 +40258,7 @@ function panelPayrollProcess(){
   h += '<button onclick="gotoPanel(\'payroll-rollup\')" class="btn-fire" style="font-size:.72rem;padding:10px 20px">📊 Weekly Rollup →</button>';
   h += '<button onclick="gotoPanel(\'payroll-debt\')" style="font-size:.72rem;padding:10px 20px;background:white;border:1.5px solid var(--brown);color:var(--brown);font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">🧾 Debt Ledger / Write-Off →</button>';
   h += '<button onclick="gotoPanel(\'payroll-upload\')" style="font-size:.72rem;padding:10px 20px;background:white;border:1.5px solid var(--brown);color:var(--brown);font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">📤 Upload New Carrier File →</button>';
+  h += '<button onclick="gotoPanel(\'aw-payfile\')" style="font-size:.72rem;padding:10px 20px;background:white;border:1.5px solid #b45309;color:#b45309;font-family:Barlow Condensed,sans-serif;letter-spacing:2px;text-transform:uppercase;border-radius:5px;cursor:pointer;font-weight:700">📑 Assurance Pay-File →</button>';
   h += '</div>';
 
   // Group weeks by periodEnd, then by carrier
