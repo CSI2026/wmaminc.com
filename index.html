@@ -3451,7 +3451,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.28.0400';
+var BUILD_VERSION = '2026.06.28.0515';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -18819,7 +18819,7 @@ async function syncPullFreshAgent(agentId){
       category:      a.category      || null,
       depts:         safeJSON(a.depts, {}),
       officeManager: a.office_manager === true,
-      canUseDartScanner: a.can_use_dart_scanner === true,
+      canUseDartScanner: (a.can_use_dart_scanner === true) || _agentMetaFlag(a,'canUseDartScanner'),
       canDistributeInventory: a.can_distribute_inventory === true,
       canTransferWithoutApproval: a.can_transfer_without_approval === true,
       tribalLockedRate: (typeof a.tribal_locked_rate === 'number') ? a.tribal_locked_rate : null,
@@ -18888,7 +18888,7 @@ async function syncPullFreshAllAgents(){
         category:      a.category      || null,
         depts:         safeJSON(a.depts, {}),
         officeManager: a.office_manager === true,
-        canUseDartScanner: a.can_use_dart_scanner === true,
+        canUseDartScanner: (a.can_use_dart_scanner === true) || _agentMetaFlag(a,'canUseDartScanner'),
         canDistributeInventory: a.can_distribute_inventory === true,
       canTransferWithoutApproval: a.can_transfer_without_approval === true,
       tribalLockedRate: (typeof a.tribal_locked_rate === 'number') ? a.tribal_locked_rate : null,
@@ -20329,7 +20329,7 @@ async function loadFromSupabase(){
           category:      a.category      || null,
           depts:         safeJSON(a.depts, {}),
           officeManager: a.office_manager === true,
-          canUseDartScanner: a.can_use_dart_scanner === true,
+          canUseDartScanner: (a.can_use_dart_scanner === true) || _agentMetaFlag(a,'canUseDartScanner'),
           canDistributeInventory: a.can_distribute_inventory === true,
       canTransferWithoutApproval: a.can_transfer_without_approval === true,
       tribalLockedRate: (typeof a.tribal_locked_rate === 'number') ? a.tribal_locked_rate : null,
@@ -21254,6 +21254,10 @@ function _buildAgentRow(agent){
   } else {
     delete meta.dartScanLog;
   }
+  // Calvin 2026-06-28: keep the DART scanner permission in _meta so it survives
+  // when the can_use_dart_scanner column is stripped on schemas that lack it.
+  if(agent.canUseDartScanner === true) meta.canUseDartScanner = true;
+  else delete meta.canUseDartScanner;
   // ── Calvin 2026-06-27: ONBOARDING TIMELINE DURABLE MARKER ──
   // Same survives-the-401 pattern as signedDocs. onboardingPropagate() writes
   // every milestone here; the onboarding-actions board + agent profile read it
@@ -21299,6 +21303,8 @@ function _buildAgentRow(agent){
   } else {
     delete dMeta.dartScanLog;
   }
+  if(agent.canUseDartScanner === true) dMeta.canUseDartScanner = true;
+  else delete dMeta.canUseDartScanner;
   // Calvin 2026-06-27: redundant onboardingTimeline copy (same as signedDocs)
   if(Array.isArray(agent.onboardingTimeline) && agent.onboardingTimeline.length){
     dMeta.onboardingTimeline = agent.onboardingTimeline;
@@ -21354,6 +21360,38 @@ function _buildAgentRow(agent){
 // Track the most recent save outcome for any UI that wants to surface it
 window._lastAgentSaveResult = null;
 
+// ── Calvin 2026-06-28: resilient agent upsert ──
+// Live schema drift (a column exists in _buildAgentRow but not yet in the
+// Supabase 'agents' table) was throwing "Could not find the 'X' column of
+// 'agents' in the schema cache" and BLOCKING the whole save — e.g. K-Anna
+// couldn't add an email because of can_use_dart_scanner. Instead of a
+// hard-coded strip list (whack-a-mole), detect the missing column from the
+// error, drop just that field, and retry. Data for stripped columns still
+// rides reports_to._meta where it matters (survives the same way signedDocs
+// does). Returns {res, err, stripped:[...]}.
+async function _agentUpsertResilient(full){
+  var row = Object.assign({}, full);
+  var stripped = [];
+  for(var attempt=0; attempt<12; attempt++){
+    var res;
+    try{
+      res = await supaClient.from('agents').upsert(row, { onConflict: 'id' }).select().single();
+    }catch(e){ return { res:null, err:e, stripped:stripped }; }
+    if(!res || !res.error) return { res:res, err:null, stripped:stripped };
+    var msg = String((res.error && (res.error.message||res.error.hint)) || res.error || '');
+    var m = msg.match(/Could not find the '([^']+)' column/i)
+         || msg.match(/column "([^"]+)" of relation/i)
+         || msg.match(/'([a-z0-9_]+)' column of 'agents'/i);
+    if(m && m[1] && Object.prototype.hasOwnProperty.call(row, m[1])){
+      delete row[m[1]];
+      stripped.push(m[1]);
+      continue; // retry without the offending column
+    }
+    return { res:res, err:null, stripped:stripped }; // a different error — let caller handle
+  }
+  return { res:null, err:new Error('too many schema-drift retries'), stripped:stripped };
+}
+
 async function saveAgentToSupabase(agent){
   // Local persistence ALWAYS happens first so the user's edit is captured
   // in memory + localStorage even if Supabase is unreachable.
@@ -21370,7 +21408,13 @@ async function saveAgentToSupabase(agent){
   console.log('[saveAgent] →', agent.id, agent.name, 'programs='+(agent.programs||[]).length, 'agentCodes='+Object.keys(agent.agentCodes||{}).length);
 
   try{
-    var res = await supaClient.from('agents').upsert(full, { onConflict: 'id' }).select().single();
+    var _resilient = await _agentUpsertResilient(full);
+    if(_resilient.stripped && _resilient.stripped.length){
+      console.warn('[saveAgent] saved without missing column(s): '+_resilient.stripped.join(', ')+
+                   ' — run ALTER TABLE to add them for full cross-device sync. Value preserved in reports_to._meta where applicable.');
+    }
+    if(_resilient.err){ throw _resilient.err; }
+    var res = _resilient.res;
     if(res && res.error){
       // Try legacy fallback ONCE — strip the newest columns in case schema is incomplete
       console.warn('[saveAgent] full upsert failed:', res.error.message || res.error, '— trying legacy column set');
@@ -56009,6 +56053,20 @@ if(typeof window!=='undefined'){
   window._dartReconstructFromAgents=_dartReconstructFromAgents;
   window._unpackDartScanLog=_unpackDartScanLog;
 }
+// Read a boolean flag packed into reports_to._meta or depts._meta on an agent
+// row (used so permissions survive when their dedicated column is stripped by
+// the schema-drift fallback).
+function _agentMetaFlag(a, key){
+  if(!a) return false;
+  try{
+    var rt=a.reports_to; if(typeof rt==='string'){ try{rt=JSON.parse(rt);}catch(e){rt=null;} }
+    if(rt && rt._meta && rt._meta[key]===true) return true;
+    var dp=a.depts; if(typeof dp==='string'){ try{dp=JSON.parse(dp);}catch(e){dp=null;} }
+    if(dp && dp._meta && dp._meta[key]===true) return true;
+  }catch(e){}
+  return false;
+}
+if(typeof window!=='undefined') window._agentMetaFlag=_agentMetaFlag;
 
 function _commitDartScan(code, type, method, imei2){
   var u = DB.current;
