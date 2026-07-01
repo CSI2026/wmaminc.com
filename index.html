@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.01.0900';
+var BUILD_VERSION = '2026.07.01.1015';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13870,6 +13870,9 @@ function _invSyncBuildMeta(poolKey){
 // saveInventory body — we only add version stamps here.
 function inventorySyncSave(){
   if(typeof supaClient === 'undefined' || !supaClient) return; // offline-safe
+  // Calvin 2026-07-01: respect the app_settings circuit breaker so these meta
+  // writes don't keep hammering a failing table (part of the flood fix).
+  if(typeof window !== 'undefined' && window._appSettingsWrite && Date.now() < window._appSettingsWrite.pausedUntil) return;
   INV_SYNC_POOLS.forEach(function(p){
     var meta = _invSyncBuildMeta(p.key);
     INV_SYNC_LOCAL_VERSION[p.key]  = meta.version;
@@ -13878,8 +13881,10 @@ function inventorySyncSave(){
       supaClient.from('app_settings').upsert(
         {key:_invSyncMetaKey(p.key), value:JSON.stringify(meta)},
         {onConflict:'key'}
-      ).then(function(){}, function(err){
-        console.warn('[inventorySyncSave] '+p.key+' meta push failed:', err);
+      ).then(function(res){
+        if(res && res.error && typeof window!=='undefined' && window._appSettingsWriteFail){ window._appSettingsWriteFail(_invSyncMetaKey(p.key), res.error); }
+      }, function(err){
+        if(typeof window!=='undefined' && window._appSettingsWriteFail){ window._appSettingsWriteFail(_invSyncMetaKey(p.key), err); }
       });
     }catch(e){
       console.warn('[inventorySyncSave] '+p.key+' threw:', e);
@@ -14292,7 +14297,17 @@ async function invDbLoadPool(poolKey){
     // Supabase default row limit is 1000 — paginate if needed
     var all = [], offset = 0, PAGE = 1000;
     while(true){
-      var res = await supaClient.from(table).select('*').range(offset, offset + PAGE - 1);
+      // Calvin 2026-07-01: retry each page a few times. A single transient
+      // failure (rate-limit / network blip) used to make the whole pool return
+      // null → the pool stayed empty on that machine even though the cloud had
+      // data. Retrying keeps a busy connection from showing 0 devices.
+      var res = null, attempt = 0;
+      while(attempt < 4){
+        res = await supaClient.from(table).select('*').range(offset, offset + PAGE - 1);
+        if(!(res && res.error)) break;
+        attempt++;
+        if(attempt < 4){ await new Promise(function(r){ setTimeout(r, 400 * attempt); }); }
+      }
       if(res && res.error){
         window._invPathBLastError = res.error;
         console.warn('[invDbLoadPool] '+table+' select failed:', res.error);
@@ -14433,6 +14448,22 @@ function _invUnionMerge(localArr, cloudArr){
 if(typeof window !== 'undefined'){ window._invUnionMerge = _invUnionMerge; }
 
 function saveInventory(){
+  // Calvin 2026-07-01: shared failure handler for the app_settings circuit
+  // breaker. After 5 consecutive failures we pause app_settings writes for 2
+  // minutes and warn ONCE (instead of flooding the console every save).
+  if(typeof window !== 'undefined' && typeof window._appSettingsWriteFail !== 'function'){
+    window._appSettingsWriteFail = function(key, err){
+      var st = window._appSettingsWrite || (window._appSettingsWrite = {fails:0, pausedUntil:0, warned:false});
+      st.fails++;
+      if(st.fails >= 5 && Date.now() >= st.pausedUntil){
+        st.pausedUntil = Date.now() + 120000; // 2-minute pause
+        if(!st.warned){
+          console.warn('[app_settings] writes failing (last key: '+key+') — pausing app_settings sync for 2 min to protect the connection. Inventory uses the per-row tables and is unaffected.', err);
+          st.warned = true;
+        }
+      }
+    };
+  }
   try{
     localStorage.setItem('wmam_inv_devices',   JSON.stringify(INVENTORY_DEVICES));
     localStorage.setItem('wmam_inv_batches',   JSON.stringify(INVENTORY_BATCHES));
@@ -14520,13 +14551,27 @@ function saveInventory(){
     // "supaClient.from(...).upsert(...).catch is not a function". We use
     // `.then(null, errFn)` — equivalent to .catch — which works on any
     // thenable. This silently warns on failure but never crashes the page.
+    // Calvin 2026-07-01: CIRCUIT BREAKER. The app_settings table has been
+    // failing writes (CORS/500/ERR_FAILED). Retrying on every save + autosave
+    // flooded the console with 100k+ errors and rate-limited the whole Supabase
+    // connection — which then broke inventory + agent loading on the same tab.
+    // After a few consecutive failures we STOP writing app_settings for 2
+    // minutes, so one bad table can't take down the rest of the app. Inventory
+    // no longer depends on app_settings (it uses the per-row Path B tables), so
+    // pausing these metadata writes is safe.
+    if(typeof window._appSettingsWrite === 'undefined'){
+      window._appSettingsWrite = {fails:0, pausedUntil:0, warned:false};
+    }
     var pushKey = function(key, val){
+      var st = window._appSettingsWrite;
+      if(Date.now() < st.pausedUntil){ return; } // breaker open — skip quietly
       try{
         supaClient.from('app_settings').upsert({key:key, value:JSON.stringify(val)}, {onConflict:'key'})
           .then(function(res){
-            if(res && res.error){ console.warn('[saveInventory] Supabase '+key+':', res.error); }
-          }, function(e){ console.warn('[saveInventory] Supabase '+key+':', e); });
-      }catch(e){ console.warn('[saveInventory] threw on '+key+':', e); }
+            if(res && res.error){ window._appSettingsWriteFail(key, res.error); }
+            else { window._appSettingsWrite.fails = 0; window._appSettingsWrite.warned = false; }
+          }, function(e){ window._appSettingsWriteFail(key, e); });
+      }catch(e){ window._appSettingsWriteFail(key, e); }
     };
     // Calvin 2026-07-01: the five device-inventory arrays are NO LONGER pushed
     // as giant JSON blobs to app_settings — that bloated the table until the
@@ -19581,6 +19626,33 @@ async function wmamInventorySyncProbe(){
 }
 if(typeof window !== 'undefined'){
   window.wmamInventorySyncProbe = wmamInventorySyncProbe;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  wmamForceInventoryReload — Calvin 2026-07-01
+//  One-command recovery: pull every device straight from the per-row Path B
+//  tables into memory + localStorage, then refresh the screen. Use this if a
+//  machine shows fewer devices than the cloud has (e.g. a rate-limited load).
+//  Run in the F12 console:  await wmamForceInventoryReload()
+// ════════════════════════════════════════════════════════════════════════
+async function wmamForceInventoryReload(){
+  if(typeof invDbLoadAllFromTables !== 'function'){ console.warn('Path B loader unavailable'); return 'unavailable'; }
+  console.log('[forceReload] pulling inventory from per-row tables…');
+  var r = await invDbLoadAllFromTables();
+  try{ if(typeof _invSyncWriteLocalOnly === 'function') _invSyncWriteLocalOnly(); else if(typeof saveInventory === 'function') saveInventory(); }catch(e){}
+  var counts = {
+    GM: (typeof GM_INVENTORY!=='undefined'?GM_INVENTORY.length:0),
+    TC: (typeof TC_INVENTORY!=='undefined'?TC_INVENTORY.length:0),
+    AW: (typeof AW_INVENTORY!=='undefined'?AW_INVENTORY.length:0),
+    EX: (typeof EX_INVENTORY!=='undefined'?EX_INVENTORY.length:0),
+    Legacy: (typeof INVENTORY_DEVICES!=='undefined'?INVENTORY_DEVICES.length:0)
+  };
+  console.log('[forceReload] loaded from tables:', counts, '(ok='+(r&&r.ok)+')');
+  try{ if(window._currentPanelId && typeof gotoPanel==='function') gotoPanel(window._currentPanelId); }catch(e){}
+  return counts;
+}
+if(typeof window !== 'undefined'){
+  window.wmamForceInventoryReload = wmamForceInventoryReload;
 }
 
 // ════════════════════════════════════════════════════════════════════════
