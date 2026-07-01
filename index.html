@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.28.1815';
+var BUILD_VERSION = '2026.07.01.0900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14528,25 +14528,33 @@ function saveInventory(){
           }, function(e){ console.warn('[saveInventory] Supabase '+key+':', e); });
       }catch(e){ console.warn('[saveInventory] threw on '+key+':', e); }
     };
-    pushKey('inv_devices',    INVENTORY_DEVICES);
+    // Calvin 2026-07-01: the five device-inventory arrays are NO LONGER pushed
+    // as giant JSON blobs to app_settings — that bloated the table until the
+    // whole app_settings read 500'd for everyone. Devices now sync via the
+    // per-row Path B tables (invDbUpsertDevices) + localStorage. Only the small
+    // metadata (batches, requests, ids, markets) stays in app_settings.
     pushKey('inv_batches',    INVENTORY_BATCHES);
     pushKey('inv_transfers',  INVENTORY_TRANSFERS);
     pushKey('inv_requests',   INVENTORY_REQUESTS);
     pushKey('inv_nextid',     INV_NEXT_ID);
-    pushKey('gm_inventory',   GM_INVENTORY);
     pushKey('gm_activations', GM_ACTIVATIONS);
     pushKey('gm_transfers',   GM_TRANSFERS);
     pushKey('inv_markets',    INV_MARKETS);
     pushKey('inv_upsell_pct', INV_UPSELL_REQUIREMENTS);
-    pushKey('aw_inventory',   AW_INVENTORY);
     pushKey('aw_activations', AW_ACTIVATIONS);
     pushKey('aw_transfers',   AW_TRANSFERS);
-    pushKey('tc_inventory',   TC_INVENTORY);
     pushKey('tc_activations', TC_ACTIVATIONS);
     pushKey('tc_transfers',   TC_TRANSFERS);
-    pushKey('ex_inventory',   EX_INVENTORY);
     pushKey('ex_activations', EX_ACTIVATIONS);
     pushKey('ex_transfers',   EX_TRANSFERS);
+    // ── Device inventory → Path B per-row tables (durable multi-user home) ──
+    if(typeof invDbUpsertDevices === 'function'){
+      try{ invDbUpsertDevices('gm', GM_INVENTORY); }catch(e){}
+      try{ invDbUpsertDevices('tc', TC_INVENTORY); }catch(e){}
+      try{ invDbUpsertDevices('aw', AW_INVENTORY); }catch(e){}
+      try{ invDbUpsertDevices('ex', EX_INVENTORY); }catch(e){}
+      try{ invDbUpsertDevices('legacy', INVENTORY_DEVICES); }catch(e){}
+    }
     // Ship A3 — pickups + discrepancy tickets
     pushKey('inv_pickups',         INVENTORY_PICKUPS);
     pushKey('inv_discrepancies',   INVENTORY_DISCREPANCY_TICKETS);
@@ -20902,19 +20910,36 @@ async function loadFromSupabase(){
     }
 
     // Load settings (EmailJS keys)
-    // Calvin 2026-06-08: the 'assigned_doc_status' blob row has grown so
-    // large in production that fetching the full app_settings table can
-    // time out (Postgres error 57014). Strategy: try the full load first,
-    // and if it returns null (likely timeout on the giant blob), fall
-    // back to loading WITHOUT that single row. Per-agent rows are the
-    // authoritative source anyway.
-    var settings = await sbSelect('app_settings');
-    if(!settings && supaClient){
-      console.warn('[loadFromSupabase] full app_settings load failed — retrying without giant assigned_doc_status blob');
-      try {
-        var fb = await supaClient.from('app_settings').select('key,value').neq('key', 'assigned_doc_status');
-        if(fb && !fb.error && fb.data) settings = fb.data;
-      } catch(e){ console.warn('[loadFromSupabase] fallback also failed:', e); }
+    // Calvin 2026-07-01: the full app_settings load (select=*) now returns a
+    // 500 in production — giant blob rows (assigned_doc_status + legacy
+    // inventory blobs) blow past the server's response/timeout limits, which
+    // was killing cloud loading for EVERYONE. Fix: never pull those giant rows.
+    // Inventory now lives in per-row Path B tables and signed docs live on
+    // per-agent rows, so none of these blobs are needed by the load anymore.
+    var GIANT_BLOB_KEYS = ['assigned_doc_status',
+      'gm_inventory','tc_inventory','aw_inventory','ex_inventory','inv_devices'];
+    var settings = null;
+    if(supaClient){
+      try{
+        var _q = supaClient.from('app_settings').select('key,value');
+        GIANT_BLOB_KEYS.forEach(function(k){ _q = _q.neq('key', k); });
+        var _sres = await _q;
+        if(_sres && !_sres.error && _sres.data){ settings = _sres.data; }
+        else if(_sres && _sres.error){ console.warn('[loadFromSupabase] targeted app_settings load error:', _sres.error); }
+      }catch(e){ console.warn('[loadFromSupabase] targeted app_settings load threw:', e); }
+    }
+    // Legacy fallbacks (older behavior) only if the targeted load came back empty
+    if(!settings){
+      settings = await sbSelect('app_settings');
+      if(!settings && supaClient){
+        console.warn('[loadFromSupabase] full app_settings load failed — retrying without giant blobs');
+        try {
+          var _fq = supaClient.from('app_settings').select('key,value');
+          GIANT_BLOB_KEYS.forEach(function(k){ _fq = _fq.neq('key', k); });
+          var fb = await _fq;
+          if(fb && !fb.error && fb.data) settings = fb.data;
+        } catch(e){ console.warn('[loadFromSupabase] fallback also failed:', e); }
+      }
     }
     if(settings){
       // Calvin 2026-05-14: app_settings load is direct now — no queue check needed
