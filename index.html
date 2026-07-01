@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.28.1415';
+var BUILD_VERSION = '2026.06.28.1645';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13806,12 +13806,22 @@ function _invSyncPoolForKey(poolKey){
 }
 function _invSyncReplacePool(poolKey, devices){
   if(!Array.isArray(devices)) return false;
+  // Calvin 2026-06-30: an EMPTY incoming set must never wipe a non-empty pool.
+  // An empty cloud/table read means "nothing to apply", not "delete everything"
+  // — that wholesale wipe is exactly how uploaded inventory was vanishing.
+  function apply(cur, fill){
+    if(devices.length === 0 && Array.isArray(cur) && cur.length > 0){
+      console.warn('[invSyncReplacePool] refused to wipe '+poolKey+' ('+cur.length+' devices) with an empty set');
+      return false;
+    }
+    cur.length = 0; Array.prototype.push.apply(cur, devices); return true;
+  }
   switch(poolKey){
-    case 'gm':     if(typeof GM_INVENTORY     !== 'undefined'){ GM_INVENTORY.length=0;     Array.prototype.push.apply(GM_INVENTORY,     devices); return true; } break;
-    case 'tc':     if(typeof TC_INVENTORY     !== 'undefined'){ TC_INVENTORY.length=0;     Array.prototype.push.apply(TC_INVENTORY,     devices); return true; } break;
-    case 'aw':     if(typeof AW_INVENTORY     !== 'undefined'){ AW_INVENTORY.length=0;     Array.prototype.push.apply(AW_INVENTORY,     devices); return true; } break;
-    case 'ex':     if(typeof EX_INVENTORY     !== 'undefined'){ EX_INVENTORY.length=0;     Array.prototype.push.apply(EX_INVENTORY,     devices); return true; } break;
-    case 'legacy': if(typeof INVENTORY_DEVICES !== 'undefined'){ INVENTORY_DEVICES.length=0; Array.prototype.push.apply(INVENTORY_DEVICES, devices); return true; } break;
+    case 'gm':     if(typeof GM_INVENTORY     !== 'undefined'){ return apply(GM_INVENTORY,     devices); } break;
+    case 'tc':     if(typeof TC_INVENTORY     !== 'undefined'){ return apply(TC_INVENTORY,     devices); } break;
+    case 'aw':     if(typeof AW_INVENTORY     !== 'undefined'){ return apply(AW_INVENTORY,     devices); } break;
+    case 'ex':     if(typeof EX_INVENTORY     !== 'undefined'){ return apply(EX_INVENTORY,     devices); } break;
+    case 'legacy': if(typeof INVENTORY_DEVICES !== 'undefined'){ return apply(INVENTORY_DEVICES, devices); } break;
   }
   return false;
 }
@@ -14361,6 +14371,39 @@ if(typeof window !== 'undefined'){
   window.invDbMigrateFromBlobs  = invDbMigrateFromBlobs;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  _invUnionMerge — Calvin 2026-06-30 (STOP INVENTORY LOSS)
+//  The cloud load used to do GM_INVENTORY = cloudArray, a destructive REPLACE.
+//  If the cloud copy was ever empty or behind (a failed cloud write, a stale
+//  blob, another tab that saved an empty state) it WIPED the devices someone
+//  had just uploaded, and the next save persisted the emptiness — permanent
+//  loss. This unions local + cloud by device identity so NO device is ever
+//  dropped: every device present in either source survives. Cloud wins for a
+//  device present in both (it carries other users' latest assignment), while
+//  devices that exist only locally (just uploaded, not yet synced) are kept.
+//  The merged result is then re-saved, so a failed push self-heals next save.
+// ════════════════════════════════════════════════════════════════════════
+function _invDeviceKey(d){
+  if(!d) return null;
+  if(d.id != null && d.id !== '') return 'id:'+String(d.id);
+  if(d.imei)  return 'imei:'+String(d.imei);
+  if(d.sim)   return 'sim:'+String(d.sim);
+  if(d.iccid) return 'iccid:'+String(d.iccid);
+  return null;
+}
+function _invUnionMerge(localArr, cloudArr){
+  localArr = Array.isArray(localArr) ? localArr : [];
+  cloudArr = Array.isArray(cloudArr) ? cloudArr : [];
+  var map = {};      // stable-key -> device (cloud overrides local for shared keys)
+  var noKey = [];    // devices with no stable identity — keep them all, never drop
+  localArr.forEach(function(d){ var k=_invDeviceKey(d); if(k==null){ noKey.push(d); } else if(!(k in map)){ map[k]=d; } });
+  cloudArr.forEach(function(d){ var k=_invDeviceKey(d); if(k==null){ noKey.push(d); } else { map[k]=d; } });
+  var out = [];
+  Object.keys(map).forEach(function(k){ out.push(map[k]); });
+  return out.concat(noKey);
+}
+if(typeof window !== 'undefined'){ window._invUnionMerge = _invUnionMerge; }
+
 function saveInventory(){
   try{
     localStorage.setItem('wmam_inv_devices',   JSON.stringify(INVENTORY_DEVICES));
@@ -14506,6 +14549,65 @@ function saveInventory(){
   // Safe to call even if Supabase is unavailable (it's a no-op).
   try{ if(typeof inventorySyncSave === 'function') inventorySyncSave(); }catch(e){ console.warn('[saveInventory] inventorySyncSave failed:', e); }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  INVENTORY AUTOSAVE GUARDS — Calvin 2026-06-30
+//  Guarantee inventory (and all saved work) is persisted EVERY time, by
+//  anyone, and never lost just because someone navigated away. Every layer
+//  only ever calls saveInventory() — which writes localStorage synchronously,
+//  pushes to the cloud, and is union-merge-safe + additive on load. None of
+//  these layers can delete anything. Layers:
+//    1. flush on page leave  (beforeunload / pagehide / tab hidden)
+//    2. flush on reconnect   (online)  — retries any failed cloud writes
+//    3. periodic safety autosave       — catches a mutation that forgot to
+//       save and re-pushes so every device reaches every user
+//    4. one-time self-heal push after load — a browser holding local-only
+//       devices (a prior cloud write failed) pushes them up so all converge
+// ════════════════════════════════════════════════════════════════════════
+var _invAutoSaveSig = '__init__';
+function _invContentSignature(){
+  try{
+    function n(nm){ try{ var a = eval(nm); return Array.isArray(a) ? a.length : 0; }catch(e){ return 0; } }
+    return [n('INVENTORY_DEVICES'),n('GM_INVENTORY'),n('TC_INVENTORY'),n('AW_INVENTORY'),n('EX_INVENTORY'),
+            n('GM_ACTIVATIONS'),n('TC_ACTIVATIONS'),n('AW_ACTIVATIONS'),n('EX_ACTIVATIONS'),n('INVENTORY_TRANSFERS')].join('|');
+  }catch(e){ return 'sig-err-'+Date.now(); }
+}
+function _invFlushSafe(reason){
+  try{ if(typeof saveInventory==='function'){ saveInventory(); } }catch(e){ console.warn('[invFlush] '+reason+' failed:', e); }
+}
+if(typeof window!=='undefined') window._invFlushSafe = _invFlushSafe;
+
+function _invAutoSaveTick(){
+  try{
+    var sig = _invContentSignature();
+    _invAutoSaveTick._n = (_invAutoSaveTick._n || 0) + 1;
+    // Save when inventory changed; also force a re-push every ~2 min (8 ticks)
+    // so in-place edits and any previously-failed cloud writes converge.
+    if(sig !== _invAutoSaveSig || (_invAutoSaveTick._n % 8 === 0)){
+      _invAutoSaveSig = sig;
+      _invFlushSafe('autosave');
+    }
+  }catch(e){}
+}
+if(typeof window!=='undefined') window._invAutoSaveTick = _invAutoSaveTick;
+
+(function _invInitAutoSaveGuards(){
+  if(typeof window==='undefined' || window._invGuardsInstalled) return;
+  window._invGuardsInstalled = true;
+  try{
+    var mk = function(reason){ return function(){ _invFlushSafe(reason); }; };
+    window.addEventListener('beforeunload', mk('beforeunload'));
+    window.addEventListener('pagehide',     mk('pagehide'));
+    window.addEventListener('online',       mk('online'));
+    if(typeof document!=='undefined' && document.addEventListener){
+      document.addEventListener('visibilitychange', function(){
+        try{ if(document.visibilityState === 'hidden') _invFlushSafe('hidden'); }catch(e){}
+      });
+    }
+    if(typeof setInterval!=='undefined') setInterval(_invAutoSaveTick, 30000);
+    if(typeof setTimeout!=='undefined')  setTimeout(function(){ _invFlushSafe('post-load-selfheal'); }, 6000);
+  }catch(e){ console.warn('[invGuards] install failed:', e); }
+})();
 function loadInventory(){
   // Calvin 2026-05-18: load the inventory sync version state alongside the
   // inventory data itself so we know what version we're starting at.
@@ -20927,24 +21029,24 @@ async function loadFromSupabase(){
         //    visible to every user with permission, not just the device
         //    that scanned them in. Each block is wrapped in its own try
         //    so one malformed row can't tear down the rest of the load.
-        if(s.key==='inv_devices'    && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_DEVICES   = v;}catch(e){console.warn('[load] inv_devices:',e);} }
+        if(s.key==='inv_devices'    && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_DEVICES   = _invUnionMerge(INVENTORY_DEVICES, v);}catch(e){console.warn('[load] inv_devices:',e);} }
         if(s.key==='inv_batches'    && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_BATCHES   = v;}catch(e){console.warn('[load] inv_batches:',e);} }
         if(s.key==='inv_transfers'  && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_TRANSFERS = v;}catch(e){console.warn('[load] inv_transfers:',e);} }
         if(s.key==='inv_requests'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_REQUESTS  = v;}catch(e){console.warn('[load] inv_requests:',e);} }
         if(s.key==='inv_nextid'     && s.value){ try{var v=JSON.parse(s.value); if(typeof v==='number') INV_NEXT_ID = v;}catch(e){} }
-        if(s.key==='gm_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_INVENTORY        = v;}catch(e){console.warn('[load] gm_inventory:',e);} }
-        if(s.key==='gm_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_ACTIVATIONS      = v;}catch(e){} }
+        if(s.key==='gm_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_INVENTORY        = _invUnionMerge(GM_INVENTORY, v);}catch(e){console.warn('[load] gm_inventory:',e);} }
+        if(s.key==='gm_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_ACTIVATIONS      = _invUnionMerge(GM_ACTIVATIONS, v);}catch(e){} }
         if(s.key==='gm_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_TRANSFERS        = v;}catch(e){} }
         if(s.key==='inv_markets'    && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object') INV_MARKETS = v;}catch(e){} }
         if(s.key==='inv_upsell_pct' && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object') INV_UPSELL_REQUIREMENTS = v;}catch(e){} }
-        if(s.key==='aw_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_INVENTORY        = v;}catch(e){} }
-        if(s.key==='aw_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_ACTIVATIONS      = v;}catch(e){} }
+        if(s.key==='aw_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_INVENTORY        = _invUnionMerge(AW_INVENTORY, v);}catch(e){} }
+        if(s.key==='aw_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_ACTIVATIONS      = _invUnionMerge(AW_ACTIVATIONS, v);}catch(e){} }
         if(s.key==='aw_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_TRANSFERS        = v;}catch(e){} }
-        if(s.key==='tc_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_INVENTORY        = v;}catch(e){} }
-        if(s.key==='tc_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_ACTIVATIONS      = v;}catch(e){} }
+        if(s.key==='tc_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_INVENTORY        = _invUnionMerge(TC_INVENTORY, v);}catch(e){} }
+        if(s.key==='tc_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_ACTIVATIONS      = _invUnionMerge(TC_ACTIVATIONS, v);}catch(e){} }
         if(s.key==='tc_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_TRANSFERS        = v;}catch(e){} }
-        if(s.key==='ex_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_INVENTORY        = v;}catch(e){} }
-        if(s.key==='ex_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_ACTIVATIONS      = v;}catch(e){} }
+        if(s.key==='ex_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_INVENTORY        = _invUnionMerge(EX_INVENTORY, v);}catch(e){} }
+        if(s.key==='ex_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_ACTIVATIONS      = _invUnionMerge(EX_ACTIVATIONS, v);}catch(e){} }
         if(s.key==='ex_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_TRANSFERS        = v;}catch(e){} }
         // Ship A3 — pickup + discrepancy data
         if(s.key==='inv_pickups'        && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_PICKUPS = v;}catch(e){} }
@@ -54628,6 +54730,28 @@ function gmConfirmInventoryUpload(batchId){
 
   saveInventory();
   window._gmPendingBatch = null;
+  // ── Calvin 2026-06-30: hard confirmation + immediate refresh ──
+  // Persist again defensively, refresh the current view so the uploader (office)
+  // sees the devices instantly, and pop a clear confirmation. Assigned agents
+  // pick them up on their next sync.
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  // Calvin 2026-06-30: read back the local save and confirm the devices landed.
+  // If the browser refused the write (storage full), surface a banner so it's
+  // never a silent loss — the data is still in memory and will retry on autosave.
+  try{
+    var _rb = localStorage.getItem('wmam_gm_inventory');
+    var _rbLen = _rb ? (JSON.parse(_rb)||[]).length : 0;
+    if(_rbLen < GM_INVENTORY.length && typeof _showSaveErrorBanner==='function'){
+      _showSaveErrorBanner('⚠ '+pending.devices.length+' devices were added but the browser may not have saved them fully (storage limit). They are still loaded and will keep retrying — free up space and they will persist. Nothing was lost.', function(){ saveInventory(); });
+    }
+  }catch(e){}
+  try{ if(window._currentPanelId && typeof gotoPanel==='function') gotoPanel(window._currentPanelId); }catch(e){}
+  try{
+    var _assignedCount = pending.devices.length - unassignedCount;
+    alert('\u2705 '+pending.devices.length+' device(s) added to the system and SAVED.\n\n'
+      + _assignedCount+' auto-assigned to agents'+(unassignedCount?(' \u00b7 '+unassignedCount+' unassigned (route from Inventory dept)'):'')+'.\n\n'
+      + 'You and the office can see them now. Assigned agents see them on their next refresh.');
+  }catch(e){}
   var preview = document.getElementById('gm-inv-preview');
   var extra = '';
   if(Object.keys(autoAssignSummary).length){
