@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.01.1130';
+var BUILD_VERSION = '2026.07.01.1315';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14293,6 +14293,9 @@ async function invDbLoadPool(poolKey){
   if(typeof supaClient === 'undefined' || !supaClient) return null;
   var table = _invPoolTableName(poolKey);
   if(!table) return null;
+  // Calvin 2026-07-01: if the backend is currently down, don't pile on more
+  // requests — bail fast and keep whatever we already have.
+  if(typeof window._sbIsDown === 'function' && window._sbIsDown()) return null;
   try{
     // Supabase default row limit is 1000 — paginate if needed
     var all = [], offset = 0, PAGE = 1000;
@@ -14300,11 +14303,15 @@ async function invDbLoadPool(poolKey){
       // Calvin 2026-07-01: retry each page a few times. A single transient
       // failure (rate-limit / network blip) used to make the whole pool return
       // null → the pool stayed empty on that machine even though the cloud had
-      // data. Retrying keeps a busy connection from showing 0 devices.
+      // data. Retrying keeps a busy connection from showing 0 devices. But if
+      // the backend is genuinely DOWN (503), stop immediately so we don't slow
+      // its recovery.
       var res = null, attempt = 0;
       while(attempt < 4){
         res = await supaClient.from(table).select('*').range(offset, offset + PAGE - 1);
         if(!(res && res.error)) break;
+        if(typeof window._sbNoteResult === 'function') window._sbNoteResult(res.error);
+        if(typeof window._sbLooksDown === 'function' && window._sbLooksDown(res.error)) break; // backend down — don't retry
         attempt++;
         if(attempt < 4){ await new Promise(function(r){ setTimeout(r, 400 * attempt); }); }
       }
@@ -14314,6 +14321,7 @@ async function invDbLoadPool(poolKey){
         return null;
       }
       if(!res || !res.data) break;
+      if(typeof window._sbNoteResult === 'function') window._sbNoteResult(null); // healthy
       all = all.concat(res.data);
       if(res.data.length < PAGE) break;
       offset += PAGE;
@@ -14447,6 +14455,44 @@ function _invUnionMerge(localArr, cloudArr){
 }
 if(typeof window !== 'undefined'){ window._invUnionMerge = _invUnionMerge; }
 
+// ════════════════════════════════════════════════════════════════════════
+//  SUPABASE BACKEND HEALTH BREAKER — Calvin 2026-07-01
+//  When the backend itself is down (503 Service Unavailable / PGRST002 schema
+//  cache / upstream timeout), continuing to fire reads + writes makes recovery
+//  slower and floods the console with thousands of errors. This detects a down
+//  backend and pauses ALL Supabase traffic for 60s so it can recover; the app
+//  keeps running on localStorage + the per-row cache meanwhile. One probe is
+//  allowed after the pause; if still down, the pause extends.
+// ════════════════════════════════════════════════════════════════════════
+if(typeof window !== 'undefined' && typeof window._sbNoteResult !== 'function'){
+  window._sbHealth = window._sbHealth || {fails:0, downUntil:0, warned:false};
+  window._sbIsDown = function(){ return Date.now() < window._sbHealth.downUntil; };
+  window._sbLooksDown = function(err){
+    if(!err) return false;
+    if(err.status===502 || err.status===503 || err.status===504) return true;
+    var s = ((err.message||'')+' '+(err.code||'')+' '+(err.details||'')).toString();
+    // Only UNAMBIGUOUS backend-down signals — not generic "Failed to fetch"
+    // (that can be a single blocked request / extension) and not app_settings-
+    // specific CORS/500s, which are handled by their own breaker.
+    return /\b50[234]\b|Service Unavailable|PGRST002|schema cache|upstream request timeout/i.test(s);
+  };
+  window._sbNoteResult = function(err){
+    var h = window._sbHealth;
+    if(err && window._sbLooksDown(err)){
+      h.fails++;
+      if(h.fails >= 3){
+        h.downUntil = Date.now() + 60000; // pause everything 60s
+        if(!h.warned){
+          console.warn('[supabase] backend unreachable (503 / schema-cache / timeout). Pausing ALL cloud requests for 60s so it can recover. The app is running on local data — your inventory is safe. If this persists, restart the project in the Supabase dashboard.');
+          h.warned = true;
+        }
+      }
+    } else if(!err){
+      h.fails = 0; h.warned = false; h.downUntil = 0; // healthy again
+    }
+  };
+}
+
 function saveInventory(){
   // Calvin 2026-07-01: shared failure handler for the app_settings circuit
   // breaker. After 5 consecutive failures we pause app_settings writes for 2
@@ -14565,13 +14611,14 @@ function saveInventory(){
     var pushKey = function(key, val){
       var st = window._appSettingsWrite;
       if(Date.now() < st.pausedUntil){ return; } // breaker open — skip quietly
+      if(typeof window._sbIsDown === 'function' && window._sbIsDown()){ return; } // backend down — skip
       try{
         supaClient.from('app_settings').upsert({key:key, value:JSON.stringify(val)}, {onConflict:'key'})
           .then(function(res){
-            if(res && res.error){ window._appSettingsWriteFail(key, res.error); }
-            else { window._appSettingsWrite.fails = 0; window._appSettingsWrite.warned = false; }
-          }, function(e){ window._appSettingsWriteFail(key, e); });
-      }catch(e){ window._appSettingsWriteFail(key, e); }
+            if(res && res.error){ window._appSettingsWriteFail(key, res.error); if(window._sbNoteResult) window._sbNoteResult(res.error); }
+            else { window._appSettingsWrite.fails = 0; window._appSettingsWrite.warned = false; if(window._sbNoteResult) window._sbNoteResult(null); }
+          }, function(e){ window._appSettingsWriteFail(key, e); if(window._sbNoteResult) window._sbNoteResult(e); });
+      }catch(e){ window._appSettingsWriteFail(key, e); if(window._sbNoteResult) window._sbNoteResult(e); }
     };
     // Calvin 2026-07-01: the five device-inventory arrays are NO LONGER pushed
     // as giant JSON blobs to app_settings — that bloated the table until the
@@ -14586,7 +14633,10 @@ function saveInventory(){
     // to the cloud at most once every 6 seconds; if another save lands sooner,
     // we schedule ONE trailing push so the latest state still syncs.
     var _cbNow = Date.now();
-    if((_cbNow - (window._invCloudLast || 0)) < 6000){
+    if(typeof window._sbIsDown === 'function' && window._sbIsDown()){
+      // Backend is down (503/timeout) — skip all cloud writes. localStorage
+      // above already saved the data; it will sync once the backend recovers.
+    } else if((_cbNow - (window._invCloudLast || 0)) < 6000){
       if(!window._invCloudPendingTimer){
         window._invCloudPendingTimer = setTimeout(function(){
           window._invCloudPendingTimer = null;
@@ -21018,14 +21068,14 @@ async function loadFromSupabase(){
     var GIANT_BLOB_KEYS = ['assigned_doc_status',
       'gm_inventory','tc_inventory','aw_inventory','ex_inventory','inv_devices'];
     var settings = null;
-    if(supaClient){
+    if(supaClient && !(typeof window._sbIsDown==='function' && window._sbIsDown())){
       try{
         var _q = supaClient.from('app_settings').select('key,value');
         GIANT_BLOB_KEYS.forEach(function(k){ _q = _q.neq('key', k); });
         var _sres = await _q;
-        if(_sres && !_sres.error && _sres.data){ settings = _sres.data; }
-        else if(_sres && _sres.error){ console.warn('[loadFromSupabase] targeted app_settings load error:', _sres.error); }
-      }catch(e){ console.warn('[loadFromSupabase] targeted app_settings load threw:', e); }
+        if(_sres && !_sres.error && _sres.data){ settings = _sres.data; if(typeof window._sbNoteResult==='function') window._sbNoteResult(null); }
+        else if(_sres && _sres.error){ if(typeof window._sbNoteResult==='function') window._sbNoteResult(_sres.error); console.warn('[loadFromSupabase] targeted app_settings load error:', _sres.error); }
+      }catch(e){ if(typeof window._sbNoteResult==='function') window._sbNoteResult(e); console.warn('[loadFromSupabase] targeted app_settings load threw:', e); }
     }
     // Legacy fallbacks (older behavior) only if the targeted load came back empty
     if(!settings){
@@ -21800,6 +21850,17 @@ async function saveAgentToSupabase(agent){
   try{ _wmamBackupAgents(); }catch(bkE){}
   saveToStorage();
 
+  // Calvin 2026-07-01: if the Supabase backend is currently DOWN (platform
+  // outage — 503 / PGRST002 schema cache), don't hammer it or scare the user
+  // with a red "Save Failed" banner. The edit is safe in localStorage above and
+  // will sync when the backend recovers. Show ONE calm offline notice instead.
+  if(typeof window._sbIsDown === 'function' && window._sbIsDown()){
+    if(typeof _showOfflineBannerOnce === 'function') _showOfflineBannerOnce();
+    var deferredResult = { ok:false, deferred:true, error:'backend-unavailable (offline — saved locally)' };
+    window._lastAgentSaveResult = deferredResult;
+    return deferredResult;
+  }
+
   if(!supaClient){
     var noClientResult = { ok: false, error: 'Supabase client not initialized' };
     window._lastAgentSaveResult = noClientResult;
@@ -21818,6 +21879,7 @@ async function saveAgentToSupabase(agent){
     if(_resilient.err){ throw _resilient.err; }
     var res = _resilient.res;
     if(res && res.error){
+      if(window._sbNoteResult) window._sbNoteResult(res.error);
       // Try legacy fallback ONCE — strip the newest columns in case schema is incomplete
       console.warn('[saveAgent] full upsert failed:', res.error.message || res.error, '— trying legacy column set');
       var legacy = Object.assign({}, full);
@@ -21863,8 +21925,13 @@ async function saveAgentToSupabase(agent){
         var failResult = { ok: false, error: (res2.error.message || res2.error || res.error.message || 'Unknown error'), code: res2.error.code || res.error.code };
         window._lastAgentSaveResult = failResult;
         console.error('[saveAgent] ✗ legacy fallback ALSO failed for agent #'+agent.id+':', failResult.error);
-        // Surface to UI
-        try{ _showSaveErrorBanner('Save failed for ' + agent.name + ': ' + failResult.error, function(){ saveAgentToSupabase(agent); }); }catch(e){}
+        if(window._sbNoteResult) window._sbNoteResult(res2.error);
+        // Surface to UI — calm offline notice if the backend is down, else the red banner
+        if(window._sbLooksDown && window._sbLooksDown(res2.error)){
+          if(typeof _showOfflineBannerOnce === 'function') _showOfflineBannerOnce();
+        } else {
+          try{ _showSaveErrorBanner('Save failed for ' + agent.name + ': ' + failResult.error, function(){ saveAgentToSupabase(agent); }); }catch(e){}
+        }
         return failResult;
       }
       // Legacy succeeded
@@ -21886,7 +21953,12 @@ async function saveAgentToSupabase(agent){
     console.error('[saveAgent] ✗ network/exception for agent #'+agent.id+':', errMsg);
     var netResult = { ok: false, error: errMsg, network: true };
     window._lastAgentSaveResult = netResult;
-    try{ _showSaveErrorBanner('Save failed for ' + agent.name + ' (network): ' + errMsg, function(){ saveAgentToSupabase(agent); }); }catch(e){}
+    if(window._sbNoteResult) window._sbNoteResult(networkErr);
+    if(window._sbLooksDown && window._sbLooksDown(networkErr)){
+      if(typeof _showOfflineBannerOnce === 'function') _showOfflineBannerOnce();
+    } else {
+      try{ _showSaveErrorBanner('Save failed for ' + agent.name + ' (network): ' + errMsg, function(){ saveAgentToSupabase(agent); }); }catch(e){}
+    }
     return netResult;
   }
 }
@@ -21998,6 +22070,35 @@ function _showSaveErrorBanner(message, retryFn){
     setTimeout(function(){ if(banner.parentNode) banner.remove(); }, 30000);
   }catch(e){ console.warn('[showSaveError]', e); }
 }
+
+// Calvin 2026-07-01: a CALM, throttled "working offline" notice for when the
+// Supabase backend is down (platform outage). Instead of a red "Save Failed"
+// banner storm, show one amber notice at most once a minute. Data is safe
+// locally and syncs when the backend returns.
+function _showOfflineBannerOnce(){
+  try{
+    var now = Date.now();
+    if(window._offlineBannerLast && (now - window._offlineBannerLast) < 60000) return;
+    window._offlineBannerLast = now;
+    var existing = document.getElementById('wmam-offline-banner');
+    if(existing) existing.remove();
+    var banner = document.createElement('div');
+    banner.id = 'wmam-offline-banner';
+    banner.style.cssText = 'position:fixed;top:20px;right:20px;z-index:99999;background:#B45309;color:white;padding:14px 18px;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.3);font-family:Barlow Condensed,sans-serif;font-size:.85rem;max-width:440px;display:flex;align-items:flex-start;gap:12px';
+    var msg = document.createElement('div');
+    msg.style.cssText = 'flex:1;line-height:1.4';
+    msg.innerHTML = '<div style="font-weight:700;margin-bottom:4px">☁ Cloud temporarily unavailable</div><div style="font-size:.78rem;opacity:.95">The database host (Supabase) is having an outage. Your changes are <b>saved on this device</b> and will sync automatically when it\'s back. Nothing is lost.</div>';
+    banner.appendChild(msg);
+    var closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText = 'background:transparent;color:white;border:none;font-size:1rem;cursor:pointer;padding:0 4px';
+    closeBtn.onclick = function(){ banner.remove(); };
+    banner.appendChild(closeBtn);
+    document.body.appendChild(banner);
+    setTimeout(function(){ if(banner.parentNode) banner.remove(); }, 12000);
+  }catch(e){}
+}
+if(typeof window !== 'undefined') window._showOfflineBannerOnce = _showOfflineBannerOnce;
 
 async function deleteAgentFromSupabase(agentId){
   if(!supaClient) return;
