@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.06.28.1645';
+var BUILD_VERSION = '2026.06.28.1815';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14182,6 +14182,34 @@ function _invRowToDevice(row){
   });
   return dev;
 }
+
+// Upsert MANY devices in one shot (chunked). Calvin 2026-06-30 — used by every
+// upload so freshly-added devices become real per-row SQL immediately and show
+// up for every user (owner/office/manager/agent), not just the uploader.
+async function invDbUpsertDevices(poolKey, devices){
+  if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
+  var table = _invPoolTableName(poolKey);
+  if(!table) return {ok:false, error:'unknown-pool'};
+  var poolDef = INV_SYNC_POOLS.find(function(p){return p.key===poolKey;}) || {};
+  var rows = [];
+  (devices || []).forEach(function(d){
+    if(!d) return;
+    if(typeof stampDeviceEdit === 'function') stampDeviceEdit(d);
+    var row = _invDeviceToRow(d, poolDef.label);
+    if(row && row.id) rows.push(row);
+  });
+  if(!rows.length) return {ok:true, count:0};
+  var okAll = true, lastErr = null;
+  try{
+    var CH = 500;
+    for(var i=0;i<rows.length;i+=CH){
+      var res = await supaClient.from(table).upsert(rows.slice(i,i+CH), {onConflict:'id'});
+      if(res && res.error){ okAll=false; lastErr=res.error; window._invPathBLastError=res.error; console.warn('[invDbUpsertDevices] '+table+' chunk failed:', res.error); }
+    }
+  }catch(e){ okAll=false; lastErr=e; window._invPathBLastError=e; console.warn('[invDbUpsertDevices] '+table+' threw:', e); }
+  return {ok:okAll, count:rows.length, error:lastErr};
+}
+if(typeof window !== 'undefined'){ window.invDbUpsertDevices = invDbUpsertDevices; }
 
 // Upsert one device. Returns a Promise that resolves to {ok, error}.
 async function invDbUpsertDevice(poolKey, device){
@@ -54730,6 +54758,19 @@ function gmConfirmInventoryUpload(batchId){
 
   saveInventory();
   window._gmPendingBatch = null;
+  // ── Calvin 2026-06-30: write each uploaded device to its per-row SQL table
+  //    RIGHT NOW so everyone (owner/office/manager/agent) sees it on their next
+  //    load — not just this browser. This is the durable, multi-user path;
+  //    the blob + localStorage above are backups. Fire-and-forget so the UI
+  //    doesn't block; failures are logged and retried by autosave.
+  try{
+    if(typeof invDbUpsertDevices === 'function'){
+      invDbUpsertDevices('gm', pending.devices).then(function(res){
+        if(!res || !res.ok){ console.warn('[gmConfirmInventoryUpload] Path B per-row write issue:', res && res.error); }
+        else { console.log('[gmConfirmInventoryUpload] Path B wrote '+res.count+' device rows'); }
+      });
+    }
+  }catch(e){ console.warn('[gmConfirmInventoryUpload] Path B write threw:', e); }
   // ── Calvin 2026-06-30: hard confirmation + immediate refresh ──
   // Persist again defensively, refresh the current view so the uploader (office)
   // sees the devices instantly, and pop a clear confirmation. Assigned agents
