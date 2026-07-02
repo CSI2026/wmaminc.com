@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.01.1700';
+var BUILD_VERSION = '2026.07.01.1900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -7854,6 +7854,52 @@ function payrollBuildWeeklyRollup(periodEnd){
     }
     a.netCents = a.grossCents - a.chargebackCents - a.carryoverAppliedCents;
     if(a.netCents < 0) a.netCents = 0; // never negative deposit; remainder stays in debt ledger
+    // ── Calvin 2026-07-01: LOANS / ADVANCES / RECURRING FEES ──
+    // Applied LAST, after all campaign sections and carryover, so the paystub
+    // reads: campaign totals → fees/loans → deposit. Each is its own labeled
+    // line. Capped by what's left so the deposit never goes negative; loan
+    // shortfalls stay on the balance, recurring shortfalls accrue as arrears
+    // (both handled at finalize via payrollCommitObligations).
+    if(typeof obligationsDueForAgent === 'function'){
+      var alreadyCommitted = (typeof OBLIGATION_COMMITS !== 'undefined') && OBLIGATION_COMMITS[periodEnd];
+      var catLabelOf = function(o){ return ({'loan':'Loan','advance':'Advance','recurring-fee':'Recurring Fee','invoice-debt':'Invoice Plan'})[o.category] || 'Obligation'; };
+      if(alreadyCommitted){
+        // Historical view: show what was ACTUALLY collected that week, from the
+        // payment ledger — includes obligations since paid off or stopped.
+        (typeof PAYROLL_OBLIGATIONS !== 'undefined' ? PAYROLL_OBLIGATIONS : []).forEach(function(o){
+          if(!o || o.agentId !== parseInt(aid,10)) return;
+          var collected = (o.payments||[]).filter(function(p){ return p.periodEnd === periodEnd && p.kind === 'payroll'; })
+                                          .reduce(function(s,p){ return s + (p.amountCents||0); }, 0);
+          if(collected <= 0) return;
+          a.lines.push({ carrier: catLabelOf(o)+': '+(o.label||''), weekId:null, grossCents:-collected, chargebackCents:0,
+                         kind:'obligation', obligationId:o.id, category:o.category, dueCents:collected, balanceAfterCents:null });
+          a.netCents -= collected;
+          a.obligationsCents = (a.obligationsCents||0) + collected;
+          result.totals.obligationsCents = (result.totals.obligationsCents||0) + collected;
+        });
+      } else {
+      obligationsDueForAgent(parseInt(aid,10)).forEach(function(d){
+        var o = d.obligation;
+        var apply = Math.min(d.dueCents, a.netCents);
+        if(apply <= 0){ return; } // nothing collectible this week; shortfall handled at finalize
+        var catLabel = catLabelOf(o);
+        a.lines.push({
+          carrier:      catLabel+': '+(o.label||''),
+          weekId:       null,
+          grossCents:   -apply,
+          chargebackCents: 0,
+          kind:         'obligation',
+          obligationId: o.id,
+          category:     o.category,
+          dueCents:     d.dueCents,
+          balanceAfterCents: (o.terms==='recurring') ? null : Math.max(0, (o.balanceCents||0) - apply)
+        });
+        a.netCents -= apply;
+        a.obligationsCents = (a.obligationsCents||0) + apply;
+        result.totals.obligationsCents = (result.totals.obligationsCents||0) + apply;
+      });
+      }
+    }
     result.totals.grossCents += a.grossCents;
     result.totals.chargebackCents += a.chargebackCents;
     result.totals.carryoverAppliedCents += a.carryoverAppliedCents;
@@ -13616,6 +13662,9 @@ function canAccess(u, area){
     // Beta-flag manager — Owner only
     case 'payroll-view-beta':
       return isOwner(u);
+    // Loans · Advances · Recurring Fees — Owner + Payroll dept
+    case 'payroll-loans':
+      return isOwner(u) || (typeof isPayroll==='function' && isPayroll(u));
     // My Orders — Square purchases history (any active user)
     case 'my-orders':
       return !!u.active;
@@ -21267,6 +21316,8 @@ async function loadFromSupabase(){
         if(s.key==='completion_nextid'    && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) COMPLETION_NEXT_ID = n;}catch(e){} }
         // Calvin 2026-06-10 — failed-BG cost ledger + weekly invoices
         if(s.key==='failed_bg_costs'      && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) FAILED_BG_COSTS = v;}catch(e){} }
+        if(s.key==='payroll_obligations'  && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)){ PAYROLL_OBLIGATIONS.length=0; Array.prototype.push.apply(PAYROLL_OBLIGATIONS, v); }}catch(e){} }
+        if(s.key==='obligation_commits'   && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object'){ Object.keys(OBLIGATION_COMMITS).forEach(function(k){delete OBLIGATION_COMMITS[k];}); Object.keys(v).forEach(function(k){OBLIGATION_COMMITS[k]=v[k];}); }}catch(e){} }
         if(s.key==='bg_fail_invoices'     && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) BG_FAIL_INVOICES = v;}catch(e){} }
         // Calvin 2026-06-10 v1330 — applicants pre-BG
         if(s.key==='applicants_pre_bg'    && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) APPLICANTS_PRE_BG = v;}catch(e){} }
@@ -21405,6 +21456,7 @@ async function loadFromSupabase(){
     // (Supabase load happens via app_settings batch loader elsewhere)
     if(typeof loadFailedBgCostsFromLocal === 'function'){
       try{ loadFailedBgCostsFromLocal(); }catch(e){}
+      try{ loadObligationsFromLocal(); }catch(e){}
     }
     // Calvin 2026-06-10 v1330: load applicants ledger
     if(typeof loadApplicantsFromLocal === 'function'){
@@ -25376,6 +25428,178 @@ function loadFailedBgCostsFromLocal(){
     if(i) BG_FAIL_INVOICES = JSON.parse(i) || [];
   }catch(e){ console.warn('[loadFailedBgCostsFromLocal] failed:', e); }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  PAYROLL OBLIGATIONS — Loans · Advances · Recurring Fees · Invoice Debt
+//  Calvin 2026-07-01 spec:
+//  • Owner + K-Anna (Payroll) create/manage; agents can only SEE their own.
+//  • Categories: 'loan', 'advance', 'recurring-fee', 'invoice-debt'
+//    (invoice-debt = an inventory/other invoice converted into a payment plan)
+//  • Terms: 'full-next-week' (whole balance on next check),
+//           'weekly-amount'  ($X per week until the balance is paid),
+//           'recurring'      (fixed fee every week until manually stopped —
+//                             e.g. Tanita $600 office payroll split, Brandon
+//                             $200 marketing, Juan $75 company overhead)
+//  • Every deduction taken on a paycheck is recorded in payments[] so the
+//    balance updates automatically and everyone sees the same numbers.
+//  • Shortfalls carry: if the check can't cover the amount due, the unpaid
+//    part stays on the balance (loans) or accrues as arrears (recurring).
+//  • On the paystub these appear as their own labeled section, always the
+//    LAST thing before the deposit total.
+// ════════════════════════════════════════════════════════════════════════
+var PAYROLL_OBLIGATIONS = [];
+var OBLIGATION_COMMITS  = {};   // {periodEnd: {committedAt, by}} — idempotent finalize
+
+function saveObligations(){
+  try{ localStorage.setItem('wmam_payroll_obligations', JSON.stringify(PAYROLL_OBLIGATIONS)); }catch(e){}
+  try{ localStorage.setItem('wmam_obligation_commits', JSON.stringify(OBLIGATION_COMMITS)); }catch(e){}
+  try{
+    if(typeof supaClient !== 'undefined' && supaClient){
+      supaClient.from('app_settings').upsert([
+        {key:'payroll_obligations', value:JSON.stringify(PAYROLL_OBLIGATIONS)},
+        {key:'obligation_commits',  value:JSON.stringify(OBLIGATION_COMMITS)}
+      ]).then(function(){}).catch(function(){});
+    }
+  }catch(e){}
+}
+function loadObligationsFromLocal(){
+  try{
+    var o = localStorage.getItem('wmam_payroll_obligations');
+    if(o){ var arr = JSON.parse(o) || []; PAYROLL_OBLIGATIONS.length = 0; Array.prototype.push.apply(PAYROLL_OBLIGATIONS, arr); }
+    var cm = localStorage.getItem('wmam_obligation_commits');
+    if(cm){ var obj = JSON.parse(cm) || {}; Object.keys(OBLIGATION_COMMITS).forEach(function(k){delete OBLIGATION_COMMITS[k];}); Object.keys(obj).forEach(function(k){OBLIGATION_COMMITS[k]=obj[k];}); }
+  }catch(e){ console.warn('[loadObligationsFromLocal] failed:', e); }
+}
+if(typeof window!=='undefined'){
+  window.PAYROLL_OBLIGATIONS = PAYROLL_OBLIGATIONS;
+  window.OBLIGATION_COMMITS = OBLIGATION_COMMITS;
+  window.saveObligations = saveObligations;
+  window.loadObligationsFromLocal = loadObligationsFromLocal;
+}
+
+function obligationCreate(opts){
+  var u = DB.current || {};
+  var canDo = (typeof isOwner==='function' && isOwner(u)) || (typeof isPayroll==='function' && isPayroll(u));
+  if(!canDo){ alert('Only Owner or Payroll can create loans/fees.'); return null; }
+  if(!opts || !opts.agentId || !opts.category) return null;
+  var agent = (DB.agents||[]).find(function(a){ return a && a.id === opts.agentId; });
+  if(!agent){ alert('Agent not found.'); return null; }
+  var isRecurring = opts.category === 'recurring-fee' || opts.terms === 'recurring';
+  var ob = {
+    id:            'ob-'+Date.now()+'-'+Math.floor(Math.random()*10000),
+    agentId:       agent.id,
+    agentName:     agent.name,
+    category:      opts.category,                     // loan | advance | recurring-fee | invoice-debt
+    label:         opts.label || ({'loan':'Loan','advance':'Pay Advance','recurring-fee':'Recurring Fee','invoice-debt':'Invoice Payment Plan'})[opts.category] || 'Obligation',
+    principalCents: isRecurring ? 0 : (opts.amountCents||0),
+    balanceCents:   isRecurring ? 0 : (opts.amountCents||0),
+    arrearsCents:   0,                                // recurring: unpaid weeks accumulate here
+    terms:         isRecurring ? 'recurring' : (opts.terms || 'full-next-week'),
+    weeklyAmountCents: opts.weeklyAmountCents || (isRecurring ? (opts.amountCents||0) : 0),
+    status:        'active',                          // active | paid | stopped
+    createdBy:     u.name || '', createdById: u.id || null,
+    createdAt:     new Date().toISOString(),
+    notes:         opts.notes || '',
+    payments:      []                                 // {date, periodEnd, amountCents, by, kind:'payroll'|'manual'}
+  };
+  PAYROLL_OBLIGATIONS.push(ob);
+  saveObligations();
+  return ob;
+}
+if(typeof window!=='undefined') window.obligationCreate = obligationCreate;
+
+// What is DUE from this agent for a given week (pure view — no mutation).
+function obligationsDueForAgent(agentId){
+  return (PAYROLL_OBLIGATIONS||[]).filter(function(o){
+    return o && o.agentId === agentId && o.status === 'active';
+  }).map(function(o){
+    var due = 0;
+    if(o.terms === 'recurring'){ due = (o.weeklyAmountCents||0) + (o.arrearsCents||0); }
+    else if(o.terms === 'weekly-amount'){ due = Math.min(o.weeklyAmountCents||0, o.balanceCents||0); if(due<=0) due = o.balanceCents||0; }
+    else { due = o.balanceCents||0; } // full-next-week
+    return { obligation:o, dueCents: Math.max(0, due) };
+  }).filter(function(x){ return x.dueCents > 0; });
+}
+if(typeof window!=='undefined') window.obligationsDueForAgent = obligationsDueForAgent;
+
+// Record a payment against an obligation (payroll deduction OR manual payment
+// like cash/Zelle). Updates balance/arrears + payment history automatically so
+// everyone sees the money the same way. Marks 'paid' when a loan hits $0.
+function obligationRecordPayment(obligationId, amountCents, meta){
+  var o = (PAYROLL_OBLIGATIONS||[]).find(function(x){ return x && x.id === obligationId; });
+  if(!o || amountCents <= 0) return false;
+  meta = meta || {};
+  o.payments.push({
+    date:        new Date().toISOString(),
+    periodEnd:   meta.periodEnd || null,
+    amountCents: amountCents,
+    by:          meta.by || ((DB.current||{}).name || ''),
+    kind:        meta.kind || 'manual'
+  });
+  if(o.terms === 'recurring'){
+    // payment covers arrears first; recurring has no principal to pay off
+    o.arrearsCents = Math.max(0, (o.arrearsCents||0) - amountCents);
+  } else {
+    o.balanceCents = Math.max(0, (o.balanceCents||0) - amountCents);
+    if(o.balanceCents === 0){ o.status = 'paid'; o.paidAt = new Date().toISOString(); }
+  }
+  saveObligations();
+  return true;
+}
+if(typeof window!=='undefined') window.obligationRecordPayment = obligationRecordPayment;
+
+function obligationStop(obligationId, reason){
+  var u = DB.current || {};
+  var canDo = (typeof isOwner==='function' && isOwner(u)) || (typeof isPayroll==='function' && isPayroll(u));
+  if(!canDo){ alert('Only Owner or Payroll can stop an obligation.'); return false; }
+  var o = (PAYROLL_OBLIGATIONS||[]).find(function(x){ return x && x.id === obligationId; });
+  if(!o) return false;
+  o.status = 'stopped'; o.stoppedAt = new Date().toISOString(); o.stoppedBy = u.name || ''; o.stopReason = reason || '';
+  saveObligations();
+  return true;
+}
+if(typeof window!=='undefined') window.obligationStop = obligationStop;
+
+// FINALIZE a week's obligation deductions (K-Anna's button on the rollup).
+// Uses the same math the rollup DISPLAYS, then records each collected amount
+// as a payroll payment + accrues recurring arrears for shortfalls. Idempotent
+// per periodEnd so double-clicking can never double-collect.
+function payrollCommitObligations(periodEnd){
+  var u = DB.current || {};
+  var canDo = (typeof isOwner==='function' && isOwner(u)) || (typeof isPayroll==='function' && isPayroll(u));
+  if(!canDo){ alert('Only Owner or Payroll can finalize deductions.'); return false; }
+  if(OBLIGATION_COMMITS[periodEnd]){ alert('Deductions for '+periodEnd+' were already finalized on '+OBLIGATION_COMMITS[periodEnd].committedAt.slice(0,10)+'.'); return false; }
+  var rollup = (typeof payrollBuildWeeklyRollup === 'function') ? payrollBuildWeeklyRollup(periodEnd) : null;
+  if(!rollup) return false;
+  Object.keys(rollup.agents).forEach(function(aid){
+    (rollup.agents[aid].lines||[]).forEach(function(L){
+      if(L.kind !== 'obligation' || !L.obligationId) return;
+      var o = (PAYROLL_OBLIGATIONS||[]).find(function(x){ return x && x.id === L.obligationId; });
+      if(!o) return;
+      var collected = Math.abs(L.grossCents||0);
+      if(collected > 0){
+        obligationRecordPayment(o.id, collected, {periodEnd: periodEnd, by: (u.name||'')+' (payroll finalize)', kind:'payroll'});
+      }
+      // recurring shortfall accrues as arrears so next week's due includes it
+      if(o.terms === 'recurring' && L.dueCents && collected < L.dueCents){
+        o.arrearsCents = (L.dueCents - collected);
+      }
+    });
+    // Recurring fees where NOTHING was collectible this week (no line at all)
+    // still accrue: the missed week's fee is added to arrears.
+    (PAYROLL_OBLIGATIONS||[]).forEach(function(o){
+      if(!o || o.status !== 'active' || o.terms !== 'recurring') return;
+      if(String(o.agentId) !== String(aid)) return;
+      var paidThisWeek = (o.payments||[]).some(function(p){ return p.periodEnd === periodEnd && p.kind === 'payroll'; });
+      if(!paidThisWeek){ o.arrearsCents = (o.arrearsCents||0) + (o.weeklyAmountCents||0); }
+    });
+  });
+  OBLIGATION_COMMITS[periodEnd] = { committedAt: new Date().toISOString(), by: u.name || '' };
+  saveObligations();
+  return true;
+}
+if(typeof window!=='undefined') window.payrollCommitObligations = payrollCommitObligations;
+
 
 // Compute the Sunday-Saturday window containing a given date (defaults to today).
 // Returns {start: 'YYYY-MM-DD', end: 'YYYY-MM-DD'} where start is Sunday and
@@ -34005,6 +34229,9 @@ function buildNav(u){
     if(canAccess(u, 'my-payroll')){
       payrollItems += boDropBtn('my-payroll','💰 My Payroll');
     }
+    if((typeof isOwner==='function' && isOwner(u)) || (typeof isPayroll==='function' && isPayroll(u))){
+      payrollItems += boDropBtn('payroll-loans','💳 Loans & Recurring');
+    }
     // Beta whitelist manager (Owner only)
     if(isOwner(u)){
       payrollItems += boDropBtn('payroll-view-beta','🧪 Payroll View Beta');
@@ -36169,6 +36396,7 @@ function gotoPanel(id, params){
     'mass-email':panelMassEmail,
     'mass-sms':panelMassSms,
     'my-payroll':panelMyPayroll,
+    'payroll-loans':panelPayrollLoans,
     'payroll-view-beta':panelPayrollViewBeta,
     'my-orders':panelMyOrders,
     'wr-music':panelWrMusic,
@@ -41112,6 +41340,16 @@ function panelPayrollRollup(){
     h += '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No approved weeks yet. Approve at least one campaign in the Payroll Processing panel first.</div>';
     return h;
   }
+  // ── Calvin 2026-07-01: finalize week deductions (loans/advances/fees) ──
+  var _obCommitted = (typeof OBLIGATION_COMMITS !== 'undefined') && OBLIGATION_COMMITS[periodEnd];
+  h += '<div style="margin-bottom:14px;display:flex;gap:10px;align-items:center;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+  if(_obCommitted){
+    h += '<span style="background:rgba(22,163,74,.1);color:#16a34a;padding:8px 14px;border-radius:6px;font-weight:700">\u2713 Deductions finalized '+_escapeHtml((_obCommitted.committedAt||'').slice(0,10))+' by '+_escapeHtml(_obCommitted.by||'')+' \u2014 loan/fee balances updated</span>';
+  } else {
+    h += '<button onclick="if(confirm(\'Finalize this week\\\'s loan/advance/fee deductions? Balances will update and payments will be recorded. This runs ONCE per week.\')){ if(payrollCommitObligations(\''+periodEnd+'\')){ alert(\'\u2713 Deductions finalized \u2014 all balances updated.\'); gotoPanel(\'payroll-rollup\',{periodEnd:\''+periodEnd+'\'}); } }" class="btn-fire" style="padding:9px 18px;font-size:.74rem;background:#16a34a;border-color:#16a34a">\u2705 Finalize Week Deductions (Loans/Fees)</button>';
+    h += '<span style="color:var(--muted)">Applies loans, advances & recurring fees to this week\'s deposits and records the payments.</span>';
+  }
+  h += '</div>';
   var rollup = payrollBuildWeeklyRollup(periodEnd);
   var agentIds = Object.keys(rollup.agents).sort(function(a,b){
     return (rollup.agents[b].netCents || 0) - (rollup.agents[a].netCents || 0);
@@ -77062,12 +77300,163 @@ function panelMyPayroll(){
   });
   h += '</tbody></table></div></div>';
 
+  // ── Calvin 2026-07-01: PAY STUB — per-campaign breakdown + deposit total ──
+  // For each approved week: one section per campaign (commissions + that
+  // campaign's chargebacks/fees with a section total), then carryover + any
+  // Loans / Advances / Recurring Fees as the LAST items, then the deposit.
+  try{
+    var stubPeriods = {};
+    (PAYROLL_WEEKS||[]).forEach(function(wk){ if(wk && wk.status==='approved' && wk.periodEnd && (wk.rows||[]).some(function(r){return r.agentId===u.id;})) stubPeriods[wk.periodEnd]=true; });
+    var stubList = Object.keys(stubPeriods).sort().reverse().slice(0,8);
+    if(stubList.length && typeof payrollBuildWeeklyRollup === 'function'){
+      h += '<div class="bo-card" style="margin-top:18px"><div class="bo-card-head"><div class="bo-card-title">\ud83e\uddfe Pay Stubs \u2014 How Each Deposit Was Calculated</div></div>';
+      h += '<div style="padding:14px 18px">';
+      stubList.forEach(function(pe){
+        var roll = payrollBuildWeeklyRollup(pe);
+        var me = roll.agents[u.id];
+        if(!me) return;
+        h += '<div style="border:1px solid var(--border);border-radius:8px;margin-bottom:14px;overflow:hidden">';
+        h += '<div style="background:linear-gradient(135deg,#003594,#001e52);color:white;padding:10px 16px;font-family:Bebas Neue,sans-serif;letter-spacing:2px;font-size:.95rem;display:flex;justify-content:space-between"><span>WEEK ENDING '+_escapeHtml(pe)+'</span><span>DEPOSIT: '+moneyFmt(me.netCents)+'</span></div>';
+        h += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.78rem">';
+        (me.lines||[]).filter(function(L){return L.kind==='carrier-line';}).forEach(function(L){
+          var sec = (L.grossCents||0) - (L.chargebackCents||0);
+          h += '<tr style="border-top:1px solid var(--border);background:rgba(0,53,148,.04)"><td style="padding:8px 12px;font-weight:700" colspan="2">'+_escapeHtml(L.carrier||'')+'</td></tr>';
+          h += '<tr><td style="padding:4px 24px;color:var(--muted)">Commissions</td><td style="padding:4px 12px;text-align:right;color:#16a34a;font-weight:700">'+moneyFmt(L.grossCents)+'</td></tr>';
+          if(L.chargebackCents){ h += '<tr><td style="padding:4px 24px;color:var(--muted)">Chargebacks / Fees</td><td style="padding:4px 12px;text-align:right;color:#dc2626">-'+moneyFmt(Math.abs(L.chargebackCents))+'</td></tr>'; }
+          h += '<tr><td style="padding:4px 24px;font-weight:700">'+_escapeHtml(L.carrier||'')+' Total</td><td style="padding:4px 12px;text-align:right;font-weight:700">'+moneyFmt(sec)+'</td></tr>';
+        });
+        (me.lines||[]).filter(function(L){return L.kind==='carryover';}).forEach(function(L){
+          h += '<tr style="border-top:1px solid var(--border)"><td style="padding:6px 12px;color:#B45309;font-weight:700">Carryover Debt</td><td style="padding:6px 12px;text-align:right;color:#dc2626;font-weight:700">'+moneyFmt(L.grossCents)+'</td></tr>';
+        });
+        (me.lines||[]).filter(function(L){return L.kind==='obligation';}).forEach(function(L){
+          var bal = (L.balanceAfterCents!=null) ? ' <span style="color:var(--muted);font-size:.68rem">(balance after: '+moneyFmt(L.balanceAfterCents)+')</span>' : '';
+          h += '<tr style="border-top:1px solid var(--border)"><td style="padding:6px 12px;color:#B45309;font-weight:700">'+_escapeHtml(L.carrier||'')+bal+'</td><td style="padding:6px 12px;text-align:right;color:#dc2626;font-weight:700">'+moneyFmt(L.grossCents)+'</td></tr>';
+        });
+        h += '<tr style="border-top:2px solid var(--border);background:rgba(22,163,74,.06)"><td style="padding:9px 12px;font-family:Bebas Neue,sans-serif;letter-spacing:2px;font-size:.9rem">TOTAL DEPOSIT</td><td style="padding:9px 12px;text-align:right;font-weight:700;font-size:.95rem;color:#16a34a">'+moneyFmt(me.netCents)+'</td></tr>';
+        h += '</table></div>';
+      });
+      h += '</div></div>';
+    }
+  }catch(e){ console.warn('[panelMyPayroll] stub render failed:', e); }
+
   // Footnote
   h += '<div style="margin-top:14px;padding:12px 16px;background:rgba(0,53,148,.04);border-left:3px solid var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);line-height:1.5">';
   h += '<strong>How this works:</strong> Each row is one carrier\'s pay period. Gross is what was earned before chargebacks, net is what you actually take home. Finalized weeks have been approved by Calvin. Questions? Reach out to Onboarding.';
   h += '</div>';
   return h;
 }
+
+// ── PANEL: Loans · Advances · Recurring Fees (Owner + Payroll) ──
+// Calvin 2026-07-01: K-Anna/Owner create loans, pay advances, invoice payment
+// plans, and recurring fees. Deductions apply automatically on payroll; every
+// payment updates the balance so everyone sees the same numbers. Agents see
+// their own line items on their pay stub (My Payroll) but cannot edit.
+function panelPayrollLoans(){
+  var u = DB.current;
+  var canDo = u && ((typeof isOwner==='function' && isOwner(u)) || (typeof isPayroll==='function' && isPayroll(u)));
+  if(!canDo){
+    return panelHeader('\ud83d\udcb3 Loans & Recurring') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">\ud83d\udd12 Owner + Payroll only.</div></div>';
+  }
+  var h = panelHeader('\ud83d\udcb3 Loans \u00b7 Advances \u00b7 Recurring Fees');
+  h += '<div style="background:rgba(0,53,148,.05);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-family:Barlow Condensed,sans-serif;font-size:.76rem;color:var(--brown);line-height:1.55">';
+  h += '<strong>How it works:</strong> pick the person, the category, the amount, and the terms. The deduction applies automatically on payroll as its own labeled line \u2014 always the last thing before the deposit total. Every payment (payroll or manual) updates the balance for everyone. Shortfalls carry until paid.';
+  h += '</div>';
+
+  // ── Create form ──
+  h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid var(--blue)"><div class="bo-card-head"><div class="bo-card-title">\u2795 New Loan / Advance / Fee</div></div>';
+  h += '<div style="padding:16px 18px;font-family:Barlow Condensed,sans-serif;font-size:.8rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;align-items:end">';
+  h += '<div><label style="display:block;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Agent (search by name)</label><input id="obAgentSearch" list="obAgentList" placeholder="Start typing a name\u2026" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:5px;font-family:Barlow Condensed,sans-serif"><datalist id="obAgentList">';
+  (DB.agents||[]).filter(function(a){return a && a.active;}).sort(function(a,b){return (a.name||'').localeCompare(b.name||'');}).forEach(function(a){
+    h += '<option value="'+_escapeAttr(a.name)+'">';
+  });
+  h += '</datalist></div>';
+  h += '<div><label style="display:block;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Category</label><select id="obCategory" onchange="obTermsSync()" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:5px;font-family:Barlow Condensed,sans-serif"><option value="loan">Loan</option><option value="advance">Pay Advance</option><option value="invoice-debt">Invoice Payment Plan</option><option value="recurring-fee">Recurring Fee</option></select></div>';
+  h += '<div><label style="display:block;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Label / Reason</label><input id="obLabel" placeholder="e.g. Office Payroll Split" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:5px;font-family:Barlow Condensed,sans-serif"></div>';
+  h += '<div><label style="display:block;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Amount ($)</label><input id="obAmount" type="number" step="0.01" min="0" placeholder="400.00" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:5px;font-family:Barlow Condensed,sans-serif"></div>';
+  h += '<div><label style="display:block;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Terms</label><select id="obTerms" onchange="obTermsSync()" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:5px;font-family:Barlow Condensed,sans-serif"><option value="full-next-week">Pay back in full next week</option><option value="weekly-amount">$X weekly until paid</option><option value="recurring">Recurring until further notice</option></select></div>';
+  h += '<div id="obWeeklyWrap" style="display:none"><label style="display:block;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Weekly Payment ($)</label><input id="obWeekly" type="number" step="0.01" min="0" placeholder="50.00" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:5px;font-family:Barlow Condensed,sans-serif"></div>';
+  h += '<div><button onclick="obCreateClick()" class="btn-fire" style="padding:10px 20px;font-size:.76rem">\u2795 Create</button></div>';
+  h += '</div></div>';
+
+  // ── Active + recent obligations table ──
+  var money = function(c){ var n=(c||0)/100; return (n<0?'-$':'$')+Math.abs(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','); };
+  var all = (PAYROLL_OBLIGATIONS||[]).slice().sort(function(a,b){ return (b.createdAt||'').localeCompare(a.createdAt||''); });
+  var active = all.filter(function(o){return o.status==='active';});
+  var done   = all.filter(function(o){return o.status!=='active';}).slice(0,20);
+  var renderRows = function(list, isActive){
+    var out = '';
+    list.forEach(function(o){
+      var catLabel = ({'loan':'Loan','advance':'Advance','recurring-fee':'Recurring Fee','invoice-debt':'Invoice Plan'})[o.category] || o.category;
+      var termLabel = o.terms==='recurring' ? money(o.weeklyAmountCents)+'/wk until stopped' : o.terms==='weekly-amount' ? money(o.weeklyAmountCents)+'/wk until paid' : 'Full next week';
+      var balLabel  = o.terms==='recurring' ? (o.arrearsCents? '<span style="color:#dc2626">arrears '+money(o.arrearsCents)+'</span>' : '\u2014') : money(o.balanceCents)+' left of '+money(o.principalCents);
+      var paidCt    = (o.payments||[]).length;
+      out += '<tr style="border-top:1px solid var(--border)'+(isActive?'':';opacity:.6')+'">';
+      out += '<td style="padding:7px 10px;font-weight:700">'+_escapeHtml(o.agentName||'')+'</td>';
+      out += '<td style="padding:7px 10px">'+catLabel+'<div style="font-size:.68rem;color:var(--muted)">'+_escapeHtml(o.label||'')+'</div></td>';
+      out += '<td style="padding:7px 10px">'+termLabel+'</td>';
+      out += '<td style="padding:7px 10px">'+balLabel+'</td>';
+      out += '<td style="padding:7px 10px;text-align:center">'+paidCt+'</td>';
+      out += '<td style="padding:7px 10px">'+(isActive
+          ? '<button onclick="obPayClick(\''+o.id+'\')" style="background:white;border:1px solid #16a34a;color:#16a34a;font-size:.64rem;padding:4px 9px;border-radius:4px;cursor:pointer;letter-spacing:1px;text-transform:uppercase;margin-right:5px">Record Payment</button>'
+            +'<button onclick="obStopClick(\''+o.id+'\')" style="background:white;border:1px solid #dc2626;color:#dc2626;font-size:.64rem;padding:4px 9px;border-radius:4px;cursor:pointer;letter-spacing:1px;text-transform:uppercase">Stop</button>'
+          : '<span style="font-size:.68rem;color:var(--muted);text-transform:uppercase">'+(o.status||'')+(o.stoppedBy?(' by '+_escapeHtml(o.stoppedBy)):'')+'</span>')+'</td>';
+      out += '</tr>';
+    });
+    return out;
+  };
+  h += '<div class="bo-card" style="margin-bottom:18px"><div class="bo-card-head"><div class="bo-card-title">\ud83d\udfe2 Active ('+active.length+')</div></div>';
+  h += '<div style="padding:0 8px 12px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.76rem"><tr style="text-align:left;color:var(--muted);font-size:.64rem;letter-spacing:1px;text-transform:uppercase"><th style="padding:6px 10px">Person</th><th style="padding:6px 10px">Type</th><th style="padding:6px 10px">Terms</th><th style="padding:6px 10px">Balance</th><th style="padding:6px 10px;text-align:center">Payments</th><th style="padding:6px 10px"></th></tr>';
+  h += active.length ? renderRows(active, true) : '<tr><td colspan="6" style="padding:24px;text-align:center;color:var(--muted)">No active loans, advances, or fees.</td></tr>';
+  h += '</table></div></div>';
+  if(done.length){
+    h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">\u2705 Paid / Stopped (recent)</div></div>';
+    h += '<div style="padding:0 8px 12px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.76rem">'+renderRows(done,false)+'</table></div></div>';
+  }
+  return h;
+}
+function obTermsSync(){
+  try{
+    var cat = document.getElementById('obCategory');
+    var terms = document.getElementById('obTerms');
+    if(cat && terms && cat.value==='recurring-fee'){ terms.value='recurring'; }
+    var wrap = document.getElementById('obWeeklyWrap');
+    if(wrap && terms){ wrap.style.display = (terms.value==='weekly-amount') ? '' : 'none'; }
+  }catch(e){}
+}
+function obCreateClick(){
+  var name = (document.getElementById('obAgentSearch')||{}).value || '';
+  var agent = (DB.agents||[]).find(function(a){ return a && a.active && (a.name||'').toLowerCase() === name.trim().toLowerCase(); });
+  if(!agent){ alert('Pick an agent from the list (exact name).'); return; }
+  var cat = (document.getElementById('obCategory')||{}).value || 'loan';
+  var label = (document.getElementById('obLabel')||{}).value || '';
+  var amt = Math.round(parseFloat((document.getElementById('obAmount')||{}).value || '0') * 100);
+  if(!amt || amt <= 0){ alert('Enter an amount.'); return; }
+  var terms = (document.getElementById('obTerms')||{}).value || 'full-next-week';
+  var weekly = Math.round(parseFloat((document.getElementById('obWeekly')||{}).value || '0') * 100);
+  if(terms==='weekly-amount' && (!weekly || weekly<=0)){ alert('Enter the weekly payment amount.'); return; }
+  var ob = obligationCreate({agentId:agent.id, category:cat, label:label, amountCents:amt, terms:terms, weeklyAmountCents: terms==='weekly-amount' ? weekly : (terms==='recurring'?amt:0)});
+  if(ob){
+    alert('\u2713 Created: '+ob.agentName+' \u2014 '+(ob.label||ob.category)+'. It will deduct automatically on payroll.');
+    try{ if(typeof pushNotification==='function'){ pushNotification({toIds:[agent.id],toRoles:[],icon:'\ud83d\udcb3',title:'New '+(({'loan':'Loan','advance':'Pay Advance','recurring-fee':'Recurring Fee','invoice-debt':'Payment Plan'})[cat]||'Obligation'),body:(ob.label||'')+' \u2014 '+(terms==='recurring'? ('$'+(ob.weeklyAmountCents/100).toFixed(2)+'/week until further notice') : ('$'+(amt/100).toFixed(2)+(terms==='weekly-amount' ? (' at $'+(weekly/100).toFixed(2)+'/week') : ' due next paycheck')))+'. It will show as a line item on your pay stub.',panel:'my-payroll',priority:'normal'}); } }catch(e){}
+    gotoPanel('payroll-loans');
+  }
+}
+function obPayClick(obligationId){
+  var amtStr = prompt('Payment amount received (e.g. 50.00):');
+  if(amtStr===null) return;
+  var amt = Math.round(parseFloat(amtStr)*100);
+  if(!amt || amt<=0){ alert('Invalid amount.'); return; }
+  if(obligationRecordPayment(obligationId, amt, {kind:'manual', by:(DB.current||{}).name||''})){
+    alert('\u2713 Payment recorded \u2014 balance updated for everyone.');
+    gotoPanel('payroll-loans');
+  }
+}
+function obStopClick(obligationId){
+  var reason = prompt('Stop this obligation? Reason (optional):');
+  if(reason===null) return;
+  if(obligationStop(obligationId, reason)){ gotoPanel('payroll-loans'); }
+}
+if(typeof window!=='undefined'){ window.panelPayrollLoans=panelPayrollLoans; window.obTermsSync=obTermsSync; window.obCreateClick=obCreateClick; window.obPayClick=obPayClick; window.obStopClick=obStopClick; }
 
 // ── PANEL: Beta-flag manager (Owner-only) ──
 function panelPayrollViewBeta(){
