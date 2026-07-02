@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.01.1600';
+var BUILD_VERSION = '2026.07.01.1700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -24311,6 +24311,16 @@ function bgFireFailedEmail(agent, campaigns, reason){
       }
     });
     if(typeof saveFailedBgCosts === 'function') saveFailedBgCosts();
+    // Calvin 2026-07-01: auto-post each newly logged charge straight onto the
+    // manager's payroll (first available check). K-Anna sees it as a labeled
+    // line item and can remove it via the BG panel if needed.
+    try{
+      (FAILED_BG_COSTS||[]).forEach(function(c){
+        if(c && c.agentId === agent.id && c.status === 'open' && typeof _bgAutoPostToPayroll === 'function'){
+          _bgAutoPostToPayroll(c);
+        }
+      });
+    }catch(e){ console.warn('[bgFireFailedEmail] auto-post to payroll failed:', e); }
   }catch(e){ console.warn('[bgFireFailedEmail] cost ledger write failed:', e); }
 }
 
@@ -24328,6 +24338,48 @@ function _bgFailCharges(campaigns){
   return charges;
 }
 if(typeof window!=='undefined') window._bgFailCharges = _bgFailCharges;
+
+// ── Calvin 2026-07-01: AUTO-POST failed-BG charge to the manager's payroll ──
+// The instant a BG is marked failed, the charge posts to the onboarding
+// manager's debt ledger so it lands on their FIRST AVAILABLE paycheck as a
+// labeled line ("BG-Fail: <agent> — <campaigns>"). The existing ledger already
+// caps deductions so pay never goes negative and carries any remainder.
+// The FAILED_BG_COSTS entry is marked 'applied' so the weekly invoice is the
+// paper trail only — it can never charge the same fail twice.
+function _bgAutoPostToPayroll(entry){
+  if(!entry || entry.status !== 'open') return false;
+  if(!entry.managerId){ return false; } // no manager to charge — stays 'open' for office review
+  if(typeof payrollAddDebt !== 'function') return false;
+  payrollAddDebt(entry.managerId, entry.amountCents,
+    'BG-Fail: '+entry.agentName+' — '+entry.campaignName, 'bg:'+entry.id);
+  entry.status    = 'applied';
+  entry.appliedAt = new Date().toISOString();
+  if(typeof saveFailedBgCosts === 'function') saveFailedBgCosts();
+  return true;
+}
+if(typeof window!=='undefined') window._bgAutoPostToPayroll = _bgAutoPostToPayroll;
+
+// K-Anna (payroll) / Owner can REMOVE a posted BG charge — reverses the exact
+// amount off the manager's debt ledger and marks the cost 'reversed'.
+function bgReverseCharge(costId){
+  var u = DB.current || {};
+  var canDo = (typeof isOwner==='function' && isOwner(u)) || (typeof isPayroll==='function' && isPayroll(u));
+  if(!canDo){ alert('Only Owner or Payroll can remove a BG charge.'); return false; }
+  var entry = (FAILED_BG_COSTS||[]).find(function(c){ return c && String(c.id) === String(costId); });
+  if(!entry){ alert('Charge not found.'); return false; }
+  if(entry.status === 'reversed'){ alert('Already removed.'); return false; }
+  if(entry.status === 'applied' && entry.managerId && typeof payrollClearDebt === 'function'){
+    payrollClearDebt(entry.managerId, entry.amountCents,
+      'BG-Fail REMOVED by '+(u.name||'payroll')+': '+entry.agentName, 'bg:'+entry.id);
+  }
+  entry.status     = 'reversed';
+  entry.reversedAt = new Date().toISOString();
+  entry.reversedBy = u.name || '';
+  if(typeof saveFailedBgCosts === 'function') saveFailedBgCosts();
+  if(typeof gotoPanel === 'function' && window._currentPanelId){ try{ gotoPanel(window._currentPanelId); }catch(e){} }
+  return true;
+}
+if(typeof window!=='undefined') window.bgReverseCharge = bgReverseCharge;
 
 // ════════════════════════════════════════════════════════════════════
 //  FAILED BG COST LEDGER + WEEKLY INVOICE  (Calvin 2026-06-10)
@@ -49318,8 +49370,7 @@ function panelBgCheckQueue(){
     });
     h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid #dc2626"><div class="bo-card-head"><div class="bo-card-title">💸 Failed-BG Weekly Reimbursement Invoice</div></div>';
     h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.55">';
-    h += '<strong>$21 per failed BG check</strong> — billed to the immediate manager (TL or MM) who hired the agent. ';
-    h += 'Weekly invoice runs Sunday–Saturday and emails K-Anna + Makenzie + the manager. No e-sign required. ';
+    h += '<strong>$21 Gen Mobile · $25 covers all other campaigns (one BG, good 90 days)</strong> — charged to the immediate manager (TL or MM) who hired the agent. Auto-posts to that manager\'s next paycheck as a labeled deduction; weekly invoice is the paper trail. ';
     h += '<br><br>';
     h += '<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;background:rgba(0,0,0,.03);padding:10px 14px;border-radius:6px;margin-bottom:10px">';
     h += '<div><strong style="color:#dc2626">'+openCount+'</strong> open cost'+(openCount!==1?'s':'')+' total ($'+(openTotal/100).toFixed(2)+')</div>';
@@ -49330,6 +49381,32 @@ function panelBgCheckQueue(){
     h += '<button onclick="bgGenerateInvoiceClick()" class="btn-fire" style="padding:9px 18px;font-size:.74rem;background:#dc2626">📧 Generate + Email Weekly Invoice Now</button>';
     h += '<button onclick="gotoPanel(\'bg-fail-invoices\')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:9px 18px;border-radius:5px;cursor:pointer">📋 View Past Invoices ('+(BG_FAIL_INVOICES||[]).length+')</button>';
     h += '</div>';
+    // ── Calvin 2026-07-01: itemized BG charges (payroll line items) ──
+    // Every charge shows WHICH pending agent failed, the manager being charged,
+    // the amount, and its status. Payroll/Owner can REMOVE a charge — that
+    // reverses it off the manager's paycheck ledger immediately.
+    try{
+      var _bgAll = (FAILED_BG_COSTS||[]).slice().sort(function(a,b){ return (b.failedAt||'').localeCompare(a.failedAt||''); }).slice(0,40);
+      if(_bgAll.length){
+        var _canRemove = (typeof isOwner==='function' && isOwner(u)) || (typeof isPayroll==='function' && isPayroll(u));
+        h += '<div style="margin-top:14px;font-family:Bebas Neue,sans-serif;font-size:.82rem;letter-spacing:1.5px;color:var(--brown)">CHARGES — PAYROLL LINE ITEMS</div>';
+        h += '<table style="width:100%;border-collapse:collapse;margin-top:6px;font-family:Barlow Condensed,sans-serif;font-size:.76rem">';
+        h += '<tr style="text-align:left;color:var(--muted);font-size:.66rem;letter-spacing:1px;text-transform:uppercase"><th style="padding:5px 8px">Failed Agent</th><th style="padding:5px 8px">Campaign(s)</th><th style="padding:5px 8px">Charged To</th><th style="padding:5px 8px;text-align:right">Amount</th><th style="padding:5px 8px">Status</th><th style="padding:5px 8px"></th></tr>';
+        _bgAll.forEach(function(c){
+          var stColor = c.status==='applied' ? '#B45309' : c.status==='reversed' ? '#6B7280' : '#dc2626';
+          var stLabel = c.status==='applied' ? 'On paycheck' : c.status==='reversed' ? 'Removed'+(c.reversedBy?(' by '+c.reversedBy):'') : (c.status||'open');
+          h += '<tr style="border-top:1px solid var(--border)'+(c.status==='reversed'?';opacity:.55':'')+'">';
+          h += '<td style="padding:6px 8px;font-weight:700">'+(c.agentName||'?')+'</td>';
+          h += '<td style="padding:6px 8px">'+(c.campaignName||'')+'</td>';
+          h += '<td style="padding:6px 8px">'+(c.managerName||'—')+'</td>';
+          h += '<td style="padding:6px 8px;text-align:right;font-weight:700;color:#dc2626">$'+((c.amountCents||0)/100).toFixed(2)+'</td>';
+          h += '<td style="padding:6px 8px;color:'+stColor+'">'+stLabel+'</td>';
+          h += '<td style="padding:6px 8px;text-align:right">'+((_canRemove && c.status!=='reversed') ? '<button onclick="bgReverseCharge(\''+c.id+'\')" style="background:white;border:1px solid #dc2626;color:#dc2626;font-size:.66rem;padding:4px 10px;border-radius:4px;cursor:pointer;letter-spacing:1px;text-transform:uppercase">Remove</button>' : '')+'</td>';
+          h += '</tr>';
+        });
+        h += '</table>';
+      }
+    }catch(e){}
     h += '</div></div>';
   }catch(e){ console.warn('[panelBgCheckQueue] invoice section render failed:', e); }
 
