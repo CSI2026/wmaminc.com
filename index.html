@@ -3453,7 +3453,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.02.1700';
+var BUILD_VERSION = '2026.07.02.1900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -5215,6 +5215,7 @@ async function _notifPushToSupabase(n){
       ts:        n.ts
     };
     var result = await supaClient.from('notifications').insert(row);
+    try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
     if(result && result.error){
       console.warn('[_notifPushToSupabase] insert failed for #'+n.id+': '+result.error.message);
     }
@@ -14249,6 +14250,7 @@ function _invRowToDevice(row){
 // upload so freshly-added devices become real per-row SQL immediately and show
 // up for every user (owner/office/manager/agent), not just the uploader.
 async function invDbUpsertDevices(poolKey, devices){
+  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
   if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
   var table = _invPoolTableName(poolKey);
   if(!table) return {ok:false, error:'unknown-pool'};
@@ -14671,6 +14673,7 @@ function saveInventory(localOnly){
       window._appSettingsWrite = {fails:0, pausedUntil:0, warned:false};
     }
     var pushKey = function(key, val){
+      try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
       var st = window._appSettingsWrite;
       if(Date.now() < st.pausedUntil){ return; } // breaker open — skip quietly
       if(typeof window._sbIsDown === 'function' && window._sbIsDown()){ return; } // backend down — skip
@@ -21926,6 +21929,7 @@ async function _agentUpsertResilient(full){
 }
 
 async function saveAgentToSupabase(agent){
+  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
   // Local persistence ALWAYS happens first so the user's edit is captured
   // in memory + localStorage even if Supabase is unreachable.
   try{ _wmamBackupAgents(); }catch(bkE){}
@@ -25431,6 +25435,7 @@ if(typeof window !== 'undefined'){
 }
 
 function saveFailedBgCosts(){
+  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
   try{ localStorage.setItem('wmam_failed_bg_costs', JSON.stringify(FAILED_BG_COSTS)); }catch(e){}
   try{ localStorage.setItem('wmam_bg_fail_invoices', JSON.stringify(BG_FAIL_INVOICES)); }catch(e){}
   // Push to Supabase app_settings if available
@@ -25475,6 +25480,7 @@ var PAYROLL_OBLIGATIONS = [];
 var OBLIGATION_COMMITS  = {};   // {periodEnd: {committedAt, by}} — idempotent finalize
 
 function saveObligations(){
+  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
   try{ localStorage.setItem('wmam_payroll_obligations', JSON.stringify(PAYROLL_OBLIGATIONS)); }catch(e){}
   try{ localStorage.setItem('wmam_obligation_commits', JSON.stringify(OBLIGATION_COMMITS)); }catch(e){}
   try{
@@ -25640,6 +25646,7 @@ if(typeof window!=='undefined') window.payrollCommitObligations = payrollCommitO
 // ════════════════════════════════════════════════════════════════════════
 var EXPIRED_DEVICE_CHARGES = [];
 function saveExpiredCharges(){
+  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
   try{ localStorage.setItem('wmam_expired_device_charges', JSON.stringify(EXPIRED_DEVICE_CHARGES)); }catch(e){}
   try{ if(typeof supaClient!=='undefined' && supaClient){ supaClient.from('app_settings').upsert([{key:'expired_device_charges', value:JSON.stringify(EXPIRED_DEVICE_CHARGES)}]).then(function(){}).catch(function(){}); } }catch(e){}
 }
@@ -26132,9 +26139,44 @@ if(typeof document !== 'undefined'){
 var WMAM_AUTOREFRESH_TIMER = null;
 var WMAM_AUTOREFRESH_LAST_HASH = {};
 
+// ── Calvin 2026-07-02 EGRESS FIX ──
+// 548GB/250GB overage traced to this poll: select * on agents+notifications+
+// app_settings every 15s per user. Now every cloud WRITE bumps a tiny
+// 'data_version' row, and the poll reads ONLY that row (~100 bytes). The full
+// 3-table pull happens only when the version actually changed, plus a
+// 10-minute safety-net full pull so nothing can ever go stale even if a
+// write path misses the bump. Behavior is identical — updates still land
+// within one tick — the data just isn't re-downloaded when nothing moved.
+function sbBumpDataVersion(){
+  try{
+    if(typeof supaClient === 'undefined' || !supaClient) return;
+    var now = Date.now();
+    if(now - (window._dvLastBump||0) < 2000) return;
+    window._dvLastBump = now;
+    var v = String(now);
+    window._lastSeenDataVersion = v;
+    supaClient.from('app_settings').upsert([{key:'data_version', value:v}]).then(function(){}).catch(function(){});
+  }catch(e){}
+}
+if(typeof window!=='undefined') window.sbBumpDataVersion = sbBumpDataVersion;
+
 async function _autoRefreshTick(){
   if(!supaClient) return;
   if(!DB.current) return; // not logged in yet
+  var _now = Date.now();
+  var _force = (_now - (window._lastFullPull||0)) > 600000;
+  try{
+    var _vres = await supaClient.from('app_settings').select('value').eq('key','data_version').limit(1);
+    var _v = (_vres && _vres.data && _vres.data[0]) ? _vres.data[0].value : null;
+    if(_v !== null && _v !== undefined){
+      if(!_force && _v === window._lastSeenDataVersion) return;   // nothing changed — ~0 egress
+      window._lastSeenDataVersion = _v;
+    } else {
+      // version row doesn't exist yet — create it so future ticks are cheap
+      try{ window._dvLastBump = 0; sbBumpDataVersion(); }catch(e){}
+    }
+  }catch(e){ /* check failed — fall through to full pull (safe) */ }
+  window._lastFullPull = _now;
   try{
     // Calvin 2026-05-14: tables that ACTUALLY exist in Supabase. Sales aren't
     // their own tables — they're stored as monthly_sales JSON on each agent
@@ -26291,7 +26333,7 @@ function startAutoRefresh(){
     _autoRefreshTickGuarded('initial');
   }, 5000);
   // Periodic interval (works in foreground; may be throttled in background)
-  WMAM_AUTOREFRESH_TIMER = setInterval(function(){ _autoRefreshTickGuarded('interval'); }, 15000);
+  WMAM_AUTOREFRESH_TIMER = setInterval(function(){ if(typeof document!=='undefined' && document.hidden) return; _autoRefreshTickGuarded('interval'); }, 15000);
   // CRITICAL: poll immediately when tab regains visibility or focus —
   // this is what handles the case where the user has been on another tab
   // and Chrome has throttled the background interval.
