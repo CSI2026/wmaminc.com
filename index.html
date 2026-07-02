@@ -3453,7 +3453,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.02.2400';
+var BUILD_VERSION = '2026.07.02.2500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -21249,6 +21249,7 @@ async function loadFromSupabase(){
         if(s.key==='fb_registry' && s.value){ try{localStorage.setItem('wmam_fb_registry',s.value);}catch(e){} }
         if(s.key==='onboarding_records' && s.value){ try{ONBOARDING_RECORDS=JSON.parse(s.value)||{};}catch(e){} }
         if(s.key==='rank_history' && s.value){ try{RANK_HISTORY=JSON.parse(s.value)||{};}catch(e){} }
+        if(s.key==='inactivity_flags' && s.value){ try{ var _inf=JSON.parse(s.value)||[]; var _tgt=(typeof window!=='undefined'&&window.INACTIVITY_FLAGS)?window.INACTIVITY_FLAGS:null; if(_tgt){ _tgt.length=0; _inf.forEach(function(f){_tgt.push(f);}); } }catch(e){} }
         if(s.key==='wmam_programs' && s.value){ try{
           // ── Calvin 2026-06-11 v2130: MERGE not REPLACE ──
           // Was a destructive overwrite — if app_settings had a stale
@@ -25910,6 +25911,179 @@ if(typeof window!=='undefined') window.expChargeWaive = expChargeWaive;
 (function(){
   if(typeof window === 'undefined' || window._expSweepScheduled) return;
   window._expSweepScheduled = true;
+// ═══════════════════════════════════════════════════════════════════════
+// Calvin 2026-07-02 — AGENT INACTIVITY ENFORCEMENT
+// Rule: an agent HOLDING DEVICES who goes 2 WORKING DAYS (Sat+Sun excluded)
+// without a single sale gets flagged. The upline is notified, and the
+// DIRECT manager's back office LOCKS (BG-authorization style) until they
+// acknowledge each flag and commit to collecting the inventory or getting
+// it activated. Deterministic sweep: any user's app run computes the same
+// flags from shared data — true automation with no server cron. Shared
+// ledger in app_settings keeps locks/acks in sync across everyone.
+// ═══════════════════════════════════════════════════════════════════════
+var INACTIVITY_FLAGS = (typeof window!=='undefined' && window.INACTIVITY_FLAGS) ? window.INACTIVITY_FLAGS : [];
+if(typeof window!=='undefined') window.INACTIVITY_FLAGS = INACTIVITY_FLAGS;
+function loadInactivityFlags(){
+  try{ var x=localStorage.getItem('wmam_inactivity_flags'); if(x){ var arr=JSON.parse(x)||[]; INACTIVITY_FLAGS.length=0; arr.forEach(function(f){ INACTIVITY_FLAGS.push(f); }); } }catch(e){}
+}
+if(typeof window!=='undefined'){ window.loadInactivityFlags=loadInactivityFlags; }
+function saveInactivityFlags(){
+  try{ localStorage.setItem('wmam_inactivity_flags', JSON.stringify(INACTIVITY_FLAGS)); }catch(e){}
+  try{ if(typeof supaClient!=='undefined' && supaClient){ supaClient.from('app_settings').upsert({key:'inactivity_flags',value:JSON.stringify(INACTIVITY_FLAGS)},{onConflict:'key'}).then(function(){}).catch(function(){}); } }catch(e){}
+  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
+}
+loadInactivityFlags();
+
+// Working days between two ISO dates: counts Mon–Fri strictly AFTER `fromISO`
+// through `toISO` inclusive-of-yesterday semantics are handled by caller.
+function workingDaysBetween(fromISO, toISO){
+  try{
+    var d = new Date(fromISO+'T00:00:00'); var end = new Date(toISO+'T00:00:00');
+    var n = 0;
+    while(d < end){
+      d.setDate(d.getDate()+1);
+      if(d > end) break;
+      var dow = d.getDay();
+      if(dow!==0 && dow!==6) n++;
+    }
+    return n;
+  }catch(e){ return 0; }
+}
+if(typeof window!=='undefined') window.workingDaysBetween = workingDaysBetween;
+
+// Baseline for an agent who has never sold: earliest date on a held device.
+function _inactBaseline(a){
+  var last = null;
+  try{ last = agentLastSaleDate(a); }catch(e){}
+  if(last) return last;
+  var earliest = null;
+  try{
+    unionAllInventoryPools().forEach(function(d){
+      if(!d || d.deletedAt || d.status==='deleted') return;
+      if(d.status==='sold' || d.status==='activated' || d.soldAt) return;
+      if(d.holderId!==a.id && d.assignedTo!==a.id) return;
+      var t = (d.assignedAt || d.receivedAt || d.createdAt || '').slice(0,10);
+      if(t && (!earliest || t < earliest)) earliest = t;
+    });
+  }catch(e){}
+  return earliest; // null → cannot evaluate, skip (no false flags)
+}
+
+function inactivitySweep(){
+  var out = {flagged:0};
+  try{
+    var today = new Date().toISOString().slice(0,10);
+    (DB.agents||[]).forEach(function(a){
+      if(!a || !a.active || a.role!=='Field Agent') return;
+      if(!agentHoldsDevices(a)) return;                  // rule applies to device holders only
+      var base = _inactBaseline(a);
+      if(!base) return;
+      // after an acknowledgment, the clock restarts from the ack date
+      var lastAck = null;
+      INACTIVITY_FLAGS.forEach(function(f){ if(f && f.agentId===a.id && f.status==='acked' && f.ackAt){ var d=f.ackAt.slice(0,10); if(!lastAck||d>lastAck) lastAck=d; } });
+      var clockStart = (lastAck && lastAck > base) ? lastAck : base;
+      var wd = workingDaysBetween(clockStart, today);
+      if(wd < 2) return;
+      // one OPEN flag per agent at a time
+      var open = INACTIVITY_FLAGS.find(function(f){ return f && f.agentId===a.id && f.status==='open'; });
+      if(open) return;
+      var mgr = null; try{ mgr = _expDirectMgrOf(a.id); }catch(e){}
+      var flag = {
+        id: 'inact-'+a.id+'-'+Date.now(),
+        agentId: a.id, agentName: a.name,
+        managerId: mgr ? mgr.id : null, managerName: mgr ? mgr.name : null,
+        flaggedAt: new Date().toISOString(),
+        lastSaleDate: agentLastSaleDate(a) || null,
+        workingDays: wd,
+        status: 'open', ackBy: null, ackAt: null, ackAction: null
+      };
+      INACTIVITY_FLAGS.push(flag);
+      out.flagged++;
+      // notify direct manager + upline chain
+      try{
+        var chain = [];
+        if(a.teamLeaderId) chain.push(a.teamLeaderId);
+        if(a.marketManagerId) chain.push(a.marketManagerId);
+        if(a.campaignManagerId) chain.push(a.campaignManagerId);
+        chain = chain.filter(function(v,i){ return v && chain.indexOf(v)===i; });
+        chain.forEach(function(mid){
+          pushNotification({
+            toIds: [mid],
+            title: '\u26a0\ufe0f Agent Inactivity \u2014 Action Required',
+            body: a.name+' has devices in hand and no sales in '+wd+' working days. '+(mgr&&mid===mgr.id?'Your back office is locked until you acknowledge and act \u2014 collect the inventory or get it activated.':'Heads up \u2014 '+(mgr?mgr.name:'the direct manager')+' must acknowledge.'),
+            panel: 'dashboard'
+          });
+        });
+      }catch(e){}
+    });
+    if(out.flagged) saveInactivityFlags();
+  }catch(e){ console.warn('[inactivitySweep]', e); }
+  return out;
+}
+if(typeof window!=='undefined') window.inactivitySweep = inactivitySweep;
+if(typeof window!=='undefined'){ window.saveInactivityFlags=saveInactivityFlags; window.myInactivityLocks=myInactivityLocks; }
+
+// Open flags that lock THIS user (they are the direct manager on record).
+function myInactivityLocks(u){
+  if(!u) return [];
+  try{
+    if(typeof isOwner==='function' && isOwner(u)) return []; // owner never locked
+    return INACTIVITY_FLAGS.filter(function(f){ return f && f.status==='open' && f.managerId===u.id; });
+  }catch(e){ return []; }
+}
+function inactivityAcknowledge(flagId, action){
+  try{
+    var f = INACTIVITY_FLAGS.find(function(x){ return x && x.id===flagId; });
+    if(!f) return;
+    f.status='acked'; f.ackBy = DB.current?DB.current.id:null; f.ackAt = new Date().toISOString(); f.ackAction = action||'collect';
+    saveInactivityFlags();
+    try{
+      pushNotification({ toIds: [f.agentId], title: '\u26a0\ufe0f Inventory Warning',
+        body: 'You have devices and no sales in '+f.workingDays+' working days. Your manager will '+(f.ackAction==='collect'?'collect the inventory':'work with you to activate it')+' \u2014 sell or activate now to keep your devices.', panel: 'dashboard' });
+    }catch(e){}
+    var overlay = document.getElementById('inactLockOverlay');
+    if(overlay){
+      if(!myInactivityLocks(DB.current).length){ overlay.remove(); try{ gotoPanel(window._currentPanelId||'dashboard'); }catch(e){} }
+      else { showInactivityLockIfNeeded(true); }
+    }
+  }catch(e){ console.warn('[inactivityAcknowledge]', e); }
+}
+if(typeof window!=='undefined') window.inactivityAcknowledge = inactivityAcknowledge;
+
+function showInactivityLockIfNeeded(force){
+  try{
+    var u = DB.current; if(!u) return false;
+    var locks = myInactivityLocks(u);
+    var existing = document.getElementById('inactLockOverlay');
+    if(!locks.length){ if(existing) existing.remove(); return false; }
+    if(existing && !force) return true;
+    if(existing) existing.remove();
+    var h = '<div id="inactLockOverlay" style="position:fixed;inset:0;background:rgba(10,14,28,.88);backdrop-filter:blur(4px);z-index:99990;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto">';
+    h += '<div style="background:#fff;border-radius:18px;max-width:620px;width:100%;box-shadow:0 30px 80px rgba(0,0,0,.5);overflow:hidden">';
+    h += '<div style="background:linear-gradient(120deg,#7a1212,#CC0000);padding:18px 24px"><div style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;letter-spacing:2px;color:#fff">\u26a0\ufe0f AGENT INACTIVITY \u2014 ACKNOWLEDGMENT REQUIRED</div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:rgba(255,255,255,.85)">Your back office is locked until you acknowledge each flagged agent and commit to an action.</div></div>';
+    h += '<div style="padding:18px 24px;max-height:60vh;overflow-y:auto">';
+    locks.forEach(function(f){
+      h += '<div style="border:1px solid rgba(204,0,0,.3);border-radius:12px;padding:14px 16px;margin-bottom:12px;background:rgba(204,0,0,.03)">'
+        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.95rem;font-weight:700;color:#16213b">'+_escapeHtml(f.agentName||('Agent '+f.agentId))+'</div>'
+        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:#4B5563;margin:3px 0 10px">Devices in hand \u00b7 <b style="color:#CC0000">'+f.workingDays+' working days with zero sales</b>'+(f.lastSaleDate?(' \u00b7 last sale '+f.lastSaleDate):' \u00b7 no sales recorded')+'</div>'
+        +'<label style="display:flex;align-items:flex-start;gap:8px;font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:#16213b;margin-bottom:10px;cursor:pointer"><input type="checkbox" id="inact-ck-'+f.id+'" style="margin-top:3px;accent-color:#CC0000"> I acknowledge my agent has gone '+f.workingDays+' work days without a sale and I will act on the inventory.</label>'
+        +'<div style="display:flex;gap:8px;flex-wrap:wrap">'
+        +'<button onclick="(function(){var c=document.getElementById(\'inact-ck-'+f.id+'\');if(!c||!c.checked){alert(\'Check the acknowledgment box first.\');return;}inactivityAcknowledge(\''+f.id+'\',\'collect\');})()" style="background:#7a1212;color:#fff;border:none;font-family:Barlow Condensed,sans-serif;font-size:.68rem;letter-spacing:2px;text-transform:uppercase;padding:9px 16px;border-radius:8px;cursor:pointer;font-weight:700">\ud83d\udce6 I will collect the inventory</button>'
+        +'<button onclick="(function(){var c=document.getElementById(\'inact-ck-'+f.id+'\');if(!c||!c.checked){alert(\'Check the acknowledgment box first.\');return;}inactivityAcknowledge(\''+f.id+'\',\'activate\');})()" style="background:#003594;color:#fff;border:none;font-family:Barlow Condensed,sans-serif;font-size:.68rem;letter-spacing:2px;text-transform:uppercase;padding:9px 16px;border-radius:8px;cursor:pointer;font-weight:700">\u26a1 Agent will activate it</button>'
+        +'</div></div>';
+    });
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#7684a3">The clock restarts after acknowledgment \u2014 if the agent goes another 2 working days without a sale while still holding devices, this lock returns.</div>';
+    h += '</div></div></div>';
+    document.body.insertAdjacentHTML('beforeend', h);
+    return true;
+  }catch(e){ console.warn('[inactLock]', e); return false; }
+}
+if(typeof window!=='undefined') window.showInactivityLockIfNeeded = showInactivityLockIfNeeded;
+
+// Boot: sweep 10s after load (data hydrated), then enforce the lock.
+try{ setTimeout(function(){ try{ var r = inactivitySweep(); if(r.flagged) console.log('[inactivitySweep] flagged='+r.flagged); showInactivityLockIfNeeded(); }catch(e){} }, 10000); }catch(e){}
+
   try{ setTimeout(function(){ try{ var r = expiredDeviceSweep(); if(r.created||r.flagged) console.log('[expiredDeviceSweep] created='+r.created+' reimburse-flagged='+r.flagged); }catch(e){} }, 9000); }catch(e){}
 })();
 
@@ -36442,6 +36616,9 @@ if(typeof window !== 'undefined') window._renderDenialBannersForCurrentUser = _r
 function gotoPanel(id, params){
   // Calvin 2026-05-14: track current panel so realtime/polling can re-render it
   window._currentPanelId = id;
+  // Calvin 2026-07-02: inactivity lock — a direct manager with open flags
+  // cannot use the back office until each flag is acknowledged.
+  try{ if(typeof showInactivityLockIfNeeded==='function') showInactivityLockIfNeeded(); }catch(e){}
 
   // ── Calvin 2026-05-18 — INVENTORY SYNC PULL ──
   // Pull latest inventory version metadata on EVERY navigation. Internally
