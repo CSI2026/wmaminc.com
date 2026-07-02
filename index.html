@@ -3453,7 +3453,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.02.3000';
+var BUILD_VERSION = '2026.07.02.3200';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -20896,6 +20896,80 @@ async function seedDefaultAgents(){
   console.log('Seeding complete!');
 }
 
+// ═══ Calvin 2026-07-02 — AGENT ROSTER RESTORE TOOL (additive-only) ═══
+// If the cloud 'agents' key is ever lost or partial, this restores agents
+// from Calvin's backup JSON (the wmaminc_b...json exports in Downloads).
+// STRICTLY ADDITIVE: adds agents that are MISSING (by id and by name);
+// never overwrites or alters an existing agent. Owner-only.
+// Console use:  wmamRestoreFromBackup()  — opens a file picker.
+function _wmamExtractAgentsFromBackup(parsed){
+  try{
+    if(Array.isArray(parsed) && parsed.length && parsed[0] && parsed[0].name && (parsed[0].role||parsed[0].username)) return parsed;      // plain agent array
+    if(parsed && Array.isArray(parsed.agents)) return parsed.agents;                                                                       // {agents:[...]}
+    if(Array.isArray(parsed) && parsed.length && parsed[0] && parsed[0].key){                                                              // app_settings rows
+      var row = parsed.find(function(r){ return r && r.key==='agents'; });
+      if(row && row.value) return JSON.parse(row.value)||[];
+    }
+    if(parsed && typeof parsed==='object'){                                                                                                // {key:value} map / localStorage dump
+      for(var k in parsed){
+        if(/agents/i.test(k)){
+          var v = parsed[k];
+          if(typeof v==='string'){ try{ v=JSON.parse(v); }catch(e){} }
+          if(Array.isArray(v) && v.length && v[0] && v[0].name) return v;
+        }
+      }
+    }
+  }catch(e){ console.warn('[restore] parse:', e); }
+  return null;
+}
+function wmamMergeAgentsAdditive(backupAgents){
+  var added = [], skipped = 0;
+  var byId = {}, byName = {};
+  (DB.agents||[]).forEach(function(a){ if(a){ byId[a.id]=true; byName[String(a.name||'').toLowerCase()]=true; } });
+  (backupAgents||[]).forEach(function(b){
+    if(!b || !b.name) return;
+    if(byId[b.id] || byName[String(b.name).toLowerCase()]){ skipped++; return; } // NEVER touch existing
+    DB.agents.push(b);
+    byId[b.id]=true; byName[String(b.name).toLowerCase()]=true;
+    added.push(b);
+  });
+  if(added.length){
+    try{ saveToStorage(); }catch(e){}
+    added.forEach(function(a){ try{ saveAgentToSupabase(a); }catch(e){} });
+    try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 100); }catch(e){}
+  }
+  console.log('[restore] added '+added.length+' missing agent(s); left '+skipped+' existing untouched:');
+  added.forEach(function(a){ console.log('  + '+a.name+' (id '+a.id+', '+(a.role||'?')+')'); });
+  return {added:added.length, skipped:skipped};
+}
+function wmamRestoreFromBackup(){
+  try{
+    var u = DB.current;
+    if(!u || !(typeof isOwner==='function' && isOwner(u))){ alert('Owner only.'); return; }
+    var inp = document.createElement('input');
+    inp.type='file'; inp.accept='.json,application/json';
+    inp.onchange = function(){
+      var f = inp.files && inp.files[0]; if(!f) return;
+      var rd = new FileReader();
+      rd.onload = function(){
+        try{
+          var parsed = JSON.parse(rd.result);
+          var agents = _wmamExtractAgentsFromBackup(parsed);
+          if(!agents || !agents.length){ alert('No agents found in that file. Check it is a wmaminc backup JSON.'); return; }
+          var have = (DB.agents||[]).length;
+          if(!confirm('Backup contains '+agents.length+' agents. Current roster has '+have+'. Add ONLY the missing ones (existing agents untouched)?')) return;
+          var r = wmamMergeAgentsAdditive(agents);
+          alert('Restore complete: '+r.added+' agent(s) added, '+r.skipped+' already present (untouched). Refresh to see them everywhere.');
+          try{ gotoPanel(window._currentPanelId||'dashboard'); }catch(e){}
+        }catch(e){ alert('Could not read that file: '+e.message); }
+      };
+      rd.readAsText(f);
+    };
+    inp.click();
+  }catch(e){ alert('Restore failed to start: '+e.message); }
+}
+if(typeof window!=='undefined'){ window.wmamRestoreFromBackup = wmamRestoreFromBackup; window.wmamMergeAgentsAdditive = wmamMergeAgentsAdditive; window._wmamExtractAgentsFromBackup = _wmamExtractAgentsFromBackup; }
+
 async function loadFromSupabase(){
   if(!supaClient){ loadFromStorage(); return; }
   try{
@@ -34790,6 +34864,10 @@ function buildNav(u){
                  + (canAccess(u,'org-tree') ? boDropBtn('org-tree','🌳 Visual Org Tree') : '')
                  + (canAccess(u,'agent-codes') ? boDropBtn('agent-codes','🔑 Agent Codes') : '');
   }
+  // Calvin 2026-07-02: placement queue lives here for office (dedupe)
+  if(peopleItems && canAccess(u,'agents-pending') && canAccess(u,'pending-agents')){
+    peopleItems += boDropBtn('pending-agents','🕒 Pending Placements');
+  }
   if(peopleItems) h += boGroupDrop('dd-people','👥 People ▾', peopleItems);
 
   // Payroll Portal. Three possible items, each gated independently:
@@ -35019,7 +35097,12 @@ function buildNav(u){
   if(_isPeopleMgr || isOffice){
     var paCount = 0;
     try{ paCount = (typeof pendingAgentsForViewer === 'function') ? pendingAgentsForViewer(u).length : 0; }catch(e){}
-    h += boNavBtnWithBadge('pending-agents','🕒 Pending Agents', paCount);
+    // Calvin 2026-07-02 DEDUPE: office already has the Agents Pending
+    // pipeline tab - twin tabs removed. Office reaches the placement queue
+    // via People > Pending Placements; managers keep this top-level button.
+    if(!canAccess(u,'agents-pending')){
+      h += boNavBtnWithBadge('pending-agents','🕒 Pending Agents', paCount);
+    }
   }
 
   // Team Rooms / Markets.
@@ -35119,6 +35202,30 @@ document.addEventListener('click', function(e){
     closeAllBODD();
   }
 });
+
+// ── Calvin 2026-07-02 POP v2: numbers count up when a panel lands ──
+function boCountUp(){
+  try{
+    if(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    var els = document.querySelectorAll('#boBody .bs-val');
+    els.forEach(function(el){
+      var raw = (el.textContent||'').trim().replace(/,/g,'');
+      if(!/^\d{1,6}$/.test(raw)) return;
+      var target = parseInt(raw,10); if(!target) return;
+      var t0 = null;
+      function step(ts){
+        if(!t0) t0 = ts;
+        var pr = Math.min(1,(ts-t0)/500);
+        var eased = 1-Math.pow(1-pr,3);
+        el.textContent = Math.round(target*eased).toLocaleString();
+        if(pr<1) requestAnimationFrame(step);
+      }
+      el.textContent='0';
+      requestAnimationFrame(step);
+    });
+  }catch(e){}
+}
+if(typeof window!=='undefined') window.boCountUp = boCountUp;
 
 function boGroupDrop(ddId, label, innerHtml){
   return '<div class="bo-nav-group">'
@@ -37005,6 +37112,7 @@ function gotoPanel(id, params){
     var _invBanner = (typeof renderInventoryConflictBanner === 'function')
       ? renderInventoryConflictBanner() : '';
     document.getElementById('boBody').innerHTML = _invBanner + (map[id]||panelBO)();
+    try{ if(typeof boCountUp==='function') boCountUp(); }catch(e){}
     setTimeout(startSBClock, 60);
   }catch(e){
     console.error('Panel error for '+id+':', e);
@@ -50755,7 +50863,13 @@ function panelAgentsPending(){
     return a && (a.stage === 'awaiting-esign' || a.stage === 'bg-ready-to-run' || a.stage === 'bg-submitted');
   });
   var legacyPending = (DB.agents||[]).filter(function(a){
-    return a && a.active && isAgentPendingBgReview(a);
+    if(!a || !a.active || !isAgentPendingBgReview(a)) return false;
+    // Calvin 2026-07-02: department/office accounts (HR, Inventory, Payroll,
+    // Onboarding, admins) are NOT field applicants - they flooded this list
+    // as look-alike duplicates. Records untouched; just not misfiled here.
+    if(a.category==='office') return false;
+    try{ if(typeof isOfficeRole==='function' && isOfficeRole(a)) return false; }catch(e){}
+    return true;
   });
 
   if(!open.length && !legacyPending.length){
@@ -83026,6 +83140,22 @@ html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
   transition:transform .15s ease, box-shadow .15s ease;
 }
 .qa-dept-tile:hover{transform:translateY(-3px);box-shadow:0 14px 28px rgba(28,49,94,.16), inset 0 1px 0 #fff;}
+
+/* ── Calvin 2026-07-02 POP v2: make the office feel ALIVE ── */
+@keyframes boRise { from { opacity:0; transform:translateY(10px);} to { opacity:1; transform:translateY(0);} }
+#boBody .bo-card { animation: boRise .35s ease both; }
+#boBody .bo-card:nth-of-type(2){ animation-delay:.05s; }
+#boBody .bo-card:nth-of-type(3){ animation-delay:.10s; }
+#boBody .bo-card:nth-of-type(4){ animation-delay:.15s; }
+#boBody .bo-card:nth-of-type(5){ animation-delay:.20s; }
+@keyframes boShine { from { left:-80%; } to { left:130%; } }
+.qa-tile, .btn-fire { position:relative; overflow:hidden; }
+.qa-tile:hover::after, .btn-fire:hover::after {
+  content:''; position:absolute; top:0; left:-80%; width:50%; height:100%;
+  background:linear-gradient(105deg, transparent, rgba(255,255,255,.45), transparent);
+  animation: boShine .6s ease;
+}
+@keyframes badgePulse { 0%,100%{ transform:scale(1);} 50%{ transform:scale(1.12);} }
 
 /* ── numbers count-up + accessibility ── */
 @media (prefers-reduced-motion: reduce){
