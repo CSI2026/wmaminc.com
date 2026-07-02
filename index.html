@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- WMAMinc back-office — build 2026-06-03-1730 — comms-visibility-fix-v2 -->
+<!-- WMAMinc back-office — single-file SPA — version lives in BUILD_VERSION -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -3453,7 +3453,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.02.2100';
+var BUILD_VERSION = '2026.07.02.2300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -11215,6 +11215,7 @@ var ONBOARDING_RULES = [
 function saveOnboardingRecords(){
   try{ localStorage.setItem('wmam_onboarding', JSON.stringify(ONBOARDING_RECORDS)); }catch(e){}
   if(supaClient)(async function(){ try{ await supaClient.from('app_settings').upsert({key:'onboarding_records',value:JSON.stringify(ONBOARDING_RECORDS)},{onConflict:'key'}); }catch(e){} })();
+  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
 }
 function loadOnboardingRecords(){
   try{ var s=localStorage.getItem('wmam_onboarding'); if(s) ONBOARDING_RECORDS=JSON.parse(s)||{}; }catch(e){}
@@ -17414,6 +17415,70 @@ function gmAssignToMM(imeis, mmId, market){
 }
 
 // Transfer devices from MM/TL to another user (TL or Agent)
+// ── Calvin 2026-07-02 FULL AUDIT: three dead buttons found and built ──
+// 1) gmInitiateSelfReturn — the agent "Submit Return Request" form existed
+//    but its submit function was never written. It now rides the REAL GM
+//    transfer pipeline (gmCreateTransferRequest) so the TL/MM target gets
+//    the standard signature/acceptance flow, and the reason+notes travel
+//    on the request record.
+function gmInitiateSelfReturn(){
+  try{
+    var u = DB.current; if(!u){ alert('Not signed in.'); return; }
+    var tSel = document.getElementById('gmsr-target');
+    var toId = tSel ? parseInt(tSel.value,10) : NaN;
+    if(!toId || isNaN(toId)){ alert('Pick who receives the devices (your TL or MM).'); return; }
+    var reasonEl = document.getElementById('gmsr-reason');
+    var reason = reasonEl ? reasonEl.value : 'Unsold';
+    var notesEl = document.getElementById('gmsr-notes');
+    var notes = notesEl ? notesEl.value.trim() : '';
+    var imeis = Array.prototype.slice.call(document.querySelectorAll('.gmsr-cb:checked')).map(function(cb){ return cb.value; });
+    if(!imeis.length){ alert('Select at least one device to return.'); return; }
+    var req = gmCreateTransferRequest(u.id, toId, imeis, false);
+    if(!req){ return; }
+    req.isReturn = true;
+    req.returnReason = reason;
+    req.returnNotes = notes;
+    try{ saveInventory(); }catch(e){}
+    try{
+      pushNotification({
+        toId: toId,
+        title: '↩️ Device Return Request',
+        body: u.name+' is returning '+imeis.length+' device'+(imeis.length===1?'':'s')+' — reason: '+reason+(notes?(' — "'+notes+'"'):''),
+        panel: 'pending-transfers'
+      });
+    }catch(e){}
+    alert('Return request submitted for '+imeis.length+' device'+(imeis.length===1?'':'s')+'. Your manager must accept it — devices stay in your name until then.');
+    try{ gotoPanel('inv-my-inventory'); }catch(e){}
+  }catch(e){ alert('Return failed: '+e.message); }
+}
+if(typeof window!=='undefined') window.gmInitiateSelfReturn = gmInitiateSelfReturn;
+
+// 2+3) Onboarding checklist pane in the agent management panel referenced
+//     obToggleItem/obSaveNotes that never existed — the entire pane was dead.
+//     Both now persist to ONBOARDING_RECORDS (the same store the pane reads)
+//     via saveOnboardingRecords(), which handles localStorage + cloud.
+function obToggleItem(agentId, itemId, checked){
+  try{
+    if(!ONBOARDING_RECORDS[agentId]) ONBOARDING_RECORDS[agentId] = {};
+    if(checked){ ONBOARDING_RECORDS[agentId][itemId] = new Date().toISOString(); }
+    else { delete ONBOARDING_RECORDS[agentId][itemId]; }
+    saveOnboardingRecords();
+  }catch(e){ console.warn('[obToggleItem]', e); }
+}
+if(typeof window!=='undefined') window.obToggleItem = obToggleItem;
+
+function obSaveNotes(agentId){
+  try{
+    var el = document.getElementById('amp-ob-notes');
+    if(!el) return;
+    if(!ONBOARDING_RECORDS[agentId]) ONBOARDING_RECORDS[agentId] = {};
+    ONBOARDING_RECORDS[agentId].notes = el.value;
+    saveOnboardingRecords();
+    alert('Onboarding notes saved.');
+  }catch(e){ alert('Save failed: '+e.message); }
+}
+if(typeof window!=='undefined') window.obSaveNotes = obSaveNotes;
+
 function gmCreateTransferRequest(fromId, toId, imeis, requiresApproval){
   var from = DB.agents.find(function(a){return a.id===fromId;});
   var to   = DB.agents.find(function(a){return a.id===toId;});
@@ -37568,9 +37633,29 @@ function panelBO(){
       var aw = agentSalesCount(a,{program:rp,period:'week'});
       return (bw-aw) || ((b.sales||0)-(a.sales||0));
     });
+    // ── Calvin 2026-07-02 RANKING LAW + manager dual rank ──
+    // Pool now excludes anyone without devices in their name (self stays
+    // visible so the user always sees where they stand once stocked).
+    peerPool = peerPool.filter(function(a){ return rankEligible(a) || a.id===u.id; });
     var myOverallRank  = peerPool.findIndex(function(a){return a.id===u.id;})+1;
     var totalSalesAgents = peerPool.length;
     var rankProgLabel = myBaseProgs.join('/').toUpperCase();
+    // Manager rank: managers compete against ALL managers (every level),
+    // same eligibility law applied.
+    var MGR_ROLES = ['Team Leader','Market Manager','Campaign Manager','IBO'];
+    var isMgrUser = MGR_ROLES.indexOf(u.role)>=0;
+    var mgrRank = 0, mgrPoolSize = 0;
+    if(isMgrUser){
+      var rp2 = (myBaseProgs && myBaseProgs[0]) || 'Lifeline';
+      var mgrPool = (DB.agents||[]).filter(function(a){
+        return a && a.active && MGR_ROLES.indexOf(a.role)>=0 && (rankEligible(a) || a.id===u.id);
+      }).sort(function(a,b){
+        var bw=0,aw=0; try{ bw=agentSalesCount(b,{program:rp2,period:'week'})||0; aw=agentSalesCount(a,{program:rp2,period:'week'})||0; }catch(e){}
+        return (bw-aw) || ((b.sales||0)-(a.sales||0));
+      });
+      mgrRank = mgrPool.findIndex(function(a){return a.id===u.id;})+1;
+      mgrPoolSize = mgrPool.length;
+    }
     // ── Per-program sales — derived from monthlySales (auto-resets with calendar) ──
     var now2       = new Date();
     var thisMonth  = now2.toISOString().slice(0,7);           // e.g. "2026-04"
@@ -37718,7 +37803,7 @@ function panelBO(){
       var pct = Math.min(100, Math.round((wkTotal/Math.max(1,wkGoal))*100));
       // program rank + chase (peers in my first program)
       var rkProg = sbProgs[0]||'Lifeline';
-      var peers = (DB.agents||[]).filter(function(a){ return a && a.active && isSalesRole(a); })
+      var peers = (DB.agents||[]).filter(function(a){ return rankEligible(a) || (a && a.id===u.id); })
         .map(function(a){ var n=0; try{ n=agentSalesCount(a,{program:rkProg,period:'week'})||0; }catch(e){} return {a:a,n:n}; })
         .sort(function(x,y){ return y.n-x.n; });
       var myIdx = peers.findIndex(function(x){ return x.a.id===u.id; });
@@ -37794,241 +37879,134 @@ function panelBO(){
     if(u.role === 'Field Agent'){
       html += _agentBodyV2();
     } else {
-    // ── 3-column body ──
-    html += '<div style="display:grid;grid-template-columns:1fr 1.2fr 1fr;align-items:stretch;">';
-
-    // ══════════ LEFT: MONTHLY PRODUCTION ══════════
-    html += '<div style="border-right:2px solid '+themeBlue+';padding:12px 10px 10px;text-align:center;background:'+panBg+';display:flex;flex-direction:column;">';
-    html += '<div style="'+hdrSt+'">— MONTHLY<br>PRODUCTION —</div>';
-
-    if(!isMultiProg){
-      // Single program
-      var singleSales = salesForProg(sbProgs[0]);
-      if(showTeamSplit){
-        // TL/MM: show MY SALES + TEAM TOTAL side by side
-        var tSales = teamSalesForProg(sbProgs[0]);
-        var col0   = progColor(sbProgs[0]);
-        var goal0  = progGoal(sbProgs[0],'month');
-        html += teamSplitPanel(singleSales, tSales, col0, goal0);
-      } else {
-        html += '<div style="'+lblSt+'">SO FAR</div>';
-        html += '<div style="margin:0 auto 3px">'+sbLED(singleSales,44,80,6)+'</div>';
-        html += '<div style="'+lblSt+';margin-bottom:8px">SO FAR</div>';
+    // ── Calvin 2026-07-02 MANAGER BOARD V2 — the approved mockup, exact ──
+    // Three columns: Monthly Production | Available Inventory | Weekly
+    // Production, with the Chase strip below. Theme vars carry pink for the
+    // office ladies and navy for everyone else. All numbers live; the
+    // ranking law (devices required) governs every rank shown.
+    (function(){
+      var orbF = "font-family:Orbitron,Oswald,'Arial Black',sans-serif;";
+      var teamWord = (u.role==='Team Leader') ? 'team' : 'market';
+      var myCamps = [];
+      if(Array.isArray(u.campaigns) && u.campaigns.length){ myCamps = u.campaigns.slice(); }
+      else { try{ sbProgs.forEach(function(pp){ getCampaignsForProgram(pp).forEach(function(c){ if(myCamps.indexOf(c)<0) myCamps.push(c); }); }); }catch(e){} }
+      var orgIds = []; try{ orgIds = agentIdsInMyOrgEffective(u)||[]; }catch(e){}
+      function campSales(a, c, per){ try{ return agentSalesCount(a,{campaign:c,period:per})||0; }catch(e){ return 0; } }
+      function orgCamp(c, per){
+        var t = 0;
+        (DB.agents||[]).forEach(function(a){ if(a && a.active && orgIds.indexOf(a.id)>=0) t += campSales(a,c,per); });
+        return t;
       }
-    } else {
-      // Multi-program — row per program
-      sbProgs.forEach(function(prog){
-        var col = progColor(prog);
-        var goal = progGoal(prog,'month');
-        var progSales = salesForProg(prog);
-        var pct = goal>0?Math.min(100,Math.round((progSales/goal)*100)):0;
-        if(showTeamSplit){
-          var tSales = teamSalesForProg(prog);
-          html += '<div style="border-radius:5px;padding:5px 8px;margin-bottom:4px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:3px">'+prog+'</div>'
-            +teamSplitPanel(progSales,tSales,col,goal)
-            +'</div>';
-        } else {
-          html += '<div style="border-radius:5px;padding:6px 8px;margin-bottom:5px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:3px">'+prog+'</div>'
-            +'<div style="display:flex;align-items:center;gap:7px">'
-            +'<div style="flex-shrink:0">'+sbLED(progSales,28,50,4)+'</div>'
-            +'<div style="flex:1;min-width:0">'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.4rem;color:rgba(255,255,255,.4);margin-bottom:3px">/ '+goal+' goal</div>'
-            +'<div style="background:rgba(255,255,255,.08);border-radius:2px;height:4px;overflow:hidden"><div style="background:'+col+';width:'+pct+'%;height:4px;border-radius:2px"></div></div>'
-            +'</div></div></div>';
+      var _sb = {available:0,sold:0,total:0,expired:0,byCampaign:{},expiredWorst:null,expiringSoon:null,_today:new Date().toISOString().slice(0,10)};
+      try{ _sb = scoreboardInventory(u); }catch(e){}
+      var daysLeftMo = (function(){ var d=new Date(); return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate()-d.getDate(); })();
+      var hdrC = 'text-align:center;font-family:Oswald,Arial,sans-serif;font-size:.56rem;letter-spacing:4px;text-transform:uppercase;color:'+themeBlueLight+';border-bottom:2px solid '+themeBlueMid+';padding-bottom:7px;margin-bottom:11px;font-weight:700';
+      var cardBase = 'background:rgba(255,255,255,.04);border:1px solid '+themeBlueMid+';border-left:4px solid '+themeBlue+';border-radius:0 10px 10px 0;padding:9px 11px;margin-bottom:9px';
+      function prodCard(c, per, showGoal){
+        var mine = campSales(u, c, per), org = orgCamp(c, per);
+        var g = 0; try{ g = progGoal(campaignProgram(c), 'week')||0; }catch(e){}
+        var stock = _sb.byCampaign[c]||0;
+        var pct = g>0 ? Math.min(100, Math.round((mine/g)*100)) : Math.min(100, mine);
+        var dow = (new Date().getDay()||7);
+        var paceMark = Math.round((dow/7)*100);
+        var verdict = '';
+        if(per==='week' && g>0){
+          var expected = g*(dow/7);
+          if(stock<=0 && mine<expected) verdict = '<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;color:#f09595;margin-top:3px">behind pace \u2014 no stock \u26a0</div>';
+          else if(mine >= expected*1.15) verdict = '<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;color:#9fe1cb;margin-top:3px">ahead of pace \u2713\u2713</div>';
+          else if(mine >= expected*0.85) verdict = '<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;color:#9fe1cb;margin-top:3px">on pace \u2713</div>';
+          else verdict = '<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;color:#fac775;margin-top:3px">behind pace</div>';
         }
-      });
-    }
-
-    html += '<div style="'+divSt+'"></div>';
-    html += '<div style="font-family:Oswald,Arial Black,sans-serif;font-size:2rem;font-weight:700;color:'+themeBlue+';line-height:1;margin-bottom:2px">'+daysLeftMon+'</div>';
-    html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.54rem;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.55);margin-bottom:7px">DAYS LEFT</div>';
-    html += clkBadge(daysLeftMon,'DAYS<br>LEFT IN MONTH');
-    html += '</div>';
-
-    // ══════════ CENTER: AVAILABLE INVENTORY ══════════
-    html += '<div style="border-right:2px solid '+themeBlue+';padding:12px 10px 10px;text-align:center;background:'+panBg+';display:flex;flex-direction:column;">';
-    html += '<div style="'+hdrSt+';letter-spacing:1.5px;">AVAILABLE INVENTORY</div>';
-
-    if(!hasLifeline){
-      // ACA / Internet only — no inventory
-      html += '<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px 0">'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.65rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.25)">N/A</div>'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.2);margin-top:4px">Inventory not</div>'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.2)">applicable for</div>'
-        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.2)">this program</div>'
-        +'</div>';
-    } else {
-      // ── Calvin 2026-05-03: Show SOLD breakdown on master dashboard ──
-      // Numbers come from scoreboardInventory(u) — role-aware:
-      //   Field Agent  → only what THEY hold
-      //   Team Leader  → self + team
-      //   Market Mgr   → whole market (themselves + all reports)
-      //   Campaign Mgr → entire org including unassigned pool
-      //   Owner/Inv    → everything
-      // This replaces the older _invForUser-based numbers which over-counted
-      // for managers (everything visible) and under-counted when the user
-      // wasn't "coded" on the campaign.
-      var _sb = (function(){
-        try { return scoreboardInventory(u); }
-        catch(e){ console.warn('[panelBO] scoreboardInventory failed:', e); return {available:0, sold:0, total:0}; }
-      })();
-      var soldCount      = _sb.sold;
-      var availableCount = _sb.available;
-      var sbTotal        = _sb.total;
-
-      // Has Lifeline — show inventory
-      html += '<div style="'+lblSt+'">AVAILABLE</div>';
-      html += '<div style="margin:0 auto 3px;filter:drop-shadow(0 0 14px '+themeBlueLight+') drop-shadow(0 0 30px '+themeBlueMid+')">'+sbLED(availableCount,44,80,6)+'</div>';
-
-      // Sold/Activated breakdown row — this is what the master dashboard was missing
-      if(soldCount > 0 || sbTotal > 0){
-        html += '<div style="display:flex;justify-content:center;gap:14px;margin-bottom:6px;font-family:Oswald,Arial,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase">';
-        html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">TOTAL</div><div style="color:#fff;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+sbTotal+'</div></div>';
-        html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">SOLD</div><div style="color:#5fdc8c;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+soldCount+'</div></div>';
-        if(_sb.expired > 0){
-          html += '<div style="text-align:center"><div style="color:rgba(255,255,255,.4);font-size:.5rem;letter-spacing:2px">EXPIRED</div><div style="color:#f09595;font-family:Oswald,Arial Black,sans-serif;font-size:.92rem;font-weight:700;line-height:1.1">'+_sb.expired+'</div></div>';
-        }
-        html += '</div>';
+        return '<div style="'+cardBase+'">'
+          +'<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;text-transform:uppercase;color:'+themeBlueLight+';font-weight:700">'+_escapeHtml(c)+'</span>'
+          +(showGoal&&g?'<span style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;letter-spacing:1px;color:#ffd98a">G:'+g+'</span>':'')+'</div>'
+          +'<div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:2px">'
+          +'<span style="'+orbF+'font-size:1.15rem;color:#fff;font-weight:700">'+mine+'</span>'
+          +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.56rem;color:rgba(255,255,255,.45)">'+teamWord+' <b style="'+orbF+'color:#fff;font-weight:700">'+org+'</b></span></div>'
+          +'<div style="height:5px;border-radius:100px;background:rgba(255,255,255,.08);margin-top:6px;position:relative">'
+          +'<div style="width:'+pct+'%;height:100%;border-radius:100px;background:linear-gradient(90deg,'+themeBlueDark+','+themeBlueLight+');box-shadow:0 0 8px '+themeBlueMid+'"></div>'
+          +(per==='week'&&g?'<div style="position:absolute;left:'+paceMark+'%;top:-2px;width:2px;height:9px;background:#ffd98a"></div>':'')
+          +'</div>'+verdict+'</div>';
       }
-      // ── Calvin 2026-07-02: per-campaign stock chips (same role scope) ──
-      try{
-        var _campKeys = Object.keys(_sb.byCampaign||{});
-        if(_campKeys.length){
-          html += '<div style="display:flex;justify-content:center;gap:5px;flex-wrap:wrap;margin-bottom:7px">';
-          _campKeys.sort().forEach(function(ck){
-            var shortName = ck.replace('Gen Mobile','GM').replace('TruConnect','TC').replace('Assurance Wireless','AW');
-            html += '<span style="background:rgba(255,255,255,.06);border:1px solid '+themeBlueMid+';border-radius:100px;padding:2px 9px;font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:1px;color:rgba(255,255,255,.7);text-transform:uppercase">'+_escapeHtml(shortName)+' <b style="color:#fff;font-size:.62rem">'+_sb.byCampaign[ck]+'</b></span>';
-          });
-          html += '</div>';
-        }
-        // Expired / expiring alert cards — the buried "expires in" becomes an alarm
-        if(_sb.expiredWorst){
-          var _dEx = Math.round((new Date(((_sb.expiredWorst.expiryDate||'').slice(0,10))+'T00:00:00') - new Date(_sb._today+'T00:00:00'))/86400000);
-          var _cEx = (typeof _deviceChargeCents==='function') ? Math.round(_deviceChargeCents(_sb.expiredWorst)/100) : 0;
-          html += '<div style="margin:0 4px 6px;background:rgba(226,75,74,.16);border:1px solid rgba(226,75,74,.6);border-radius:9px;padding:6px 9px;text-align:left;box-shadow:0 0 14px rgba(226,75,74,.25)">'
-            +'<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;letter-spacing:2px;color:#f7c1c1;text-transform:uppercase">\ud83d\udea8 EXPIRED \u2014 CHARGE PENDING</span><span style="font-family:Oswald,Arial Black,sans-serif;font-size:.8rem;color:#f09595;font-weight:700">'+_dEx+'d</span></div>'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.56rem;color:#ffdada;margin-top:2px">'+_escapeHtml(_sb.expiredWorst.model||'Device')+' \u2026'+_escapeHtml(String(_sb.expiredWorst.imei||'').slice(-4))+(_sb.expiredWorst.holderName?(' \u00b7 '+_escapeHtml(_sb.expiredWorst.holderName)):'')+(_cEx?(' \u2014 activate to erase the $'+_cEx):'')+'</div></div>';
-        }
-        if(_sb.expiringSoon){
-          var _dSo = Math.round((new Date(((_sb.expiringSoon.expiryDate||'').slice(0,10))+'T00:00:00') - new Date(_sb._today+'T00:00:00'))/86400000);
-          if(_dSo <= 14){
-            html += '<div style="margin:0 4px 6px;background:rgba(250,199,117,.1);border:1px solid rgba(250,199,117,.45);border-radius:9px;padding:6px 9px;text-align:left">'
-              +'<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;letter-spacing:2px;color:#fac775;text-transform:uppercase">\u23f3 EXPIRING SOON \u2014 SELL FIRST</span><span style="font-family:Oswald,Arial Black,sans-serif;font-size:.8rem;color:#fac775;font-weight:700">'+_dSo+'d</span></div>'
-              +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.56rem;color:#ffe9c2;margin-top:2px">'+_escapeHtml(_sb.expiringSoon.model||'Device')+' \u2026'+_escapeHtml(String(_sb.expiringSoon.imei||'').slice(-4))+(_sb.expiringSoon.holderName?(' \u00b7 '+_escapeHtml(_sb.expiringSoon.holderName)):'')+'</div></div>';
-          }
-        }
-        // Subtle stock runway — one thin line, only when it computes
-        try{
-          var _wkPace = 0;
-          sbProgs.forEach(function(pp){ _wkPace += (salesForProgWeek(pp)||0); });
-          var _dow = new Date().getDay()||7; var _perDay = _wkPace/_dow;
-          if(availableCount > 0 && _perDay > 0.2){
-            var _runDays = Math.round(availableCount/_perDay);
-            if(_runDays <= 10){
-              html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:1.5px;color:'+(_runDays<=3?'#f09595':'rgba(255,255,255,.45)')+';text-transform:uppercase;margin-bottom:5px">\u2248 '+_runDays+'d of stock at current pace</div>';
-            }
-          }
-        }catch(e){}
-        html += '<div onclick="gotoPanel(\'inv-request\')" style="margin:0 4px 7px;background:linear-gradient(135deg,'+themeBlueMid+','+themeBlue+');border:1px solid '+themeBlueLight+';border-radius:9px;padding:6px;text-align:center;font-family:Oswald,Arial,sans-serif;font-size:.54rem;letter-spacing:2px;color:#fff;cursor:pointer;font-weight:700;text-transform:uppercase">+ REQUEST MORE DEVICES</div>';
-      }catch(e){ console.warn('[scoreboard] center upgrades failed safely:', e); }
-
-      html += '<div style="'+divSt+'"></div>';
-      html += '<div style="margin-top:auto;">';
-      html += '<div style="'+lblSt+';letter-spacing:4px;margin-bottom:5px">EXPIRES IN</div>';
-
-      if(allBatches.length===0){
-        html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.65rem;color:rgba(255,255,255,.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px">NO INVENTORY</div>';
-      } else if(allBatches.length===1){
-        var dr  = invDaysRemaining(allBatches[0].expiryDate,allBatches[0].assignedDate);
-        var drs = dr!==null?String(dr):'\u2014';
-        var urgC = expiryColor(dr);
-        html += '<div style="margin-bottom:10px">'
-          +'<span style="font-family:Oswald,Arial Black,sans-serif;font-size:2rem;font-weight:700;color:'+urgC+'">'+drs+'</span>'
-          +' <span style="font-family:Oswald,Arial,sans-serif;font-size:.9rem;letter-spacing:3px;color:'+urgC+'">DAYS</span></div>';
-        var bp = Math.min(100,Math.round((allBatches[0].count/200)*100));
-        html += '<div style="background:rgba(255,255,255,.1);border-radius:3px;height:11px;margin-bottom:3px;overflow:hidden"><div style="background:linear-gradient(90deg,'+themeBlueMid+','+themeBlueLight+');width:'+bp+'%;height:11px;border-radius:3px"></div></div>';
-        html += '<div style="display:flex;justify-content:flex-end;margin-bottom:2px"><span style="font-family:Oswald,Arial,sans-serif;font-size:.52rem;color:rgba(255,255,255,.5)">200</span></div>';
-        html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.52rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4)">MONTHLY GOAL</div>';
-      } else {
-        var cols = Math.min(allBatches.length,3);
-        html += '<div style="display:grid;grid-template-columns:repeat('+cols+',1fr);gap:4px;margin-bottom:8px">';
-        allBatches.slice(0,cols).forEach(function(b){
-          var dr   = invDaysRemaining(b.expiryDate,b.assignedDate);
-          var drs  = dr!==null?String(dr):'\u2014';
-          var urgC = expiryColor(dr);
-          var pct  = availableCount>0?Math.min(100,Math.round((b.count/availableCount)*100)):0;
-          html += '<div style="background:rgba(21,101,192,.12);border:1px solid '+urgC+';border-radius:5px;padding:5px 3px;text-align:center">'
-            +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:1.2rem;font-weight:700;color:'+urgC+';line-height:1">'+drs+'</div>'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.38rem;text-transform:uppercase;color:rgba(255,255,255,.4);margin-bottom:2px">DAYS</div>'
-            +'<div style="background:rgba(255,255,255,.08);border-radius:2px;height:3px;margin-bottom:3px;overflow:hidden"><div style="background:'+urgC+';width:'+pct+'%;height:3px;border-radius:2px"></div></div>'
-            +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:.85rem;font-weight:700;color:#fff;line-height:1">'+b.count+'</div>'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.36rem;text-transform:uppercase;color:rgba(255,255,255,.35)">DEVICES</div>'
-            +'</div>';
-        });
-        html += '</div>';
-        var totGoal = sbProgs.filter(function(p){return p==='Lifeline';}).length*200 || 200;
-        var totBarPct = totGoal>0?Math.min(100,Math.round((availableCount/totGoal)*100)):0;
-        html += '<div style="background:rgba(255,255,255,.1);border-radius:3px;height:11px;margin-bottom:3px;overflow:hidden"><div style="background:linear-gradient(90deg,'+themeBlueMid+','+themeBlueLight+');width:'+totBarPct+'%;height:11px;border-radius:3px"></div></div>';
-        html += '<div style="display:flex;justify-content:flex-end;margin-bottom:2px"><span style="font-family:Oswald,Arial,sans-serif;font-size:.52rem;color:rgba(255,255,255,.5)">'+totGoal+'</span></div>';
-        html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.52rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.4)">MONTHLY GOAL</div>';
-      }
+      html += '<div style="display:grid;grid-template-columns:1fr 1.15fr 1fr;gap:13px;align-items:start;padding:13px 14px 6px">';
+      // ── LEFT: MONTHLY ──
+      html += '<div><div style="'+hdrC+'">\u2014 MONTHLY PRODUCTION \u2014</div>';
+      myCamps.forEach(function(c){ html += prodCard(c,'month',false); });
+      html += '<div style="margin-top:10px;background:rgba(255,255,255,.03);border:1px solid '+themeBlueMid+';border-radius:10px;padding:9px;text-align:center">'
+        +'<div style="'+orbF+'font-size:1.5rem;color:'+themeBlueLight+';font-weight:700;line-height:1">'+daysLeftMo+'</div>'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;letter-spacing:2px;color:rgba(255,255,255,.4);margin-top:2px;text-transform:uppercase">DAYS LEFT IN MONTH</div></div>';
       html += '</div>';
-    }
-    html += '</div>';
-
-    // ══════════ RIGHT: WEEKLY PRODUCTION ══════════
-    html += '<div style="padding:12px 10px 10px;text-align:center;background:'+panBg+';display:flex;flex-direction:column;">';
-    html += '<div style="'+hdrSt+'">— WEEKLY<br>PRODUCTION —</div>';
-
-    if(!isMultiProg){
-      var wg = progGoal(sbProgs[0],'week');
-      var singleWSales = salesForProgWeek(sbProgs[0]);
-      if(showTeamSplit){
-        var tWSales = teamSalesForProg(sbProgs[0]); // weekly team approx
-        html += teamSplitPanel(singleWSales, tWSales, progColor(sbProgs[0]), wg);
-      } else {
-        html += '<div style="'+lblSt+'">(Goal '+wg+')</div>';
-        html += '<div style="margin:0 auto 3px">'+sbLED(singleWSales,44,80,6)+'</div>';
-        html += '<div style="'+lblSt+';margin-bottom:8px">THIS WEEK</div>';
-      }
-    } else {
-      sbProgs.forEach(function(prog){
-        var col  = progColor(prog);
-        var wg   = progGoal(prog,'week');
-        var wSales = salesForProgWeek(prog);
-        var pct  = wg>0?Math.min(100,Math.round((wSales/wg)*100)):0;
-        var wRule= weekRuleForProg(prog);
-        if(showTeamSplit){
-          var tWSales = teamSalesForProg(prog);
-          html += '<div style="border-radius:5px;padding:5px 8px;margin-bottom:4px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:2px">'+prog+' · G:'+wg+'</div>'
-            +teamSplitPanel(wSales,tWSales,col,wg)
-            +'</div>';
-        } else {
-          html += '<div style="border-radius:5px;padding:6px 8px;margin-bottom:5px;background:rgba(21,101,192,.08);border-left:3px solid '+col+'">'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:'+col+';margin-bottom:3px">'+prog+' · G:'+wg+'</div>'
-            +'<div style="display:flex;align-items:center;gap:7px">'
-            +'<div style="flex-shrink:0">'+sbLED(wSales,28,50,4)+'</div>'
-            +'<div style="flex:1;min-width:0">'
-            +'<div style="background:rgba(255,255,255,.08);border-radius:2px;height:4px;overflow:hidden;margin-bottom:3px"><div style="background:'+col+';width:'+pct+'%;height:4px;border-radius:2px"></div></div>'
-            +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.38rem;color:rgba(255,255,255,.3)">'+wRule+'</div>'
-            +'</div></div></div>';
-        }
+      // ── CENTER: AVAILABLE INVENTORY ──
+      html += '<div style="background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02));border:1px solid '+themeBlueMid+';border-radius:14px;padding:12px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 0 26px '+themeBlueDark+'">';
+      html += '<div style="text-align:center;font-family:Oswald,Arial,sans-serif;font-size:.56rem;letter-spacing:4px;color:'+themeBlueLight+';font-weight:700;border-bottom:2px solid '+themeBlueMid+';padding-bottom:7px;text-transform:uppercase">AVAILABLE INVENTORY</div>';
+      html += '<div style="text-align:center;margin-top:8px"><div style="'+orbF+'font-size:3.6rem;font-weight:700;color:#fff;line-height:1;text-shadow:0 0 24px '+themeBlueLight+', 0 0 70px '+themeBlueMid+'">'+_sb.available+'</div>';
+      html += '<div style="display:flex;justify-content:center;gap:20px;margin-top:7px">'
+        +'<div><div style="font-family:Oswald,Arial,sans-serif;font-size:.42rem;letter-spacing:2px;color:rgba(255,255,255,.4)">TOTAL</div><div style="'+orbF+'font-size:.9rem;color:#fff;font-weight:700">'+_sb.total+'</div></div>'
+        +'<div><div style="font-family:Oswald,Arial,sans-serif;font-size:.42rem;letter-spacing:2px;color:rgba(255,255,255,.4)">SOLD</div><div style="'+orbF+'font-size:.9rem;color:#5dcaa5;font-weight:700">'+_sb.sold+'</div></div>'
+        +'<div><div style="font-family:Oswald,Arial,sans-serif;font-size:.42rem;letter-spacing:2px;color:rgba(255,255,255,.4)">EXPIRED</div><div style="'+orbF+'font-size:.9rem;color:#f09595;font-weight:700">'+(_sb.expired||0)+'</div></div>'
+        +'</div></div>';
+      html += '<div style="display:grid;grid-template-columns:repeat('+Math.max(1,myCamps.length)+',1fr);gap:6px;margin-top:10px">';
+      myCamps.forEach(function(c){
+        var n = _sb.byCampaign[c]||0;
+        var abbr = c.replace('Gen Mobile','GM').replace('TruConnect','TC').replace('Assurance Wireless','AW').replace('Excess Telecom','EX');
+        var zero = n<=0;
+        html += '<div style="background:'+(zero?'rgba(226,75,74,.12)':'rgba(255,255,255,.05)')+';border:1px solid '+(zero?'rgba(240,149,149,.4)':themeBlueMid)+';border-radius:8px;padding:6px;text-align:center">'
+          +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;letter-spacing:1px;color:'+(zero?'#f09595':themeBlueLight)+';text-transform:uppercase">'+_escapeHtml(abbr)+'</div>'
+          +'<div style="'+orbF+'font-size:.9rem;color:'+(zero?'#f09595':'#fff')+';font-weight:700">'+n+'</div></div>';
       });
-    }
+      html += '</div>';
+      if(_sb.expiredWorst){
+        var dEx = Math.round((new Date(((_sb.expiredWorst.expiryDate||'').slice(0,10))+'T00:00:00') - new Date(_sb._today+'T00:00:00'))/86400000);
+        var cEx = 0; try{ cEx = Math.round(_deviceChargeCents(_sb.expiredWorst)/100); }catch(e){}
+        html += '<div style="margin-top:10px;background:rgba(226,75,74,.15);border:1px solid rgba(226,75,74,.55);border-radius:10px;padding:8px 10px;box-shadow:0 0 14px rgba(226,75,74,.22)">'
+          +'<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;letter-spacing:2px;color:#f7c1c1;text-transform:uppercase">\ud83d\udea8 EXPIRED \u2014 CHARGE PENDING</span><span style="'+orbF+'font-size:.85rem;color:#f09595;font-weight:700">'+dEx+'d</span></div>'
+          +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.58rem;color:#ffdada;margin-top:3px">'+_escapeHtml(_sb.expiredWorst.model||'Device')+' \u2026'+_escapeHtml(String(_sb.expiredWorst.imei||'').slice(-4))+(_sb.expiredWorst.holderName?(' \u00b7 '+_escapeHtml(_sb.expiredWorst.holderName)):'')+(cEx?(' \u2014 activate to erase the $'+cEx):'')+'</div></div>';
+      }
+      if(_sb.expiringSoon){
+        var dSo = Math.round((new Date(((_sb.expiringSoon.expiryDate||'').slice(0,10))+'T00:00:00') - new Date(_sb._today+'T00:00:00'))/86400000);
+        if(dSo<=14){
+          html += '<div style="margin-top:7px;background:rgba(250,199,117,.1);border:1px solid rgba(250,199,117,.45);border-radius:10px;padding:7px 10px;display:flex;justify-content:space-between;align-items:center">'
+            +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.56rem;color:#ffe9c2">\u23f3 '+_escapeHtml(_sb.expiringSoon.model||'Device')+' \u2026'+_escapeHtml(String(_sb.expiringSoon.imei||'').slice(-4))+' \u2014 sell first</span>'
+            +'<span style="'+orbF+'font-size:.8rem;color:#fac775;font-weight:700">'+dSo+'d</span></div>';
+        }
+      }
+      html += '<div onclick="gotoPanel(\'inv-request\')" style="margin-top:10px;background:linear-gradient(135deg,'+themeBlueMid+','+themeBlue+');border:1px solid '+themeBlueLight+';border-radius:10px;padding:9px;text-align:center;font-family:Oswald,Arial,sans-serif;font-size:.56rem;letter-spacing:3px;color:#fff;cursor:pointer;font-weight:700;text-transform:uppercase">+ REQUEST MORE DEVICES</div>';
+      html += '</div>';
+      // ── RIGHT: WEEKLY ──
+      html += '<div><div style="'+hdrC+'">\u2014 WEEKLY PRODUCTION \u2014</div>';
+      myCamps.forEach(function(c){ html += prodCard(c,'week',true); });
+      html += '<div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px">';
+      html += '<div style="background:rgba(232,160,32,.12);border:1px solid rgba(245,201,106,.45);border-radius:10px;padding:9px;text-align:center">'
+        +'<div style="'+orbF+'font-size:1.15rem;color:#ffd98a;font-weight:700;line-height:1">\u2605'+myOverallRank+'</div>'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.4rem;letter-spacing:1.5px;color:#c9b183;margin-top:2px;text-transform:uppercase">RANK OF '+totalSalesAgents+' WITH DEVICES</div>'
+        +(isMgrUser&&mgrRank?'<div style="font-family:Oswald,Arial,sans-serif;font-size:.44rem;letter-spacing:1px;color:'+themeBlueLight+';margin-top:3px;text-transform:uppercase">MGR #'+mgrRank+' OF '+mgrPoolSize+'</div>':'')
+        +'</div>';
+      html += '<div style="background:rgba(255,255,255,.03);border:1px solid '+themeBlueMid+';border-radius:10px;padding:9px;text-align:center;display:flex;flex-direction:column;justify-content:center">'
+        +'<div style="'+orbF+'font-size:1.15rem;color:'+themeBlueLight+';font-weight:700;line-height:1">'+daysLeftWk+'</div>'
+        +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.4rem;letter-spacing:1.5px;color:rgba(255,255,255,.4);margin-top:2px;text-transform:uppercase">DAYS LEFT IN WEEK</div></div>';
+      html += '</div></div>';
+      html += '</div>'; // end grid
+      // ── THE CHASE strip ──
+      try{
+        var ahead = (myOverallRank>1 && peerPool[myOverallRank-2]) ? peerPool[myOverallRank-2] : null;
+        var rp3 = (myBaseProgs && myBaseProgs[0]) || 'Lifeline';
+        var chase;
+        if(ahead){
+          var aheadN=0, mineN=0;
+          try{ aheadN=agentSalesCount(ahead,{program:rp3,period:'week'})||0; mineN=agentSalesCount(u,{program:rp3,period:'week'})||0; }catch(e){}
+          var gap = Math.max(1,(aheadN-mineN)+1);
+          var nm = String(ahead.name||'').split(' ');
+          chase = gap+' more sale'+(gap===1?'':'s')+' passes '+_escapeHtml(nm[0]+' '+(nm[1]||'').charAt(0))+'. (#'+(myOverallRank-1)+') \u2014 '+daysLeftWk+' day'+(daysLeftWk===1?'':'s')+' left';
+        } else {
+          chase = '\ud83d\udc51 #1 \u2014 defend the crown \u2014 '+daysLeftWk+' day'+(daysLeftWk===1?'':'s')+' left';
+        }
+        html += '<div style="margin:4px 14px 12px;background:linear-gradient(90deg,'+themeBlueDark+',rgba(255,255,255,.03));border:1px solid '+themeBlueMid+';border-radius:12px;padding:9px 15px;display:flex;justify-content:space-between;align-items:center;gap:10px">'
+          +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;color:'+themeBlueLight+';font-weight:700;flex-shrink:0">\ud83c\udfaf THE CHASE</span>'
+          +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.72rem;color:#fff;font-weight:700;text-align:center">'+chase+'</span>'
+          +'<span style="width:60px;flex-shrink:0"></span></div>';
+      }catch(e){}
+    })();
 
-    html += '<div style="'+divSt+'"></div>';
-    html += '<div style="display:flex;align-items:center;justify-content:center;gap:3px;margin-bottom:2px">'
-      +'<span style="color:'+themeBlue+';font-size:1.3rem;line-height:1">&#9733;</span>'
-      +'<span style="font-family:Oswald,Arial Black,sans-serif;font-size:2rem;font-weight:700;color:'+themeBlue+';line-height:1">'+myOverallRank+'</span>'
-      +'</div>';
-    html += '<div style="font-family:Oswald,Arial,sans-serif;font-size:.54rem;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.55);margin-bottom:7px">RANK IN '+rankProgLabel+' ('+totalSalesAgents+' PEERS)</div>';
-    html += clkBadge(daysLeftWk,'DAYS<br>LEFT IN WEEK');
-    html += '</div>';
-
-    html += '</div>'; // end 3-col
     } // end non-agent 3-column body (agents got _agentBodyV2 above)
     html += '<div style="height:5px;background:linear-gradient(90deg,'+themeBlueDark+','+themeBlue+','+themeBlueLight+','+themeBlue+','+themeBlueDark+')"></div>';
     html += '</div></div>'; // end inner + outer frame
@@ -38268,8 +38246,8 @@ function panelBO(){
         } else {
           clickHandler = '';
         }
-        html += '<div onclick="'+clickHandler+'" style="display:flex;align-items:center;gap:10px;background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:11px 13px;cursor:pointer;transition:all .15s">'
-          +'<span style="font-size:1.3rem;flex-shrink:0">'+l.ic+'</span>'
+        html += '<div onclick="'+clickHandler+'" class="qa-tile" style="--qa:'+col+';justify-content:flex-start">'
+          +'<span class="qa-ic">'+l.ic+'</span>'
           +'<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;font-weight:700;color:var(--brown)">'+l.nm+'</div>'
           +(l.badge?'<div style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:1px;text-transform:uppercase;color:'+col+'">'+l.badge+'</div>':'')
           +'</div></div>';
@@ -39002,7 +38980,7 @@ function startImpersonation(agentId){
   var old=document.getElementById('imp-banner'); if(old) old.remove();
   var banner=document.createElement('div'); banner.id='imp-banner';
   banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99998;background:linear-gradient(90deg,#CC0000,#8b0000);color:white;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:9px 20px;display:flex;align-items:center;justify-content:space-between;box-shadow:0 2px 12px rgba(204,0,0,.4)';
-  banner.innerHTML='<span>VIEWING AS: <strong>'+target.name+'</strong> &middot; '+target.role+' &middot; <span style="opacity:.7;font-size:.65rem">build 2026-06-03-1730</span></span>'
+  banner.innerHTML='<span>VIEWING AS: <strong>'+target.name+'</strong> &middot; '+target.role+' &middot; <span style="opacity:.7;font-size:.65rem">build '+(typeof BUILD_VERSION!=='undefined'?BUILD_VERSION:'')+'</span></span>'
     +'<button onclick="returnToOwnerView()" style="background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.4);color:white;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;padding:5px 14px;border-radius:4px;cursor:pointer">Exit Impersonation</button>';
   document.body.prepend(banner);
   var bo=document.getElementById('backoffice'); if(bo) bo.style.paddingTop='40px';
@@ -64025,6 +64003,29 @@ function agentSalesCount(agent, q){
 }
 if(typeof window!=='undefined') window.agentSalesCount = agentSalesCount;
 
+// ── Calvin 2026-07-02 RANKING LAW ──
+// "It's not fair to rank a person who doesn't have inventory to work."
+// An agent appears on ANY ranking (scoreboard rank, chase, leaderboard,
+// peer counts) ONLY if they hold at least one available device. This is
+// the single source of truth — every ranking reads it.
+function agentHoldsDevices(a){
+  try{
+    if(!a) return false;
+    var pool = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools() : [];
+    for(var i=0;i<pool.length;i++){
+      var d = pool[i];
+      if(!d || d.deletedAt || d.status==='deleted') continue;
+      if(d.status==='sold' || d.status==='activated' || d.soldAt) continue;
+      if(d.holderId===a.id || d.assignedTo===a.id) return true;
+    }
+    return false;
+  }catch(e){ return false; }
+}
+function rankEligible(a){
+  return !!(a && a.active && (typeof isSalesRole!=='function' || isSalesRole(a)) && agentHoldsDevices(a));
+}
+if(typeof window!=='undefined'){ window.agentHoldsDevices = agentHoldsDevices; window.rankEligible = rankEligible; }
+
 // Personal + team rollup for a user, using the SAME org scope as
 // scoreboardInventory (agentIdsInMyOrgEffective). Returns {personal,team,total}.
 function salesRollupForUser(user, q){
@@ -64286,130 +64287,77 @@ function panelLB(){
   var progColors = { Lifeline:'#FF8C5A', Internet:'#60A5FA', ACA:'#6EE7B7' };
   var progIcons  = { Lifeline:'📱', Internet:'💻', ACA:'🏥' };
 
+  // ── Calvin 2026-07-02 ARENA LEADERBOARD (approved design) ──
+  // Gold podium top 3 + glowing ranked rows + YOU highlight. Program tabs,
+  // Lifeline default. Access logic above is unchanged: users only see boards
+  // for programs they're coded on; Owner/Admin/CM see all.
   var h = panelHeader('🏆 Leaderboard');
-
-  // ── Notice banner ──
-  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.18);border-radius:8px;padding:12px 18px;margin-bottom:20px;display:flex;align-items:center;gap:10px">'
-    +'<span style="font-size:1.1rem">⚖️</span>'
-    +'<span style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);letter-spacing:1px">Rankings are <strong>program-specific</strong> — you only see rankings for programs you are active in. Agents compete peer-to-peer within their own program.</span>'
-    +'</div>';
-
-  // ── No programs visible ──
   if(!visiblePrograms.length){
-    h += '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">'
-      +'No program rankings available. Contact your manager to verify your program assignment.</div></div>';
+    h += '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No program boards available for your profile yet.</div></div>';
     return h;
   }
-
-  // ── Per-program leaderboard boards — only render programs this user can see ──
-  visiblePrograms.forEach(function(prog){
-    var agents = (progMap[prog]||[]).slice().sort(function(a,b){return (b.sales||0)-(a.sales||0);});
-    if(!agents.length) return;
-    var col = progColors[prog]||'var(--blue)';
-    var ico = progIcons[prog]||'🏆';
-    var progTotal = agents.reduce(function(s,a){return s+(a.sales||0);},0);
-
-    h += '<div class="bo-card" style="margin-bottom:20px">';
-    h += '<div class="bo-card-head" style="border-left:4px solid '+col+'">'
-      +'<div class="bo-card-title" style="color:'+col+'">'+ico+' '+prog+' Leaderboard</div>'
-      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.68rem;letter-spacing:2px;color:var(--muted)">'
-      +agents.length+' AGENTS &nbsp;·&nbsp; '+progTotal+' TOTAL ENROLLMENTS</div>'
-      +'</div>';
-    h += '<div style="overflow-x:auto"><table><thead><tr>'
-      +'<th style="width:60px">Rank</th><th>Agent</th><th>Role</th>'
-      +'<th style="text-align:right">Sales</th><th>Progress</th>'
-      +'</tr></thead><tbody>';
-
-    var top = agents[0] ? (agents[0].sales||0) : 1;
-    agents.forEach(function(a,i){
-      var rank  = i+1;
-      var medal = rank===1?'🥇':rank===2?'🥈':rank===3?'🥉':'';
-      var pct   = top > 0 ? Math.round(((a.sales||0)/top)*100) : 0;
-      var isMe  = (a.id === u.id);
-      var rowBg = isMe ? 'background:rgba(0,53,148,.07);' : (rank<=3?'background:rgba(255,140,90,.04);':'');
-      h += '<tr style="'+rowBg+'">'
-        +'<td><span style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:'+(rank<=3?col:'var(--muted)')+'">'+medal+(medal?'':('#'+rank))+'</span>'+(isMe?'<span style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;color:var(--blue);margin-left:4px">YOU</span>':'')+'</td>'
-        +'<td style="font-weight:700;color:var(--brown)">'+(isMe?'<strong>'+a.name+'</strong>':a.name)+'</td>'
-        +'<td style="font-size:.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px">'+a.role+'</td>'
-        +'<td style="font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:'+col+';text-align:right">'+(a.sales||0)+'</td>'
-        +'<td style="min-width:90px"><div style="background:var(--sand);border-radius:10px;height:5px;overflow:hidden"><div style="background:'+col+';width:'+pct+'%;height:5px;border-radius:10px"></div></div></td>'
-        +'</tr>';
-    });
-    h += '</tbody></table></div></div>';
+  var curProg = (window._lbProg && visiblePrograms.indexOf(window._lbProg)>=0) ? window._lbProg : visiblePrograms[0];
+  window._lbProg = curProg;
+  // tabs
+  h += '<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">';
+  visiblePrograms.forEach(function(pg){
+    var on = pg===curProg;
+    h += '<button onclick="window._lbProg=this.dataset.pg;gotoPanel(\'lb\')" data-pg="'+_escapeHtml(pg)+'" style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;padding:8px 20px;border-radius:100px;cursor:pointer;font-weight:700;'+(on?'background:linear-gradient(135deg,var(--blue),#1b56c9);color:#fff;border:none;box-shadow:0 6px 14px rgba(0,53,148,.3)':'background:#fff;color:var(--muted);border:1px solid var(--border)')+'">'+_escapeHtml(pg)+'</button>';
   });
-
-  // ── MM vs MM Board — restricted to MM / office / owner only ──
-  if(canSeeMMBoard){
-    var mmAgents = DB.agents.filter(function(a){
-      return a.active && a.role==='Market Manager';
-    });
-
-    if(mmAgents.length){
-      var mmData = mmAgents.map(function(mm){
-        var myPersonal = mm.sales||0;
-        var teamAgents = DB.agents.filter(function(a){
-          return a.active && isSalesRole(a) && a.id!==mm.id &&
-            (a.marketManagerId===mm.id || a.campaignManagerId===mm.id);
-        });
-        var teamTotal = teamAgents.reduce(function(s,a){return s+(a.sales||0);},0);
-        var progs = Array.isArray(mm.programs)&&mm.programs.length ? mm.programs : (mm.program?[mm.program]:[]);
-        return {
-          agent: mm,
-          personal: myPersonal,
-          teamTotal: teamTotal,
-          marketTotal: myPersonal + teamTotal,
-          teamCount: teamAgents.length,
-          progs: progs
-        };
-      }).sort(function(a,b){return b.marketTotal - a.marketTotal;});
-
-      h += '<div class="bo-card" style="margin-bottom:20px;border:2px solid rgba(124,58,237,.35)">';
-      h += '<div class="bo-card-head" style="border-left:4px solid #7c3aed">'
-        +'<div class="bo-card-title" style="color:#7c3aed">🏛️ Market Manager Rankings</div>'
-        +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;letter-spacing:2px;color:var(--muted)">VISIBLE TO MM · OFFICE DEPARTMENTS · LEADERSHIP ONLY</div>'
-        +'</div>';
-      h += '<div style="padding:10px 18px 6px;background:rgba(124,58,237,.04);border-bottom:1px solid rgba(124,58,237,.12)">'
-        +'<span style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">Market Total = MM\'s personal sales + all agents under their market. Each MM ranked peer-to-peer.</span>'
-        +'</div>';
-      h += '<div style="overflow-x:auto"><table><thead><tr>'
-        +'<th>Rank</th><th>Market Manager</th><th>Programs</th>'
-        +'<th style="text-align:right">Personal</th>'
-        +'<th style="text-align:right">Team</th>'
-        +'<th style="text-align:right">Market Total</th>'
-        +'<th>Progress</th>'
-        +'</tr></thead><tbody>';
-
-      var mmTop = mmData[0] ? mmData[0].marketTotal : 1;
-      mmData.forEach(function(d,i){
-        var rank  = i+1;
-        var medal = rank===1?'🥇':rank===2?'🥈':rank===3?'🥉':'';
-        var pct   = mmTop > 0 ? Math.round((d.marketTotal/mmTop)*100) : 0;
-        var isMe  = (d.agent.id === u.id);
-        var rowBg = isMe ? 'background:rgba(124,58,237,.08);' : (rank<=3?'background:rgba(124,58,237,.03);':'');
-        var progBadges = d.progs.length
-          ? d.progs.map(function(p){
-              var bc = {Lifeline:'#FF8C5A',Internet:'#60A5FA',ACA:'#6EE7B7'}[p]||'#888';
-              return '<span style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:1px;background:'+bc+'22;color:'+bc+';border:1px solid '+bc+'55;padding:2px 7px;border-radius:100px;margin-right:3px">'+p+'</span>';
-            }).join('')
-          : '<span style="font-size:.65rem;color:var(--muted)">—</span>';
-        h += '<tr style="'+rowBg+'">'
-          +'<td><span style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:'+(rank<=3?'#7c3aed':'var(--muted)')+'">'+medal+(medal?'':('#'+rank))+'</span>'+(isMe?'<span style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;color:#7c3aed;margin-left:4px">YOU</span>':'')+'</td>'
-          +'<td style="font-weight:700;color:var(--brown)">'+(isMe?'<strong>'+d.agent.name+'</strong>':d.agent.name)
-            +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;color:var(--muted)">'+d.teamCount+' agents in market</div></td>'
-          +'<td>'+progBadges+'</td>'
-          +'<td style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--muted);text-align:right">'+d.personal+'</td>'
-          +'<td style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;color:var(--muted);text-align:right">'+d.teamTotal+'</td>'
-          +'<td style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;color:#7c3aed;text-align:right;font-weight:700">'+d.marketTotal+'</td>'
-          +'<td style="min-width:90px"><div style="background:var(--sand);border-radius:10px;height:5px;overflow:hidden"><div style="background:#7c3aed;width:'+pct+'%;height:5px;border-radius:10px"></div></div></td>'
-          +'</tr>';
-      });
-      h += '</tbody></table></div></div>';
-    }
+  h += '</div>';
+  // ranked list: weekly sales in program
+  var ranked = (progMap[curProg]||[]).filter(function(a){
+    // Calvin's ranking law: no devices in your name, not on the board.
+    return rankEligible(a);
+  }).map(function(a){
+    var n=0; try{ n=agentSalesCount(a,{program:curProg,period:'week'})||0; }catch(e){}
+    return {a:a,n:n};
+  }).sort(function(x,y){ return y.n-x.n || String(x.a.name).localeCompare(String(y.a.name)); });
+  var lead = ranked.length? Math.max(1, ranked[0].n) : 1;
+  var meId = u ? u.id : -1;
+  // arena container (dark)
+  h += '<div style="background:linear-gradient(160deg,#0b1022,#0d1b45);border-radius:18px;padding:22px 20px;box-shadow:0 14px 34px rgba(13,27,69,.35)">';
+  h += '<div style="text-align:center;font-family:Oswald,Arial,sans-serif;font-size:.62rem;letter-spacing:4px;color:#8fc2ff;text-transform:uppercase;margin-bottom:16px">'+_escapeHtml(curProg)+' — THIS WEEK</div>';
+  if(!ranked.length){
+    h += '<div style="padding:30px;text-align:center;color:rgba(255,255,255,.4);font-family:Barlow Condensed,sans-serif">No agents on this board yet.</div></div>';
+    return h;
   }
-
+  // podium
+  var med=[{c:'linear-gradient(140deg,#f5c96a,#e8a020)',t:'#5a3c05',m:'🥇',ring:'rgba(245,201,106,.5)'},
+           {c:'linear-gradient(140deg,#e6e9f0,#b9c2d4)',t:'#3c465c',m:'🥈',ring:'rgba(200,210,228,.4)'},
+           {c:'linear-gradient(140deg,#e0a37a,#b96a3a)',t:'#4d2a10',m:'🥉',ring:'rgba(224,163,122,.4)'}];
+  var order=[1,0,2]; // silver, gold, bronze visual order
+  h += '<div style="display:grid;grid-template-columns:1fr 1.15fr 1fr;gap:10px;align-items:end;max-width:640px;margin:0 auto 18px">';
+  order.forEach(function(idx){
+    var r=ranked[idx]; if(!r){ h+='<div></div>'; return; }
+    var m=med[idx]; var tall = idx===0;
+    var isMe = r.a.id===meId;
+    h += '<div style="background:rgba(255,255,255,.05);border:1px solid '+(isMe?'#8fc2ff':m.ring)+';border-radius:14px;padding:'+(tall?'18px 12px':'12px 10px')+';text-align:center;box-shadow:0 0 20px '+m.ring+'">'
+      +'<div style="font-size:'+(tall?'1.6rem':'1.2rem')+'">'+m.m+'</div>'
+      +'<div style="width:'+(tall?'46px':'38px')+';height:'+(tall?'46px':'38px')+';border-radius:50%;background:'+m.c+';margin:6px auto;display:flex;align-items:center;justify-content:center;font-family:Oswald,Arial Black,sans-serif;font-weight:700;color:'+m.t+';font-size:'+(tall?'1rem':'.8rem')+'">'+_escapeHtml(String(r.a.name||'?').split(' ').map(function(x){return x.charAt(0);}).join('').slice(0,2).toUpperCase())+'</div>'
+      +'<div style="font-family:Oswald,Arial,sans-serif;font-size:'+(tall?'.8rem':'.68rem')+';color:#fff;font-weight:700">'+_escapeHtml(r.a.name||'')+(isMe?' <span style="color:#8fc2ff">(YOU)</span>':'')+'</div>'
+      +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:'+(tall?'1.5rem':'1.1rem')+';color:#ffd98a;font-weight:700;line-height:1.2">'+r.n+'</div>'
+      +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.46rem;letter-spacing:2px;color:rgba(255,255,255,.4);text-transform:uppercase">sales</div>'
+      +'</div>';
+  });
+  h += '</div>';
+  // rows 4+
+  h += '<div style="display:flex;flex-direction:column;gap:7px;max-width:760px;margin:0 auto">';
+  ranked.forEach(function(r,i){
+    if(i<3) return;
+    var isMe = r.a.id===meId;
+    var pct = Math.max(3, Math.round((r.n/lead)*100));
+    var mv=''; try{ if(typeof rankMovementFor==='function'){ var d=rankMovementFor(r.a.id, curProg, i+1); if(d>0) mv='<span style="color:#5dcaa5;font-size:.62rem">\u25b2'+d+'</span>'; else if(d<0) mv='<span style="color:#f09595;font-size:.62rem">\u25bc'+(-d)+'</span>'; } }catch(e){}
+    h += '<div style="display:flex;align-items:center;gap:12px;background:'+(isMe?'rgba(56,138,221,.16)':'rgba(255,255,255,.04)')+';border:1px solid '+(isMe?'#8fc2ff':'rgba(255,255,255,.08)')+';border-radius:10px;padding:8px 14px">'
+      +'<div style="width:34px;text-align:center;font-family:Oswald,Arial Black,sans-serif;font-size:.85rem;color:'+(isMe?'#8fc2ff':'rgba(255,255,255,.55)')+';font-weight:700">#'+(i+1)+'</div>'
+      +'<div style="flex:1;min-width:0"><div style="font-family:Oswald,Arial,sans-serif;font-size:.74rem;color:#fff;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+_escapeHtml(r.a.name||'')+(isMe?' <span style="color:#8fc2ff">(YOU)</span>':'')+' '+mv+'</div>'
+      +'<div style="height:5px;border-radius:100px;background:rgba(255,255,255,.08);margin-top:4px"><div style="width:'+pct+'%;height:100%;border-radius:100px;background:linear-gradient(90deg,#378add,#8fc2ff);box-shadow:0 0 8px rgba(56,138,221,.6)"></div></div></div>'
+      +'<div style="font-family:Oswald,Arial Black,sans-serif;font-size:.95rem;color:#ffd98a;font-weight:700">'+r.n+'</div>'
+      +'</div>';
+  });
+  h += '</div></div>';
   return h;
 }
-
 function panelLinks(){
   var u = DB.current;
   var myLinks = (u.links||[]).map(function(lid){
@@ -82648,6 +82596,11 @@ body { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
 
 /* ── modals float higher ── */
 .bo-modal-card, [id$="Modal"] > div > div { border-radius: 18px; }
+
+/* ── make the canvas gradient actually show through the back office ── */
+#boBody, .bo-body { background: transparent !important; }
+.bo-page, #backofficePage, .bo-shell { background: transparent !important; }
+html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%) fixed; }
 
 /* ── quick-access tiles (Calvin 2026-07-02: pic-2 tile language) ── */
 .qa-tile{
