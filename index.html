@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.01.1900';
+var BUILD_VERSION = '2026.07.01.2030';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -7905,6 +7905,10 @@ function payrollBuildWeeklyRollup(periodEnd){
     result.totals.carryoverAppliedCents += a.carryoverAppliedCents;
     result.totals.netCents += a.netCents;
   });
+  // ── Calvin 2026-07-01: expired-device charges + 7-day reimbursements ──
+  // Applied AFTER all agents are built (the manager-covers-shortfall cascade
+  // needs both people's nets). Committed weeks rebuild from payment history.
+  try{ if(typeof _expApplyToRollup === 'function') _expApplyToRollup(result, periodEnd); }catch(e){ console.warn('[rollup] expired-device apply failed:', e); }
   return result;
 }
 
@@ -21317,6 +21321,7 @@ async function loadFromSupabase(){
         // Calvin 2026-06-10 — failed-BG cost ledger + weekly invoices
         if(s.key==='failed_bg_costs'      && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) FAILED_BG_COSTS = v;}catch(e){} }
         if(s.key==='payroll_obligations'  && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)){ PAYROLL_OBLIGATIONS.length=0; Array.prototype.push.apply(PAYROLL_OBLIGATIONS, v); }}catch(e){} }
+        if(s.key==='expired_device_charges' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)){ EXPIRED_DEVICE_CHARGES.length=0; Array.prototype.push.apply(EXPIRED_DEVICE_CHARGES, v); }}catch(e){} }
         if(s.key==='obligation_commits'   && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object'){ Object.keys(OBLIGATION_COMMITS).forEach(function(k){delete OBLIGATION_COMMITS[k];}); Object.keys(v).forEach(function(k){OBLIGATION_COMMITS[k]=v[k];}); }}catch(e){} }
         if(s.key==='bg_fail_invoices'     && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) BG_FAIL_INVOICES = v;}catch(e){} }
         // Calvin 2026-06-10 v1330 — applicants pre-BG
@@ -21457,6 +21462,7 @@ async function loadFromSupabase(){
     if(typeof loadFailedBgCostsFromLocal === 'function'){
       try{ loadFailedBgCostsFromLocal(); }catch(e){}
       try{ loadObligationsFromLocal(); }catch(e){}
+      try{ loadExpiredChargesFromLocal(); }catch(e){}
     }
     // Calvin 2026-06-10 v1330: load applicants ledger
     if(typeof loadApplicantsFromLocal === 'function'){
@@ -25594,11 +25600,227 @@ function payrollCommitObligations(periodEnd){
       if(!paidThisWeek){ o.arrearsCents = (o.arrearsCents||0) + (o.weeklyAmountCents||0); }
     });
   });
+  // Expired-device charges + reimbursements commit on the same finalize click
+  try{ if(typeof _expCommitWeek === 'function') _expCommitWeek(periodEnd, rollup); }catch(e){ console.warn('[commit] expired-device commit failed:', e); }
   OBLIGATION_COMMITS[periodEnd] = { committedAt: new Date().toISOString(), by: u.name || '' };
   saveObligations();
   return true;
 }
 if(typeof window!=='undefined') window.payrollCommitObligations = payrollCommitObligations;
+
+// ════════════════════════════════════════════════════════════════════════
+//  EXPIRED DEVICE CHARGES — Calvin 2026-07-01 locked spec
+//  • Trigger: the TEAM expiry date on the device (our cushion date, NOT the
+//    carrier's) passes and the device is not activated/sold.
+//  • Charge = that device's own LOCKED cost from upload (devCost).
+//  • Charged to the HOLDER first; whatever their check can't cover, their
+//    DIRECT MANAGER picks up; any leftover carries as debt (manager's ledger).
+//  • Lands on the FIRST AVAILABLE payroll after expiry.
+//  • If the device is activated within 7 DAYS of its expiry date, each payer
+//    is reimbursed EXACTLY what they paid (agent $50 / mgr $25 on a $75
+//    device), on the payroll for the week it was activated.
+// ════════════════════════════════════════════════════════════════════════
+var EXPIRED_DEVICE_CHARGES = [];
+function saveExpiredCharges(){
+  try{ localStorage.setItem('wmam_expired_device_charges', JSON.stringify(EXPIRED_DEVICE_CHARGES)); }catch(e){}
+  try{ if(typeof supaClient!=='undefined' && supaClient){ supaClient.from('app_settings').upsert([{key:'expired_device_charges', value:JSON.stringify(EXPIRED_DEVICE_CHARGES)}]).then(function(){}).catch(function(){}); } }catch(e){}
+}
+function loadExpiredChargesFromLocal(){
+  try{ var c = localStorage.getItem('wmam_expired_device_charges'); if(c){ var arr=JSON.parse(c)||[]; EXPIRED_DEVICE_CHARGES.length=0; Array.prototype.push.apply(EXPIRED_DEVICE_CHARGES, arr); } }catch(e){}
+}
+if(typeof window!=='undefined'){ window.EXPIRED_DEVICE_CHARGES=EXPIRED_DEVICE_CHARGES; window.saveExpiredCharges=saveExpiredCharges; window.loadExpiredChargesFromLocal=loadExpiredChargesFromLocal; }
+
+function _deviceChargeCents(d){
+  var v = d && (d.devCost != null ? d.devCost : (d.invoiceCost != null ? d.invoiceCost : d.deviceCost));
+  var n = (typeof v === 'number') ? v : parseFloat(String(v||'').replace(/[^0-9.]/g,''));
+  return Math.round((n||0) * 100);
+}
+function _expAddDays(dateStr, n){
+  var d = new Date(dateStr+'T00:00:00'); d.setDate(d.getDate()+n);
+  return d.toISOString().slice(0,10);
+}
+function _expDirectMgrOf(agentId){
+  var ag = (DB.agents||[]).find(function(a){ return a && a.id === agentId; });
+  if(!ag) return null;
+  var mid = ag.teamLeaderId || ag.marketManagerId || null;
+  if(!mid) return null;
+  return (DB.agents||[]).find(function(a){ return a && a.id === mid && a.active; }) || null;
+}
+
+// Sweep all device pools: create charges for newly expired devices and flag
+// within-7-day activations for reimbursement. Idempotent per device.
+function expiredDeviceSweep(){
+  var today = new Date().toISOString().slice(0,10);
+  var pools = [];
+  if(typeof GM_INVENTORY!=='undefined') pools.push(['Gen Mobile', GM_INVENTORY]);
+  if(typeof TC_INVENTORY!=='undefined') pools.push(['TruConnect', TC_INVENTORY]);
+  if(typeof AW_INVENTORY!=='undefined') pools.push(['Assurance Wireless', AW_INVENTORY]);
+  var created = 0, flagged = 0;
+  pools.forEach(function(p){
+    var campaign = p[0];
+    (p[1]||[]).forEach(function(d){
+      if(!d || d.deletedAt) return;
+      var key = String(d.id || d.imei || '');
+      if(!key) return;
+      var exp = (d.expiryDate||'').slice(0,10);
+      var existing = EXPIRED_DEVICE_CHARGES.find(function(c){ return c && c.deviceKey === key; });
+      var actDate = (d.activatedAt||'').slice(0,10);
+      var isSoldOrActive = !!actDate || d.status === 'sold' || d.status === 'activated';
+      // Reimbursement flag: charged device later activated within 7 days of OUR expiry
+      if(existing && actDate && existing.status !== 'reimbursed' && existing.status !== 'waived'){
+        if(actDate <= _expAddDays(existing.expiredOn, 7)){ if(!existing.reimburseDue){ existing.reimburseDue = true; existing.activatedAt = actDate; flagged++; } }
+      }
+      if(existing) return;
+      // New charge: expired (team date passed), not activated before/on expiry, held by someone
+      if(!exp || exp >= today) return;
+      if(isSoldOrActive && actDate && actDate <= exp) return;      // activated in time — no charge
+      var holderId = d.holderId || d.assignedTo || null;
+      if(!holderId) return;                                        // office/unassigned stock — no personal charge
+      var amount = _deviceChargeCents(d);
+      if(amount <= 0) return;
+      var holder = (DB.agents||[]).find(function(a){ return a && a.id === holderId; });
+      var mgr = _expDirectMgrOf(holderId);
+      EXPIRED_DEVICE_CHARGES.push({
+        id:'exp-'+Date.now()+'-'+Math.floor(Math.random()*10000),
+        deviceKey:key, imei:d.imei||'', model:d.model||'', campaign:campaign,
+        holderId:holderId, holderName:(holder&&holder.name)||d.holderName||d.assignedToName||('Agent #'+holderId),
+        mgrId:(mgr&&mgr.id)||null, mgrName:(mgr&&mgr.name)||'',
+        amountCents:amount, expiredOn:exp, createdAt:new Date().toISOString(),
+        status:'active',            // active | collected | reimbursed | waived
+        reimburseDue:false, activatedAt:(isSoldOrActive?actDate:null)||null,
+        collected:[],               // {payerId,payerName,role:'holder'|'manager',amountCents,periodEnd}
+        reimbursed:[]               // {payerId,amountCents,periodEnd}
+      });
+      // If activated AFTER expiry but within the 7-day window, flag immediately
+      var justPushed = EXPIRED_DEVICE_CHARGES[EXPIRED_DEVICE_CHARGES.length-1];
+      if(actDate && actDate <= _expAddDays(exp,7)){ justPushed.reimburseDue = true; }
+      created++;
+    });
+  });
+  if(created || flagged) saveExpiredCharges();
+  return {created:created, flagged:flagged};
+}
+if(typeof window!=='undefined') window.expiredDeviceSweep = expiredDeviceSweep;
+
+function _expCollectedSum(c){ return (c.collected||[]).reduce(function(s,x){return s+(x.amountCents||0);},0); }
+function _expReimbursedSum(c){ return (c.reimbursed||[]).reduce(function(s,x){return s+(x.amountCents||0);},0); }
+
+// Applies expired-device lines to a built rollup (called from
+// payrollBuildWeeklyRollup). Pure for uncommitted weeks; committed weeks
+// rebuild from the collected/reimbursed history so stubs never shift.
+function _expApplyToRollup(result, periodEnd){
+  if(typeof EXPIRED_DEVICE_CHARGES === 'undefined' || !EXPIRED_DEVICE_CHARGES.length) return;
+  var committed = (typeof OBLIGATION_COMMITS !== 'undefined') && OBLIGATION_COMMITS[periodEnd];
+  var addLine = function(aid, line, delta){
+    var a = result.agents[aid]; if(!a) return 0;
+    a.lines.push(line); a.netCents += delta;
+    if(delta < 0){ a.obligationsCents = (a.obligationsCents||0) - delta; result.totals.obligationsCents = (result.totals.obligationsCents||0) - delta; }
+    result.totals.netCents += delta;
+    return delta;
+  };
+  EXPIRED_DEVICE_CHARGES.forEach(function(c){
+    if(!c || c.status === 'waived') return;
+    var tag = c.model + (c.imei ? ' \u00b7 \u2026'+String(c.imei).slice(-4) : '');
+    if(committed){
+      (c.collected||[]).filter(function(x){return x.periodEnd===periodEnd;}).forEach(function(x){
+        addLine(x.payerId, {carrier:'Expired Device: '+tag+(x.role==='manager'?(' (covering '+c.holderName+')'):''), weekId:null, grossCents:-x.amountCents, chargebackCents:0, kind:'expired', chargeId:c.id, payerRole:x.role}, -x.amountCents);
+      });
+      (c.reimbursed||[]).filter(function(x){return x.periodEnd===periodEnd;}).forEach(function(x){
+        addLine(x.payerId, {carrier:'Reimbursement \u2014 Activated in time: '+tag, weekId:null, grossCents:x.amountCents, chargebackCents:0, kind:'expired-reimb', chargeId:c.id}, x.amountCents);
+      });
+      return;
+    }
+    // Reimbursements due (activated within 7 days): pay back each payer their share
+    if(c.reimburseDue && _expCollectedSum(c) > _expReimbursedSum(c)){
+      var byPayer = {};
+      (c.collected||[]).forEach(function(x){ byPayer[x.payerId] = (byPayer[x.payerId]||0) + x.amountCents; });
+      (c.reimbursed||[]).forEach(function(x){ byPayer[x.payerId] = (byPayer[x.payerId]||0) - x.amountCents; });
+      Object.keys(byPayer).forEach(function(pid){
+        if(byPayer[pid] > 0 && result.agents[pid]){
+          addLine(pid, {carrier:'Reimbursement \u2014 Activated in time: '+tag, weekId:null, grossCents:byPayer[pid], chargebackCents:0, kind:'expired-reimb', chargeId:c.id}, byPayer[pid]);
+        }
+      });
+      return;
+    }
+    if(c.status !== 'active' || c.reimburseDue) return;
+    // Collection: holder first, direct manager covers the shortfall
+    var due = c.amountCents - _expCollectedSum(c);
+    if(due <= 0) return;
+    var h = result.agents[c.holderId];
+    if(h){
+      var a1 = Math.min(due, Math.max(0, h.netCents));
+      if(a1 > 0){ addLine(c.holderId, {carrier:'Expired Device: '+tag, weekId:null, grossCents:-a1, chargebackCents:0, kind:'expired', chargeId:c.id, payerRole:'holder'}, -a1); due -= a1; }
+    }
+    if(due > 0 && c.mgrId && result.agents[c.mgrId]){
+      var m = result.agents[c.mgrId];
+      var a2 = Math.min(due, Math.max(0, m.netCents));
+      if(a2 > 0){ addLine(c.mgrId, {carrier:'Expired Device: '+tag+' (covering '+c.holderName+')', weekId:null, grossCents:-a2, chargebackCents:0, kind:'expired', chargeId:c.id, payerRole:'manager'}, -a2); }
+    }
+  });
+}
+if(typeof window!=='undefined') window._expApplyToRollup = _expApplyToRollup;
+
+// Commit expired-device lines for a finalized week: record who actually paid
+// what, carry any remainder as debt on the manager's ledger (or holder's if no
+// manager), and mark reimbursements paid. Called by payrollCommitObligations.
+function _expCommitWeek(periodEnd, rollup){
+  Object.keys(rollup.agents).forEach(function(aid){
+    (rollup.agents[aid].lines||[]).forEach(function(L){
+      var c = L.chargeId && EXPIRED_DEVICE_CHARGES.find(function(x){ return x && x.id === L.chargeId; });
+      if(!c) return;
+      if(L.kind === 'expired' && L.grossCents < 0){
+        c.collected.push({payerId:parseInt(aid,10), payerName:rollup.agents[aid].agentName, role:L.payerRole||'holder', amountCents:Math.abs(L.grossCents), periodEnd:periodEnd});
+      }
+      if(L.kind === 'expired-reimb' && L.grossCents > 0){
+        c.reimbursed.push({payerId:parseInt(aid,10), amountCents:L.grossCents, periodEnd:periodEnd});
+      }
+    });
+  });
+  EXPIRED_DEVICE_CHARGES.forEach(function(c){
+    if(!c || c.status === 'waived') return;
+    if(c.reimburseDue){
+      if(_expReimbursedSum(c) >= _expCollectedSum(c) && _expCollectedSum(c) > 0){ c.status = 'reimbursed'; }
+      return;
+    }
+    var remaining = c.amountCents - _expCollectedSum(c);
+    if(remaining <= 0 && c.status === 'active'){ c.status = 'collected'; }
+    else if(remaining > 0 && c.status === 'active' && !c.debtPosted){
+      // Neither check could fully cover it this week → remainder carries as
+      // debt (manager is the backstop; holder if no manager). The debt ledger
+      // collects it on future checks automatically.
+      var debtorId = c.mgrId || c.holderId;
+      if(debtorId && typeof payrollAddDebt === 'function'){
+        payrollAddDebt(debtorId, remaining, 'Expired Device remainder: '+c.model+' \u00b7 \u2026'+String(c.imei).slice(-4)+' (holder: '+c.holderName+')', 'exp:'+c.id);
+        c.collected.push({payerId:debtorId, payerName:(c.mgrId?c.mgrName:c.holderName), role:(c.mgrId?'manager':'holder'), amountCents:remaining, periodEnd:periodEnd, viaDebtLedger:true});
+        c.debtPosted = true;
+        c.status = 'collected';
+      }
+    }
+  });
+  saveExpiredCharges();
+}
+if(typeof window!=='undefined') window._expCommitWeek = _expCommitWeek;
+
+// K-Anna/Owner can waive a charge entirely.
+function expChargeWaive(chargeId){
+  var u = DB.current || {};
+  var canDo = (typeof isOwner==='function' && isOwner(u)) || (typeof isPayroll==='function' && isPayroll(u));
+  if(!canDo){ alert('Only Owner or Payroll can waive a charge.'); return false; }
+  var c = EXPIRED_DEVICE_CHARGES.find(function(x){ return x && x.id === chargeId; });
+  if(!c) return false;
+  c.status = 'waived'; c.waivedBy = u.name || ''; c.waivedAt = new Date().toISOString();
+  saveExpiredCharges();
+  if(typeof gotoPanel === 'function' && window._currentPanelId){ try{ gotoPanel(window._currentPanelId); }catch(e){} }
+  return true;
+}
+if(typeof window!=='undefined') window.expChargeWaive = expChargeWaive;
+
+// Boot sweep (delayed so inventory is loaded first)
+(function(){
+  if(typeof window === 'undefined' || window._expSweepScheduled) return;
+  window._expSweepScheduled = true;
+  try{ setTimeout(function(){ try{ var r = expiredDeviceSweep(); if(r.created||r.flagged) console.log('[expiredDeviceSweep] created='+r.created+' reimburse-flagged='+r.flagged); }catch(e){} }, 9000); }catch(e){}
+})();
 
 
 // Compute the Sunday-Saturday window containing a given date (defaults to today).
@@ -77412,6 +77634,28 @@ function panelPayrollLoans(){
     h += '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">\u2705 Paid / Stopped (recent)</div></div>';
     h += '<div style="padding:0 8px 12px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.76rem">'+renderRows(done,false)+'</table></div></div>';
   }
+  // ── Expired-device auto-charges (rules-driven) ──
+  try{ if(typeof expiredDeviceSweep === 'function') expiredDeviceSweep(); }catch(e){}
+  var expAll = (typeof EXPIRED_DEVICE_CHARGES!=='undefined' ? EXPIRED_DEVICE_CHARGES : []).slice().sort(function(a,b){ return (b.createdAt||'').localeCompare(a.createdAt||''); }).slice(0,40);
+  h += '<div class="bo-card" style="margin-top:18px;border-left:4px solid #B45309"><div class="bo-card-head"><div class="bo-card-title">\u23f3 Expired Device Charges (automatic)</div></div>';
+  h += '<div style="padding:12px 18px;font-family:Barlow Condensed,sans-serif;font-size:.74rem;color:var(--brown);line-height:1.5">Devices past their <strong>team expiry date</strong> (our cushion, not the carrier\'s) that were never activated auto-charge the holder at the device\'s locked cost; the direct manager covers any shortfall. Activate within <strong>7 days of expiry</strong> and every payer is reimbursed their exact share automatically.</div>';
+  h += '<div style="padding:0 8px 12px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.74rem">';
+  h += '<tr style="text-align:left;color:var(--muted);font-size:.62rem;letter-spacing:1px;text-transform:uppercase"><th style="padding:6px 10px">Device</th><th style="padding:6px 10px">Holder</th><th style="padding:6px 10px">Backstop Mgr</th><th style="padding:6px 10px;text-align:right">Charge</th><th style="padding:6px 10px">Status</th><th style="padding:6px 10px"></th></tr>';
+  if(!expAll.length){ h += '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">No expired-device charges. \u2713</td></tr>'; }
+  expAll.forEach(function(c){
+    var col = (c.collected||[]).reduce(function(sm,x){return sm+(x.amountCents||0);},0);
+    var st = c.status==='waived' ? 'Waived by '+_escapeHtml(c.waivedBy||'') : c.reimburseDue ? (c.status==='reimbursed'?'\u2713 Reimbursed (activated in time)':'\u21a9 Reimbursement due') : c.status==='collected' ? 'Collected' : (col>0 ? ('Collecting \u2014 $'+(col/100).toFixed(2)+' so far') : 'Pending next payroll');
+    var stCol = c.status==='waived' ? '#6B7280' : c.reimburseDue ? '#16a34a' : c.status==='collected' ? '#B45309' : '#dc2626';
+    h += '<tr style="border-top:1px solid var(--border)'+(c.status==='waived'?';opacity:.55':'')+'">';
+    h += '<td style="padding:6px 10px;font-weight:700">'+_escapeHtml(c.model||'')+' <span style="color:var(--muted);font-weight:400">\u2026'+_escapeHtml(String(c.imei||'').slice(-4))+'</span><div style="font-size:.64rem;color:var(--muted)">'+_escapeHtml(c.campaign||'')+' \u00b7 expired '+_escapeHtml(c.expiredOn||'')+'</div></td>';
+    h += '<td style="padding:6px 10px">'+_escapeHtml(c.holderName||'')+'</td>';
+    h += '<td style="padding:6px 10px">'+_escapeHtml(c.mgrName||'\u2014')+'</td>';
+    h += '<td style="padding:6px 10px;text-align:right;font-weight:700;color:#dc2626">$'+((c.amountCents||0)/100).toFixed(2)+'</td>';
+    h += '<td style="padding:6px 10px;color:'+stCol+'">'+st+'</td>';
+    h += '<td style="padding:6px 10px;text-align:right">'+((c.status==='active'||c.reimburseDue)&&c.status!=='waived' ? '<button onclick="expChargeWaive(\''+c.id+'\')" style="background:white;border:1px solid #6B7280;color:#6B7280;font-size:.62rem;padding:4px 9px;border-radius:4px;cursor:pointer;letter-spacing:1px;text-transform:uppercase">Waive</button>' : '')+'</td>';
+    h += '</tr>';
+  });
+  h += '</table></div></div>';
   return h;
 }
 function obTermsSync(){
