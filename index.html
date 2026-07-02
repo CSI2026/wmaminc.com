@@ -3452,7 +3452,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.01.1500';
+var BUILD_VERSION = '2026.07.01.1600';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -24222,8 +24222,8 @@ function bgFireFailedEmail(agent, campaigns, reason){
           campaigns:    campaigns,
           campaignsList: campaigns.join(', '),
           reason:       reason || '',
-          costPerFail:  '$21.00',
-          costTotal:    '$'+(campaigns.length * 21).toFixed(2),
+          costPerFail:  (function(){ var ch=(typeof _bgFailCharges==='function')?_bgFailCharges(campaigns):[]; return ch.map(function(c){return '$'+(c.amountCents/100).toFixed(2)+' ('+c.label+')';}).join(' + '); })(),
+          costTotal:    (function(){ var ch=(typeof _bgFailCharges==='function')?_bgFailCharges(campaigns):[]; var t=ch.reduce(function(s,c){return s+c.amountCents;},0); return '$'+(t/100).toFixed(2); })(),
           appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
         }
       }).catch(function(e){ console.warn('[bgFireFailedEmail] upline email failed:', e); });
@@ -24268,47 +24268,66 @@ function bgFireFailedEmail(agent, campaigns, reason){
     }
   }
 
-  // 5. Record cost to ledger ($21 per failed campaign, billed to immediate mgr)
+  // 5. Record cost to ledger, billed to immediate mgr.
+  // Calvin 2026-07-01: charge amount depends on the campaign.
+  //   • Gen Mobile requires GEN MOBILE'S own BG → $21 (applies only to a GM coding)
+  //   • Every OTHER campaign uses OUR bg company, and one check is good for 90
+  //     days across ALL of them → a SINGLE $25 covers TC + Assurance + ACA + any
+  //     other non-GM campaigns together (not per-campaign).
+  //   • Coded for GM *and* non-GM and fails → $21 + $25 = $46.
   try{
     if(typeof FAILED_BG_COSTS === 'undefined') window.FAILED_BG_COSTS = [];
-    campaigns.forEach(function(camp){
-      // Idempotent: skip if we already logged this agent+campaign+fail
+    var _bgCharges = (typeof _bgFailCharges === 'function') ? _bgFailCharges(campaigns) : [];
+    _bgCharges.forEach(function(chg){
+      // Idempotent: skip if we already logged this agent + this charge bucket
       var existing = FAILED_BG_COSTS.find(function(c){
-        return c.agentId === agent.id && c.campaignName === camp && c.status !== 'reversed';
+        return c.agentId === agent.id && (c.bgBucket||c.campaignName) === chg.bucket && c.status !== 'reversed';
       });
       if(existing) return;
       FAILED_BG_COSTS.push({
         id:           Date.now()+'-'+Math.floor(Math.random()*10000),
         agentId:      agent.id,
         agentName:    agent.name,
-        campaignName: camp,
+        campaignName: chg.label,      // human label, e.g. "Gen Mobile" or "TruConnect, Assurance, ACA"
+        bgBucket:     chg.bucket,      // 'gm' | 'other' — the idempotency/charge bucket
+        campaigns:    chg.campaigns,   // the campaigns this charge covers
         managerId:    immediateMgr ? immediateMgr.id : null,
         managerName:  immediateMgr ? immediateMgr.name : '(no manager assigned)',
         failedAt:     new Date().toISOString(),
-        amountCents:  2100,   // $21 per Calvin's locked spec
+        amountCents:  chg.amountCents, // 2100 (GM) or 2500 (all non-GM)
         reason:       reason || '',
-        status:       'open',     // 'open' | 'invoiced' | 'reversed'
+        status:       'open',          // 'open' | 'invoiced' | 'applied' | 'reversed'
+        appliedWeekId: null,           // set when it lands on a paycheck (additive payroll)
         invoiceId:    null,
         invoicedAt:   null
       });
-      // Calvin 2026-06-10 v2130: mirror to OPERATING_COSTS so the company's
-      // P&L Year-to-Date reflects this $21 expense immediately. Until the
-      // manager pays the weekly invoice, it sits as a company cost. (When
-      // they pay, mark the cost as reversed via the invoice flow — separate
-      // ledger reconciliation.)
       if(typeof p3LogAutoCost === 'function'){
         p3LogAutoCost({
           category:'bg-fail',
-          amountCents:2100,
-          description:'BG-fail $21 — '+agent.name+' / '+camp+(immediateMgr ? ' (manager: '+immediateMgr.name+')' : ''),
-          refId:'bg-fail:'+agent.id+':'+camp
+          amountCents: chg.amountCents,
+          description:'BG-fail $'+(chg.amountCents/100).toFixed(0)+' — '+agent.name+' / '+chg.label+(immediateMgr ? ' (manager: '+immediateMgr.name+')' : ''),
+          refId:'bg-fail:'+agent.id+':'+chg.bucket
         });
       }
     });
-    // Persist to localStorage and Supabase
     if(typeof saveFailedBgCosts === 'function') saveFailedBgCosts();
   }catch(e){ console.warn('[bgFireFailedEmail] cost ledger write failed:', e); }
 }
+
+// ── Calvin 2026-07-01: resolve failed-BG charges from the coded campaigns ──
+// Gen Mobile → its own $21 BG. All other campaigns share ONE reusable $25 BG
+// (good 90 days across every non-GM campaign). Returns 0, 1, or 2 charge buckets.
+function _bgFailCharges(campaigns){
+  var camps = Array.isArray(campaigns) ? campaigns.filter(Boolean) : [];
+  var isGM  = function(c){ return /gen\s*mobile/i.test(String(c||'')); };
+  var hasGM = camps.some(isGM);
+  var nonGM = camps.filter(function(c){ return !isGM(c); });
+  var charges = [];
+  if(hasGM)        charges.push({ bucket:'gm',    label:'Gen Mobile',      amountCents:2100, campaigns:['Gen Mobile'] });
+  if(nonGM.length) charges.push({ bucket:'other', label:nonGM.join(', '),  amountCents:2500, campaigns:nonGM });
+  return charges;
+}
+if(typeof window!=='undefined') window._bgFailCharges = _bgFailCharges;
 
 // ════════════════════════════════════════════════════════════════════
 //  FAILED BG COST LEDGER + WEEKLY INVOICE  (Calvin 2026-06-10)
