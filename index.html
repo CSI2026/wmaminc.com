@@ -20943,6 +20943,74 @@ function wmamMergeAgentsAdditive(backupAgents){
   added.forEach(function(a){ console.log('  + '+a.name+' (id '+a.id+', '+(a.role||'?')+')'); });
   return {added:added.length, skipped:skipped};
 }
+// ═══ Calvin 2026-07-02 — AUTOMATIC DAILY BACKUP (approved) ═══
+// Once per day, after cloud data loads, a snapshot of the irreplaceables
+// (agents, programs, campaigns, payroll weeks) is stored locally. Last 10
+// kept. Download any snapshot as wmaminc_backup_YYYY-MM-DD.json — the same
+// format wmamRestoreFromBackup() reads, so backup → restore is a closed loop.
+function _wmamBackupPayload(){
+  var pay = {};
+  try{ pay = (typeof PAYROLL_WEEKS!=='undefined') ? PAYROLL_WEEKS : {}; }catch(e){}
+  return {
+    ts: new Date().toISOString(),
+    build: (typeof BUILD_VERSION!=='undefined'?BUILD_VERSION:''),
+    agents: (DB && DB.agents) ? DB.agents : [],
+    programs: (typeof WMAM_PROGRAMS!=='undefined') ? WMAM_PROGRAMS : [],
+    campaigns: (typeof WMAM_CAMPAIGNS!=='undefined') ? WMAM_CAMPAIGNS : [],
+    payrollWeeks: pay
+  };
+}
+function wmamCreateBackupSnapshot(force){
+  try{
+    var today = new Date().toISOString().slice(0,10);
+    var list = [];
+    try{ list = JSON.parse(localStorage.getItem('wmam_auto_backups')||'[]')||[]; }catch(e){ list=[]; }
+    if(!force && list.some(function(b){ return b && b.day===today; })) return {created:false, reason:'already-have-today'};
+    var payload = _wmamBackupPayload();
+    if(!payload.agents || payload.agents.length===0) return {created:false, reason:'no-agents-loaded-yet'}; // never snapshot an empty roster
+    list.push({ day: today, ts: payload.ts, json: JSON.stringify(payload) });
+    while(list.length>10) list.shift();
+    try{ localStorage.setItem('wmam_auto_backups', JSON.stringify(list)); }
+    catch(e){ // quota: drop oldest until it fits
+      while(list.length>1){ list.shift(); try{ localStorage.setItem('wmam_auto_backups', JSON.stringify(list)); break; }catch(e2){} }
+    }
+    console.log('[backup] snapshot saved for '+today+' — '+payload.agents.length+' agents, '+((payload.programs||[]).length)+' programs, last '+list.length+' kept');
+    return {created:true, agents:payload.agents.length};
+  }catch(e){ console.warn('[backup]', e); return {created:false, reason:e.message}; }
+}
+function wmamListBackups(){
+  var list=[]; try{ list = JSON.parse(localStorage.getItem('wmam_auto_backups')||'[]')||[]; }catch(e){}
+  list.forEach(function(b,i){
+    var n=0; try{ n=(JSON.parse(b.json).agents||[]).length; }catch(e){}
+    console.log('  ['+i+'] '+b.day+' — '+n+' agents');
+  });
+  if(!list.length) console.log('  (no snapshots yet)');
+  return list.length;
+}
+function wmamDownloadSnapshot(idx){
+  try{
+    var list=[]; try{ list = JSON.parse(localStorage.getItem('wmam_auto_backups')||'[]')||[]; }catch(e){}
+    var b = (typeof idx==='number') ? list[idx] : (list.length ? list[list.length-1] : null);
+    var json, day;
+    if(b && b.json){ json=b.json; day=b.day; }
+    else { var payload=_wmamBackupPayload(); json=JSON.stringify(payload); day=new Date().toISOString().slice(0,10); } // live snapshot fallback — always works even with no saved snapshots
+    var blob = new Blob([json], {type:'application/json'});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'wmaminc_backup_'+day+'.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ try{ URL.revokeObjectURL(a.href); }catch(e){} }, 2000);
+    return true;
+  }catch(e){ alert('Backup download failed: '+e.message); return false; }
+}
+if(typeof window!=='undefined'){
+  window.wmamCreateBackupSnapshot=wmamCreateBackupSnapshot;
+  window.wmamListBackups=wmamListBackups;
+  window.wmamDownloadSnapshot=wmamDownloadSnapshot;
+  // auto-snapshot ~20s after boot (cloud data loaded), once per day
+  try{ setTimeout(function(){ try{ wmamCreateBackupSnapshot(false); }catch(e){} }, 20000); }catch(e){}
+}
+
 function wmamRestoreFromBackup(){
   try{
     var u = DB.current;
@@ -26282,6 +26350,74 @@ function inactivityAcknowledge(flagId, action){
   }catch(e){ console.warn('[inactivityAcknowledge]', e); }
 }
 if(typeof window!=='undefined') window.inactivityAcknowledge = inactivityAcknowledge;
+
+// ═══ Calvin 2026-07-02 — MORNING GREETING (approved) ═══
+// First login each weekday (Mon–Fri) shows a warm, random positive line to
+// EVERYONE — owner, office, agents. Once per day; weekends stay silent. The
+// pick is random per person per day, mixed tone (motivational / hype / calm).
+var WMAM_GREET_LINES = [
+  "make today fantastic.", "let\u2019s make it a great one.", "today\u2019s got your name on it.",
+  "go get it \u2014 you\u2019ve got this.", "big things happen for people who show up. that\u2019s you.",
+  "one call at a time \u2014 you\u2019re built for this.", "your energy sets the tone today. bring it.",
+  "progress over perfection \u2014 just start.", "great things ahead \u2014 let\u2019s go get them.",
+  "you\u2019re exactly where you need to be. make it count.", "today is a fresh 100%. spend it well.",
+  "confidence looks good on you. wear it today.", "let\u2019s turn effort into wins.",
+  "steady and strong \u2014 that\u2019s how it\u2019s done.", "the team\u2019s better with you in it. let\u2019s work.",
+  "small wins stack into big ones. start stacking.", "you set the pace \u2014 make it a good one.",
+  "another day to be great. take it.", "focus + heart = results. you\u2019ve got both.",
+  "make the kind of day you\u2019ll be proud of."
+];
+function _wmamGreetName(u){
+  try{ var n=String(u.name||'').trim().split(' ')[0]; return n||'there'; }catch(e){ return 'there'; }
+}
+function _wmamDailySeed(u){
+  // deterministic per person + per calendar day so the line is stable if the
+  // modal is re-checked in the same session, but changes day to day.
+  var d = new Date().toISOString().slice(0,10);
+  var key = (u&&u.id?u.id:0) + '|' + d;
+  var h = 0; for(var i=0;i<key.length;i++){ h = (h*31 + key.charCodeAt(i))>>>0; }
+  return h;
+}
+function showMorningGreetingIfNeeded(){
+  try{
+    var u = DB.current; if(!u) return false;
+    var now = new Date();
+    var dow = now.getDay();
+    if(dow===0 || dow===6) return false;                 // weekends silent
+    var today = now.toISOString().slice(0,10);
+    var stampKey = 'wmam_greet_'+ (u.id||'x');
+    if(localStorage.getItem(stampKey) === today) return false; // once per weekday, first login
+    if(document.getElementById('wmamGreetOverlay')) return false;
+    var line = WMAM_GREET_LINES[_wmamDailySeed(u) % WMAM_GREET_LINES.length];
+    var hr = now.getHours();
+    var salute = hr<12 ? 'Good morning' : (hr<17 ? 'Good afternoon' : 'Good evening');
+    var isPink = false; try{ isPink = [2,3,4].indexOf(u.id)>=0; }catch(e){}
+    var g1 = isPink ? '#be185d' : '#003594';
+    var g2 = isPink ? '#ec4899' : '#7c3aed';
+    var initials = String(u.name||'?').split(' ').map(function(x){return x.charAt(0);}).join('').toUpperCase().slice(0,2);
+    localStorage.setItem(stampKey, today); // stamp immediately so it never double-fires
+    var h = '<div id="wmamGreetOverlay" style="position:fixed;inset:0;z-index:99992;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(8,12,26,.55);backdrop-filter:blur(3px);animation:wmamGreetFade .4s ease" onclick="(function(e){var o=document.getElementById(\'wmamGreetOverlay\');if(o)o.remove();})()">';
+    h += '<div style="position:relative;max-width:440px;width:100%;border-radius:20px;overflow:hidden;box-shadow:0 30px 90px rgba(0,0,0,.5);transform:translateY(0);animation:wmamGreetPop .5s cubic-bezier(.2,.9,.3,1.2) both" onclick="event.stopPropagation()">';
+    h += '<div style="background:linear-gradient(135deg,'+g1+','+g2+');padding:30px 26px 26px;text-align:center;position:relative;overflow:hidden">';
+    h += '<div style="position:absolute;inset:0;background:repeating-linear-gradient(115deg,transparent 0 30px,rgba(255,255,255,.06) 30px 32px)"></div>';
+    h += '<div style="position:relative">';
+    h += '<div style="width:66px;height:66px;margin:0 auto 14px;border-radius:50%;background:rgba(255,255,255,.9);display:flex;align-items:center;justify-content:center;font-family:Bebas Neue,sans-serif;font-size:1.6rem;color:'+g1+';box-shadow:0 8px 24px rgba(0,0,0,.25)">'+_escapeHtml(initials)+'</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,.85)">'+salute+'</div>';
+    h += '<div style="font-family:Bebas Neue,sans-serif;font-size:2.4rem;line-height:1;color:#fff;letter-spacing:1px;margin:2px 0 10px">'+_escapeHtml(_wmamGreetName(u))+',</div>';
+    h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.15rem;color:#fff;font-weight:600;line-height:1.3">'+line+'</div>';
+    h += '</div></div>';
+    h += '<div style="background:#fff;padding:16px;text-align:center">';
+    h += '<button onclick="(function(){var o=document.getElementById(\'wmamGreetOverlay\');if(o)o.remove();})()" style="background:linear-gradient(135deg,'+g1+','+g2+');color:#fff;border:none;font-family:Barlow Condensed,sans-serif;font-size:.8rem;letter-spacing:2px;text-transform:uppercase;padding:11px 34px;border-radius:100px;cursor:pointer;font-weight:700;box-shadow:0 6px 18px rgba(0,0,0,.15)">Let\u2019s go \u2192</button>';
+    h += '</div></div></div>';
+    document.body.insertAdjacentHTML('beforeend', h);
+    return true;
+  }catch(e){ console.warn('[greeting]', e); return false; }
+}
+if(typeof window!=='undefined'){
+  window.showMorningGreetingIfNeeded = showMorningGreetingIfNeeded;
+  // fire shortly after login/boot, once data + current user are set
+  setTimeout(function(){ try{ showMorningGreetingIfNeeded(); }catch(e){} }, 2600);
+}
 
 function showInactivityLockIfNeeded(force){
   try{
@@ -39714,6 +39850,8 @@ function panelOwner(){
   adminActions.forEach(function(qa){
     h += '<button onclick="gotoPanel(\'' + qa.panel + '\')" class="qa-tile" style="--qa:#4B5563"><span class="qa-ic">' + qa.icon + '</span><span>' + qa.label + '</span></button>';
   });
+  // Calvin 2026-07-02: one-click backup download (auto-snapshots run daily)
+  h += '<button onclick="wmamDownloadSnapshot()" class="qa-tile" style="--qa:#059669"><span class="qa-ic">\ud83d\udcbe</span><span>Download Backup</span></button>';
   h += '</div>';
 
   h += '</div></div>'; // end quick actions card
@@ -83271,6 +83409,8 @@ html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
   animation: boShine .6s ease;
 }
 @keyframes badgePulse { 0%,100%{ transform:scale(1);} 50%{ transform:scale(1.12);} }
+@keyframes wmamGreetFade { from{opacity:0;} to{opacity:1;} }
+@keyframes wmamGreetPop { from{opacity:0;transform:translateY(18px) scale(.96);} to{opacity:1;transform:translateY(0) scale(1);} }
 
 /* ── numbers count-up + accessibility ── */
 @media (prefers-reduced-motion: reduce){
