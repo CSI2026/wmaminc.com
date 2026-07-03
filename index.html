@@ -3453,7 +3453,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.02.3400';
+var BUILD_VERSION = '2026.07.02.3500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13691,6 +13691,9 @@ function canAccess(u, area){
     // K-Anna et al. can find pending applicants instantly without drilling
     // into the Onboarding panel.
     case 'backups':          return isOwner(u) || isOfficeRole(u);
+    case 'my-calendar':      return bookingCanHost(u);
+    case 'book-call':        return !!u;
+    case 'my-bookings':      return !!u;
     case 'agents-pending':
       // Calvin 2026-06-10 v1930: ALL of onboarding/HR sees the Agents Pending
       // tab. This must match getOnboardingStaff so the notification recipients
@@ -21550,6 +21553,8 @@ async function loadFromSupabase(){
         if(s.key==='fb_registry' && s.value){ try{localStorage.setItem('wmam_fb_registry',s.value);}catch(e){} }
         if(s.key==='onboarding_records' && s.value){ try{ONBOARDING_RECORDS=JSON.parse(s.value)||{};}catch(e){} }
         if(s.key==='rank_history' && s.value){ try{RANK_HISTORY=JSON.parse(s.value)||{};}catch(e){} }
+        if(s.key==='booking_slots' && s.value){ try{ var _bs=JSON.parse(s.value)||[]; BOOKING_SLOTS.length=0; _bs.forEach(function(x){BOOKING_SLOTS.push(x);}); }catch(e){} }
+        if(s.key==='bookings' && s.value){ try{ var _bk=JSON.parse(s.value)||[]; BOOKINGS.length=0; _bk.forEach(function(x){BOOKINGS.push(x);}); }catch(e){} }
         if(s.key==='inactivity_flags' && s.value){ try{ var _inf=JSON.parse(s.value)||[]; var _tgt=(typeof window!=='undefined'&&window.INACTIVITY_FLAGS)?window.INACTIVITY_FLAGS:null; if(_tgt){ _tgt.length=0; _inf.forEach(function(f){_tgt.push(f);}); } }catch(e){} }
         if(s.key==='wmam_programs' && s.value){ try{
           // ── Calvin 2026-06-11 v2130: MERGE not REPLACE ──
@@ -26797,6 +26802,160 @@ var WMAM_AUTOREFRESH_LAST_HASH = {};
 // 10-minute safety-net full pull so nothing can ever go stale even if a
 // write path misses the bump. Behavior is identical — updates still land
 // within one tick — the data just isn't re-downloaded when nothing moved.
+// === Calvin 2026-07-02 - BOOKING / CALENDAR SYSTEM (Calendly-style) ===
+// Hosts (owner + office staff now; CM/IBO later) add specific open slots.
+// Anyone books an open slot -> auto-confirms, spins up a unique recorded
+// Daily room, notifies host + booker in-app, and emails both (via brevoSend
+// once the Brevo key is set). A 1-hour reminder fires from a pg_cron job
+// (script provided separately) so it works even with no app open.
+var BOOKING_SLOTS = (typeof window!=='undefined' && window.BOOKING_SLOTS) ? window.BOOKING_SLOTS : [];
+var BOOKINGS      = (typeof window!=='undefined' && window.BOOKINGS) ? window.BOOKINGS : [];
+if(typeof window!=='undefined'){ window.BOOKING_SLOTS=BOOKING_SLOTS; window.BOOKINGS=BOOKINGS; }
+function loadBookingData(){
+  try{ var a=localStorage.getItem('wmam_booking_slots'); if(a){ var arr=JSON.parse(a)||[]; BOOKING_SLOTS.length=0; arr.forEach(function(x){BOOKING_SLOTS.push(x);}); } }catch(e){}
+  try{ var b=localStorage.getItem('wmam_bookings'); if(b){ var br=JSON.parse(b)||[]; BOOKINGS.length=0; br.forEach(function(x){BOOKINGS.push(x);}); } }catch(e){}
+}
+function saveBookingData(){
+  try{ localStorage.setItem('wmam_booking_slots', JSON.stringify(BOOKING_SLOTS)); }catch(e){}
+  try{ localStorage.setItem('wmam_bookings', JSON.stringify(BOOKINGS)); }catch(e){}
+  try{ if(typeof supaClient!=='undefined' && supaClient){
+    supaClient.from('app_settings').upsert({key:'booking_slots',value:JSON.stringify(BOOKING_SLOTS)},{onConflict:'key'}).then(function(){}).catch(function(){});
+    supaClient.from('app_settings').upsert({key:'bookings',value:JSON.stringify(BOOKINGS)},{onConflict:'key'}).then(function(){}).catch(function(){});
+  } }catch(e){}
+  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 60); }catch(e){}
+}
+loadBookingData();
+if(typeof window!=='undefined'){ window.loadBookingData=loadBookingData; window.saveBookingData=saveBookingData; }
+function bookingCanHost(u){
+  if(!u) return false;
+  try{ if(typeof isOwner==='function' && isOwner(u)) return true; }catch(e){}
+  try{ if(typeof isOfficeRole==='function' && isOfficeRole(u)) return true; }catch(e){}
+  return false;
+}
+function _bkId(pfx){ return (pfx||'bk')+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,6); }
+function _bkFmt(dtISO){
+  try{ var d=new Date(dtISO); return d.toLocaleString('en-US',{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}); }catch(e){ return dtISO; }
+}
+function bookingAddSlot(hostId, startISO, minutes){
+  var slot = { id:_bkId('slot'), hostId:hostId, start:startISO, minutes:(minutes||30), status:'open' };
+  BOOKING_SLOTS.push(slot); saveBookingData(); return slot;
+}
+function bookingRemoveSlot(slotId){
+  var i = BOOKING_SLOTS.findIndex(function(s){ return s && s.id===slotId; });
+  if(i>=0){ BOOKING_SLOTS.splice(i,1); saveBookingData(); return true; }
+  return false;
+}
+function bookingOpenSlotsFor(hostId){
+  var now = Date.now();
+  return BOOKING_SLOTS.filter(function(s){ return s && s.hostId===hostId && s.status==='open' && new Date(s.start).getTime()>now; })
+    .sort(function(a,b){ return new Date(a.start)-new Date(b.start); });
+}
+function bookingCreate(slotId, booker){
+  try{
+    var slot = BOOKING_SLOTS.find(function(s){ return s && s.id===slotId; });
+    if(!slot){ return {ok:false, error:'Slot not found'}; }
+    if(slot.status!=='open'){ return {ok:false, error:'That time was just taken - pick another.'}; }
+    if(!booker || !booker.name || !booker.email || !/@/.test(booker.email)){ return {ok:false, error:'Name and a valid email are required.'}; }
+    var host = (DB.agents||[]).find(function(a){ return a && a.id===slot.hostId; });
+    var roomName = 'booking-'+slot.id.replace(/[^a-zA-Z0-9]/g,'');
+    var roomUrl  = 'https://wmaminc.daily.co/'+roomName;
+    var bk = {
+      id:_bkId('book'), slotId:slot.id, hostId:slot.hostId,
+      hostName: host?host.name:'Host',
+      bookerId: booker.id||null, bookerName:booker.name, bookerEmail:booker.email,
+      topic: booker.topic||'', start:slot.start, minutes:slot.minutes,
+      roomUrl:roomUrl, recorded:true, status:'confirmed',
+      createdAt:new Date().toISOString()
+    };
+    slot.status='booked'; slot.bookingId=bk.id;
+    BOOKINGS.push(bk);
+    saveBookingData();
+    try{
+      pushNotification({ toIds:[slot.hostId], title:'\uD83D\uDCC5 New call booked',
+        body: bk.bookerName+' booked '+_bkFmt(bk.start)+(bk.topic?(' - '+bk.topic):''), panel:'my-bookings' });
+      if(bk.bookerId) pushNotification({ toIds:[bk.bookerId], title:'\u2705 Call confirmed',
+        body:'Your call with '+bk.hostName+' is set for '+_bkFmt(bk.start), panel:'my-bookings' });
+    }catch(e){}
+    try{ bookingEmailConfirm(bk); }catch(e){}
+    return {ok:true, booking:bk};
+  }catch(e){ return {ok:false, error:e.message}; }
+}
+function bookingCancel(bookingId, byWhom){
+  try{
+    var bk = BOOKINGS.find(function(b){ return b && b.id===bookingId; });
+    if(!bk) return {ok:false, error:'Booking not found'};
+    bk.status='cancelled'; bk.cancelledAt=new Date().toISOString(); bk.cancelledBy=byWhom||null;
+    var slot = BOOKING_SLOTS.find(function(s){ return s && s.id===bk.slotId; });
+    if(slot){ slot.status='open'; delete slot.bookingId; }
+    saveBookingData();
+    try{
+      pushNotification({ toIds:[bk.hostId], title:'\u274C Call cancelled', body:'Call with '+bk.bookerName+' on '+_bkFmt(bk.start)+' was cancelled.', panel:'my-bookings' });
+      if(bk.bookerId) pushNotification({ toIds:[bk.bookerId], title:'\u274C Call cancelled', body:'Your call with '+bk.hostName+' on '+_bkFmt(bk.start)+' was cancelled.', panel:'my-bookings' });
+    }catch(e){}
+    try{ bookingEmailCancel(bk); }catch(e){}
+    return {ok:true};
+  }catch(e){ return {ok:false, error:e.message}; }
+}
+function _bkEmailShell(title, bodyHtml){
+  return '<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto">'
+    +'<div style="background:#003594;padding:20px;text-align:center;color:white"><h2 style="margin:0">'+title+'</h2></div>'
+    +'<div style="padding:24px;background:#f8f9fa;line-height:1.6;color:#333">'+bodyHtml+'</div>'
+    +'<div style="background:#002268;padding:14px;text-align:center;color:rgba(255,255,255,.7);font-size:12px">WMAMinc. &nbsp;|&nbsp; ONE TEAM. ONE DREAM.</div></div>';
+}
+function bookingEmailConfirm(bk){
+  if(typeof brevoSend!=='function') return;
+  var host = (DB.agents||[]).find(function(a){ return a && a.id===bk.hostId; });
+  var when = _bkFmt(bk.start);
+  var joinBtn = '<div style="text-align:center;margin:18px 0"><a href="'+bk.roomUrl+'" style="background:#003594;color:#fff;text-decoration:none;padding:12px 26px;border-radius:6px;font-weight:bold">Join the call</a></div>';
+  brevoSend({ to:[{email:bk.bookerEmail, name:bk.bookerName}],
+    subject:'\u2705 Your call with '+bk.hostName+' is confirmed - '+when,
+    htmlContent:_bkEmailShell('Call confirmed',
+      'Hi '+_escapeHtml(bk.bookerName)+',<br><br>Your call with <strong>'+_escapeHtml(bk.hostName)+'</strong> is booked for <strong>'+when+'</strong> ('+bk.minutes+' min).'
+      +(bk.topic?('<br><br><strong>Topic:</strong> '+_escapeHtml(bk.topic)):'')
+      +joinBtn+'This call will be recorded. You will get a reminder one hour before.') });
+  if(host && host.email){
+    brevoSend({ to:[{email:host.email, name:host.name}],
+      subject:'\uD83D\uDCC5 New call booked - '+bk.bookerName+' - '+when,
+      htmlContent:_bkEmailShell('New call booked',
+        '<strong>'+_escapeHtml(bk.bookerName)+'</strong> ('+_escapeHtml(bk.bookerEmail)+') booked <strong>'+when+'</strong>.'
+        +(bk.topic?('<br><br><strong>Topic:</strong> '+_escapeHtml(bk.topic)):'')+joinBtn) });
+  }
+}
+function bookingEmailCancel(bk){
+  if(typeof brevoSend!=='function') return;
+  var when=_bkFmt(bk.start);
+  brevoSend({ to:[{email:bk.bookerEmail, name:bk.bookerName}], subject:'\u274C Call cancelled - '+when,
+    htmlContent:_bkEmailShell('Call cancelled','Your call with '+_escapeHtml(bk.hostName)+' on <strong>'+when+'</strong> has been cancelled. Please book another open time if needed.') });
+}
+function bookingSendReminder(bk){
+  if(typeof brevoSend!=='function' || !bk) return;
+  var when=_bkFmt(bk.start);
+  var joinBtn = '<div style="text-align:center;margin:18px 0"><a href="'+bk.roomUrl+'" style="background:#003594;color:#fff;text-decoration:none;padding:12px 26px;border-radius:6px;font-weight:bold">Join the call</a></div>';
+  brevoSend({ to:[{email:bk.bookerEmail,name:bk.bookerName}], subject:'\u23F0 Reminder: your call is in 1 hour - '+when,
+    htmlContent:_bkEmailShell('Starting in 1 hour','Hi '+_escapeHtml(bk.bookerName)+', your call with '+_escapeHtml(bk.hostName)+' starts at <strong>'+when+'</strong>.'+joinBtn) });
+  var host=(DB.agents||[]).find(function(a){return a&&a.id===bk.hostId;});
+  if(host&&host.email) brevoSend({ to:[{email:host.email,name:host.name}], subject:'\u23F0 Call in 1 hour - '+bk.bookerName,
+    htmlContent:_bkEmailShell('Call in 1 hour','Your call with '+_escapeHtml(bk.bookerName)+' starts at <strong>'+when+'</strong>.'+joinBtn) });
+  bk.reminded=true; saveBookingData();
+}
+function bookingReminderSweep(){
+  try{
+    var now=Date.now();
+    BOOKINGS.forEach(function(bk){
+      if(!bk||bk.status!=='confirmed'||bk.reminded) return;
+      var t=new Date(bk.start).getTime(); var diff=t-now;
+      if(diff>0 && diff<=3600000) bookingSendReminder(bk);
+    });
+  }catch(e){}
+}
+if(typeof window!=='undefined'){
+  window.bookingAddSlot=bookingAddSlot; window.bookingRemoveSlot=bookingRemoveSlot;
+  window.bookingOpenSlotsFor=bookingOpenSlotsFor; window.bookingCreate=bookingCreate;
+  window.bookingCancel=bookingCancel; window.bookingCanHost=bookingCanHost;
+  window.bookingSendReminder=bookingSendReminder; window.bookingReminderSweep=bookingReminderSweep;
+  setInterval(function(){ try{ bookingReminderSweep(); }catch(e){} }, 5*60*1000);
+}
+
 function sbBumpDataVersion(){
   try{
     if(typeof supaClient === 'undefined' || !supaClient) return;
@@ -35094,6 +35253,9 @@ function buildNav(u){
   // calls, announcements, community channels, and (office) mass email/SMS.
   var mcItems = '';
   if(canAccess(u,'meetings')) mcItems += boDropBtn('meetings','📞 Meetings & Video Calls');
+  mcItems += boDropBtn('book-call','📅 Book a Call');
+  mcItems += boDropBtn('my-bookings','📆 My Calls');
+  if(bookingCanHost(u)) mcItems += boDropBtn('my-calendar','⚙️ My Calendar');
   if(canAccess(u,'announcements')){
     mcItems += boDropBtn('announce','📢 Announcements');
     // Calvin 2026-07-02: the 20-link channel wall is gone. ONE link opens the
@@ -35159,6 +35321,9 @@ function buildNav(u){
   }
   if(peopleItems && canAccess(u,'backups')){
     peopleItems += boDropBtn('backups','💾 Backups');
+  }
+  if(peopleItems && bookingCanHost(u)){
+    peopleItems += boDropBtn('my-calendar','📅 My Calendar');
   }
   if(peopleItems) h += boGroupDrop('dd-people','👥 People ▾', peopleItems);
 
@@ -37311,7 +37476,7 @@ function gotoPanel(id, params){
     'supply-mgmt':panelSupplyMgmt,'pending-transfers':panelPendingTransfers,
     'agent-codes':panelAgentCodes,'goal-settings':panelGoalSettings,
     'form-builder':panelFormBuilder,announce:panelAnnounce,
-    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'onboarding-actions':panelOnboardingActions,'pending-agents':panelPendingAgents,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,'bg-check-queue':panelBgCheckQueue,'bg-fail-invoices':panelBgFailInvoices,'agents-pending':panelAgentsPending,'backups':panelBackups,
+    'daily-audit':panelDailyAudit,'audit-detail':panelAuditDetail,'audit-archive':panelAuditArchive,'encroachment':panelEncroachment,'encroach-detail':panelEncroachDetail,'compliance-settings':panelComplianceSettings,'sync-status':panelSyncStatus,applications:panelApplications,payroll:panelPayroll,onboarding:panelOnboarding,'onboarding-actions':panelOnboardingActions,'pending-agents':panelPendingAgents,'edit-start-dates':panelEditStartDates,'doc-assignments':panelDocAssignments,'bg-check-queue':panelBgCheckQueue,'bg-fail-invoices':panelBgFailInvoices,'agents-pending':panelAgentsPending,'backups':panelBackups,'my-calendar':panelMyCalendar,'book-call':panelBookCall,'my-bookings':panelMyBookings,
     'recruit-tracker':panelRecruitTracker,subs:panelSubs,
     lb:panelLB,links:panelLinks,myteam:panelMyTeam,
     agents:panelAgents,'ll-teams':panelMarketsAdmin,
@@ -49313,6 +49478,124 @@ if(typeof window !== 'undefined'){
   window.panelContactDirectory = panelContactDirectory;
   window.panelContactAdmin     = panelContactAdmin;
   window.panelContactLog       = panelContactLog;
+}
+
+// === Calvin 2026-07-02 - BOOKING PANELS ===
+// panelMyCalendar : host adds/removes open slots (owner + office staff)
+// panelBookCall   : anyone picks a host + open slot, books it
+// panelMyBookings : upcoming calls; host can cancel; join link per booking
+function panelMyCalendar(){
+  var u=DB.current;
+  if(!bookingCanHost(u)) return '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">Calendars are available to the owner and office staff.</div>';
+  var slots=bookingOpenSlotsFor(u.id);
+  var booked=BOOKINGS.filter(function(b){return b&&b.hostId===u.id&&b.status==='confirmed'&&new Date(b.start).getTime()>Date.now();}).sort(function(a,b){return new Date(a.start)-new Date(b.start);});
+  var h='<div style="max-width:820px;margin:0 auto">';
+  h+='<div class="bo-card" style="margin-bottom:16px"><div class="bo-card-head"><div class="bo-card-title">\uD83D\uDCC5 My Calendar \u2014 Open Times</div></div>';
+  h+='<div style="padding:16px 18px">';
+  h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted);margin-bottom:12px">Add the specific times you are open for calls. People can book any open slot and it confirms automatically \u2014 you can cancel any call. Each booking gets its own recorded video room.</div>';
+  h+='<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;background:rgba(0,53,148,.04);border:1px solid var(--border);border-radius:10px;padding:14px">';
+  h+='<div><label class="f-label">Date</label><input type="date" id="cal-date" class="f-select" style="min-width:150px"></div>';
+  h+='<div><label class="f-label">Time</label><input type="time" id="cal-time" class="f-select" style="min-width:120px"></div>';
+  h+='<div><label class="f-label">Length</label><select id="cal-len" class="f-select"><option value="15">15 min</option><option value="30" selected>30 min</option><option value="45">45 min</option><option value="60">60 min</option></select></div>';
+  h+='<button onclick="calAddSlot()" class="btn-fire" style="font-size:.72rem;padding:9px 20px">+ Add Open Slot</button>';
+  h+='</div>';
+  h+='<div style="margin-top:16px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Open slots ('+slots.length+')</div>';
+  if(!slots.length){ h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);font-style:italic;padding:8px 0">No open times yet \u2014 add some above.</div>'; }
+  else { slots.forEach(function(s){
+    h+='<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:rgba(255,255,255,.5);border:1px solid var(--border);border-radius:8px;margin-bottom:6px">'
+      +'<span style="flex:1;font-family:Barlow Condensed,sans-serif;font-size:.85rem;color:var(--brown);font-weight:700">'+_escapeHtml(_bkFmt(s.start))+' \u00b7 '+s.minutes+' min</span>'
+      +'<button onclick="calRemoveSlot(\''+s.id+'\')" style="background:none;border:1px solid rgba(204,0,0,.3);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:4px 12px;border-radius:100px;cursor:pointer">Remove</button></div>';
+  }); }
+  h+='</div></div></div>';
+  h+='<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">\u2705 Upcoming Booked Calls ('+booked.length+')</div></div><div style="padding:14px 18px">';
+  if(!booked.length){ h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);font-style:italic">No calls booked yet.</div>'; }
+  else { booked.forEach(function(b){
+    h+='<div style="display:flex;align-items:center;gap:12px;padding:11px 13px;background:rgba(0,53,148,.04);border:1px solid var(--border);border-left:4px solid var(--blue);border-radius:0 10px 10px 0;margin-bottom:8px">'
+      +'<div style="flex:1"><div style="font-family:Barlow Condensed,sans-serif;font-size:.9rem;font-weight:700;color:var(--brown)">'+_escapeHtml(b.bookerName)+' \u00b7 '+_escapeHtml(_bkFmt(b.start))+'</div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">'+_escapeHtml(b.bookerEmail)+(b.topic?(' \u00b7 '+_escapeHtml(b.topic)):'')+'</div></div>'
+      +'<a href="'+b.roomUrl+'" target="_blank" style="background:var(--blue);color:#fff;text-decoration:none;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:6px 14px;border-radius:100px">Join</a>'
+      +'<button onclick="calCancelBooking(\''+b.id+'\')" style="background:none;border:1px solid rgba(204,0,0,.3);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:6px 12px;border-radius:100px;cursor:pointer">Cancel</button></div>';
+  }); }
+  h+='</div></div></div>';
+  return h;
+}
+function calAddSlot(){
+  var d=document.getElementById('cal-date'), t=document.getElementById('cal-time'), l=document.getElementById('cal-len');
+  if(!d||!d.value||!t||!t.value){ alert('Pick a date and time.'); return; }
+  var iso=new Date(d.value+'T'+t.value).toISOString();
+  if(new Date(iso).getTime()<=Date.now()){ alert('Pick a time in the future.'); return; }
+  bookingAddSlot(DB.current.id, iso, parseInt(l.value,10)||30);
+  gotoPanel('my-calendar');
+}
+function calRemoveSlot(id){ if(confirm('Remove this open slot?')){ bookingRemoveSlot(id); gotoPanel('my-calendar'); } }
+function calCancelBooking(id){ if(confirm('Cancel this call? The person will be notified and the time reopens.')){ bookingCancel(id, DB.current?DB.current.id:null); gotoPanel('my-calendar'); } }
+
+function panelBookCall(){
+  var u=DB.current;
+  var hosts=(DB.agents||[]).filter(function(a){ return a && a.active && bookingCanHost(a) && bookingOpenSlotsFor(a.id).length>0; });
+  var h='<div style="max-width:720px;margin:0 auto">';
+  h+='<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">\uD83D\uDCDE Book a Conference Call</div></div><div style="padding:16px 18px">';
+  if(!hosts.length){ h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--muted);font-style:italic">No one has open times posted right now. Check back soon.</div></div></div></div>'; return h; }
+  h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted);margin-bottom:14px">Pick who you want to meet with and an open time. It confirms instantly and you\u2019ll get a video link + email.</div>';
+  h+='<label class="f-label">Who would you like to meet with?</label><select id="bk-host" class="f-select" onchange="bkRenderSlots()"><option value="">-- Select --</option>'
+    +hosts.map(function(a){ return '<option value="'+a.id+'">'+_escapeHtml(a.name)+(a.role?(' \u2014 '+_escapeHtml(a.role)):'')+'</option>'; }).join('')+'</select>';
+  h+='<div id="bk-slots" style="margin-top:14px"></div>';
+  h+='<div id="bk-form" style="display:none;margin-top:14px;background:rgba(0,53,148,.04);border:1px solid var(--border);border-radius:10px;padding:14px">';
+  h+='<input type="hidden" id="bk-slotid">';
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><label class="f-label">Your name *</label><input id="bk-name" class="f-select" value="'+(u?_escapeHtml(u.name||''):'')+'"></div>'
+    +'<div><label class="f-label">Your email *</label><input id="bk-email" class="f-select" value="'+(u&&u.email?_escapeHtml(u.email):'')+'"></div></div>';
+  h+='<div style="margin-top:10px"><label class="f-label">What\u2019s it about? (optional)</label><textarea id="bk-topic" class="f-select" rows="2" placeholder="Quick note on the topic..."></textarea></div>';
+  h+='<button onclick="bkSubmit()" class="btn-fire" style="margin-top:12px;font-size:.72rem;padding:10px 24px;width:100%">Confirm my call \u2192</button></div>';
+  h+='</div></div></div>';
+  return h;
+}
+function bkRenderSlots(){
+  var sel=document.getElementById('bk-host'); var hostId=parseInt(sel.value,10);
+  var box=document.getElementById('bk-slots'); var form=document.getElementById('bk-form');
+  form.style.display='none';
+  if(!hostId){ box.innerHTML=''; return; }
+  var slots=bookingOpenSlotsFor(hostId);
+  if(!slots.length){ box.innerHTML='<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted);font-style:italic">No open times for this person right now.</div>'; return; }
+  var html='<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Pick a time</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px">';
+  slots.forEach(function(s){
+    html+='<div onclick="bkPickSlot(\''+s.id+'\',this)" style="cursor:pointer;padding:10px 12px;background:rgba(255,255,255,.6);border:1px solid var(--border);border-radius:8px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);font-weight:700;text-align:center" class="bk-slot-opt">'+_escapeHtml(_bkFmt(s.start))+'<br><span style="font-size:.62rem;color:var(--muted);font-weight:400">'+s.minutes+' min</span></div>';
+  });
+  html+='</div>'; box.innerHTML=html;
+}
+function bkPickSlot(id, el){
+  document.querySelectorAll('.bk-slot-opt').forEach(function(x){ x.style.borderColor='var(--border)'; x.style.background='rgba(255,255,255,.6)'; });
+  if(el){ el.style.borderColor='var(--blue)'; el.style.background='rgba(0,53,148,.1)'; }
+  document.getElementById('bk-slotid').value=id;
+  document.getElementById('bk-form').style.display='block';
+}
+function bkSubmit(){
+  var slotId=document.getElementById('bk-slotid').value;
+  var name=document.getElementById('bk-name').value.trim();
+  var email=document.getElementById('bk-email').value.trim();
+  var topic=document.getElementById('bk-topic').value.trim();
+  if(!slotId){ alert('Pick a time first.'); return; }
+  if(!name||!/@/.test(email)){ alert('Enter your name and a valid email.'); return; }
+  var r=bookingCreate(slotId, {id:(DB.current?DB.current.id:null), name:name, email:email, topic:topic});
+  if(!r.ok){ alert(r.error||'Could not book that time.'); return; }
+  alert('Your call is confirmed for '+_bkFmt(r.booking.start)+'. A confirmation with the video link is on its way, and you\u2019ll get a reminder an hour before.');
+  gotoPanel('my-bookings');
+}
+
+function panelMyBookings(){
+  var u=DB.current;
+  var mine=BOOKINGS.filter(function(b){ return b && b.status==='confirmed' && (b.bookerId===u.id || b.hostId===u.id) && new Date(b.start).getTime()>Date.now(); }).sort(function(a,b){return new Date(a.start)-new Date(b.start);});
+  var h='<div style="max-width:720px;margin:0 auto"><div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">\uD83D\uDCC6 My Calls</div></div><div style="padding:14px 18px">';
+  if(!mine.length){ h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--muted);font-style:italic">No upcoming calls. Book one from \u201CBook a Call.\u201D</div>'; }
+  else { mine.forEach(function(b){
+    var iAmHost=b.hostId===u.id;
+    h+='<div style="display:flex;align-items:center;gap:12px;padding:11px 13px;background:rgba(0,53,148,.04);border:1px solid var(--border);border-left:4px solid var(--blue);border-radius:0 10px 10px 0;margin-bottom:8px">'
+      +'<div style="flex:1"><div style="font-family:Barlow Condensed,sans-serif;font-size:.9rem;font-weight:700;color:var(--brown)">'+_escapeHtml(_bkFmt(b.start))+' \u00b7 '+b.minutes+' min</div>'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">'+(iAmHost?('with '+_escapeHtml(b.bookerName)):('with '+_escapeHtml(b.hostName)))+(b.topic?(' \u00b7 '+_escapeHtml(b.topic)):'')+' \u00b7 \uD83D\uDD34 recorded</div></div>'
+      +'<a href="'+b.roomUrl+'" target="_blank" style="background:var(--blue);color:#fff;text-decoration:none;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:7px 16px;border-radius:100px">Join call</a>'
+      +'<button onclick="calCancelBooking(\''+b.id+'\')" style="background:none;border:1px solid rgba(204,0,0,.3);color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1px;text-transform:uppercase;padding:7px 12px;border-radius:100px;cursor:pointer">Cancel</button></div>';
+  }); }
+  h+='</div></div></div>';
+  return h;
 }
 
 function panelMeetings(){
