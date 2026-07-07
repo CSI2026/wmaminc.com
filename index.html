@@ -3463,7 +3463,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.05.8400';
+var BUILD_VERSION = '2026.07.05.8500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14706,7 +14706,20 @@ function saveInventory(localOnly){
     // Phase 3 — Operating costs
     localStorage.setItem('wmam_operating_costs',      JSON.stringify(OPERATING_COSTS));
     localStorage.setItem('wmam_op_cost_nextid',       String(OP_COST_NEXT_ID));
-  }catch(e){ console.warn('Inventory save:',e); }
+  }catch(e){
+    // v8500: on localStorage quota, prune old backup/snapshot keys (they pile up
+    // and eat the ~5MB budget) and retry the critical inventory writes once.
+    if(e && (e.name==='QuotaExceededError' || /quota/i.test(String((e&&e.message)||e)))){
+      try{
+        var _pk=[]; for(var _i=0;_i<localStorage.length;_i++){ var _k=localStorage.key(_i); if(_k && /(_backup_\d|snapshot)/i.test(_k)) _pk.push(_k); }
+        _pk.sort(); while(_pk.length>2){ localStorage.removeItem(_pk.shift()); }
+        localStorage.setItem('wmam_inv_devices', JSON.stringify(INVENTORY_DEVICES));
+        localStorage.setItem('wmam_tc_inventory', JSON.stringify(TC_INVENTORY));
+        localStorage.setItem('wmam_gm_inventory', JSON.stringify(GM_INVENTORY));
+        console.warn('Inventory save: quota hit — pruned old backups and retried.');
+      }catch(e2){ console.warn('Inventory save failed even after pruning backups:', e2); }
+    } else { console.warn('Inventory save:',e); }
+  }
   saveSupplyInventory();
 
   // ── SUPABASE SYNC ──
@@ -16885,7 +16898,15 @@ function processDartInventoryUpload(csvText, batchId){
   try{
     var _bk = INVENTORY_DEVICES.filter(function(d){ return d && String(d.campaign).toUpperCase()==='DART'; });
     localStorage.setItem('wmam_dart_inv_backup_'+Date.now(), JSON.stringify(_bk));
+    // keep only the last 2 DART backups so they don't eat the ~5MB localStorage quota
+    var _dbk=[]; for(var _i=0;_i<localStorage.length;_i++){ var _k=localStorage.key(_i); if(_k && _k.indexOf('wmam_dart_inv_backup_')===0) _dbk.push(_k); }
+    _dbk.sort(); while(_dbk.length>2){ localStorage.removeItem(_dbk.shift()); }
   }catch(e){}
+  // v8500: guaranteed-unique ids across ALL inventory. INV_NEXT_ID isn't always
+  // ahead of existing dev-N ids, and a collision made the DB reject the whole
+  // batch (ON CONFLICT ... cannot affect row a second time). Seed from the real max.
+  var _dartMaxDevN = (typeof INV_NEXT_ID==='number') ? (INV_NEXT_ID-1) : 0;
+  INVENTORY_DEVICES.forEach(function(d){ if(d && typeof d.id==='string'){ var _m=d.id.match(/^dev-(\d+)$/); if(_m){ var _n=parseInt(_m[1],10); if(_n>_dartMaxDevN) _dartMaxDevN=_n; } } });
   var rows = _dartParseCsv(csvText);
   if(!rows.length) return {error:'No rows found', created:0, merged:0, total:0};
   var holder = _dartInvHolder();
@@ -16917,7 +16938,7 @@ function processDartInventoryUpload(csvText, batchId){
     } else {
       // CREATE — new manifest unit; held by the DART CM (never unassigned)
       INVENTORY_DEVICES.push({
-        id: 'dev-'+(typeof INV_NEXT_ID!=='undefined' ? (INV_NEXT_ID++) : (Date.now()+'-'+created)),
+        id: 'dev-'+(++_dartMaxDevN),
         type: type,
         imei: isPhone ? imei : null,
         imei2: null,
@@ -16940,6 +16961,7 @@ function processDartInventoryUpload(csvText, batchId){
     }
     if(isPhone) phones++; else sims++;
   });
+  try{ if(typeof INV_NEXT_ID!=='undefined') INV_NEXT_ID = _dartMaxDevN + 1; }catch(e){}
   try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
   return {created:created, merged:merged, phones:phones, sims:sims, skipped:skipped, total:rows.length, holder:(holder&&holder.name)||null};
 }
