@@ -3463,7 +3463,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.05.8000';
+var BUILD_VERSION = '2026.07.05.8100';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -16832,6 +16832,10 @@ function _tcNextId(){
 
 // Main upload processor. Returns {newDevices, duplicates, total, unknownMarkets, batchId}.
 // Caller should then call invDbUpsertDevice for each new device for Path B sync.
+function _tcOwnerFallback(){
+  if(typeof DB==='undefined' || !DB.agents) return null;
+  return DB.agents.find(function(a){ return a && (a.role==='Owner' || (typeof isOwner==='function' && isOwner(a))); }) || null;
+}
 function _tcFindAgentByName(name){
   if(!name || typeof DB==='undefined' || !DB.agents) return null;
   var norm = String(name).trim().toLowerCase().replace(/\s+/g,' ');
@@ -16909,12 +16913,18 @@ function processTCInventoryUpload(htmlText, batchId){
     //  - "Available"  => genuine available stock (no holder, status 'available')
     //  - otherwise (e.g. "Checked Out") => assign to the named agent (v7600),
     //    or the market MM/CM when the name doesn't match a known agent.
+    // v8100 (Calvin): inventory is NEVER unassigned. Checked-out -> the named
+    // agent; Available (or an unmatched name) -> the market's manager (MM, or the
+    // market's CM via cmModel: Tanita=OK / Brandon=Dallas), owner as last resort.
+    // Available devices are held by the MM but keep status 'available'.
     var fileStatus     = (cells[2] || '').trim().toLowerCase();
     var isAvailable    = (fileStatus === 'available');
     var personAssigned = (cells[7] || '').trim();
     var directAgent    = (!isAvailable && personAssigned) ? _tcFindAgentByName(personAssigned) : null;
-    var autoRecipient  = isAvailable ? null : (directAgent || resolution.agent);
-    var routeSource    = isAvailable ? 'available-stock' : (directAgent ? 'person-assigned' : resolution.source);
+    var marketMgr      = resolution.agent || _tcOwnerFallback();
+    var autoRecipient  = isAvailable ? marketMgr : (directAgent || resolution.agent || marketMgr);
+    var routeSource    = isAvailable ? (resolution.agent ? 'available-mm' : 'available-owner')
+                        : (directAgent ? 'person-assigned' : (resolution.agent ? resolution.source : 'owner-fallback'));
 
     // ── Diagnostic capture ──
     // First time we see this market, record the resolver's debug info.
@@ -16938,7 +16948,7 @@ function processTCInventoryUpload(htmlText, batchId){
     if(autoRecipient) routingDiagnosticsByMarket[market].assignedCount++;
     else              routingDiagnosticsByMarket[market].unassignedCount++;
 
-    var devStatus    = isAvailable ? 'available' : (autoRecipient ? 'assigned' : 'unassigned');
+    var devStatus    = isAvailable ? 'available' : 'assigned';
     var devHolderId  = autoRecipient ? autoRecipient.id   : null;
     var devHolderName= autoRecipient ? autoRecipient.name : '';
     var routeKey;
@@ -41852,7 +41862,7 @@ function _briefCompany(){
   var salesAgents=(DB.agents||[]).filter(function(a){ try{return a&&a.active&&isSalesRole(a);}catch(e){return false;} });
   var wk=0; salesAgents.forEach(function(a){ wk+=_briefStat(a); });
   var perf=salesAgents.map(function(a){return {a:a,n:_briefStat(a)};}).sort(function(x,y){return y.n-x.n;});
-  var devOut=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.holderId||d.assignedTo);}).length; }catch(e){}
+  var devOut=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; }catch(e){}
   return {salesAgents:salesAgents, wk:wk, perf:perf, mvp:(perf[0]&&perf[0].n>0?perf[0]:null), devOut:devOut};
 }
 function _briefCounts(){
@@ -41986,7 +41996,7 @@ function _ownerStatSet(){
     var ll=progTotal(['Lifeline']), llA=progAgents(['Lifeline']);
     var intT=progTotal(['Internet']), intA=progAgents(['Internet']);
     var aca=progTotal(['ACA']), acaA=progAgents(['ACA']);
-    var devOut=0,invAvail=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.holderId||d.assignedTo);}).length; invAvail=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.holderId||d.assignedTo);}).length; }catch(e){}
+    var devOut=0,invAvail=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; invAvail=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; }catch(e){}
     // sorted: PEOPLE -> ENROLLMENTS -> PROGRAMS -> INVENTORY
     out.push({big:sales.length, lbl:'Sales agents', sub:inactive+' inactive', panel:'agents'});
     out.push({big:mgrs, lbl:'Managers', sub:leaders+' team leaders', panel:'agents'});
@@ -42091,7 +42101,7 @@ function _ownerHybridBoard(){
   var pat=weeklyPatternThisMonth();
   var progs=_programList();
   // devices in field
-  var devOut=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.holderId||d.assignedTo);}).length; }catch(e){}
+  var devOut=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; }catch(e){}
   // action queue counts (best-effort, all guarded)
   function _len(fn){ try{ var r=fn(); return Array.isArray(r)?r.length:(r||0); }catch(e){ return 0; } }
   var invApprovals=0; try{ invApprovals=(typeof INVENTORY_REQUESTS!=='undefined'?INVENTORY_REQUESTS:[]).filter(function(r){return r&&(r.status==='pending'||!r.status);}).length; }catch(e){}
@@ -42253,7 +42263,7 @@ function _ownerDash3(u){
     var mkts=_od3Num(function(){return (typeof marketActiveList==='function')?marketActiveList().length:((typeof MARKETS!=='undefined'&&MARKETS)?MARKETS.length:0);},0);
     var mgrs=sales.filter(function(a){return a.role==='Market Manager'||a.role==='Campaign Manager';}).length;
     var perf=sales.map(function(a){ var n=0; try{n=agentSalesCount(a,{period:'week'})||0;}catch(e){} return {a:a,n:n}; }).sort(function(x,y){return y.n-x.n;});
-    var devOut=0,invAvail=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.holderId||d.assignedTo);}).length; invAvail=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.holderId||d.assignedTo);}).length; }catch(e){}
+    var devOut=0,invAvail=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; invAvail=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; }catch(e){}
     var invReq=_od3Num(function(){return (typeof INVENTORY_REQUESTS!=='undefined'?INVENTORY_REQUESTS:[]).filter(function(r){return r&&(r.status==='pending'||!r.status);}).length;},0);
     var inact=_od3Num(function(){return (typeof INACTIVITY_FLAGS!=='undefined'?INACTIVITY_FLAGS:[]).filter(function(f){return f&&f.status!=='resolved'&&!f.acknowledgedAt;}).length;},0);
     var pend=_od3Num(function(){return (DB.agents||[]).filter(function(a){ return a && (String(a.username||'').indexOf('.pending')>=0||(a._meta&&a._meta.pending)); }).length;},0);
