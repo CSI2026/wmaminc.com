@@ -3463,7 +3463,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.05.8200';
+var BUILD_VERSION = '2026.07.05.8400';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -16843,6 +16843,105 @@ function _tcFindAgentByName(name){
   return DB.agents.find(function(a){
     return a && a.name && String(a.name).trim().toLowerCase().replace(/\s+/g,' ')===norm;
   }) || null;
+}
+// ── DART inventory importer (Calvin 2026-07-07) — idempotent merge by identity ──
+// DART phones key on IMEI, DART SIMs key on ESN (SIMs are always separate for DART).
+// Works in EITHER arrival order: manifest-first or scanner-first. Re-uploading the
+// same manifest never duplicates. Backs up before merging (never lose work).
+function _dartDigits(x){ return String(x==null?'':x).replace(/\D/g,''); }
+function _dartInvHolder(){
+  if(typeof DB==='undefined' || !DB.agents) return null;
+  var cm = DB.agents.find(function(a){ return a && a.active && a.role==='Campaign Manager' && (a.channels||[]).some(function(c){ return String(c).toLowerCase().indexOf('dart')>=0; }); });
+  if(cm) return cm;
+  cm = DB.agents.find(function(a){ return a && a.active && a.role==='Campaign Manager' && String(a.cmModel||'').toLowerCase().indexOf('oklahoma')>=0; });
+  if(cm) return cm;
+  return DB.agents.find(function(a){ return a && (a.role==='Owner' || (typeof isOwner==='function' && isOwner(a))); }) || null;
+}
+// tolerant CSV parser -> array of objects keyed by header
+function _dartParseCsv(text){
+  if(!text) return [];
+  var lines = String(text).replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(function(l){ return l.trim().length; });
+  if(lines.length < 2) return [];
+  function splitLine(line){
+    var out=[], cur='', q=false;
+    for(var i=0;i<line.length;i++){ var ch=line[i];
+      if(q){ if(ch==='"'){ if(line[i+1]==='"'){ cur+='"'; i++; } else q=false; } else cur+=ch; }
+      else { if(ch==='"') q=true; else if(ch===','){ out.push(cur); cur=''; } else cur+=ch; }
+    }
+    out.push(cur); return out;
+  }
+  var headers = splitLine(lines[0]).map(function(h){ return h.trim(); });
+  var rows=[];
+  for(var r=1;r<lines.length;r++){
+    var cells = splitLine(lines[r]);
+    var o={}; for(var c=0;c<headers.length;c++){ o[headers[c]] = (cells[c]!=null?cells[c]:'').trim(); }
+    rows.push(o);
+  }
+  return rows;
+}
+function processDartInventoryUpload(csvText, batchId){
+  if(typeof INVENTORY_DEVICES === 'undefined' || !Array.isArray(INVENTORY_DEVICES)) return {error:'inventory not ready', created:0, merged:0};
+  // backup DART inventory before merge — never lose work
+  try{
+    var _bk = INVENTORY_DEVICES.filter(function(d){ return d && String(d.campaign).toUpperCase()==='DART'; });
+    localStorage.setItem('wmam_dart_inv_backup_'+Date.now(), JSON.stringify(_bk));
+  }catch(e){}
+  var rows = _dartParseCsv(csvText);
+  if(!rows.length) return {error:'No rows found', created:0, merged:0, total:0};
+  var holder = _dartInvHolder();
+  var created=0, merged=0, phones=0, sims=0, skipped=0;
+  rows.forEach(function(r){
+    var imei = _dartDigits(r['IMEI']);
+    var esn  = _dartDigits(r['ESN']);
+    var isPhone = !!imei;                 // DART: phone has IMEI; SIM has ESN + blank IMEI
+    var key = isPhone ? imei : esn;
+    if(!key){ skipped++; return; }        // no identity -> can't track, skip
+    var type = isPhone ? 'phone' : 'sim';
+    var us = String(r['Unit Status']||'').trim().toLowerCase().replace(/[\s\-_]/g,'');
+    var manifestStatus = (us==='intransit') ? 'intransit' : 'available';
+    var existing = INVENTORY_DEVICES.find(function(d){
+      return d && String(d.campaign).toUpperCase()==='DART' && (isPhone ? d.imei===imei : d.sim===esn);
+    });
+    if(existing){
+      // MERGE — fill manifest details; never clobber a device already received/scanned/sold
+      existing.dartUnitStatus = r['Unit Status'] || existing.dartUnitStatus;
+      existing.make = r['Make Name'] || existing.make;
+      existing.model = r['Model Name'] || existing.model;
+      existing.dartBox = r['Box'] || existing.dartBox;
+      existing.shippedAt = r['Date Shipped'] || existing.shippedAt;
+      if(!isPhone && esn && !existing.sim) existing.sim = esn;
+      existing.manifestSeen = true;
+      var locked = existing.scannedAt || ['assigned','sold','activated','received'].indexOf(existing.status)>=0;
+      if(!locked) existing.status = manifestStatus;
+      merged++;
+    } else {
+      // CREATE — new manifest unit; held by the DART CM (never unassigned)
+      INVENTORY_DEVICES.push({
+        id: 'dev-'+(typeof INV_NEXT_ID!=='undefined' ? (INV_NEXT_ID++) : (Date.now()+'-'+created)),
+        type: type,
+        imei: isPhone ? imei : null,
+        imei2: null,
+        sim: isPhone ? null : esn,
+        campaign: 'DART',
+        batchId: batchId||null,
+        status: manifestStatus,
+        holderId: holder ? holder.id : null,
+        holderName: holder ? holder.name : null,
+        assignedTo: holder ? holder.id : null,
+        marketManagerId: holder ? holder.id : null,
+        dartUnitStatus: r['Unit Status'],
+        make: r['Make Name'], model: r['Model Name'], dartBox: r['Box'],
+        shippedAt: r['Date Shipped'],
+        manifestSeen: true,
+        scannedAt: null,
+        uploadDate: (new Date()).toISOString().slice(0,10)
+      });
+      created++;
+    }
+    if(isPhone) phones++; else sims++;
+  });
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  return {created:created, merged:merged, phones:phones, sims:sims, skipped:skipped, total:rows.length, holder:(holder&&holder.name)||null};
 }
 function processTCInventoryUpload(htmlText, batchId){
   var parsed = parseTCInventoryHTML(htmlText);
@@ -63581,7 +63680,18 @@ async function _carrierInvHandlePaste(campaign, mode){
       if(typeof gotoPanel === 'function') gotoPanel(route);
       return;
     }
-    // Inventory paste: parse digit runs, route to _commitDartScan
+    // DART inventory MANIFEST CSV (Store/Type/Unit Status/IMEI/ESN...) -> idempotent
+    // merge importer: phones by IMEI, SIMs by ESN, Intransit vs Available, never dupes,
+    // held by the DART CM, backup-before-merge. Works in either arrival order.
+    if(/unit\s*status/i.test(text) && /imei|esn/i.test(text) && typeof processDartInventoryUpload === 'function'){
+      var _mres = processDartInventoryUpload(text, 'dart-manifest-'+Date.now());
+      if(_mres && _mres.error){ alert('DART manifest error: '+_mres.error); return; }
+      alert('DART inventory manifest processed:\n' + _mres.created + ' new, ' + _mres.merged + ' merged (no duplicates)\n' + _mres.phones + ' phones, ' + _mres.sims + ' SIMs\nHeld by ' + (_mres.holder || 'DART CM') + '.');
+      ta.value = '';
+      if(typeof gotoPanel === 'function') gotoPanel(route);
+      return;
+    }
+    // Otherwise: parse digit runs, route to _commitDartScan
     if(typeof _commitDartScan !== 'function'){
       alert('DART scanner module not loaded — refresh the page and try again.'); return;
     }
