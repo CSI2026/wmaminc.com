@@ -3463,7 +3463,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.05.8900';
+var BUILD_VERSION = '2026.07.05.9000';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -16979,6 +16979,97 @@ function _carrierInvReconcileBanner(devices){
     +'</div>';
 }
 if(typeof window!=='undefined'){ window._invShippedNotReceived=_invShippedNotReceived; window.invReconcileShipped=invReconcileShipped; window._carrierInvReconcileBanner=_carrierInvReconcileBanner; }
+// ════════════════════════════════════════════════════════════════════════
+//  One-time admin operations (Calvin 2026-07-07) — each BACKS UP first, does
+//  the change on cloud + local, then RE-READS localStorage to VERIFY it saved,
+//  and returns a report. Nothing is assumed — the report proves persistence.
+// ════════════════════════════════════════════════════════════════════════
+
+// Purge all Gen Mobile inventory (the delete the Inv Dept did that didn't stick).
+async function wmamPurgeGmInventory(){
+  function isGm(d){ return d && /gen\s*mobile|^gm$/i.test(String(d.campaign||'')); }
+  var gmPool    = (typeof GM_INVENTORY!=='undefined' && Array.isArray(GM_INVENTORY)) ? GM_INVENTORY.slice() : [];
+  var gmLegacy  = (typeof INVENTORY_DEVICES!=='undefined' && Array.isArray(INVENTORY_DEVICES)) ? INVENTORY_DEVICES.filter(isGm) : [];
+  var before    = gmPool.length + gmLegacy.length;
+  if(!before) return {before:0, note:'No Gen Mobile devices found — nothing to purge.'};
+  // 1) BACKUP (recoverable)
+  var backupKey = 'wmam_gm_purge_backup_'+Date.now();
+  try{ localStorage.setItem(backupKey, JSON.stringify({gm:gmPool, legacy:gmLegacy})); }catch(e){}
+  // 2) CLOUD delete
+  var cloud = {};
+  try{
+    if(typeof invDbBulkDelete==='function'){
+      var r1 = await invDbBulkDelete('gm', gmPool.map(function(d){return String(d.id);}));
+      cloud.gm_inventory = r1.ok ? ('deleted '+r1.deletedCount) : ('ERROR '+JSON.stringify(r1.error));
+      if(gmLegacy.length){
+        var r2 = await invDbBulkDelete('legacy', gmLegacy.map(function(d){return String(d.id);}));
+        cloud.inventory_devices = r2.ok ? ('deleted '+r2.deletedCount) : ('ERROR '+JSON.stringify(r2.error));
+      }
+    } else cloud.note='invDbBulkDelete unavailable';
+  }catch(e){ cloud.error = e.message; }
+  // 3) LOCAL delete
+  if(typeof GM_INVENTORY!=='undefined' && Array.isArray(GM_INVENTORY)) GM_INVENTORY.length=0;
+  if(typeof INVENTORY_DEVICES!=='undefined' && Array.isArray(INVENTORY_DEVICES)){
+    for(var i=INVENTORY_DEVICES.length-1;i>=0;i--){ if(isGm(INVENTORY_DEVICES[i])) INVENTORY_DEVICES.splice(i,1); }
+  }
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  try{ if(typeof saveToStorage==='function') saveToStorage(); }catch(e){}
+  // 4) VERIFY by re-reading localStorage
+  var lsGm=0, lsLegacyGm=0;
+  try{ lsGm = (JSON.parse(localStorage.getItem('wmam_gm_inventory')||'[]')||[]).length; }catch(e){}
+  try{ lsLegacyGm = (JSON.parse(localStorage.getItem('wmam_inv_devices')||'[]')||[]).filter(isGm).length; }catch(e){}
+  var savedOk = (lsGm===0 && lsLegacyGm===0);
+  return {
+    before:before, cloud:cloud,
+    localGmRemaining:lsGm, localLegacyGmRemaining:lsLegacyGm,
+    SAVED_TO_LOCALSTORAGE: savedOk,
+    verdict: savedOk ? 'CONFIRMED: '+before+' GM devices removed and localStorage verified empty of GM.' : 'WARNING: GM still present in localStorage after save — do NOT reload; tell Calvin.',
+    backupKey:backupKey
+  };
+}
+if(typeof window!=='undefined') window.wmamPurgeGmInventory = wmamPurgeGmInventory;
+
+// Re-point existing UNASSIGNED Dallas B inventory to Brandon Smith.
+function wmamRerouteDallasBToBrandon(){
+  var brandon = (DB.agents||[]).find(function(a){ return a && /brandon\s*smith/i.test(a.name||''); });
+  if(!brandon) return {error:'Brandon Smith not found in DB.agents'};
+  var owner = (DB.agents||[]).find(function(a){ return a && (a.role==='Owner' || (typeof isOwner==='function' && isOwner(a))); });
+  function isDallasB(d){
+    var m = String(d.market||d.teamDd||d.marketName||'');
+    if(typeof _marketTokenMatch==='function') return _marketTokenMatch(m,'Dallas B') || _marketTokenMatch(m,'Team Dallas TX B');
+    return /dallas/i.test(m) && /\bb\b/i.test(m);
+  }
+  function isUnassigned(d){
+    if(!d.holderId) return true;
+    if(owner && d.holderId===owner.id) return true;
+    return ['available','unassigned','uploaded'].indexOf(String(d.status||'').toLowerCase())>=0;
+  }
+  var pool = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools() : [];
+  var examined=0, moved=0, backup=[];
+  pool.forEach(function(d){
+    if(!d || d.deletedAt || d.status==='sold') return;
+    if(!isDallasB(d)) return;
+    examined++;
+    if(isUnassigned(d)){
+      backup.push({id:d.id, holderId:d.holderId, holderName:d.holderName, status:d.status});
+      d.holderId=brandon.id; d.holderName=brandon.name; d.assignedTo=brandon.id; d.marketManagerId=brandon.id;
+      moved++;
+    }
+  });
+  if(moved){ try{ localStorage.setItem('wmam_dallasb_reroute_backup_'+Date.now(), JSON.stringify(backup)); }catch(e){} }
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  try{ if(typeof saveToStorage==='function') saveToStorage(); }catch(e){}
+  // VERIFY: re-read the union and count Dallas B devices now held by Brandon
+  var after = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools() : [];
+  var nowBrandon = after.filter(function(d){ return d && isDallasB(d) && d.holderId===brandon.id; }).length;
+  var stillUnassigned = after.filter(function(d){ return d && isDallasB(d) && !d.deletedAt && d.status!=='sold' && isUnassigned(d) && d.holderId!==brandon.id; }).length;
+  return {
+    brandon:brandon.name, dallasBExamined:examined, moved:moved,
+    dallasBNowHeldByBrandon:nowBrandon, dallasBStillUnassigned:stillUnassigned,
+    verdict: (stillUnassigned===0) ? 'CONFIRMED: all unassigned Dallas B inventory now routes to Brandon.' : ('NOTE: '+stillUnassigned+' Dallas B device(s) still unassigned — check market name match.')
+  };
+}
+if(typeof window!=='undefined') window.wmamRerouteDallasBToBrandon = wmamRerouteDallasBToBrandon;
 function processDartInventoryUpload(csvText, batchId){
   if(typeof INVENTORY_DEVICES === 'undefined' || !Array.isArray(INVENTORY_DEVICES)) return {error:'inventory not ready', created:0, merged:0};
   // backup DART inventory before merge — never lose work
