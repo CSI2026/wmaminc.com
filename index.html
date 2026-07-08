@@ -3463,7 +3463,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.05.9400';
+var BUILD_VERSION = '2026.07.05.9600';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -16535,6 +16535,7 @@ function processGMInventoryUpload(csvText, batchId){
   GM_INVENTORY.forEach(function(d){ existingIMEIs[d.imei]=d; });
 
   var newDevices=[], duplicates=[], unknownMarkets={};
+  var gmUpdatedCount=0, gmReassignedCount=0, _gmUnmatchedNames=[]; // vendor-wins reconcile
   var marketBreakdown={};
 
   // ── Calvin 2026-05-01: per-MARKET auto-assignment ──
@@ -16631,14 +16632,9 @@ function processGMInventoryUpload(csvText, batchId){
     if(!marketBreakdown[market]) marketBreakdown[market]=0;
     marketBreakdown[market]++;
 
-    if(existingIMEIs[imei]){
-      // Duplicate — check if it's in same market or different (flag if different)
-      var existing = existingIMEIs[imei];
-      duplicates.push({imei:imei, existingMarket:existing.market, newMarket:market, existingStatus:existing.status, flagged:existing.market!==market});
-      return;
-    }
-
     if(typeof _invTombHas==='function' && _invTombHas(imei)){ return; } // deleted -> never resurrect
+    var _gmExisting = existingIMEIs[imei] || null;  // vendor-wins: reconcile instead of skip
+    if(_gmExisting){ duplicates.push({imei:imei, existingMarket:_gmExisting.market, newMarket:market, existingStatus:_gmExisting.status, flagged:_gmExisting.market!==market}); }
     var uploadExpiry = (typeof window._gmExpiryOverride === 'string' && window._gmExpiryOverride)
                        ? window._gmExpiryOverride
                        : new Date(Date.now() + 30*86400000).toISOString().slice(0,10);
@@ -16649,6 +16645,7 @@ function processGMInventoryUpload(csvText, batchId){
     //   3. Otherwise unassigned in pool
     var resolution = gmResolveUploadRecipient(recipientName, market);
     var autoAgent = resolution ? resolution.agent : null;
+    if(recipientName && !autoAgent && _gmUnmatchedNames.indexOf(recipientName)<0){ _gmUnmatchedNames.push(recipientName); }
     if(resolution && autoAgent){
       var key = market + ' → ' + autoAgent.name + ' (' + resolution.source + ')';
       routingReport[key] = (routingReport[key] || 0) + 1;
@@ -16677,6 +16674,29 @@ function processGMInventoryUpload(csvText, batchId){
                        : uploadExpiry;
     }
 
+    if(_gmExisting){
+      // VENDOR FILE WINS: reconcile the existing GM device's placement to the file.
+      var _gmPrev = _gmExisting.holderId;
+      var _gmNew  = autoAgent ? autoAgent.id : null;
+      _gmExisting.status         = autoAgent ? 'assigned' : 'unassigned';
+      _gmExisting.assignedTo     = _gmNew;
+      _gmExisting.assignedToName = autoAgent ? autoAgent.name : '';
+      _gmExisting.holderId       = _gmNew;
+      _gmExisting.holderName     = autoAgent ? autoAgent.name : '';
+      _gmExisting.recipientId    = _gmNew;
+      _gmExisting.recipientName  = autoAgent ? autoAgent.name : '';
+      _gmExisting.mmId           = _gmNew;
+      _gmExisting.mmName         = autoAgent ? autoAgent.name : '';
+      _gmExisting.market         = market;
+      if(dueDate) _gmExisting.vendorDueDate = dueDate;
+      gmUpdatedCount++;
+      if(String(_gmPrev==null?'':_gmPrev) !== String(_gmNew==null?'':_gmNew)){
+        gmReassignedCount++;
+        if(!Array.isArray(_gmExisting.chainOfCustody)) _gmExisting.chainOfCustody = [];
+        _gmExisting.chainOfCustody.push({ type:'reassigned-on-reupload', at:nowISO, to:(autoAgent?autoAgent.name:''), toId:_gmNew, fromId:_gmPrev, source:'vendor-file-wins', batchId:batchId });
+      }
+      return;
+    }
     newDevices.push({
       id:            'gm-'+(new Date().getTime())+'-'+Math.random().toString(36).substr(2,6),
       imei:          imei,
@@ -16752,7 +16772,8 @@ function processGMInventoryUpload(csvText, batchId){
     duplicates: duplicates,
     unknownMarkets: unknownMarkets,
     marketBreakdown: marketBreakdown,
-    routingReport: routingReport
+    routingReport: routingReport,
+    reconciliation: { newCreated: newDevices.length, reconciled: gmUpdatedCount, reassigned: gmReassignedCount, unmatchedNames: _gmUnmatchedNames }
   };
 }
 
@@ -17158,6 +17179,9 @@ function processTCInventoryUpload(htmlText, batchId){
 
   var newDevices = [];
   var duplicates = [];
+  var reassignedCount = 0;   // vendor-wins: existing devices whose holder changed
+  var updatedCount = 0;      // existing devices reconciled to the file
+  var _tcUnmatchedNames = [];// Person Assigned names with no roster match
   var unknownMarkets = {};
   var marketBreakdown = {};
   var carrierBreakdown = {};
@@ -17197,7 +17221,7 @@ function processTCInventoryUpload(htmlText, batchId){
 
     // Dedup: re-uploading the same file is a no-op for already-known IMEIs
     if(typeof _invTombHas==='function' && _invTombHas(imei)){ return; } // deleted -> never resurrect
-    if(existingIMEIs[imei]){ duplicates.push(imei); return; }
+    var _tcExisting = existingIMEIs[imei] || null;  // vendor-wins: reconcile instead of skip
 
     var market = tcMarketTranslate(teamDd);
     if(!market) unknownMarkets[teamDd || '(blank)'] = (unknownMarkets[teamDd || '(blank)'] || 0) + 1;
@@ -17223,6 +17247,7 @@ function processTCInventoryUpload(htmlText, batchId){
     var isAvailable    = (fileStatus === 'available');
     var personAssigned = (cells[7] || '').trim();
     var directAgent    = (!isAvailable && personAssigned) ? _tcFindAgentByName(personAssigned) : null;
+    if(!isAvailable && personAssigned && !directAgent && _tcUnmatchedNames.indexOf(personAssigned)<0){ _tcUnmatchedNames.push(personAssigned); }
     var marketMgr      = resolution.agent || _tcOwnerFallback();
     var autoRecipient  = isAvailable ? marketMgr : (directAgent || resolution.agent || marketMgr);
     var routeSource    = isAvailable ? (resolution.agent ? 'available-mm' : 'available-owner')
@@ -17281,6 +17306,27 @@ function processTCInventoryUpload(htmlText, batchId){
       }
     }
 
+    if(_tcExisting){
+      // VENDOR FILE WINS: reconcile the existing device's placement to the file.
+      var _prevHolder = _tcExisting.holderId;
+      _tcExisting.status     = devStatus;
+      _tcExisting.holderId   = devHolderId;
+      _tcExisting.holderName = devHolderName;
+      _tcExisting.assignedTo = devHolderId;
+      _tcExisting.market     = market;
+      if(model) _tcExisting.model = model;
+      if(cost)  _tcExisting.cost  = cost;
+      if(vendorDueISO) _tcExisting.vendorDueDate = vendorDueISO;
+      _tcExisting.mmId   = (routeSource === 'market-mm' && autoRecipient) ? autoRecipient.id   : null;
+      _tcExisting.mmName = (routeSource === 'market-mm' && autoRecipient) ? autoRecipient.name : '';
+      duplicates.push(imei); updatedCount++;
+      if(String(_prevHolder==null?'':_prevHolder) !== String(devHolderId==null?'':devHolderId)){
+        reassignedCount++;
+        if(!Array.isArray(_tcExisting.chainOfCustody)) _tcExisting.chainOfCustody = [];
+        _tcExisting.chainOfCustody.push({ type:'reassigned-on-reupload', at:nowISO, to:devHolderName, toId:devHolderId, fromId:_prevHolder, source:'vendor-file-wins', batchId:batchId });
+      }
+      return;
+    }
     var dev = {
       id:             'tc-' + (++_tcIdN),
       imei:           imei,
@@ -17376,6 +17422,7 @@ function processTCInventoryUpload(htmlText, batchId){
     carrierBreakdown: carrierBreakdown,
     routingBreakdown: routingBreakdown,
     routingDiagnostics: Object.keys(routingDiagnosticsByMarket).map(function(k){ return routingDiagnosticsByMarket[k]; }),
+    reconciliation: { fileRows: rows.length, newCreated: newDevices.length, reconciled: updatedCount, reassigned: reassignedCount, unmatchedNames: _tcUnmatchedNames },
     batchId: batchId
   };
 }
