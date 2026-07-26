@@ -18493,7 +18493,7 @@ function inventorySummary(user){
   // Calvin 2026-05-03: ALWAYS-ON DIAGNOSTIC LOGGING. Until inventory
   // visibility is rock-solid, every call dumps its trace to console.
   // To silence later: set window._invDbg = false.
-  var dbg = (window._invDbg !== false);
+  var dbg = (window._invDbg === true); // default OFF — set window._invDbg=true in console to debug
   var all = invScopedDevicesAllCampaigns(user);
   var lg  = legacyScopedDevices(user);
   if(dbg) console.log('[invSum] user='+(user&&user.id)+' role='+(user&&user.role)+' scoped='+all.length+' legacy='+lg.length);
@@ -18542,11 +18542,21 @@ function inventorySummary(user){
     if(dbg && added2) console.log('[invSum] safety net added '+added2+' device(s) by holder match');
   }
 
-  var total = all.length + lg.length;
+  // Deduplicate all+lg by id/imei to avoid double-counting
+  var _totalSeen = {};
+  var _allUniq = [];
+  all.concat(lg).forEach(function(d){
+    if(!d) return;
+    var k = d.id || d.imei;
+    if(k && _totalSeen[k]) return;
+    if(k) _totalSeen[k] = true;
+    _allUniq.push(d);
+  });
+  var total = _allUniq.length;
   if(dbg) console.log('[invSum] FINAL total='+total+' for user='+(user&&user.id));
 
   function _isAvailableStatus(s){
-    return s === 'unassigned' || s === 'uploaded' || s === 'available' || !s;
+    return s === 'unassigned' || s === 'uploaded' || s === 'available' || s === 'pending-acceptance' || !s;
   }
   function _isAssignedStatus(s){
     return s === 'assigned';
@@ -18563,29 +18573,17 @@ function inventorySummary(user){
     return invDaysRemaining(d.expiryDate, d.assignedDate);
   }
 
-  var sold       = all.filter(_isSoldStatus).length + lg.filter(_isSoldStatus).length;
-  var assigned   = all.filter(function(d){return _isAssignedStatus(d.status);}).length
-                 + lg.filter(function(d){return _isAssignedStatus(d.status);}).length;
-  var unassigned = all.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length
-                 + lg.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length;
-  var activated  = all.filter(function(d){return d.status==='activated';}).length
-                 + lg.filter(function(d){return d.status==='activated';}).length;
+  var sold       = _allUniq.filter(_isSoldStatus).length;
+  var assigned   = _allUniq.filter(function(d){return _isAssignedStatus(d.status);}).length;
+  var unassigned = _allUniq.filter(function(d){return _isAvailableStatus(d.status) && !_isSoldStatus(d);}).length;
+  var activated  = _allUniq.filter(function(d){return d.status==='activated';}).length;
   function _isExpiringDays(d, lo, hi){
     var dy = _daysLeft(d);
     return dy!==null && dy>=lo && dy<=hi;
   }
-  var expiring5  = all.filter(function(d){return _isExpiringDays(d,0,5);}).length
-                 + lg.filter(function(d){return _isExpiringDays(d,0,5);}).length;
-  var expiring10 = all.filter(function(d){return _isExpiringDays(d,0,10);}).length
-                 + lg.filter(function(d){return _isExpiringDays(d,0,10);}).length;
-  var expired    = all.filter(function(d){
-                     var dy = _daysLeft(d);
-                     return dy!==null && dy<0 && d.status==='assigned';
-                   }).length
-                 + lg.filter(function(d){
-                     var dy = _daysLeft(d);
-                     return dy!==null && dy<0 && d.status==='assigned';
-                   }).length;
+  var expiring5  = _allUniq.filter(function(d){return _isExpiringDays(d,0,5);}).length;
+  var expiring10 = _allUniq.filter(function(d){return _isExpiringDays(d,0,10);}).length;
+  var expired    = _allUniq.filter(function(d){var dy=_daysLeft(d);return dy!==null&&dy<0&&d.status==='assigned';}).length;
   return {
     total:total, assigned:assigned, unassigned:unassigned, activated:activated, sold:sold,
     expiring5:expiring5, expiring10:expiring10, expired:expired,
@@ -18773,9 +18771,11 @@ function invScopedDevices(user, campaign){
 
 // All devices this user can see across every campaign
 function invScopedDevicesAllCampaigns(user){
-  var out = [];
+  var out = []; var _seen = {};
   activeCampaigns().forEach(function(c){
     invScopedDevices(user, c).forEach(function(d){
+      var k = d.imei||d.id;
+      if(_seen[k]) return; _seen[k]=true;
       if(!d.campaign) d.campaign = c;
       out.push(d);
     });
@@ -19106,9 +19106,19 @@ function scoreboardInventory(user){
   var out = {available:0, sold:0, total:0, expired:0, byCampaign:{}, expiredWorst:null, expiringSoon:null, _today:new Date().toISOString().slice(0,10)};
   if(!user) return out;
 
-  var pool = (typeof unionAllInventoryPools === 'function')
+  // Build deduplicated pool to prevent double-counting
+  var _rawPool = (typeof unionAllInventoryPools === 'function')
     ? unionAllInventoryPools()
     : (Array.isArray(INVENTORY_DEVICES) ? INVENTORY_DEVICES.slice() : []);
+  var _sbSeen = {};
+  var pool = [];
+  _rawPool.forEach(function(d){
+    if(!d) return;
+    var k = d.imei || d.id;
+    if(k && _sbSeen[k]) return;
+    if(k) _sbSeen[k] = true;
+    pool.push(d);
+  });
   if(!pool || !pool.length) return out;
 
   // ── Determine the set of agent IDs the scoreboard should aggregate ──
@@ -19144,7 +19154,7 @@ function scoreboardInventory(user){
   var scopeSet = scopeIds ? scopeIds.reduce(function(m,id){m[id]=true;return m;}, {}) : null;
 
   pool.forEach(function(d){
-    if(!d) return;
+    if(!d || typeof d !== 'object') return;
     var holderId = (typeof deviceHolderId === 'function' ? deviceHolderId(d) : null) || d.holderId || null;
     var inScope = false;
     if(seeAll){
@@ -19158,16 +19168,13 @@ function scoreboardInventory(user){
     if(!inScope) return;
 
     var st = d.status;
-    // Calvin 2026-05-18: soft-deleted devices are excluded from all
-    // scoreboard counts (total, sold, available) — they're "in the trash"
-    // and shouldn't influence any visible metric. Owner can still see them
-    // in panelInvTrash for restore/empty-trash actions.
-    if(st === 'deleted') return;
+    if(st === 'deleted') return; // soft-deleted excluded from all counts
+    var isPendingAcc = (st === 'pending-acceptance'); // assigned to MM, not yet signed
     var isSold = (st === 'sold' || st === 'activated' || d.soldAt);
     out.total++;
     if(isSold) out.sold++;
     else {
-      out.available++;
+      out.available++; // includes pending-acceptance, assigned, uploaded, available
       // ── Calvin 2026-07-02: campaign split + expiry triage (same scope) ──
       var camp = d.campaign || d.carrier || 'Other';
       out.byCampaign[camp] = (out.byCampaign[camp]||0) + 1;
@@ -34153,7 +34160,9 @@ function ownerInvFilterDevices(devices){
       // normalize: 'uploaded' counts as 'unassigned' bucket (matches inventorySummary)
       if(sf === 'unassigned' && !(s==='unassigned' || s==='uploaded' || s==='available' || !d.status)) return false;
       if(sf === 'assigned'   && s !== 'assigned')  return false;
-      if(sf === 'sold'       && !(s==='sold' || d.soldAt)) return false;
+      if(sf === 'pending-acceptance' && s !== 'pending-acceptance') return false;
+      if(sf === 'awaiting'   && s !== 'uploaded')  return false;
+      if(sf === 'sold'       && !(s==='sold' || s==='activated' || d.soldAt)) return false;
       if(sf === 'activated'  && s !== 'activated') return false;
     }
     if(hf !== 'all'){
@@ -38450,7 +38459,7 @@ function panelAgentMasterProfile(agentId){
 
   // ── SIGNED CONTRACTS & E-SIGN FOLDER ──────────────────────────────
   // Visible to Owner and all office staff (HR, Onboarding, Inventory, Payroll, Admin)
-  if(canAccess(viewer,'agent-master') && (isOwner(viewer)||viewer.role==='admin'||isHR(viewer)||isInventory(viewer)||isPayroll(viewer)||isOnboarding(viewer))){
+  if(agentId && canAccess(viewer,'agent-master') && (isOwner(viewer)||viewer.role==='admin'||isHR(viewer)||isInventory(viewer)||isPayroll(viewer)||isOnboarding(viewer))){
     h += '<div class="bo-card" style="margin-bottom:14px">';
     h += '<div class="bo-card-head"><div class="bo-card-title">&#128196; Signed Contracts & E-Sign Records</div></div>';
     h += '<div style="padding:14px 20px">';
@@ -38832,9 +38841,11 @@ function invGracePeriodState(device){
   return 'normal';
 }
 function canActivateDevice(device,agent){
+  if(!device) return false;
   var state=invGracePeriodState(device);
   if(state==='no-date'||state==='normal'||state==='corp-expired') return true;
   // Grace period: display expired but corp date still valid -- managers only
+  if(!agent) return false;
   return isOwner(agent)||isInventory(agent)||agent.role==='Market Manager'||
          agent.role==='Campaign Manager'||agent.role==='IBO'||agent.role==='admin';
 }
@@ -40120,7 +40131,26 @@ function panelBO(){
   // ══════════════════════════════════════════════════════════════════════
   if(typeof devicesHeldBy === 'function' && (isSalesRole(u) || u.role==='Market Manager' || u.role==='Campaign Manager' || u.role==='Team Leader' || u.role==='IBO')){
     var topHeld = [];
-    try { topHeld = devicesHeldBy(u.id, null) || []; } catch(e){ console.warn('[panelBO] devicesHeldBy failed:', e); }
+    var _ownHeld = [];
+    try {
+      _ownHeld = devicesHeldBy(u.id, null) || [];
+      // For managers: also count team members' devices for the total
+      var hasMgrRoleChk = (u.role==='Campaign Manager'||u.role==='IBO'||u.role==='Market Manager'||u.role==='Team Leader');
+      if(hasMgrRoleChk && typeof agentIdsInMyOrgEffective==='function'){
+        var _teamIds = agentIdsInMyOrgEffective(u);
+        var _seen = {}; _ownHeld.forEach(function(d){if(d.imei) _seen[d.imei]=true;});
+        topHeld = _ownHeld.slice();
+        _teamIds.forEach(function(aid){
+          if(aid===u.id) return;
+          (devicesHeldBy(aid,null)||[]).forEach(function(d){
+            var k=d.imei||d.id;
+            if(!_seen[k]){ _seen[k]=true; topHeld.push(d); }
+          });
+        });
+      } else {
+        topHeld = _ownHeld;
+      }
+    } catch(e){ console.warn('[panelBO] devicesHeldBy failed:', e); topHeld=_ownHeld||[]; _ownHeld=_ownHeld||[]; }
     if(topHeld.length){
       var canDistTop = (typeof canDistributeInventory === 'function') && canDistributeInventory(u);
       var hasMgrRole = (u.role==='Campaign Manager' || u.role==='IBO' || u.role==='Market Manager' || u.role==='Team Leader');
@@ -40138,7 +40168,11 @@ function panelBO(){
       html += '<div style="background:'+topBg+';border:1px solid '+topAccent+'40;border-left:5px solid '+topAccent+';border-radius:10px;padding:14px 20px;margin-bottom:18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
       html += '<div style="font-size:2rem;line-height:1;flex-shrink:0">📱</div>';
       html += '<div style="flex:1;min-width:200px">';
-      html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:'+topAccent+'">YOU ARE HOLDING '+topHeld.length+' DEVICE'+(topHeld.length>1?'S':'')+'</div>';
+      var _teamCard = hasMgrRole && topHeld.length !== _ownHeld.length;
+      var _cardHdr = _teamCard
+        ? 'TEAM TOTAL: '+topHeld.length+' DEVICE'+(topHeld.length>1?'S':'')+' &#8226; YOU HOLD '+_ownHeld.length
+        : 'YOU ARE HOLDING '+topHeld.length+' DEVICE'+(topHeld.length>1?'S':'');
+      html += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.2rem;letter-spacing:2px;color:'+topAccent+'">'+_cardHdr+'</div>';
       var subParts = [];
       if(topUrgent5 > 0) subParts.push('<strong style="color:#CC0000">🔥 '+topUrgent5+' urgent (≤5 days)</strong>');
       var imeis = topHeld.slice(0,3).map(function(d){ return d.imei || d.id || '?'; });
@@ -40166,13 +40200,15 @@ function panelBO(){
           html += '<div class="bo-card-head"><div class="bo-card-title">&#128241; Team Inventory Holdings</div></div>';
           html += '<div style="padding:0 16px 12px">';
           html += '<table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif;font-size:.82rem">';
-          html += '<tr style="border-bottom:2px solid var(--border)"><th style="padding:8px 6px;text-align:left;color:var(--muted);font-weight:600">Agent</th><th style="padding:8px 6px;text-align:left;color:var(--muted);font-weight:600">Role</th><th style="padding:8px 6px;text-align:center;color:var(--muted);font-weight:600">Devices</th><th style="padding:8px 6px;text-align:center;color:var(--muted);font-weight:600">Urgent</th></tr>';
+          html += '<tr style="border-bottom:2px solid var(--border)"><th style="padding:8px 6px;text-align:left;color:var(--muted);font-weight:600">Agent</th><th style="padding:8px 6px;text-align:left;color:var(--muted);font-weight:600">Role</th><th style="padding:8px 6px;text-align:center;color:var(--muted);font-weight:600">Devices</th><th style="padding:8px 6px;text-align:center;color:var(--muted);font-weight:600">Urgent</th><th style="padding:8px 6px;text-align:center;color:var(--muted);font-weight:600">Sold</th></tr>';
           _teamInvRows.forEach(function(r){
+            var _tSold = (r.a&&r.a.id&&typeof devicesHeldBy==='function') ? (devicesHeldBy(r.a.id,null)||[]).filter(function(d){return d&&(d.status==='sold'||d.status==='activated'||d.soldAt);}).length : 0;
             html += '<tr style="border-bottom:1px solid var(--border)">';
             html += '<td style="padding:7px 6px;font-weight:600">'+r.a.name+'</td>';
             html += '<td style="padding:7px 6px;color:var(--muted)">'+r.a.role+'</td>';
             html += '<td style="padding:7px 6px;text-align:center;font-weight:700;color:var(--blue)">'+r.count+'</td>';
             html += '<td style="padding:7px 6px;text-align:center;color:'+(r.urgent?'#CC0000':'var(--muted)')+'">'+(r.urgent?'&#128293; '+r.urgent:'—')+'</td>';
+            html += '<td style="padding:7px 6px;text-align:center;color:#059669;font-weight:600">'+((_tSold>0)?'✅ '+_tSold:'—')+'</td>';
             html += '</tr>';
           });
           html += '</table></div></div>';
@@ -41732,6 +41768,8 @@ function panelBO(){
 
 
 
+  // Build number — only visible inside the back office, not public
+  html += '<div style="text-align:center;padding:8px 0 4px;font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;color:rgba(0,0,0,.18);user-select:none">Build v2026.07.26-B3 &middot; 2026-07-26</div>';
   return html;
 }
 
@@ -43154,6 +43192,7 @@ function panelOwner(){
   }catch(e){}
 
 
+  h += '<div style="text-align:right;padding:6px 20px 2px;font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;color:rgba(0,53,148,.3)">Build v2026.07.26-B3 &middot; 2026-07-26</div>';
   return h;
 }
 
@@ -49930,8 +49969,8 @@ function invAssignBatchToMM(batchId){
     });
   }
   if(assigned>0&&_batchDevices.length){
-    var _camp=_batchDevices[0].campaign||'Gen Mobile';
-    try{if(typeof invCreateAcceptanceTransfersForUpload==='function') invCreateAcceptanceTransfersForUpload(_camp,_batchDevices,DB.current);}catch(e){}
+    var _camp=(_batchDevices[0]&&_batchDevices[0].campaign)||'Gen Mobile';
+    try{if(typeof invCreateAcceptanceTransfersForUpload==='function') invCreateAcceptanceTransfersForUpload(_camp,_batchDevices,DB.current);}catch(e){console.warn('[invAssignBatchToMM] e-sign creation failed:',e);}
     if(typeof pushNotification==='function') pushNotification({toIds:[mmId],toRoles:[],icon:'\u270F\uFE0F',title:'Inventory Assigned - Signature Required',body:assigned+' device(s) need your e-signature. Batch: '+batchId,panel:'inventory',priority:'high'});
   }
   if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
@@ -49960,21 +49999,31 @@ function panelInvDashboard(){
   // top-strip stats reflect ALL devices in the system, not just legacy uploads.
   // Devices uploaded via the campaign-specific paths (GM_INVENTORY, TC_INVENTORY,
   // etc.) were invisible in this dashboard before this fix.
-  var devices = (typeof INVENTORY_DEVICES !== 'undefined' && INVENTORY_DEVICES) ? INVENTORY_DEVICES.slice() : [];
+  // Build master device list - deduplicate by IMEI so devices in both
+  // INVENTORY_DEVICES and a campaign pool only count once
+  var _dashSeen = {};
+  var devices = [];
+  function _dashPush(d, camp){
+    if(!d || typeof d !== 'object') return;
+    var key = d.imei || d.id || (d.imei&&d.id) || '';
+    if(!key) key = JSON.stringify(d).slice(0,40);
+    if(_dashSeen[key]) return;
+    _dashSeen[key] = true;
+    if(!d.campaign && camp) d.campaign = camp;
+    devices.push(d);
+  }
+  // Campaign-specific pools first (more complete data)
   if(typeof activeCampaigns === 'function'){
     activeCampaigns().forEach(function(c){
       var cfg = (typeof campaignCfg === 'function') ? campaignCfg(c) : null;
       if(cfg && typeof cfg.inventory === 'function'){
-        try {
-          var pool = cfg.inventory() || [];
-          pool.forEach(function(d){
-            // Tag with campaign so downstream rendering shows it correctly
-            if(!d.campaign) d.campaign = c;
-            devices.push(d);
-          });
-        } catch(e){ /* skip pools that fail */ }
+        try { (cfg.inventory()||[]).forEach(function(d){ _dashPush(d,c); }); } catch(e){}
       }
     });
+  }
+  // Legacy pool — only adds devices NOT already seen above
+  if(typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
+    INVENTORY_DEVICES.forEach(function(d){ _dashPush(d, d.campaign||''); });
   }
   var today   = new Date(); today.setHours(0,0,0,0);
 
@@ -49983,9 +50032,11 @@ function panelInvDashboard(){
   var assigned = devices.filter(function(d){return d.status==='assigned';}).length;
   var available= devices.filter(function(d){
     var s = d.status;
-    return s==='available' || s==='unassigned' || !s;
+    return s==='available' || s==='unassigned' || s==='pending-acceptance' || !s;
   }).length;
-  var uploaded = devices.filter(function(d){return d.status==='uploaded';}).length;
+  var uploaded    = devices.filter(function(d){return d.status==='uploaded';}).length;
+  var pendingAcc  = devices.filter(function(d){return d.status==='pending-acceptance';}).length;
+  var soldCount   = devices.filter(function(d){return d.status==='sold'||d.status==='activated'||d.soldAt;}).length;
   var expired  = devices.filter(function(d){
     return d.assignedDate && invDaysRemaining(d.expiryDate, d.assignedDate) < 0;
   }).length;
@@ -50233,7 +50284,9 @@ function panelInvDashboard(){
   h += _statBtn('Total Devices',         total,        'var(--blue)', '');
   h += _statBtn('Available',             available,    '#059669',     'available');
   h += _statBtn('Assigned to Agents',    assigned,     'var(--blue)', 'assigned');
+  h += _statBtn('Pending E-Sign',        pendingAcc,   '#7c3aed',     'pending-acceptance');
   h += _statBtn('Awaiting Assignment',   uploaded,     '#D97706',     'awaiting');
+  h += _statBtn('Sold / Activated',      soldCount,    '#059669',     'sold');
   h += _statBtn('Expired (Still Active)',expired,      '#CC0000',     'expired');
   h += _statBtn('Pending Requests',      pendingReqs,  'var(--brown)','pending-requests');
   h += '</div>';
@@ -50814,6 +50867,26 @@ function panelMyInventory(){
       h += '<span style="background:#f0f4ff;border:1px solid rgba(0,53,148,.2);border-radius:6px;padding:6px 12px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+ms.item.icon+' '+ms.item.name+' \xd7'+ms.qty+'</span>';
     });
     h += '</div></div>';
+  }
+  // ── Sold / Activated Devices Section ──
+  var _soldDevs = (allDevices||[]).filter(function(d){return d && (d.status==='sold'||d.status==='activated'||d.soldAt);});
+  if(_soldDevs.length){
+    h += '<div class="bo-card" style="margin-top:14px">';
+    h += '<div class="bo-card-head"><div class="bo-card-title" style="color:#059669">✅ Sold / Activated Devices ('+_soldDevs.length+')</div></div>';
+    h += '<div style="overflow-x:auto"><table><thead><tr>'
+       + '<th>IMEI</th><th>Type</th><th>Campaign</th><th>Sold Date</th><th>Order #</th><th>Customer</th>'
+       + '</tr></thead><tbody>';
+    _soldDevs.forEach(function(d){
+      h += '<tr style="background:#f0fdf4">';
+      h += '<td style="font-family:monospace;font-size:.75rem">'+(d.imei||d.id||'—')+'</td>';
+      h += '<td>'+(d.type||d.devType||'—')+'</td>';
+      h += '<td>'+(d.campaign||d.carrier||'—')+'</td>';
+      h += '<td>'+(d.soldAt||d.activatedAt||'—')+'</td>';
+      h += '<td>'+(d.soldOrderNumber||d.orderNumber||'—')+'</td>';
+      h += '<td>'+(d.customerName||'—')+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
   }
   h = panelHeader('📱 My Inventory') + h;
   return h;
@@ -52345,6 +52418,7 @@ function postRoomMsg(roomId){
   if(feed) feed.innerHTML=renderRoomChatFeed(roomId);
 }
 function renderRoomChatFeed(roomId){
+  if(!roomId) return '';
   var msgs=(CHANNEL_MSGS['room-chat-'+roomId]||[]).slice(0,30);
   if(!msgs.length) return '<div style="padding:12px;text-align:center;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">No messages yet.</div>';
   return msgs.map(function(m){
@@ -59009,7 +59083,7 @@ function panelGMInventory(){
   // Stats
   var all   = gmScopedDevices(u);
   var total = all.length;
-  var unassigned = all.filter(function(d){return d.status==='unassigned';}).length;
+  var unassigned = all.filter(function(d){return d.status==='unassigned'||d.status==='uploaded'||d.status==='pending-acceptance';}).length;
   var assigned   = all.filter(function(d){return d.status==='assigned';}).length;
   var activated  = all.filter(function(d){return d.status==='activated';}).length;
   var expiring   = all.filter(function(d){
@@ -59020,7 +59094,9 @@ function panelGMInventory(){
   h += '<div class="bo-stat"><div class="bs-label">Total Devices</div><div class="bs-val" style="color:var(--blue)">'+total+'</div><div class="bs-sub">Gen Mobile</div></div>';
   h += '<div class="bo-stat"><div class="bs-label">Unassigned</div><div class="bs-val" style="color:#D97706">'+unassigned+'</div><div class="bs-sub">Awaiting market assignment</div></div>';
   h += '<div class="bo-stat"><div class="bs-label">Assigned</div><div class="bs-val" style="color:var(--blue)">'+assigned+'</div><div class="bs-sub">With team/agents</div></div>';
+  var _gmSold = all.filter(function(d){return d.status==='sold'||d.status==='activated'||d.soldAt;}).length;
   h += '<div class="bo-stat"><div class="bs-label">Activated</div><div class="bs-val" style="color:#059669">'+activated+'</div><div class="bs-sub">Sold this cycle</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Sold / Out</div><div class="bs-val" style="color:#059669">'+_gmSold+'</div><div class="bs-sub">No longer available</div></div>';
   h += '<div class="bo-stat"><div class="bs-label">Expiring ≤10 Days</div><div class="bs-val" style="color:#CC0000">'+expiring+'</div><div class="bs-sub">Urgent action needed</div></div>';
   h += '</div>';
 
@@ -64460,7 +64536,9 @@ function panelCampaignInventory(campaign){
   h += '<div class="bo-stat"><div class="bs-label">Unassigned</div><div class="bs-val" style="color:#D97706">'+unassigned+'</div></div>';
   h += '<div class="bo-stat"><div class="bs-label">Assigned</div><div class="bs-val" style="color:var(--blue)">'+assigned+'</div></div>';
   h += '<div class="bo-stat"><div class="bs-label">Activated</div><div class="bs-val" style="color:#059669">'+activated+'</div></div>';
+  var _pciSold = scoped.filter(function(d){return d.status==='sold'||d.status==='activated'||d.soldAt;}).length;
   h += '<div class="bo-stat"><div class="bs-label">Expiring ≤10d</div><div class="bs-val" style="color:'+(expiring>0?'#CC0000':'#059669')+'">'+expiring+'</div></div>';
+  h += '<div class="bo-stat"><div class="bs-label">Sold / Out</div><div class="bs-val" style="color:#059669">'+_pciSold+'</div></div>';
   h += '</div>';
 
   h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">';
@@ -66788,7 +66866,9 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
   // Fallback: legacy pool uses INVENTORY_TRANSFERS and INVENTORY_DEVICES
   if(!cfg){
     if(campaign==='legacy'||!campaign){
-      cfg={id:'legacy',inventory:function(){return INVENTORY_DEVICES;},transfers:function(){return INVENTORY_TRANSFERS||[];}};
+      cfg={id:'legacy',
+        inventory:function(){return (typeof INVENTORY_DEVICES!=='undefined'&&Array.isArray(INVENTORY_DEVICES))?INVENTORY_DEVICES:[];},
+        transfers:function(){return (typeof INVENTORY_TRANSFERS!=='undefined'&&Array.isArray(INVENTORY_TRANSFERS))?INVENTORY_TRANSFERS:[];}};
     } else { return; }
   }
   var req = cfg.transfers().find(function(t){return t.id===transferId;}); if(!req) return;
@@ -77559,14 +77639,22 @@ function invMarkAsSold(opts){
     customerName: opts.customerName || ''
   });
   // ── Update agent counters ──
-  // Calvin 2026-06-27: route through the unified sales writer. This fixes the
-  // DART gap (the old local LIFELINE list omitted DART, dropping its sales
-  // into a phantom 'DART' bucket the dashboard never read), and it now writes
-  // the weekly + daily buckets and the campaign tag like every other path.
   if(opts.agentId){
     recordSale({ agentId:opts.agentId, campaign:(opts.carrier || dev.campaign || ''),
                  date:(opts.soldAt && /^\d{4}-\d{2}-\d{2}/.test(opts.soldAt)) ? opts.soldAt : dev.soldAt,
                  imei:dev.imei, source:(opts.source||'sold-report') });
+  }
+  // ── Persist sold status to localStorage + Supabase so it survives refresh ──
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  // Supabase per-row write so other browsers see the sold status immediately
+  if(typeof invDbUpsertDevice === 'function'){
+    try{
+      var _pk = 'legacy';
+      if(dev.campaign==='Gen Mobile') _pk='gm';
+      else if(dev.campaign==='TruConnect') _pk='tc';
+      else if(dev.campaign==='Assurance'||dev.campaign==='Assurance Wireless') _pk='aw';
+      invDbUpsertDevice(_pk, dev);
+    }catch(e){}
   }
   return true;
 }
