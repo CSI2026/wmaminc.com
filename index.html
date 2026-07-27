@@ -82952,7 +82952,85 @@ function vcToggleChat(){
   var open=panel.style.display==='flex';
   panel.style.display=open?'none':'flex';
   if(btn) btn.style.background=open?'rgba(255,255,255,.08)':'rgba(0,53,148,.5)';
-  if(!open){ vcRenderChatFeed(); setTimeout(function(){var i=document.getElementById('vcChatInput');if(i)i.focus();},80); }
+  if(!open){
+    if(!_vcChatChannel && _vcCurrentRoomId && typeof vcSubscribeRoomChat==='function'){
+      vcSubscribeRoomChat(_vcCurrentRoomId);
+    } else {
+      vcRenderChatFeed();
+    }
+    setTimeout(function(){var i=document.getElementById('vcChatInput');if(i)i.focus();},80);
+  }
+}
+
+var _vcChatChannel = null; // Supabase realtime channel for in-call chat
+var _vcChatLastTs  = 0;    // newest message ts we have locally
+
+// ── vcMergeRoomMsg: merge a raw Supabase row into CHANNEL_MSGS ──
+function vcMergeRoomMsg(row, roomId){
+  if(!row || !row.text || !roomId) return false;
+  var key = 'room-chat-'+roomId;
+  if(!CHANNEL_MSGS[key]) CHANNEL_MSGS[key]=[];
+  // Skip if we already have this ts (own message or duplicate)
+  var ts = row.ts || (row.inserted_at ? new Date(row.inserted_at).getTime() : 0);
+  if(CHANNEL_MSGS[key].some(function(m){return m.ts===ts && m.text===row.text;})) return false;
+  var senderName = row.sender_name || row.from || 'Unknown';
+  var init = senderName.split(' ').map(function(w){return w[0]||'';}).join('').substring(0,2).toUpperCase();
+  CHANNEL_MSGS[key].unshift({
+    id: row.id || ts, from: senderName, role: row.role||'',
+    init: row.init||init, text: row.text,
+    time: row.time || new Date(ts||Date.now()).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}),
+    ts: ts
+  });
+  if(ts > _vcChatLastTs) _vcChatLastTs = ts;
+  return true;
+}
+
+// ── vcSubscribeRoomChat: open realtime + do initial load ──
+function vcSubscribeRoomChat(roomId){
+  if(!roomId || typeof supaClient==='undefined' || !supaClient) return;
+  vcUnsubscribeRoomChat(); // close any existing channel
+  _vcChatLastTs = 0;
+
+  // 1. Initial load: fetch last 50 messages already in the room
+  try{
+    supaClient.from('channel_msgs')
+      .select('*').eq('room_id', roomId)
+      .order('ts', {ascending:false}).limit(50)
+      .then(function(res){
+        if(res && res.data && res.data.length){
+          var merged = 0;
+          res.data.forEach(function(row){ if(vcMergeRoomMsg(row, roomId)) merged++; });
+          if(merged) vcRenderChatFeed();
+        }
+      }).catch(function(){});
+  }catch(e){}
+
+  // 2. Realtime subscription: new INSERT on channel_msgs for this room
+  try{
+    _vcChatChannel = supaClient
+      .channel('vc-room-chat-'+roomId)
+      .on('postgres_changes',{
+        event:'INSERT', schema:'public', table:'channel_msgs',
+        filter:'room_id=eq.'+roomId
+      }, function(payload){
+        if(!payload || !payload.new) return;
+        if(vcMergeRoomMsg(payload.new, roomId)){
+          vcRenderChatFeed();
+          // Flash the Chat button if panel is closed
+          var panel=document.getElementById('vcChatPanel');
+          if(panel && panel.style.display!=='flex'){
+            var btn=document.getElementById('vcChatBtn');
+            if(btn){ btn.style.background='rgba(255,100,0,.5)'; setTimeout(function(){ if(btn) btn.style.background='rgba(255,255,255,.08)'; },3000); }
+          }
+        }
+      })
+      .subscribe();
+  }catch(e){ console.warn('[vcChat] realtime subscribe failed:', e); }
+}
+
+function vcUnsubscribeRoomChat(){
+  try{ if(_vcChatChannel && typeof _vcChatChannel.unsubscribe==='function') _vcChatChannel.unsubscribe(); }catch(e){}
+  _vcChatChannel = null;
 }
 
 function vcRenderChatFeed(){
@@ -83032,6 +83110,8 @@ function closeVideoCall(){
   if(modal) modal.style.display='none';
   var _mb=document.getElementById('vcMiniBubble'); if(_mb) _mb.style.display='none';
   var _cp=document.getElementById('vcChatPanel'); if(_cp) _cp.style.display='none';
+  try{ if(typeof vcUnsubscribeRoomChat==='function') vcUnsubscribeRoomChat(); }catch(e){}
+  try{ if(typeof vcUnsubscribeRoomChat==='function') vcUnsubscribeRoomChat(); }catch(e){}
   _vcCurrentRoomId=null;
 }
 
@@ -84319,6 +84399,8 @@ function launchJitsi(chId, chName, displayName, isModerator){
     });
 
     _vcCurrentRoomId = chId;
+    // Open realtime chat subscription so ALL participants see each other's messages
+    try{ if(typeof vcSubscribeRoomChat==='function') vcSubscribeRoomChat(chId); }catch(e){}
     try{ if(typeof vcRenderChatFeed==='function') vcRenderChatFeed(); }catch(e){}
     // Join the room. Daily handles the camera/mic permission prompt.
     // IMPORTANT: some builds of daily-js throw "Cannot read properties of
@@ -84644,7 +84726,16 @@ function showWaitingRoom(chId,chName,displayName){
   if(waitDiv._partPoll) clearInterval(waitDiv._partPoll);
   waitDiv._partPoll=setInterval(function(){wrFetchParticipants(chId);},10000);
   // Refresh in-call chat feed every 8s so messages from others appear
-  waitDiv._chatPoll=setInterval(function(){ try{ if(typeof vcRenderChatFeed==='function') vcRenderChatFeed(); }catch(e){}; },8000);
+  // Poll Supabase every 10s as a fallback if realtime drops
+  waitDiv._chatPoll=setInterval(function(){
+    try{
+      if(typeof vcRenderChatFeed==='function') vcRenderChatFeed();
+      // If realtime is disconnected, do a manual Supabase fetch
+      if(!_vcChatChannel && _vcCurrentRoomId && typeof vcSubscribeRoomChat==='function'){
+        vcSubscribeRoomChat(_vcCurrentRoomId);
+      }
+    }catch(e){};
+  }, 10000);
   waitDiv._poll=setInterval(async function(){
     if(!supaClient) return;
     try{
