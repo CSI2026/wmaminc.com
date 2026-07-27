@@ -3528,7 +3528,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.27.B5';
+var BUILD_VERSION = '2026.07.27.B6';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14083,8 +14083,10 @@ function inventorySyncSave(){
     // Without this guard, the deleter's empty pool gets overwritten by stale data
     // from anyone else still logged in who hasn't reloaded yet.
     var _pCleared = window._invPoolCleared && window._invPoolCleared[p.key];
-    if(_pCleared && (Date.now() - (_pCleared.ts||0)) < 600000){
-      console.log('[inventorySyncSave] skipping '+p.key+' — pool was cleared by '+_pCleared.by);
+    var _pArr = (typeof _poolArrayFor==='function') ? _poolArrayFor(p.key) : null;
+    // Only skip if pool was cleared recently AND our local copy is still stale (non-empty)
+    if(_pCleared && (Date.now() - (_pCleared.ts||0)) < 600000 && _pArr && _pArr.length > 0){
+      console.log('[inventorySyncSave] skipping '+p.key+' — pool was cleared by '+_pCleared.by+' and local copy is stale');
       return; // don't write stale data back over an intentional delete
     }
     var meta = _invSyncBuildMeta(p.key);
@@ -14737,19 +14739,23 @@ function saveInventory(localOnly){
     localStorage.setItem('wmam_inv_nextid',    String(INV_NEXT_ID));
     // Skip writing cleared pools — prevents deleted inventory from being restored
     var _siC=window._invPoolCleared||{}, _siNow=Date.now();
-    if(!_siC.gm||(_siNow-(_siC.gm.ts||0))>600000) localStorage.setItem('wmam_gm_inventory',  JSON.stringify(GM_INVENTORY));
+    var _gmLsStale = _siC.gm && (_siNow-(_siC.gm.ts||0))<600000 && GM_INVENTORY.length>0;
+    if(!_gmLsStale) localStorage.setItem('wmam_gm_inventory',  JSON.stringify(GM_INVENTORY));
     localStorage.setItem('wmam_gm_activations',JSON.stringify(GM_ACTIVATIONS));
     localStorage.setItem('wmam_gm_transfers',  JSON.stringify(GM_TRANSFERS));
     localStorage.setItem('wmam_inv_markets',   JSON.stringify(INV_MARKETS));
     localStorage.setItem('wmam_inv_upsell_pct',JSON.stringify(INV_UPSELL_REQUIREMENTS));
     // Assurance / TruConnect / Excess
-    if(!_siC.aw||(_siNow-(_siC.aw.ts||0))>600000) localStorage.setItem('wmam_aw_inventory',   JSON.stringify(AW_INVENTORY));
+    var _awLsStale = _siC.aw && (_siNow-(_siC.aw.ts||0))<600000 && AW_INVENTORY.length>0;
+    if(!_awLsStale) localStorage.setItem('wmam_aw_inventory',   JSON.stringify(AW_INVENTORY));
     localStorage.setItem('wmam_aw_activations', JSON.stringify(AW_ACTIVATIONS));
     localStorage.setItem('wmam_aw_transfers',   JSON.stringify(AW_TRANSFERS));
-    if(!_siC.tc||(_siNow-(_siC.tc.ts||0))>600000) localStorage.setItem('wmam_tc_inventory',   JSON.stringify(TC_INVENTORY));
+    var _tcLsStale = _siC.tc && (_siNow-(_siC.tc.ts||0))<600000 && TC_INVENTORY.length>0;
+    if(!_tcLsStale) localStorage.setItem('wmam_tc_inventory',   JSON.stringify(TC_INVENTORY));
     localStorage.setItem('wmam_tc_activations', JSON.stringify(TC_ACTIVATIONS));
     localStorage.setItem('wmam_tc_transfers',   JSON.stringify(TC_TRANSFERS));
-    if(!_siC.ex||(_siNow-(_siC.ex.ts||0))>600000) localStorage.setItem('wmam_ex_inventory',   JSON.stringify(EX_INVENTORY));
+    var _exLsStale = _siC.ex && (_siNow-(_siC.ex.ts||0))<600000 && EX_INVENTORY.length>0;
+    if(!_exLsStale) localStorage.setItem('wmam_ex_inventory',   JSON.stringify(EX_INVENTORY));
     localStorage.setItem('wmam_ex_activations', JSON.stringify(EX_ACTIVATIONS));
     localStorage.setItem('wmam_ex_transfers',   JSON.stringify(EX_TRANSFERS));
     // Ship A3 — Inventory Pickup Form
@@ -22978,6 +22984,31 @@ function subscribeInventoryRealtime(){
       console.log('[realtime/inv] subscription status:', status);
     });
 
+    // ── Pool-clear signals: push to all sessions when bulk delete fires ──
+    supaClient.channel('wmam-pool-clears')
+      .on('postgres_changes',{event:'*',schema:'public',table:'app_settings',
+          filter:"key=like.inv_pool_cleared_%"}, function(payload){
+        try{
+          var row = payload.new || payload.old;
+          if(!row || !row.key || !row.value) return;
+          var pk = row.key.replace('inv_pool_cleared_','');
+          var sig; try{ sig=JSON.parse(row.value); }catch(e){ return; }
+          if(!sig || !sig.ts) return;
+          window._invPoolCleared = window._invPoolCleared||{};
+          var existing = window._invPoolCleared[pk];
+          if(existing && existing.ts >= sig.ts) return; // already have this or newer
+          window._invPoolCleared[pk] = sig;
+          console.log('[realtime/clear] pool clear received for '+pk+' by '+sig.by+' — clearing local array');
+          // Immediately clear the local pool array so no stale data can be written back
+          if(typeof _invSyncReplacePool==='function') _invSyncReplacePool(pk, []);
+          // Clear localStorage for this pool
+          try{ localStorage.removeItem('wmam_'+pk+'_inventory'); }catch(e){}
+          // Re-render so the count updates on screen
+          if(typeof _smartReRender==='function') _smartReRender('inventory');
+        }catch(e){ console.warn('[realtime/clear] error:',e); }
+      })
+      .subscribe();
+
     // ── Pending conflict queue (Makenzie's review feed) ──
     WMAM_PIC_CHANNEL = supaClient.channel('wmam-pending-changes')
       .on('postgres_changes', {event:'*', schema:'public', table:'pending_inventory_changes'}, function(payload){
@@ -23023,7 +23054,11 @@ function _applyRealtimeInventoryEvent(payload, table, fromSelf){
   if(!row || !row.id) return;
   if(payload.eventType === 'DELETE' || payload.type === 'DELETE'){
     var idx = arr.findIndex(function(d){ return String(d.id) === String(row.id); });
-    if(idx >= 0) arr.splice(idx, 1);
+    if(idx >= 0){
+      arr.splice(idx, 1);
+      // Persist DELETE to localStorage so refresh doesn't restore deleted devices
+      try{ if(typeof saveInventory==='function') saveInventory(true); }catch(e){}
+    }
     return;
   }
   // INSERT or UPDATE — map row → device shape
@@ -34179,9 +34214,10 @@ function ownerInvDevicePool(campaign){
 
 // Calvin 2026-05-18 — Path B: map campaign label → poolKey ('gm','tc','aw','ex','legacy')
 function ownerInvPoolKey(campaign){
-  if(campaign === 'Legacy') return 'legacy';
+  if(campaign === 'Legacy' || campaign === 'DART') return 'legacy';
   var cfg = campaignCfg(campaign);
-  return cfg ? cfg.id : null;
+  // Fall back to legacy if campaign not in CAMPAIGN_REGISTRY
+  return cfg ? cfg.id : 'legacy';
 }
 
 // Get the transfers list for the chosen campaign. Legacy has no transfers.
@@ -34399,10 +34435,16 @@ async function ownerInvDeleteCommit(){
         window._invPoolCleared[poolKey] = JSON.parse(_clearData);
         try{
           if(typeof supaClient !== 'undefined' && supaClient){
+            // 1. Clear signal — triggers realtime push to all sessions
             supaClient.from('app_settings').upsert(
               {key:'inv_pool_cleared_'+poolKey, value:_clearData},
               {onConflict:'key'}
             ).catch(function(){});
+            // 2. Also overwrite the blob with empty array so any poll-based
+            //    session that reads app_settings gets empty, not stale data
+            if(typeof pushKey === 'function'){
+              try{ pushKey(poolKey+'_inventory', []); }catch(_pe){}
+            }
           }
         }catch(e){}
       } else {
@@ -58923,9 +58965,13 @@ function _myMarketsDeviceStats(marketName){
       if(isPoolHeld){
         stats.inPool++;
         if(status !== 'sold' && status !== 'activated' && !isExpired){
-          stats.available++;
+          stats.available++; // includes uploaded, pending-acceptance, available
           bumpCamp(pool.campaign, 'available');
         }
+      } else if(status === 'pending-acceptance' || status === 'uploaded'){
+        // Device assigned (pending e-sign) still counts toward the pool
+        stats.inPool++; stats.available++;
+        bumpCamp(pool.campaign, 'available');
       } else {
         stats.inField++;
         stats.assigned++;
@@ -77732,6 +77778,7 @@ function invMarkAsSold(opts){
                  imei:dev.imei, source:(opts.source||'sold-report') });
   }
   // ── Persist sold status to localStorage + Supabase so it survives refresh ──
+  try{ if(typeof _markDirty==='function') _markDirty('inventory'); }catch(e){}
   try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
   // Supabase per-row write so other browsers see the sold status immediately
   if(typeof invDbUpsertDevice === 'function'){
