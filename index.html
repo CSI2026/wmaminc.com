@@ -13996,7 +13996,15 @@ function _invSyncReplacePool(poolKey, devices){
   // — that wholesale wipe is exactly how uploaded inventory was vanishing.
   function apply(cur, fill){
     if(devices.length === 0 && Array.isArray(cur) && cur.length > 0){
-      console.warn('[invSyncReplacePool] refused to wipe '+poolKey+' ('+cur.length+' devices) with an empty set');
+      // Check for intentional clear signal (bulk delete by owner/inv dept)
+      var _cleared = window._invPoolCleared && window._invPoolCleared[poolKey];
+      var _clearAge = _cleared ? (Date.now() - (_cleared.ts||0)) : Infinity;
+      if(_cleared && _clearAge < 600000){
+        // Intentional clear within last 10 min — allow the wipe
+        console.log('[invSyncReplacePool] allowing intentional clear of '+poolKey+' (cleared by '+_cleared.by+')');
+        cur.length = 0; return true;
+      }
+      console.warn('[invSyncReplacePool] refused to wipe '+poolKey+' ('+cur.length+' devices) with empty set — no clear signal');
       return false;
     }
     cur.length = 0; Array.prototype.push.apply(cur, devices); return true;
@@ -14059,6 +14067,14 @@ function inventorySyncSave(){
   // writes don't keep hammering a failing table (part of the flood fix).
   if(typeof window !== 'undefined' && window._appSettingsWrite && Date.now() < window._appSettingsWrite.pausedUntil) return;
   INV_SYNC_POOLS.forEach(function(p){
+    // Skip writing back if this pool was bulk-deleted recently by another user.
+    // Without this guard, the deleter's empty pool gets overwritten by stale data
+    // from anyone else still logged in who hasn't reloaded yet.
+    var _pCleared = window._invPoolCleared && window._invPoolCleared[p.key];
+    if(_pCleared && (Date.now() - (_pCleared.ts||0)) < 600000){
+      console.log('[inventorySyncSave] skipping '+p.key+' — pool was cleared by '+_pCleared.by);
+      return; // don't write stale data back over an intentional delete
+    }
     var meta = _invSyncBuildMeta(p.key);
     INV_SYNC_LOCAL_VERSION[p.key]  = meta.version;
     INV_SYNC_REMOTE_VERSION[p.key] = meta.version; // we just made it the remote
@@ -14707,19 +14723,21 @@ function saveInventory(localOnly){
     localStorage.setItem('wmam_inv_transfers', JSON.stringify(INVENTORY_TRANSFERS));
     localStorage.setItem('wmam_inv_requests',  JSON.stringify(INVENTORY_REQUESTS));
     localStorage.setItem('wmam_inv_nextid',    String(INV_NEXT_ID));
-    localStorage.setItem('wmam_gm_inventory',  JSON.stringify(GM_INVENTORY));
+    // Skip writing cleared pools — prevents deleted inventory from being restored
+    var _siC=window._invPoolCleared||{}, _siNow=Date.now();
+    if(!_siC.gm||(_siNow-(_siC.gm.ts||0))>600000) localStorage.setItem('wmam_gm_inventory',  JSON.stringify(GM_INVENTORY));
     localStorage.setItem('wmam_gm_activations',JSON.stringify(GM_ACTIVATIONS));
     localStorage.setItem('wmam_gm_transfers',  JSON.stringify(GM_TRANSFERS));
     localStorage.setItem('wmam_inv_markets',   JSON.stringify(INV_MARKETS));
     localStorage.setItem('wmam_inv_upsell_pct',JSON.stringify(INV_UPSELL_REQUIREMENTS));
     // Assurance / TruConnect / Excess
-    localStorage.setItem('wmam_aw_inventory',   JSON.stringify(AW_INVENTORY));
+    if(!_siC.aw||(_siNow-(_siC.aw.ts||0))>600000) localStorage.setItem('wmam_aw_inventory',   JSON.stringify(AW_INVENTORY));
     localStorage.setItem('wmam_aw_activations', JSON.stringify(AW_ACTIVATIONS));
     localStorage.setItem('wmam_aw_transfers',   JSON.stringify(AW_TRANSFERS));
-    localStorage.setItem('wmam_tc_inventory',   JSON.stringify(TC_INVENTORY));
+    if(!_siC.tc||(_siNow-(_siC.tc.ts||0))>600000) localStorage.setItem('wmam_tc_inventory',   JSON.stringify(TC_INVENTORY));
     localStorage.setItem('wmam_tc_activations', JSON.stringify(TC_ACTIVATIONS));
     localStorage.setItem('wmam_tc_transfers',   JSON.stringify(TC_TRANSFERS));
-    localStorage.setItem('wmam_ex_inventory',   JSON.stringify(EX_INVENTORY));
+    if(!_siC.ex||(_siNow-(_siC.ex.ts||0))>600000) localStorage.setItem('wmam_ex_inventory',   JSON.stringify(EX_INVENTORY));
     localStorage.setItem('wmam_ex_activations', JSON.stringify(EX_ACTIVATIONS));
     localStorage.setItem('wmam_ex_transfers',   JSON.stringify(EX_TRANSFERS));
     // Ship A3 — Inventory Pickup Form
@@ -27465,10 +27483,34 @@ async function _autoRefreshTick(){
     // their own tables — they're stored as monthly_sales JSON on each agent
     // record. Notifications are real. Inventory transfers live in
     // PENDING_TRANSFERS (which syncs through app_settings).
-    // app_settings handled by realtime (wmam-agents-changes channel watches it).
-    // Only poll agents + notifications as a fallback for when realtime drops.
-    // This removes the biggest egress hit: the 200KB+ app_settings blob download.
+    // app_settings handled by realtime. Only poll agents + notifications as fallback.
     var tables = ['agents','notifications'];
+    // Also fetch pool-cleared signals so concurrent sessions stop restoring deleted inventory
+    try{
+      if(typeof supaClient !== 'undefined' && supaClient){
+        var _csRes2 = await supaClient.from('app_settings')
+          .select('key,value').like('key','inv_pool_cleared_%');
+        if(_csRes2 && _csRes2.data && _csRes2.data.length){
+          window._invPoolCleared = window._invPoolCleared || {};
+          _csRes2.data.forEach(function(row){
+            var pk = row.key.replace('inv_pool_cleared_','');
+            try{
+              var sig = JSON.parse(row.value);
+              if(sig && sig.ts && (Date.now()-sig.ts) < 600000){
+                var existing = window._invPoolCleared[pk];
+                if(!existing || sig.ts > existing.ts){
+                  window._invPoolCleared[pk] = sig;
+                  // Also clear local memory and localStorage for this pool
+                  if(typeof _invSyncReplacePool==='function') _invSyncReplacePool(pk, []);
+                  try{ localStorage.removeItem('wmam_'+pk+'_inventory'); }catch(e){}
+                  console.log('[autoRefresh] pool cleared signal: '+pk+' cleared by '+sig.by);
+                }
+              }
+            }catch(e){}
+          });
+        }
+      }
+    }catch(e){}
     for(var i = 0; i < tables.length; i++){
       var table = tables[i];
       try{
@@ -34346,6 +34388,19 @@ async function ownerInvDeleteCommit(){
       if(bulkResult && bulkResult.ok){
         pathBSuccess = true;
         console.log('[ownerInvDeleteCommit] PATH B: deleted '+bulkResult.deletedCount+' rows from Supabase '+poolKey+' table');
+        // ── CLEAR SIGNAL: tell ALL sessions this pool was intentionally emptied ──
+        // Prevents other logged-in users' autosave from writing stale data back.
+        var _clearData = JSON.stringify({ts:Date.now(), by:(DB.current&&DB.current.name)||'?', count:ids.length});
+        window._invPoolCleared = window._invPoolCleared || {};
+        window._invPoolCleared[poolKey] = JSON.parse(_clearData);
+        try{
+          if(typeof supaClient !== 'undefined' && supaClient){
+            supaClient.from('app_settings').upsert(
+              {key:'inv_pool_cleared_'+poolKey, value:_clearData},
+              {onConflict:'key'}
+            ).catch(function(){});
+          }
+        }catch(e){}
       } else {
         pathBError = (bulkResult && bulkResult.error) ? bulkResult.error : 'unknown';
         console.warn('[ownerInvDeleteCommit] PATH B failed:', pathBError);
@@ -84655,8 +84710,8 @@ function launchJitsi(chId, chName, displayName, isModerator){
         var joinPromise = dailyCallFrame.join({
           url: roomURL,
           userName: displayName,
-          startAudioOff: false,
-          startVideoOff: true  // match your previous UX where video started off
+          startAudioOff: true,   // everyone joins muted by default
+          startVideoOff: true   // camera off by default — turn on when ready
         });
         if(joinPromise && joinPromise.catch){
           joinPromise.catch(function(err){
