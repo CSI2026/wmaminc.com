@@ -2449,7 +2449,9 @@ function masterSave(cloudSync){
     if(ts) ts.textContent='Saved '+new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
   }catch(e){console.warn('[masterSave] localStorage error:',e);}
   // Tier 2: Supabase (only when dirty, max every 3 minutes)
-  if(cloudSync && typeof supaClient!=='undefined' && supaClient){
+  // Check _DIRTY before doing any cloud work — if nothing changed, skip entirely.
+  var _anyDirty = Object.keys(_DIRTY).some(function(k){ return _DIRTY[k]; });
+  if(cloudSync && typeof supaClient!=='undefined' && supaClient && _anyDirty){
     (async function(){
       try{
         if(_DIRTY.agents){
@@ -14930,9 +14932,10 @@ function _invAutoSaveTick(){
   try{
     var sig = _invContentSignature();
     _invAutoSaveTick._n = (_invAutoSaveTick._n || 0) + 1;
-    // Save when inventory changed; also force a re-push every ~2 min (8 ticks)
-    // so in-place edits and any previously-failed cloud writes converge.
-    if(sig !== _invAutoSaveSig || (_invAutoSaveTick._n % 8 === 0)){
+    // Save only when inventory actually changed (sig mismatch).
+    // beforeunload / visibilitychange handlers guarantee no data loss on close.
+    // Removed the forced push every 8 ticks — it was pushing even when nothing changed.
+    if(sig !== _invAutoSaveSig){
       _invAutoSaveSig = sig;
       _invFlushSafe('autosave');
     }
@@ -22394,6 +22397,7 @@ async function _agentUpsertResilient(full){
 }
 
 async function saveAgentToSupabase(agent){
+  try{ if(typeof _markDirty==='function') _markDirty('agents'); }catch(e){}
   try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
   // Local persistence ALWAYS happens first so the user's edit is captured
   // in memory + localStorage even if Supabase is unreachable.
@@ -22689,6 +22693,7 @@ function subscribeAgentsRealtime(){
     WMAM_REALTIME_CHANNEL = supaClient.channel('wmam-agents-changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'agents' }, function(payload){
         try{
+          window._wmamLastRealtimeEvent = Date.now(); // mark realtime as healthy
           if(payload.eventType === 'DELETE'){
             var deletedId = payload.old && payload.old.id;
             if(deletedId != null && Array.isArray(DB.agents)){
@@ -22765,7 +22770,12 @@ function _startRealtimeFallbackPolling(){
   if(WMAM_REALTIME_FALLBACK_TIMER) return; // already polling
   WMAM_REALTIME_FALLBACK_TIMER = setInterval(function(){
     if(!supaClient) return;
-    // Cheap re-load of agents
+    // Skip if realtime is healthy (fired within last 2 minutes)
+    var _rtAge = Date.now() - (window._wmamLastRealtimeEvent||0);
+    if(_rtAge < 120000 && window._wmamLastRealtimeEvent){
+      return; // realtime is live — no need to poll agents
+    }
+    // Realtime may be down — fall back to polling
     sbSelect('agents').then(function(rows){
       if(!Array.isArray(rows)) return;
       rows.forEach(function(r){ _mergeServerAgentIntoLocal(r); });
@@ -22902,6 +22912,7 @@ function subscribeInventoryRealtime(){
     ['gm_inventory','tc_inventory','aw_inventory','ex_inventory','inventory_devices'].forEach(function(table){
       WMAM_INV_CHANNEL = WMAM_INV_CHANNEL.on('postgres_changes', {event:'*', schema:'public', table:table}, function(payload){
         try{
+          window._wmamLastRealtimeEvent = Date.now(); // mark realtime as healthy
           // Skip events caused by THIS session — we already applied them locally
           if(_isOwnEvent(payload)){
             // Still apply to be safe, but don't bump the banner
@@ -27418,7 +27429,8 @@ function sbBumpDataVersion(){
   try{
     if(typeof supaClient === 'undefined' || !supaClient) return;
     var now = Date.now();
-    if(now - (window._dvLastBump||0) < 2000) return;
+    // 10s debounce: rapid saves (e.g. bulk upload) only bump the version once
+    if(now - (window._dvLastBump||0) < 10000) return;
     window._dvLastBump = now;
     var v = String(now);
     window._lastSeenDataVersion = v;
@@ -27449,7 +27461,10 @@ async function _autoRefreshTick(){
     // their own tables — they're stored as monthly_sales JSON on each agent
     // record. Notifications are real. Inventory transfers live in
     // PENDING_TRANSFERS (which syncs through app_settings).
-    var tables = ['agents','notifications','app_settings'];
+    // app_settings handled by realtime (wmam-agents-changes channel watches it).
+    // Only poll agents + notifications as a fallback for when realtime drops.
+    // This removes the biggest egress hit: the 200KB+ app_settings blob download.
+    var tables = ['agents','notifications'];
     for(var i = 0; i < tables.length; i++){
       var table = tables[i];
       try{
@@ -27600,7 +27615,15 @@ function startAutoRefresh(){
     _autoRefreshTickGuarded('initial');
   }, 5000);
   // Periodic interval (works in foreground; may be throttled in background)
-  WMAM_AUTOREFRESH_TIMER = setInterval(function(){ if(typeof document!=='undefined' && document.hidden) return; _autoRefreshTickGuarded('interval'); }, 15000);
+  // Poll every 60s as a fallback — Supabase Realtime handles instant push updates.
+  // Reducing from 15s to 60s cuts egress by 75% while realtime remains the live path.
+  WMAM_AUTOREFRESH_TIMER = setInterval(function(){
+    if(typeof document!=='undefined' && document.hidden) return;
+    // Skip if realtime received an event in the last 90s (it's healthy)
+    var _rtAge = Date.now() - (window._wmamLastRealtimeEvent||0);
+    if(_rtAge < 90000 && window._wmamLastRealtimeEvent) return;
+    _autoRefreshTickGuarded('interval');
+  }, 60000);
   // CRITICAL: poll immediately when tab regains visibility or focus —
   // this is what handles the case where the user has been on another tab
   // and Chrome has throttled the background interval.
@@ -50712,6 +50735,7 @@ function processInvUpload(){
   });
 
   saveInventory();
+  try{ if(typeof _markDirty==='function') _markDirty('inventory'); }catch(e){}
   // Immediately sync new devices to Supabase so other browsers see them
   if(typeof invDbUpsertDevice==='function'){
     INVENTORY_DEVICES.filter(function(d){return d.batchId===batchId;}).forEach(function(dev){
@@ -59608,6 +59632,7 @@ function gmConfirmInventoryUpload(batchId){
   // Persist again defensively, refresh the current view so the uploader (office)
   // sees the devices instantly, and pop a clear confirmation. Assigned agents
   // pick them up on their next sync.
+  try{ if(typeof _markDirty==='function') _markDirty('inventory'); }catch(e){}
   try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
   // Calvin 2026-06-30: read back the local save and confirm the devices landed.
   // If the browser refused the write (storage full), surface a banner so it's
@@ -66947,6 +66972,7 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
   }
 
   saveInventory();
+  try{ if(typeof _markDirty==='function') _markDirty('inventory'); }catch(e){}
 
   // ── Calvin 2026-05-19 — PATH B per-row sync on transfer ──
   // After Path A blob save, fire per-row Supabase writes for every
@@ -84964,11 +84990,29 @@ try {
   if(_bpEl && typeof BUILD_VERSION === 'string'){
     _bpEl.textContent = 'v'+BUILD_VERSION;
   }
-  var _gpEl = document.getElementById('globalBuildPill');
-  if(_gpEl && typeof BUILD_VERSION === 'string'){
-    _gpEl.textContent = 'v'+BUILD_VERSION;
-  }
+  // globalBuildPill was removed — no longer needed here
 } catch(e){}
+
+// ── REALTIME HEALTH INDICATOR ──────────────────────────────────────
+// Updates the sync bell button to show whether Supabase Realtime
+// is live (green = realtime active) or in fallback poll mode (yellow)
+setInterval(function(){
+  try{
+    var _bell = document.getElementById('sync-bell-btn');
+    if(!_bell) return;
+    var _rtAge = Date.now() - (window._wmamLastRealtimeEvent||0);
+    var _isLive = window._wmamLastRealtimeEvent && _rtAge < 120000;
+    if(_isLive){
+      _bell.title = 'Realtime sync active \u2014 all users get live updates';
+      _bell.style.borderColor = 'rgba(5,150,105,.3)';
+      _bell.style.color = '#059669';
+    } else {
+      _bell.title = 'Realtime standby \u2014 polling every 60s as fallback';
+      _bell.style.borderColor = 'rgba(217,119,6,.4)';
+      _bell.style.color = '#D97706';
+    }
+  }catch(e){}
+}, 15000); // update indicator every 15s
 
 // ── Calvin 2026-06-11 v1530: camera kill-switch on tab hide / unload ──
 // Belt-and-suspenders for the camera leak. gotoPanel already releases
