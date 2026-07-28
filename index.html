@@ -3528,7 +3528,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.27.B8';
+var BUILD_VERSION = '2026.07.28.B11';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -10216,6 +10216,35 @@ function ppDetectCarriers(input){
       }
     }catch(e){ console.warn('[ppDetectCarriers] xlsx read failed:', e); }
   }
+
+  // DART orders report CSV: 'Agent Company Name' + 'IMEI' columns + WMM- codes
+  var _dartText = text || '';
+  if(!_dartText && ab){
+    try{ _dartText = new TextDecoder('utf-8').decode(new Uint8Array(ab)); }catch(_e){ _dartText=''; }
+  }
+  if(_dartText &&
+     /Agent\s*Company\s*Name/i.test(_dartText) &&
+     /\bIMEI\b/i.test(_dartText) &&
+     /WMM\s*-/i.test(_dartText)){
+    try{
+      var _dResult = (typeof dartProcessSalesText==='function') ? dartProcessSalesText(_dartText) : null;
+      if(_dResult){
+        var _dRows = {};
+        Object.keys(_dResult.byAgent||{}).forEach(function(agentName){
+          var a = (DB.agents||[]).find(function(x){ return x && x.name===agentName; });
+          if(a) _dRows[a.id] = { activations:_dResult.byAgent[agentName], agentName:agentName };
+        });
+        detections.push({
+          carrier:'DART', source:'csv',
+          parsed:{ rows:_dRows, rawResult:_dResult, carrier:'DART' },
+          confirmed:true,
+          rowCount:Object.keys(_dRows).length,
+          unmatched:_dResult.unmatched||[]
+        });
+      }
+    }catch(_de){ console.warn('[ppDetectCarriers] DART parse error:',_de); }
+  }
+
   return detections;
 }
 
@@ -14075,8 +14104,13 @@ function _invSyncBuildMeta(poolKey){
 // saveInventory body — we only add version stamps here.
 function inventorySyncSave(){
   if(typeof supaClient === 'undefined' || !supaClient) return; // offline-safe
-  // Calvin 2026-07-01: respect the app_settings circuit breaker so these meta
-  // writes don't keep hammering a failing table (part of the flood fix).
+  // Rate-limit: max once per 5 minutes to avoid hammering app_settings
+  if(typeof window !== 'undefined'){
+    var _issNow = Date.now();
+    if(_issNow - (window._invSyncSaveLastAt||0) < 300000) return;
+    window._invSyncSaveLastAt = _issNow;
+  }
+  // Calvin 2026-07-01: respect the app_settings circuit breaker.
   if(typeof window !== 'undefined' && window._appSettingsWrite && Date.now() < window._appSettingsWrite.pausedUntil) return;
   INV_SYNC_POOLS.forEach(function(p){
     // Skip writing back if this pool was bulk-deleted recently by another user.
@@ -14407,7 +14441,7 @@ function _invRowToDevice(row){
 // upload so freshly-added devices become real per-row SQL immediately and show
 // up for every user (owner/office/manager/agent), not just the uploader.
 async function invDbUpsertDevices(poolKey, devices){
-  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
+  // sbBumpDataVersion removed — bulk routine saves don't notify all sessions
   if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
   var table = _invPoolTableName(poolKey);
   if(!table) return {ok:false, error:'unknown-pool'};
@@ -14484,19 +14518,39 @@ async function invDbBulkDelete(poolKey, deviceIds){
   var table = _invPoolTableName(poolKey);
   if(!table) return {ok:false, error:'unknown-pool'};
   try{
-    // Chunk into batches of 100 for safety on large deletes
-    var BATCH = 100, total = 0;
+    // Step 1: Delete all rows in chunks
+    var BATCH = 100, attempted = 0;
     for(var i=0;i<deviceIds.length;i+=BATCH){
       var chunk = deviceIds.slice(i, i+BATCH).map(String);
       var res = await supaClient.from(table).delete().in('id', chunk);
       if(res && res.error){
         window._invPathBLastError = res.error;
         console.warn('[invDbBulkDelete] '+table+' chunk '+(i/BATCH)+' failed:', res.error);
-        return {ok:false, error:res.error, deletedCount:total};
+        return {ok:false, error:res.error, deletedCount:attempted};
       }
-      total += chunk.length;
+      attempted += chunk.length;
     }
-    return {ok:true, deletedCount:total};
+    // Step 2: VERIFY — re-query the table to confirm rows are actually gone.
+    // Supabase with RLS can silently 'succeed' while deleting 0 rows.
+    // We send the same IDs and check if any still exist.
+    try{
+      var allIds = deviceIds.map(String);
+      var verifyRes = await supaClient
+        .from(table)
+        .select('id', {count:'exact',head:true})
+        .in('id', allIds.slice(0, 100)); // check first batch
+      var remaining = (verifyRes && verifyRes.count != null) ? verifyRes.count : null;
+      if(remaining !== null && remaining > 0){
+        // Rows still exist — delete silently failed (likely RLS)
+        console.error('[invDbBulkDelete] VERIFY FAILED: '+remaining+' rows still exist in '+table+' after delete. Possible RLS block.');
+        return {ok:false, error:{code:'RLS_BLOCKED', message:'Delete silently failed — '+remaining+' rows still exist. Check Supabase RLS policies for '+table+'.'}, deletedCount:0};
+      }
+    }catch(verifyErr){
+      // Verify failed — proceed optimistically but warn
+      console.warn('[invDbBulkDelete] could not verify delete:', verifyErr);
+    }
+    console.log('[invDbBulkDelete] VERIFIED: '+attempted+' rows deleted and confirmed gone from '+table);
+    return {ok:true, deletedCount:attempted};
   }catch(e){
     window._invPathBLastError = e;
     console.warn('[invDbBulkDelete] '+table+' threw:', e);
@@ -14837,7 +14891,8 @@ function saveInventory(localOnly){
       window._appSettingsWrite = {fails:0, pausedUntil:0, warned:false};
     }
     var pushKey = function(key, val){
-      try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
+      // sbBumpDataVersion moved to explicit calls only — not on every pushKey
+      // (30 pushKey calls per saveInventory × every session = Supabase quota killer)
       var st = window._appSettingsWrite;
       if(Date.now() < st.pausedUntil){ return; } // breaker open — skip quietly
       if(typeof window._sbIsDown === 'function' && window._sbIsDown()){ return; } // backend down — skip
@@ -14865,12 +14920,13 @@ function saveInventory(localOnly){
     if(typeof window._sbIsDown === 'function' && window._sbIsDown()){
       // Backend is down (503/timeout) — skip all cloud writes. localStorage
       // above already saved the data; it will sync once the backend recovers.
-    } else if((_cbNow - (window._invCloudLast || 0)) < 6000){
+    } else if((_cbNow - (window._invCloudLast || 0)) < 180000){
+      // 3-minute cloud debounce — reduces Supabase writes from every 6s to every 3min
       if(!window._invCloudPendingTimer){
         window._invCloudPendingTimer = setTimeout(function(){
           window._invCloudPendingTimer = null;
           try{ if(typeof saveInventory === 'function') saveInventory(); }catch(e){}
-        }, 6000 - (_cbNow - (window._invCloudLast || 0)) + 100);
+        }, 180000 - (_cbNow - (window._invCloudLast || 0)) + 100);
       }
     } else {
     window._invCloudLast = _cbNow;
@@ -14888,14 +14944,11 @@ function saveInventory(localOnly){
     pushKey('tc_transfers',   TC_TRANSFERS);
     pushKey('ex_activations', EX_ACTIVATIONS);
     pushKey('ex_transfers',   EX_TRANSFERS);
-    // ── Device inventory → Path B per-row tables (durable multi-user home) ──
-    if(typeof invDbUpsertDevices === 'function'){
-      try{ invDbUpsertDevices('gm', GM_INVENTORY); }catch(e){}
-      try{ invDbUpsertDevices('tc', TC_INVENTORY); }catch(e){}
-      try{ invDbUpsertDevices('aw', AW_INVENTORY); }catch(e){}
-      try{ invDbUpsertDevices('ex', EX_INVENTORY); }catch(e){}
-      try{ invDbUpsertDevices('legacy', INVENTORY_DEVICES); }catch(e){}
-    }
+    // ── Device inventory: per-row tables are the source of truth ──
+    // invDbUpsertDevices (bulk write ALL devices) removed from this path.
+    // Per-row writes happen ONLY via invDbUpsertDevice() on individual
+    // device changes (upload, assign, sold, etc.) — not on every autosave.
+    // This eliminates 500+ Supabase row upserts every 30 seconds.
     // Ship A3 — pickups + discrepancy tickets
     pushKey('inv_pickups',         INVENTORY_PICKUPS);
     pushKey('inv_discrepancies',   INVENTORY_DISCREPANCY_TICKETS);
@@ -14992,7 +15045,7 @@ if(typeof window!=='undefined') window._invAutoSaveTick = _invAutoSaveTick;
         try{ if(document.visibilityState === 'hidden') _invFlushSafe('hidden'); }catch(e){}
       });
     }
-    if(typeof setInterval!=='undefined') setInterval(_invAutoSaveTick, 30000);
+    if(typeof setInterval!=='undefined') setInterval(_invAutoSaveTick, 300000); // 5-min autosave (was 30s)
     if(typeof setTimeout!=='undefined')  setTimeout(function(){ _invFlushSafe('post-load-selfheal'); }, 6000);
   }catch(e){ console.warn('[invGuards] install failed:', e); }
 })();
@@ -27652,8 +27705,8 @@ function sbBumpDataVersion(){
   try{
     if(typeof supaClient === 'undefined' || !supaClient) return;
     var now = Date.now();
-    // 10s debounce: rapid saves (e.g. bulk upload) only bump the version once
-    if(now - (window._dvLastBump||0) < 10000) return;
+    // 60s debounce: limits version bumps to once per minute (was 10s)
+    if(now - (window._dvLastBump||0) < 60000) return;
     window._dvLastBump = now;
     var v = String(now);
     window._lastSeenDataVersion = v;
@@ -34638,6 +34691,8 @@ async function ownerInvDeleteCommit(){
     pathBMsg = '\n\n⚠ Supabase offline — change is local-only until reconnect.';
   } else if(pathBError && (pathBError.code === '42P01' || (pathBError.message && /relation .* does not exist/i.test(pathBError.message)))){
     pathBMsg = '\n\n⚠ Path B Supabase tables not created yet — run path_b_migration.sql in Supabase SQL Editor. Falling back to Path A blob save.';
+  } else if(pathBError && pathBError.code === 'RLS_BLOCKED'){
+    pathBMsg = '\n\n🔒 DELETE BLOCKED BY SUPABASE RLS\n\n'+(pathBError.message||'')+'\n\nFix: In Supabase → Table Editor → '+poolKey+'_inventory → RLS policies → add a DELETE policy for authenticated users, OR disable RLS on that table. Then try the delete again.';
   } else if(pathBError){
     pathBMsg = '\n\n⚠ Path B delete failed (see F12 console). Falling back to Path A blob save.';
   } else {
@@ -43803,6 +43858,37 @@ function panelPayrollUploadPreview(){
 //             allAgentIds:[...] }   // includes TL/CM who got override but
 //                                   // didn't enroll directly
 // ════════════════════════════════════════════════════════════════════════
+// ── DART Points-Based Payroll Engine ──────────────────────────────────────
+// events: [{agentId, count}] — count = # active enrollments from the CSV.
+// Pay model: each enrollment = maxPerEnrollment pts × role dollar rate.
+// Field Agent $5/pt  ·  Team Leader $6/pt  ·  Market Manager $6/pt  ·  Campaign Manager $7/pt
+// 4 pts max per enrollment → $20 agent / $24 TL·MM / $28 CM per activation.
+// No cascading upline override — each person earns their own role rate on their own activations.
+function dartCalculateWeek(events){
+  var perAgent = {};
+  var warnings = [];
+  var _dartCamp = (typeof WMAM_CAMPAIGNS!=='undefined') ? (WMAM_CAMPAIGNS||[]).find(function(cam){ return cam && cam.name==='DART'; }) : null;
+  var _dartPts  = _dartCamp && _dartCamp.settings && _dartCamp.settings.dartPoints;
+  var _maxPts   = (_dartPts && _dartPts.maxPerEnrollment) || 4;
+  var _rates    = (_dartPts && _dartPts.pointRates) || {'Field Agent':5,'Team Leader':6,'Market Manager':6,'Campaign Manager':7};
+  function _rateForRole(role){ return _rates[role] || _rates['Field Agent'] || 5; }
+  events.forEach(function(ev){
+    if(!ev || !ev.agentId || !ev.count) return;
+    var agent = (DB.agents||[]).find(function(a){ return a && a.id===ev.agentId; });
+    if(!agent){ warnings.push('Unknown agent id '+ev.agentId); return; }
+    var ratePerPt  = _rateForRole(agent.role);
+    var payPerEnroll = _maxPts * ratePerPt;
+    var totalPay     = ev.count * payPerEnroll;
+    if(!perAgent[ev.agentId]) perAgent[ev.agentId] = {amount:0, breakdown:[], rows:0};
+    perAgent[ev.agentId].amount  += totalPay;
+    perAgent[ev.agentId].rows    += ev.count;
+    perAgent[ev.agentId].breakdown.push(
+      '['+ev.count+' × $'+payPerEnroll+'] $'+totalPay.toFixed(2)+' — DART enrollments ('+_maxPts+' pts × $'+ratePerPt+'/pt)'
+    );
+  });
+  return { perAgent:perAgent, byTeam:{}, warnings:warnings };
+}
+
 function ppComputeAgentCommissions(parsed, carrier){
   var out = { byAgent:{}, totalCommissionCents:0, allAgentIds:[], warnings:[] };
   if(!parsed || !parsed.rows) return out;
@@ -43870,6 +43956,32 @@ function ppComputeAgentCommissions(parsed, carrier){
   });
 
   // 3) Run through the appropriate engine
+  // DART: pre-matched data — route directly to dartCalculateWeek
+  if(carrier === 'DART' && typeof dartCalculateWeek === 'function'){
+    var _dartEvts = [];
+    var _dartRows = parsed.rows || {};
+    Object.keys(_dartRows).forEach(function(agentId){
+      var entry = _dartRows[agentId];
+      var cnt = typeof entry==='object' ? (entry.activations||entry.count||0) : (entry||0);
+      if(cnt > 0) _dartEvts.push({ agentId: parseInt(agentId,10)||agentId, count: cnt });
+    });
+    var _dartCalc = dartCalculateWeek(_dartEvts);
+    if(_dartCalc && _dartCalc.perAgent){
+      Object.keys(_dartCalc.perAgent).forEach(function(aid){
+        var e = _dartCalc.perAgent[aid];
+        var cents = Math.round(e.amount * 100);
+        out.byAgent[aid]={commissionCents:cents, breakdown:e.breakdown||[], rows:e.rows||0};
+        out.totalCommissionCents += cents;
+        out.allAgentIds.push(parseInt(aid,10));
+      });
+    }
+    if(_dartCalc && _dartCalc.warnings && _dartCalc.warnings.length)
+      out.warnings = (out.warnings||[]).concat(_dartCalc.warnings);
+    var _unmatch = (parsed.rawResult && parsed.rawResult.unmatched)||[];
+    if(_unmatch.length) out.warnings.push('DART unmatched agent codes: '+_unmatch.join(', '));
+    return out;
+  }
+
   var engine = null;
   if(carrier === 'TruConnect' && typeof tcCalculateWeek === 'function') engine = tcCalculateWeek;
   else if(carrier === 'Gen Mobile' && typeof gmCalculateWeek === 'function') engine = gmCalculateWeek;
