@@ -3294,8 +3294,9 @@ function goBack(){
 // predictable for everyone regardless of role.
 // (Back button remains separate and handles per-panel history.)
 function homePanelFor(u){
-  // v7100 (Calvin): Home button + Dashboard tab take EVERYONE to the
-  // dashboard/scoreboard. Owner reaches P&L via the P&L nav button instead.
+  // v7500 (Calvin): the Dashboard tab takes each person to THEIR home dashboard.
+  // Owner -> the Owner Dashboard (panelOwner); everyone else -> panelBO.
+  if(u && typeof isOwner==='function' && isOwner(u)) return 'owner';
   return 'bo';
 }
 
@@ -3462,7 +3463,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.07.05.7400';
+var BUILD_VERSION = '2026.08.03.0300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13925,11 +13926,27 @@ function _invSyncPoolForKey(poolKey){
 }
 function _invSyncReplacePool(poolKey, devices){
   if(!Array.isArray(devices)) return false;
+  // Calvin 2026-08-03: NEVER re-add a permanently-deleted device from the cloud.
+  // The cloud copy can still hold deleted devices (its write can fail with 401),
+  // so strip any tombstoned identity out of EVERY incoming set before it lands in
+  // a pool. This is the definitive fix for 'delete works, then comes back on refresh'.
+  var _incomingCount = devices.length;   // original size — for the empty-read guard below
+  var _tombFiltered = 0;
+  if(typeof _invTombHas === 'function'){
+    devices = devices.filter(function(d){
+      var gone = d && (_invTombHas(d.imei) || _invTombHas(d.sim));
+      if(gone) _tombFiltered++;
+      return !gone;
+    });
+    if(_tombFiltered) console.log('[invSyncReplacePool] blocked '+_tombFiltered+' deleted device(s) from returning to '+poolKey);
+  }
   // Calvin 2026-06-30: an EMPTY incoming set must never wipe a non-empty pool.
-  // An empty cloud/table read means "nothing to apply", not "delete everything"
-  // — that wholesale wipe is exactly how uploaded inventory was vanishing.
+  // An empty cloud/table read means "nothing to apply", not "delete everything".
+  // NOTE: use the ORIGINAL incoming count for this guard — if our tombstone filter
+  // emptied a real (non-empty) cloud set, those devices are legitimately deleted and
+  // the pool SHOULD go empty; only a truly empty cloud read is refused.
   function apply(cur, fill){
-    if(devices.length === 0 && Array.isArray(cur) && cur.length > 0){
+    if(_incomingCount === 0 && Array.isArray(cur) && cur.length > 0){
       console.warn('[invSyncReplacePool] refused to wipe '+poolKey+' ('+cur.length+' devices) with an empty set');
       return false;
     }
@@ -14705,7 +14722,28 @@ function saveInventory(localOnly){
     // Phase 3 — Operating costs
     localStorage.setItem('wmam_operating_costs',      JSON.stringify(OPERATING_COSTS));
     localStorage.setItem('wmam_op_cost_nextid',       String(OP_COST_NEXT_ID));
-  }catch(e){ console.warn('Inventory save:',e); }
+  }catch(e){
+    // v8500: on localStorage quota, prune old backup/snapshot keys (they pile up
+    // and eat the ~5MB budget) and retry the critical inventory writes once.
+    if(e && (e.name==='QuotaExceededError' || /quota/i.test(String((e&&e.message)||e)))){
+      try{
+        // v8800: quota hit — drop ALL disposable backup/snapshot copies (recoverable,
+        // not source of truth) so the CRITICAL inventory + nextid writes always land.
+        var _pk=[]; for(var _i=0;_i<localStorage.length;_i++){ var _k=localStorage.key(_i); if(_k && /(backup|snapshot|_bk_|_pre_)/i.test(_k)) _pk.push(_k); }
+        _pk.forEach(function(k){ try{ localStorage.removeItem(k); }catch(_z){} });
+        if(typeof INVENTORY_DEVICES!=='undefined') localStorage.setItem('wmam_inv_devices',  JSON.stringify(INVENTORY_DEVICES));
+        if(typeof TC_INVENTORY!=='undefined')      localStorage.setItem('wmam_tc_inventory', JSON.stringify(TC_INVENTORY));
+        if(typeof GM_INVENTORY!=='undefined')      localStorage.setItem('wmam_gm_inventory', JSON.stringify(GM_INVENTORY));
+        if(typeof AW_INVENTORY!=='undefined')      localStorage.setItem('wmam_aw_inventory', JSON.stringify(AW_INVENTORY));
+        if(typeof EX_INVENTORY!=='undefined')      localStorage.setItem('wmam_ex_inventory', JSON.stringify(EX_INVENTORY));
+        if(typeof INV_NEXT_ID!=='undefined')       localStorage.setItem('wmam_inv_nextid',   String(INV_NEXT_ID));
+        console.warn('Inventory save: quota hit — dropped disposable backups and re-saved all inventory pools.');
+      }catch(e2){
+        console.error('Inventory save FAILED even after pruning — change may not persist locally:', e2);
+        try{ if(typeof alert==='function') alert('⚠ Local storage is full — this inventory change saved to the cloud but could NOT save locally. Refresh the page; if it reverts, tell Calvin (storage needs clearing).'); }catch(_a){}
+      }
+    } else { console.warn('Inventory save:',e); }
+  }
   saveSupplyInventory();
 
   // ── SUPABASE SYNC ──
@@ -16507,12 +16545,46 @@ function gmDefaultRecipient(){
 
 // ── Process Gen Mobile Inventory Upload ──
 // Returns {newDevices, duplicates, unknownMarkets, marketBreakdown}
+// ── Upload reconciliation banner (Calvin 2026-07-08) ──
+// Shows, after an inventory upload: how many devices were re-placed to match the
+// vendor file, and any "Assigned Agent"/"Person Assigned" names that did NOT match
+// a roster agent (their devices went to the market manager — fix the name to fix it).
+function _invReconcileBanner(recon){
+  if(!recon) return '';
+  function _e(x){ return (typeof escHtml==='function') ? escHtml(String(x)) : String(x); }
+  var h='';
+  var reassigned = recon.reassigned || 0;
+  var unmatched  = recon.unmatchedNames || [];
+  if(reassigned > 0){
+    h += '<div style="background:rgba(37,99,235,.08);border:1px solid #2563eb;border-radius:8px;padding:12px 14px;margin-bottom:12px;font-family:Barlow Condensed,sans-serif">'
+      +  '<div style="font-size:.85rem;color:#1e40af;font-weight:700">\uD83D\uDD04 '+reassigned+' device'+(reassigned===1?'':'s')+' re-placed to match the vendor file</div>'
+      +  '<div style="font-size:.72rem;color:var(--muted);margin-top:3px">The vendor file is the source of truth \u2014 these moved to the person the file assigns them to.</div>'
+      +  '</div>';
+  }
+  var restored = recon.restored || 0;
+  if(restored > 0){
+    h += '<div style="background:rgba(5,150,105,.08);border:1px solid #059669;border-radius:8px;padding:12px 14px;margin-bottom:12px;font-family:Barlow Condensed,sans-serif">'
+      +  '<div style="font-size:.85rem;color:#047857;font-weight:700">♻ '+restored+' previously-deleted device'+(restored===1?'':'s')+' restored from the vendor file</div>'
+      +  '<div style="font-size:.72rem;color:var(--muted);margin-top:3px">These IMEIs were deleted before but appear on this manifest — the vendor file is authoritative, so they were added back.</div>'
+      +  '</div>';
+  }
+  if(unmatched.length > 0){
+    h += '<div style="background:rgba(217,119,6,.1);border:2px solid #D97706;border-radius:8px;padding:12px 14px;margin-bottom:12px;font-family:Barlow Condensed,sans-serif">'
+      +  '<div style="font-size:.9rem;color:#92400e;font-weight:700;letter-spacing:1px">\u26A0 '+unmatched.length+' NAME'+(unmatched.length===1?'':'S')+' IN THE FILE DID NOT MATCH A ROSTER AGENT</div>'
+      +  '<div style="font-size:.74rem;color:var(--brown);margin:4px 0 6px">Their devices were routed to the market manager instead of the person. Fix the spelling on the agent profile (or in the file) so they place correctly next time:</div>'
+      +  '<div style="font-size:.8rem;color:#92400e;font-weight:600;line-height:1.7">'+unmatched.slice(0,30).map(function(n){return '\u2022 '+_e(n);}).join('<br>')+(unmatched.length>30?('<br>\u2026and '+(unmatched.length-30)+' more'):'')+'</div>'
+      +  '</div>';
+  }
+  return h;
+}
+if(typeof window!=='undefined') window._invReconcileBanner=_invReconcileBanner;
 function processGMInventoryUpload(csvText, batchId){
   var rows = parseGMInventoryCSV(csvText);
   var existingIMEIs = {};
   GM_INVENTORY.forEach(function(d){ existingIMEIs[d.imei]=d; });
 
   var newDevices=[], duplicates=[], unknownMarkets={};
+  var gmUpdatedCount=0, gmReassignedCount=0, _gmUnmatchedNames=[], gmRestoredCount=0; // vendor-wins reconcile
   var marketBreakdown={};
 
   // ── Calvin 2026-05-01: per-MARKET auto-assignment ──
@@ -16609,13 +16681,9 @@ function processGMInventoryUpload(csvText, batchId){
     if(!marketBreakdown[market]) marketBreakdown[market]=0;
     marketBreakdown[market]++;
 
-    if(existingIMEIs[imei]){
-      // Duplicate — check if it's in same market or different (flag if different)
-      var existing = existingIMEIs[imei];
-      duplicates.push({imei:imei, existingMarket:existing.market, newMarket:market, existingStatus:existing.status, flagged:existing.market!==market});
-      return;
-    }
-
+    if(typeof _invTombHas==='function' && _invTombHas(imei)){ if(typeof _invTombRemove==='function') _invTombRemove(imei); gmRestoredCount++; } // vendor manifest wins — restore a previously-deleted device
+    var _gmExisting = existingIMEIs[imei] || null;  // vendor-wins: reconcile instead of skip
+    if(_gmExisting){ duplicates.push({imei:imei, existingMarket:_gmExisting.market, newMarket:market, existingStatus:_gmExisting.status, flagged:_gmExisting.market!==market}); }
     var uploadExpiry = (typeof window._gmExpiryOverride === 'string' && window._gmExpiryOverride)
                        ? window._gmExpiryOverride
                        : new Date(Date.now() + 30*86400000).toISOString().slice(0,10);
@@ -16626,6 +16694,7 @@ function processGMInventoryUpload(csvText, batchId){
     //   3. Otherwise unassigned in pool
     var resolution = gmResolveUploadRecipient(recipientName, market);
     var autoAgent = resolution ? resolution.agent : null;
+    if(recipientName && !autoAgent && _gmUnmatchedNames.indexOf(recipientName)<0){ _gmUnmatchedNames.push(recipientName); }
     if(resolution && autoAgent){
       var key = market + ' → ' + autoAgent.name + ' (' + resolution.source + ')';
       routingReport[key] = (routingReport[key] || 0) + 1;
@@ -16654,6 +16723,29 @@ function processGMInventoryUpload(csvText, batchId){
                        : uploadExpiry;
     }
 
+    if(_gmExisting){
+      // VENDOR FILE WINS: reconcile the existing GM device's placement to the file.
+      var _gmPrev = _gmExisting.holderId;
+      var _gmNew  = autoAgent ? autoAgent.id : null;
+      _gmExisting.status         = autoAgent ? 'assigned' : 'unassigned';
+      _gmExisting.assignedTo     = _gmNew;
+      _gmExisting.assignedToName = autoAgent ? autoAgent.name : '';
+      _gmExisting.holderId       = _gmNew;
+      _gmExisting.holderName     = autoAgent ? autoAgent.name : '';
+      _gmExisting.recipientId    = _gmNew;
+      _gmExisting.recipientName  = autoAgent ? autoAgent.name : '';
+      _gmExisting.mmId           = _gmNew;
+      _gmExisting.mmName         = autoAgent ? autoAgent.name : '';
+      _gmExisting.market         = market;
+      if(dueDate) _gmExisting.vendorDueDate = dueDate;
+      gmUpdatedCount++;
+      if(String(_gmPrev==null?'':_gmPrev) !== String(_gmNew==null?'':_gmNew)){
+        gmReassignedCount++;
+        if(!Array.isArray(_gmExisting.chainOfCustody)) _gmExisting.chainOfCustody = [];
+        _gmExisting.chainOfCustody.push({ type:'reassigned-on-reupload', at:nowISO, to:(autoAgent?autoAgent.name:''), toId:_gmNew, fromId:_gmPrev, source:'vendor-file-wins', batchId:batchId });
+      }
+      return;
+    }
     newDevices.push({
       id:            'gm-'+(new Date().getTime())+'-'+Math.random().toString(36).substr(2,6),
       imei:          imei,
@@ -16729,7 +16821,8 @@ function processGMInventoryUpload(csvText, batchId){
     duplicates: duplicates,
     unknownMarkets: unknownMarkets,
     marketBreakdown: marketBreakdown,
-    routingReport: routingReport
+    routingReport: routingReport,
+    reconciliation: { newCreated: newDevices.length, reconciled: gmUpdatedCount, reassigned: gmReassignedCount, unmatchedNames: _gmUnmatchedNames, restored: gmRestoredCount }
   };
 }
 
@@ -16831,6 +16924,297 @@ function _tcNextId(){
 
 // Main upload processor. Returns {newDevices, duplicates, total, unknownMarkets, batchId}.
 // Caller should then call invDbUpsertDevice for each new device for Path B sync.
+function _tcOwnerFallback(){
+  if(typeof DB==='undefined' || !DB.agents) return null;
+  return DB.agents.find(function(a){ return a && (a.role==='Owner' || (typeof isOwner==='function' && isOwner(a))); }) || null;
+}
+function _tcFindAgentByName(name){
+  if(!name || typeof DB==='undefined' || !DB.agents) return null;
+  var norm = String(name).trim().toLowerCase().replace(/\s+/g,' ');
+  if(!norm) return null;
+  return DB.agents.find(function(a){
+    return a && a.name && String(a.name).trim().toLowerCase().replace(/\s+/g,' ')===norm;
+  }) || null;
+}
+// ── DART inventory importer (Calvin 2026-07-07) — idempotent merge by identity ──
+// DART phones key on IMEI, DART SIMs key on ESN (SIMs are always separate for DART).
+// Works in EITHER arrival order: manifest-first or scanner-first. Re-uploading the
+// same manifest never duplicates. Backs up before merging (never lose work).
+function _dartDigits(x){ return String(x==null?'':x).replace(/\D/g,''); }
+function _dartInvHolder(){
+  if(typeof DB==='undefined' || !DB.agents) return null;
+  var cm = DB.agents.find(function(a){ return a && a.active && a.role==='Campaign Manager' && (a.channels||[]).some(function(c){ return String(c).toLowerCase().indexOf('dart')>=0; }); });
+  if(cm) return cm;
+  cm = DB.agents.find(function(a){ return a && a.active && a.role==='Campaign Manager' && String(a.cmModel||'').toLowerCase().indexOf('oklahoma')>=0; });
+  if(cm) return cm;
+  return DB.agents.find(function(a){ return a && (a.role==='Owner' || (typeof isOwner==='function' && isOwner(a))); }) || null;
+}
+// tolerant CSV parser -> array of objects keyed by header
+function _dartParseCsv(text){
+  if(!text) return [];
+  var lines = String(text).replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(function(l){ return l.trim().length; });
+  if(lines.length < 2) return [];
+  function splitLine(line){
+    var out=[], cur='', q=false;
+    for(var i=0;i<line.length;i++){ var ch=line[i];
+      if(q){ if(ch==='"'){ if(line[i+1]==='"'){ cur+='"'; i++; } else q=false; } else cur+=ch; }
+      else { if(ch==='"') q=true; else if(ch===','){ out.push(cur); cur=''; } else cur+=ch; }
+    }
+    out.push(cur); return out;
+  }
+  var headers = splitLine(lines[0]).map(function(h){ return h.trim(); });
+  var rows=[];
+  for(var r=1;r<lines.length;r++){
+    var cells = splitLine(lines[r]);
+    var o={}; for(var c=0;c<headers.length;c++){ o[headers[c]] = (cells[c]!=null?cells[c]:'').trim(); }
+    rows.push(o);
+  }
+  return rows;
+}
+// ── DART inventory file picker (wired to the "Open Inventory Upload" button) ──
+function dartInvPickFile(){
+  var input=document.createElement('input');
+  input.type='file'; input.accept='.csv,text/csv'; input.style.display='none';
+  input.onchange=function(){
+    var f=input.files && input.files[0];
+    if(!f){ try{document.body.removeChild(input);}catch(_){ } return; }
+    var reader=new FileReader();
+    reader.onload=function(){
+      try{
+        var res=processDartInventoryUpload(String(reader.result||''), 'dart-manifest-'+Date.now());
+        if(res && res.error){ alert('DART manifest error: '+res.error); }
+        else { alert('DART inventory manifest processed:\n'+res.created+' new, '+res.merged+' reconciled to the vendor file (no duplicates)\n'+res.phones+' phones, '+res.sims+' SIMs\nHeld by '+(res.holder||'DART CM')+'.'); }
+        if(typeof gotoPanel==='function') gotoPanel('dart-inv2');
+      } catch(e){ alert('DART inventory parse error: '+e.message); }
+      try{ document.body.removeChild(input); }catch(_){ }
+    };
+    reader.onerror=function(){ alert('Could not read the file.'); try{document.body.removeChild(input);}catch(_){ } };
+    reader.readAsText(f);
+  };
+  document.body.appendChild(input);
+  input.click();
+}
+if(typeof window!=='undefined') window.dartInvPickFile = dartInvPickFile;
+
+// ── Received-vs-shipped reconciliation (reusable for any carrier) ──
+// Devices the provider put on a manifest (shipped) that we never confirmed
+// receiving (still Intransit, never scanned) = outstanding / possibly missing.
+function _invShippedNotReceived(campaign){
+  if(typeof INVENTORY_DEVICES==='undefined' || !Array.isArray(INVENTORY_DEVICES)) return [];
+  var up=String(campaign||'').toUpperCase();
+  return INVENTORY_DEVICES.filter(function(d){
+    if(!d || d.deletedAt) return false;
+    if(up && String(d.campaign||'').toUpperCase()!==up) return false;
+    var st=String(d.status||'').toLowerCase();
+    var us=String(d.dartUnitStatus||'').toLowerCase().replace(/[\s\-_]/g,'');
+    return d.manifestSeen===true && !d.scannedAt && (st==='intransit' || us==='intransit');
+  });
+}
+// Fire a red-alert notification naming the outstanding IMEIs/ESNs.
+function invReconcileShipped(campaign){
+  var missing=_invShippedNotReceived(campaign);
+  var ids=missing.map(function(d){ return d.imei || d.sim; }).filter(Boolean);
+  if(!missing.length){
+    if(typeof alert==='function') alert(campaign+': all shipped inventory is confirmed received. Nothing outstanding.');
+    return {count:0, ids:[]};
+  }
+  try{
+    if(typeof pushNotification==='function'){
+      pushNotification({
+        type:'warning', icon:'alert',
+        title:campaign+' \u2014 '+missing.length+' shipped device'+(missing.length===1?'':'s')+' NOT yet received',
+        body:'On the '+campaign+' manifest (shipped) but not scanned/confirmed at pickup:\n'+ids.slice(0,40).join(', ')+(ids.length>40?(' \u2026and '+(ids.length-40)+' more'):''),
+        toRoles:['Owner'],
+        data:{kind:'shipped-reconcile', campaign:campaign, ids:ids}
+      });
+    }
+  }catch(e){}
+  if(typeof alert==='function') alert(campaign+' \u2014 '+missing.length+' shipped device(s) not yet received. A notification was sent to the owner with the full IMEI/ESN list.\n\nFirst few: '+ids.slice(0,10).join(', ')+(ids.length>10?' \u2026':''));
+  return {count:missing.length, ids:ids};
+}
+// Red banner shown atop a campaign's inventory when shipped units are unconfirmed.
+function _carrierInvReconcileBanner(devices){
+  if(!Array.isArray(devices) || !devices.length) return '';
+  var camp=(devices[0] && devices[0].campaign) || '';
+  var missing=devices.filter(function(d){
+    if(!d || d.deletedAt) return false;
+    var st=String(d.status||'').toLowerCase();
+    var us=String(d.dartUnitStatus||'').toLowerCase().replace(/[\s\-_]/g,'');
+    return d.manifestSeen===true && !d.scannedAt && (st==='intransit' || us==='intransit');
+  });
+  if(!missing.length) return '';
+  return '<div style="margin:10px 0;padding:12px 14px;border:1.5px solid #dc2626;background:rgba(220,38,38,.08);border-radius:8px">'
+    +'<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1px;color:#dc2626">\u26A0 '+missing.length+' shipped device'+(missing.length===1?'':'s')+' not yet received</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--muted);margin:4px 0 8px">On the manifest (shipped) but never scanned/confirmed at pickup. As they are scanned at FedEx this clears automatically.</div>'
+    +'<button onclick="invReconcileShipped(\''+String(camp).replace(/'/g,"\\'")+'\')" style="background:#dc2626;color:#fff;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:4px;cursor:pointer;font-weight:700">Notify + list missing IMEIs</button>'
+    +'</div>';
+}
+if(typeof window!=='undefined'){ window._invShippedNotReceived=_invShippedNotReceived; window.invReconcileShipped=invReconcileShipped; window._carrierInvReconcileBanner=_carrierInvReconcileBanner; }
+// ════════════════════════════════════════════════════════════════════════
+//  One-time admin operations (Calvin 2026-07-07) — each BACKS UP first, does
+//  the change on cloud + local, then RE-READS localStorage to VERIFY it saved,
+//  and returns a report. Nothing is assumed — the report proves persistence.
+// ════════════════════════════════════════════════════════════════════════
+
+// Purge all Gen Mobile inventory (the delete the Inv Dept did that didn't stick).
+async function wmamPurgeGmInventory(){
+  function isGm(d){ return d && /gen\s*mobile|^gm$/i.test(String(d.campaign||'')); }
+  var gmPool    = (typeof GM_INVENTORY!=='undefined' && Array.isArray(GM_INVENTORY)) ? GM_INVENTORY.slice() : [];
+  var gmLegacy  = (typeof INVENTORY_DEVICES!=='undefined' && Array.isArray(INVENTORY_DEVICES)) ? INVENTORY_DEVICES.filter(isGm) : [];
+  var before    = gmPool.length + gmLegacy.length;
+  if(!before) return {before:0, note:'No Gen Mobile devices found — nothing to purge.'};
+  // 1) BACKUP (recoverable)
+  var backupKey = 'wmam_gm_purge_backup_'+Date.now();
+  try{ localStorage.setItem(backupKey, JSON.stringify({gm:gmPool, legacy:gmLegacy})); }catch(e){}
+  // 2) CLOUD delete
+  var cloud = {};
+  try{
+    if(typeof invDbBulkDelete==='function'){
+      var r1 = await invDbBulkDelete('gm', gmPool.map(function(d){return String(d.id);}));
+      cloud.gm_inventory = r1.ok ? ('deleted '+r1.deletedCount) : ('ERROR '+JSON.stringify(r1.error));
+      if(gmLegacy.length){
+        var r2 = await invDbBulkDelete('legacy', gmLegacy.map(function(d){return String(d.id);}));
+        cloud.inventory_devices = r2.ok ? ('deleted '+r2.deletedCount) : ('ERROR '+JSON.stringify(r2.error));
+      }
+    } else cloud.note='invDbBulkDelete unavailable';
+  }catch(e){ cloud.error = e.message; }
+  // 3) LOCAL delete
+  if(typeof GM_INVENTORY!=='undefined' && Array.isArray(GM_INVENTORY)) GM_INVENTORY.length=0;
+  if(typeof INVENTORY_DEVICES!=='undefined' && Array.isArray(INVENTORY_DEVICES)){
+    for(var i=INVENTORY_DEVICES.length-1;i>=0;i--){ if(isGm(INVENTORY_DEVICES[i])) INVENTORY_DEVICES.splice(i,1); }
+  }
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  try{ if(typeof saveToStorage==='function') saveToStorage(); }catch(e){}
+  // 4) VERIFY by re-reading localStorage
+  var lsGm=0, lsLegacyGm=0;
+  try{ lsGm = (JSON.parse(localStorage.getItem('wmam_gm_inventory')||'[]')||[]).length; }catch(e){}
+  try{ lsLegacyGm = (JSON.parse(localStorage.getItem('wmam_inv_devices')||'[]')||[]).filter(isGm).length; }catch(e){}
+  var savedOk = (lsGm===0 && lsLegacyGm===0);
+  return {
+    before:before, cloud:cloud,
+    localGmRemaining:lsGm, localLegacyGmRemaining:lsLegacyGm,
+    SAVED_TO_LOCALSTORAGE: savedOk,
+    verdict: savedOk ? 'CONFIRMED: '+before+' GM devices removed and localStorage verified empty of GM.' : 'WARNING: GM still present in localStorage after save — do NOT reload; tell Calvin.',
+    backupKey:backupKey
+  };
+}
+if(typeof window!=='undefined') window.wmamPurgeGmInventory = wmamPurgeGmInventory;
+
+// Re-point existing UNASSIGNED Dallas B inventory to Brandon Smith.
+function wmamRerouteDallasBToBrandon(){
+  var brandon = (DB.agents||[]).find(function(a){ return a && /brandon\s*smith/i.test(a.name||''); });
+  if(!brandon) return {error:'Brandon Smith not found in DB.agents'};
+  var owner = (DB.agents||[]).find(function(a){ return a && (a.role==='Owner' || (typeof isOwner==='function' && isOwner(a))); });
+  function isDallasB(d){
+    var m = String(d.market||d.teamDd||d.marketName||'');
+    if(typeof _marketTokenMatch==='function') return _marketTokenMatch(m,'Dallas B') || _marketTokenMatch(m,'Team Dallas TX B');
+    return /dallas/i.test(m) && /\bb\b/i.test(m);
+  }
+  function isUnassigned(d){
+    if(!d.holderId) return true;
+    if(owner && d.holderId===owner.id) return true;
+    return ['available','unassigned','uploaded'].indexOf(String(d.status||'').toLowerCase())>=0;
+  }
+  var pool = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools() : [];
+  var examined=0, moved=0, backup=[];
+  pool.forEach(function(d){
+    if(!d || d.deletedAt || d.status==='sold') return;
+    if(!isDallasB(d)) return;
+    examined++;
+    if(isUnassigned(d)){
+      backup.push({id:d.id, holderId:d.holderId, holderName:d.holderName, status:d.status});
+      d.holderId=brandon.id; d.holderName=brandon.name; d.assignedTo=brandon.id; d.marketManagerId=brandon.id;
+      moved++;
+    }
+  });
+  if(moved){ try{ localStorage.setItem('wmam_dallasb_reroute_backup_'+Date.now(), JSON.stringify(backup)); }catch(e){} }
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  try{ if(typeof saveToStorage==='function') saveToStorage(); }catch(e){}
+  // VERIFY: re-read the union and count Dallas B devices now held by Brandon
+  var after = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools() : [];
+  var nowBrandon = after.filter(function(d){ return d && isDallasB(d) && d.holderId===brandon.id; }).length;
+  var stillUnassigned = after.filter(function(d){ return d && isDallasB(d) && !d.deletedAt && d.status!=='sold' && isUnassigned(d) && d.holderId!==brandon.id; }).length;
+  return {
+    brandon:brandon.name, dallasBExamined:examined, moved:moved,
+    dallasBNowHeldByBrandon:nowBrandon, dallasBStillUnassigned:stillUnassigned,
+    verdict: (stillUnassigned===0) ? 'CONFIRMED: all unassigned Dallas B inventory now routes to Brandon.' : ('NOTE: '+stillUnassigned+' Dallas B device(s) still unassigned — check market name match.')
+  };
+}
+if(typeof window!=='undefined') window.wmamRerouteDallasBToBrandon = wmamRerouteDallasBToBrandon;
+function processDartInventoryUpload(csvText, batchId){
+  if(typeof INVENTORY_DEVICES === 'undefined' || !Array.isArray(INVENTORY_DEVICES)) return {error:'inventory not ready', created:0, merged:0};
+  // backup DART inventory before merge — never lose work
+  try{
+    var _bk = INVENTORY_DEVICES.filter(function(d){ return d && String(d.campaign).toUpperCase()==='DART'; });
+    localStorage.setItem('wmam_dart_inv_backup_'+Date.now(), JSON.stringify(_bk));
+    // keep only the last 2 DART backups so they don't eat the ~5MB localStorage quota
+    var _dbk=[]; for(var _i=0;_i<localStorage.length;_i++){ var _k=localStorage.key(_i); if(_k && _k.indexOf('wmam_dart_inv_backup_')===0) _dbk.push(_k); }
+    _dbk.sort(); while(_dbk.length>2){ localStorage.removeItem(_dbk.shift()); }
+  }catch(e){}
+  // v8500: guaranteed-unique ids across ALL inventory. INV_NEXT_ID isn't always
+  // ahead of existing dev-N ids, and a collision made the DB reject the whole
+  // batch (ON CONFLICT ... cannot affect row a second time). Seed from the real max.
+  var _dartMaxDevN = (typeof INV_NEXT_ID==='number') ? (INV_NEXT_ID-1) : 0;
+  INVENTORY_DEVICES.forEach(function(d){ if(d && typeof d.id==='string'){ var _m=d.id.match(/^dev-(\d+)$/); if(_m){ var _n=parseInt(_m[1],10); if(_n>_dartMaxDevN) _dartMaxDevN=_n; } } });
+  var rows = _dartParseCsv(csvText);
+  if(!rows.length) return {error:'No rows found', created:0, merged:0, total:0};
+  var holder = _dartInvHolder();
+  var created=0, merged=0, phones=0, sims=0, skipped=0, restored=0;
+  rows.forEach(function(r){
+    var imei = _dartDigits(r['IMEI']);
+    var esn  = _dartDigits(r['ESN']);
+    var isPhone = !!imei;                 // DART: phone has IMEI; SIM has ESN + blank IMEI
+    var key = isPhone ? imei : esn;
+    if(typeof _invTombHas==='function' && (_invTombHas(imei) || _invTombHas(esn))){ if(typeof _invTombRemove==='function'){ _invTombRemove(imei); if(esn) _invTombRemove(esn); } restored++; } // vendor manifest wins — restore a previously-deleted device
+    if(!key){ skipped++; return; }        // no identity -> can't track, skip
+    var type = isPhone ? 'phone' : 'sim';
+    var us = String(r['Unit Status']||'').trim().toLowerCase().replace(/[\s\-_]/g,'');
+    var manifestStatus = (us==='intransit') ? 'intransit' : 'available';
+    var existing = INVENTORY_DEVICES.find(function(d){
+      return d && String(d.campaign).toUpperCase()==='DART' && (isPhone ? d.imei===imei : d.sim===esn);
+    });
+    if(existing){
+      // MERGE — fill manifest details; never clobber a device already received/scanned/sold
+      existing.dartUnitStatus = r['Unit Status'] || existing.dartUnitStatus;
+      existing.make = r['Make Name'] || existing.make;
+      existing.model = r['Model Name'] || existing.model;
+      existing.dartBox = r['Box'] || existing.dartBox;
+      existing.shippedAt = r['Date Shipped'] || existing.shippedAt;
+      if(!isPhone && esn && !existing.sim) existing.sim = esn;
+      existing.manifestSeen = true;
+      var locked = existing.scannedAt || ['assigned','sold','activated','received'].indexOf(existing.status)>=0;
+      if(!locked) existing.status = manifestStatus;
+      merged++;
+    } else {
+      // CREATE — new manifest unit; held by the DART CM (never unassigned)
+      INVENTORY_DEVICES.push({
+        id: 'dev-'+(++_dartMaxDevN),
+        type: type,
+        imei: isPhone ? imei : null,
+        imei2: null,
+        sim: isPhone ? null : esn,
+        campaign: 'DART',
+        batchId: batchId||null,
+        status: manifestStatus,
+        holderId: holder ? holder.id : null,
+        holderName: holder ? holder.name : null,
+        assignedTo: holder ? holder.id : null,
+        marketManagerId: holder ? holder.id : null,
+        dartUnitStatus: r['Unit Status'],
+        make: r['Make Name'], model: r['Model Name'], dartBox: r['Box'],
+        shippedAt: r['Date Shipped'],
+        manifestSeen: true,
+        scannedAt: null,
+        uploadDate: (new Date()).toISOString().slice(0,10)
+      });
+      created++;
+    }
+    if(isPhone) phones++; else sims++;
+  });
+  try{ if(typeof INV_NEXT_ID!=='undefined') INV_NEXT_ID = _dartMaxDevN + 1; }catch(e){}
+  try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+  return {created:created, merged:merged, phones:phones, sims:sims, skipped:skipped, total:rows.length, holder:(holder&&holder.name)||null, reconciliation:{newCreated:created, reconciled:merged, reassigned:0, unmatchedNames:[], restored:restored}};
+}
 function processTCInventoryUpload(htmlText, batchId){
   var parsed = parseTCInventoryHTML(htmlText);
   var rows = parsed.rows;
@@ -16844,6 +17228,10 @@ function processTCInventoryUpload(htmlText, batchId){
 
   var newDevices = [];
   var duplicates = [];
+  var reassignedCount = 0;   // vendor-wins: existing devices whose holder changed
+  var updatedCount = 0;      // existing devices reconciled to the file
+  var _tcUnmatchedNames = [];// Person Assigned names with no roster match
+  var tcRestoredCount = 0;   // previously-deleted devices restored from the vendor file
   var unknownMarkets = {};
   var marketBreakdown = {};
   var carrierBreakdown = {};
@@ -16852,6 +17240,11 @@ function processTCInventoryUpload(htmlText, batchId){
   var skippedBlank = 0;
   var nowISO = new Date().toISOString();
 
+  // v7700 (Calvin): seed a unique id counter ONCE from the current max, so each
+  // device in this batch gets a distinct id (was: every device got the same id
+  // because _tcNextId scanned TC_INVENTORY before the batch was pushed).
+  var _tcIdN = 0;
+  TC_INVENTORY.forEach(function(d){ if(d && typeof d.id==='string'){ var _m=d.id.match(/^tc-(\d+)$/); if(_m){ var _n=parseInt(_m[1],10); if(_n>_tcIdN) _tcIdN=_n; } } });
   rows.forEach(function(cells){
     // Column layout from the TC dealer portal export (locked 2026-05-19):
     //   0: Purchase Order: PO Auto ID  (we don't store this — order tracker only)
@@ -16877,7 +17270,8 @@ function processTCInventoryUpload(htmlText, batchId){
     if(!imei){ skippedBlank++; return; }
 
     // Dedup: re-uploading the same file is a no-op for already-known IMEIs
-    if(existingIMEIs[imei]){ duplicates.push(imei); return; }
+    if(typeof _invTombHas==='function' && _invTombHas(imei)){ if(typeof _invTombRemove==='function') _invTombRemove(imei); tcRestoredCount++; } // vendor manifest wins — restore a previously-deleted device
+    var _tcExisting = existingIMEIs[imei] || null;  // vendor-wins: reconcile instead of skip
 
     var market = tcMarketTranslate(teamDd);
     if(!market) unknownMarkets[teamDd || '(blank)'] = (unknownMarkets[teamDd || '(blank)'] || 0) + 1;
@@ -16891,8 +17285,23 @@ function processTCInventoryUpload(htmlText, batchId){
     if(typeof resolveUploadRecipient === 'function' && market){
       resolution = resolveUploadRecipient(market, 'TruConnect') || {agent:null, source:null};
     }
-    var autoRecipient = resolution.agent;
-    var routeSource   = resolution.source;
+    // v7800 (Calvin): respect the file's Status column for accurate counts.
+    //  - "Available"  => genuine available stock (no holder, status 'available')
+    //  - otherwise (e.g. "Checked Out") => assign to the named agent (v7600),
+    //    or the market MM/CM when the name doesn't match a known agent.
+    // v8100 (Calvin): inventory is NEVER unassigned. Checked-out -> the named
+    // agent; Available (or an unmatched name) -> the market's manager (MM, or the
+    // market's CM via cmModel: Tanita=OK / Brandon=Dallas), owner as last resort.
+    // Available devices are held by the MM but keep status 'available'.
+    var fileStatus     = (cells[2] || '').trim().toLowerCase();
+    var isAvailable    = (fileStatus === 'available');
+    var personAssigned = (cells[7] || '').trim();
+    var directAgent    = (!isAvailable && personAssigned) ? _tcFindAgentByName(personAssigned) : null;
+    if(!isAvailable && personAssigned && !directAgent && _tcUnmatchedNames.indexOf(personAssigned)<0){ _tcUnmatchedNames.push(personAssigned); }
+    var marketMgr      = resolution.agent || _tcOwnerFallback();
+    var autoRecipient  = isAvailable ? marketMgr : (directAgent || resolution.agent || marketMgr);
+    var routeSource    = isAvailable ? (resolution.agent ? 'available-mm' : 'available-owner')
+                        : (directAgent ? 'person-assigned' : (resolution.agent ? resolution.source : 'owner-fallback'));
 
     // ── Diagnostic capture ──
     // First time we see this market, record the resolver's debug info.
@@ -16916,12 +17325,13 @@ function processTCInventoryUpload(htmlText, batchId){
     if(autoRecipient) routingDiagnosticsByMarket[market].assignedCount++;
     else              routingDiagnosticsByMarket[market].unassignedCount++;
 
-    var devStatus    = autoRecipient ? 'assigned' : 'unassigned';
+    var devStatus    = isAvailable ? 'available' : 'assigned';
     var devHolderId  = autoRecipient ? autoRecipient.id   : null;
     var devHolderName= autoRecipient ? autoRecipient.name : '';
     var routeKey;
     if(autoRecipient){
-      var roleTag = (routeSource === 'market-mm') ? ' (MM)'
+      var roleTag = (routeSource === 'person-assigned') ? ' (from file)'
+                  : (routeSource === 'market-mm') ? ' (MM)'
                   : (routeSource === 'market-cm') ? ' (CM)'
                   : (routeSource === 'cm-model-fallback') ? ' (CM via cmModel)'
                   : '';
@@ -16946,8 +17356,29 @@ function processTCInventoryUpload(htmlText, batchId){
       }
     }
 
+    if(_tcExisting){
+      // VENDOR FILE WINS: reconcile the existing device's placement to the file.
+      var _prevHolder = _tcExisting.holderId;
+      _tcExisting.status     = devStatus;
+      _tcExisting.holderId   = devHolderId;
+      _tcExisting.holderName = devHolderName;
+      _tcExisting.assignedTo = devHolderId;
+      _tcExisting.market     = market;
+      if(model) _tcExisting.model = model;
+      if(cost)  _tcExisting.cost  = cost;
+      if(vendorDueISO) _tcExisting.vendorDueDate = vendorDueISO;
+      _tcExisting.mmId   = (routeSource === 'market-mm' && autoRecipient) ? autoRecipient.id   : null;
+      _tcExisting.mmName = (routeSource === 'market-mm' && autoRecipient) ? autoRecipient.name : '';
+      duplicates.push(imei); updatedCount++;
+      if(String(_prevHolder==null?'':_prevHolder) !== String(devHolderId==null?'':devHolderId)){
+        reassignedCount++;
+        if(!Array.isArray(_tcExisting.chainOfCustody)) _tcExisting.chainOfCustody = [];
+        _tcExisting.chainOfCustody.push({ type:'reassigned-on-reupload', at:nowISO, to:devHolderName, toId:devHolderId, fromId:_prevHolder, source:'vendor-file-wins', batchId:batchId });
+      }
+      return;
+    }
     var dev = {
-      id:             _tcNextId(),
+      id:             'tc-' + (++_tcIdN),
       imei:           imei,
       type:           'phone',   // Calvin 2026-06-30: TC inventory is IMEI phones — type explicitly so phone/SIM counts read correctly everywhere
       campaign:       'TC (TruConnect)',
@@ -17041,6 +17472,7 @@ function processTCInventoryUpload(htmlText, batchId){
     carrierBreakdown: carrierBreakdown,
     routingBreakdown: routingBreakdown,
     routingDiagnostics: Object.keys(routingDiagnosticsByMarket).map(function(k){ return routingDiagnosticsByMarket[k]; }),
+    reconciliation: { fileRows: rows.length, newCreated: newDevices.length, reconciled: updatedCount, reassigned: reassignedCount, unmatchedNames: _tcUnmatchedNames, restored: tcRestoredCount },
     batchId: batchId
   };
 }
@@ -17418,13 +17850,39 @@ function gmDeviceDaysLeft(device){
   if(!expiresAt) return null;
   return Math.ceil((new Date(expiresAt)-new Date())/86400000);
 }
+// ── Vendor expiry visibility (Calvin 2026-07-14) ──
+// Devices carry TWO dates: vendorDueDate (the REAL return-by date from the
+// carrier's uploaded file) and expiryDate/roleExpiry (the internal date set for
+// MMs/TLs/agents). Owner + Inventory Dept must see the ACTUAL vendor date so
+// inventory can be moved market-to-market before it truly expires.
+// Gated by canSeeVendorDueDate() — never shown to MMs/TLs/agents.
+function _invVendorDaysLeft(device){
+  if(!device || !device.vendorDueDate) return null;
+  var v = new Date(device.vendorDueDate);
+  if(isNaN(v.getTime())) return null;
+  return Math.ceil((v - new Date()) / 86400000);
+}
+function _invVendorExpiryHTML(device){
+  try{
+    if(typeof canSeeVendorDueDate !== 'function') return '';
+    if(!canSeeVendorDueDate(typeof DB !== 'undefined' ? DB.current : null)) return '';
+  }catch(e){ return ''; }
+  if(!device || !device.vendorDueDate) return '';
+  var d = _invVendorDaysLeft(device);
+  var col = (d===null) ? 'var(--muted)' : (d<0 ? '#CC0000' : d<=10 ? '#CC0000' : d<=20 ? '#D97706' : '#0e7490');
+  var lbl = (d===null) ? '' : (d<0 ? 'VENDOR EXPIRED' : d+'d to vendor');
+  var warn = (d!==null && d<=20 && d>=0) ? '\u26A0 ' : '';
+  return '<div title="Actual return-by date from the carrier file" style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:.5px;color:'+col+';margin-top:2px;font-weight:700">'
+       + '\uD83C\uDFE2 VENDOR: '+String(device.vendorDueDate).slice(0,10)+(lbl?(' \u00B7 '+warn+lbl):'')+'</div>';
+}
+if(typeof window !== 'undefined'){ window._invVendorExpiryHTML=_invVendorExpiryHTML; window._invVendorDaysLeft=_invVendorDaysLeft; }
 function gmDaysLeftDisplay(device){
   var days = gmDeviceDaysLeft(device);
   if(days===null) return '<span style="color:var(--muted)">—</span>';
   if(days<0) return '<span style="color:#CC0000;font-weight:700">EXPIRED</span>';
   var col = days<=5?'#CC0000':days<=10?'#D97706':'#059669';
   var fire = days<=5?'🔥 ':'';
-  return '<span style="color:'+col+';font-weight:700">'+fire+days+' days</span>';
+  return '<span style="color:'+col+';font-weight:700">'+fire+days+' days</span>' + _invVendorExpiryHTML(device);
 }
 
 // Ensure market config exists
@@ -17563,7 +18021,7 @@ function gmCreateTransferRequest(fromId, toId, imeis, requiresApproval){
     agentConfirmedPossession:false,
     devices:    imeis.map(function(imei){
       var d=GM_INVENTORY.find(function(x){return x.imei===imei;})||{};
-      return {imei:imei,sim:d.sim||'',model:d.model||'',devType:d.devType||'',devCost:d.devCost||0};
+      return {imei:imei,sim:d.sim||'',make:d.make||d.makeName||'',model:d.model||'',devType:d.devType||'',devCost:d.devCost||0};
     })
   };
   GM_TRANSFERS.push(req);
@@ -17679,7 +18137,7 @@ function gmAgentSignTransfer(transferId, confirmed){
       var actualDays  = Math.min(agentDays, mmRemaining);
       dev.agentExpiresAt = new Date(now.getTime()+actualDays*86400000).toISOString();
     } else if(isTL){
-      var tlDays = mcfg.tlDays||14;
+      var tlDays = mcfg.tlDays||20;
       var mmRem  = dev.mmExpiresAt ? Math.ceil((new Date(dev.mmExpiresAt)-now)/86400000) : tlDays;
       var actDays2 = Math.min(tlDays, mmRem);
       dev.tlExpiresAt = new Date(now.getTime()+actDays2*86400000).toISOString();
@@ -22903,6 +23361,12 @@ function _applyRealtimeInventoryEvent(payload, table, fromSelf){
   if(typeof _invRowToDevice !== 'function') return;
   var dev = _invRowToDevice(row);
   if(!dev) return;
+  // Calvin 2026-07-08: NEVER resurrect a permanently-deleted device via realtime.
+  if(typeof _invTombHas==='function' && (_invTombHas(dev.imei) || _invTombHas(dev.sim))){
+    var _tk = arr.findIndex(function(d){ return String(d.id) === String(dev.id); });
+    if(_tk >= 0) arr.splice(_tk, 1);
+    return;
+  }
   var existing = arr.findIndex(function(d){ return String(d.id) === String(dev.id); });
   if(existing >= 0){
     // Merge: preserve any local-only fields the row doesn't carry
@@ -27507,8 +27971,32 @@ async function _autoRefreshTickGuarded(reason){
     console.log('[autoRefresh] tick ('+reason+')');
   }
   await _autoRefreshTick();
+  try{ if(typeof _invPurgeTombstoned==='function') _invPurgeTombstoned(); }catch(e){}
 }
 
+// Calvin 2026-07-27: DELETED-DEVICE GUARD + MANUAL SYNC
+// The background data fetch is now infrequent (10 min) to save data. To make
+// sure a deleted device can NEVER creep back between fetches, this runs a
+// LOCAL-ONLY purge every 30s — it touches no network and costs zero data, it
+// just strips any tombstoned (permanently-deleted) device out of memory.
+var WMAM_TOMB_GUARD_TIMER = null;
+function startTombstoneGuard(){
+  if(WMAM_TOMB_GUARD_TIMER) return;
+  WMAM_TOMB_GUARD_TIMER = setInterval(function(){
+    try{ if(typeof _invPurgeTombstoned==='function') _invPurgeTombstoned(); }catch(e){}
+  }, 30000);
+}
+if(typeof window!=='undefined') window.startTombstoneGuard = startTombstoneGuard;
+try{ startTombstoneGuard(); }catch(e){}
+// Manual, on-demand sync — pull latest from the cloud ONLY when the user asks,
+// then immediately purge any deleted devices that came down with it.
+async function wmamSyncNow(){
+  try{ if(typeof _autoRefreshTickGuarded==='function') await _autoRefreshTickGuarded('manual'); }catch(e){}
+  try{ if(typeof _invPurgeTombstoned==='function') _invPurgeTombstoned(); }catch(e){}
+  try{ if(typeof toast==='function') toast('Synced with the cloud'); }catch(e){}
+  try{ if(typeof renderCurrentPanel==='function') renderCurrentPanel(); }catch(e){}
+}
+if(typeof window!=='undefined') window.wmamSyncNow = wmamSyncNow;
 function startAutoRefresh(){
   if(WMAM_AUTOREFRESH_TIMER) return; // already running
   console.log('[autoRefresh] started — polls every 15s + immediately on tab focus/visibility');
@@ -27518,7 +28006,7 @@ function startAutoRefresh(){
     _autoRefreshTickGuarded('initial');
   }, 5000);
   // Periodic interval (works in foreground; may be throttled in background)
-  WMAM_AUTOREFRESH_TIMER = setInterval(function(){ if(typeof document!=='undefined' && document.hidden) return; _autoRefreshTickGuarded('interval'); }, 15000);
+  WMAM_AUTOREFRESH_TIMER = setInterval(function(){ if(typeof document!=='undefined' && document.hidden) return; _autoRefreshTickGuarded('interval'); }, 600000); // Calvin 2026-07-27: 15s -> 10min to stop burning mobile data
   // CRITICAL: poll immediately when tab regains visibility or focus —
   // this is what handles the case where the user has been on another tab
   // and Chrome has throttled the background interval.
@@ -32831,7 +33319,7 @@ if(typeof window!=='undefined'){
 // === end THEME ENGINE v2 ADMIN UI ===
 
 function _teAdvWrap(inner){
-  return '<details class="te-adv" style="margin-top:8px;border:1px solid var(--border);border-radius:12px;padding:0 14px">'
+  return '<details class="te-adv"'+(window._teAdvOpen?' open':'')+' ontoggle="window._teAdvOpen=this.open" style="margin-top:8px;border:1px solid var(--border);border-radius:12px;padding:0 14px">'
     +'<summary style="cursor:pointer;padding:13px 0;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);font-weight:700">\u2699\uFE0F Advanced \u2014 builder, presets, per-person & schedule</summary>'
     +'<div style="padding:4px 0 16px">'+inner+'</div></details>';
 }
@@ -34167,6 +34655,40 @@ function ownerInvFindBlockedByTransfer(){
 }
 
 // THE delete action — runs after DELETE typed and confirmed
+// ── Inventory deletion tombstones (Calvin 2026-07-08) ──
+// When inventory is deleted, its IMEI/ESN is recorded here so a later re-upload of a
+// vendor file that STILL lists that device does NOT resurrect it. Deleted stays deleted.
+// (An intentional re-add is possible by clearing the tombstone via _invTombRemove.)
+var INV_TOMBSTONES = {};
+function _invTombKey(x){ return String(x==null?'':x).replace(/\D/g,''); }
+function _invTombLoad(){ try{ INV_TOMBSTONES = JSON.parse(localStorage.getItem('wmam_inv_tombstones')||'{}')||{}; }catch(e){ INV_TOMBSTONES={}; } return INV_TOMBSTONES; }
+function _invTombSave(){ try{ localStorage.setItem('wmam_inv_tombstones', JSON.stringify(INV_TOMBSTONES)); }catch(e){} }
+function _invTombAdd(imei, sim, meta){
+  meta=meta||{}; var added=false;
+  [imei, sim].forEach(function(v){ var k=_invTombKey(v); if(k && !INV_TOMBSTONES[k]){ INV_TOMBSTONES[k]={at:new Date().toISOString(), by:(meta.by!=null?meta.by:null), campaign:meta.campaign||null}; added=true; } });
+  if(added) _invTombSave();
+  return added;
+}
+function _invTombHas(x){ var k=_invTombKey(x); return !!(k && INV_TOMBSTONES[k]); }
+function _invTombRemove(x){ var k=_invTombKey(x); if(k && INV_TOMBSTONES[k]){ delete INV_TOMBSTONES[k]; _invTombSave(); return true; } return false; }
+function _invTombCount(){ return Object.keys(INV_TOMBSTONES).length; }
+_invTombLoad();
+if(typeof window!=='undefined'){ window._invTombHas=_invTombHas; window._invTombAdd=_invTombAdd; window._invTombRemove=_invTombRemove; window._invTombLoad=_invTombLoad; window._invTombCount=_invTombCount; }
+function _invPurgeTombstoned(){
+  if(typeof _invTombHas!=='function') return 0;
+  var pools=[];
+  try{ if(typeof INVENTORY_DEVICES!=='undefined') pools.push(INVENTORY_DEVICES); }catch(e){}
+  try{ if(typeof GM_INVENTORY!=='undefined') pools.push(GM_INVENTORY); }catch(e){}
+  try{ if(typeof TC_INVENTORY!=='undefined') pools.push(TC_INVENTORY); }catch(e){}
+  try{ if(typeof AW_INVENTORY!=='undefined') pools.push(AW_INVENTORY); }catch(e){}
+  try{ if(typeof EX_INVENTORY!=='undefined') pools.push(EX_INVENTORY); }catch(e){}
+  var removed=0;
+  pools.forEach(function(arr){ if(!Array.isArray(arr)) return; for(var i=arr.length-1;i>=0;i--){ var d=arr[i]; if(d && (_invTombHas(d.imei)||_invTombHas(d.sim))){ arr.splice(i,1); removed++; } } });
+  if(removed){ try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){} console.log('[tombstone] purged '+removed+' resurrected device(s)'); }
+  return removed;
+}
+if(typeof window!=='undefined') window._invPurgeTombstoned=_invPurgeTombstoned;
+try{ setTimeout(function(){ try{ _invPurgeTombstoned(); }catch(e){} }, 2500); }catch(e){}
 async function ownerInvDeleteCommit(){
   // Calvin 2026-05-18: wrap whole body so async rejections surface as
   // alerts. Without this, an inline onclick="" call to an async function
@@ -34257,6 +34779,8 @@ async function ownerInvDeleteCommit(){
   ids.forEach(function(idStr){
     var idx = pool.findIndex(function(d){return String(d.id)===String(idStr);});
     if(idx >= 0){
+      var _td = pool[idx];
+      try{ if(typeof _invTombAdd==='function') _invTombAdd(_td.imei, _td.sim, {by:(DB.current&&DB.current.id), campaign:OWNER_INV_DELETE.campaign}); }catch(_e){}
       pool.splice(idx, 1);
       removed++;
     }
@@ -34497,7 +35021,7 @@ function panelOwnerInvDelete(){
        + 'style="padding:10px 14px;border:2px solid var(--red);border-radius:6px;font-family:monospace;font-size:.95rem;letter-spacing:3px;text-transform:uppercase;width:160px;text-align:center">';
     h += '<button onclick="ownerInvDeleteCommit()" '
        + 'style="background:var(--red);border:none;color:white;font-family:Barlow Condensed,sans-serif;font-size:.82rem;letter-spacing:2px;text-transform:uppercase;padding:11px 24px;border-radius:6px;cursor:pointer;font-weight:700">'
-       + '🗑 Hard Delete '+selectedCount+' Device'+(selectedCount===1?'':'s')+'</button>';
+       + '🗑 PERMANENTLY DELETE '+selectedCount+' Device'+(selectedCount===1?'':'s')+' (everywhere)</button>';
     h += '</div>';
   }
   h += '</div></div>';
@@ -35763,7 +36287,7 @@ function launchBO(u){
   }
   showPage('backoffice');
   buildNav(u);
-  gotoPanel('bo');
+  gotoPanel(homePanelFor(u));
   setTimeout(function(){ checkInventoryExpiryAlerts(); }, 1500);
   scheduleNationalCallReminders();
   setTimeout(function(){ checkAgentDocReminders(); }, 2000);
@@ -37047,7 +37571,7 @@ function buildNav(u){
   var h = '';
 
   // Dashboard (everyone)
-  h += boNavBtn('bo','🏠 Dashboard');
+  h += boNavBtn(homePanelFor(u),'🏠 Dashboard');
 
   // ── Calvin 2026-07-01 NAV REORG: Meetings/Communications — ONE home for
   // every form of contact between us, agents, and managers: video meeting
@@ -37237,6 +37761,7 @@ function buildNav(u){
       +boDropBtn('inv-my-inventory','📱 My Inventory & Transfer Tool')
       +boDropBtn('inv-requests','📋 Pending Requests')
       +(canAccess(u,'pending-transfers') ? boDropBtn('pending-transfers','🔄 Pending Transfers') : '')
+      +(canAccess(u,'inventory-pickup') ? boDropBtn('inventory-pickup','📦 Inventory Pickup Form') : '')
       +boDropBtn('pickup-confirmations','📦 Pickup Confirmations')
       +boDropBtn('discrepancy-tickets','🎫 Discrepancy Tickets')
       +boDropBtn('carrier-tickets','⚡ Carrier Tickets (Priority)')
@@ -37267,6 +37792,10 @@ function buildNav(u){
     // entry whenever _canUseDartScanner(u) is true.
     if(typeof _canUseDartScanner === 'function' && _canUseDartScanner(u)){
       campaignNavItems += boDropBtn('dart-scanner','📷 DART Pickup Scanner');
+      campaignNavItems += '<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
+    }
+    if(canAccess(u,'inventory-pickup')){
+      campaignNavItems += boDropBtn('inventory-pickup','📦 Inventory Pickup Form');
       campaignNavItems += '<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
     }
     if(typeof isSalesRole === 'function' && isSalesRole(u)){
@@ -41358,7 +41887,7 @@ function panelBO(){
         html += '<td style="padding:8px 12px;font-size:.78rem;color:var(--brown)">'+(d.campaign||d.carrier||'—')+'</td>';
         html += '<td style="padding:8px 12px;font-size:.78rem;color:var(--brown)">'+(d.market||'—')+'</td>';
         html += '<td style="padding:8px 12px;font-size:.72rem"><span style="background:rgba(0,53,148,.08);color:var(--blue);padding:2px 8px;border-radius:3px;font-size:.66rem;letter-spacing:1px;text-transform:uppercase">'+(d.status||'—')+'</span></td>';
-        html += '<td style="padding:8px 12px;font-size:.78rem;color:var(--brown)">'+(d.expiryDate||'—')+'</td>';
+        html += '<td style="padding:8px 12px;font-size:.78rem;color:var(--brown)">'+(d.expiryDate||'—')+_invVendorExpiryHTML(d)+'</td>';
         html += '<td style="padding:8px 12px;font-size:.78rem;font-weight:700;color:'+dayColor+'">'+dayText+'</td>';
         html += '</tr>';
       });
@@ -41829,7 +42358,7 @@ function _briefCompany(){
   var salesAgents=(DB.agents||[]).filter(function(a){ try{return a&&a.active&&isSalesRole(a);}catch(e){return false;} });
   var wk=0; salesAgents.forEach(function(a){ wk+=_briefStat(a); });
   var perf=salesAgents.map(function(a){return {a:a,n:_briefStat(a)};}).sort(function(x,y){return y.n-x.n;});
-  var devOut=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.holderId||d.assignedTo);}).length; }catch(e){}
+  var devOut=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; }catch(e){}
   return {salesAgents:salesAgents, wk:wk, perf:perf, mvp:(perf[0]&&perf[0].n>0?perf[0]:null), devOut:devOut};
 }
 function _briefCounts(){
@@ -41963,7 +42492,7 @@ function _ownerStatSet(){
     var ll=progTotal(['Lifeline']), llA=progAgents(['Lifeline']);
     var intT=progTotal(['Internet']), intA=progAgents(['Internet']);
     var aca=progTotal(['ACA']), acaA=progAgents(['ACA']);
-    var devOut=0,invAvail=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.holderId||d.assignedTo);}).length; invAvail=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.holderId||d.assignedTo);}).length; }catch(e){}
+    var devOut=0,invAvail=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; invAvail=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; }catch(e){}
     // sorted: PEOPLE -> ENROLLMENTS -> PROGRAMS -> INVENTORY
     out.push({big:sales.length, lbl:'Sales agents', sub:inactive+' inactive', panel:'agents'});
     out.push({big:mgrs, lbl:'Managers', sub:leaders+' team leaders', panel:'agents'});
@@ -42068,7 +42597,7 @@ function _ownerHybridBoard(){
   var pat=weeklyPatternThisMonth();
   var progs=_programList();
   // devices in field
-  var devOut=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.holderId||d.assignedTo);}).length; }catch(e){}
+  var devOut=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; }catch(e){}
   // action queue counts (best-effort, all guarded)
   function _len(fn){ try{ var r=fn(); return Array.isArray(r)?r.length:(r||0); }catch(e){ return 0; } }
   var invApprovals=0; try{ invApprovals=(typeof INVENTORY_REQUESTS!=='undefined'?INVENTORY_REQUESTS:[]).filter(function(r){return r&&(r.status==='pending'||!r.status);}).length; }catch(e){}
@@ -42230,7 +42759,7 @@ function _ownerDash3(u){
     var mkts=_od3Num(function(){return (typeof marketActiveList==='function')?marketActiveList().length:((typeof MARKETS!=='undefined'&&MARKETS)?MARKETS.length:0);},0);
     var mgrs=sales.filter(function(a){return a.role==='Market Manager'||a.role==='Campaign Manager';}).length;
     var perf=sales.map(function(a){ var n=0; try{n=agentSalesCount(a,{period:'week'})||0;}catch(e){} return {a:a,n:n}; }).sort(function(x,y){return y.n-x.n;});
-    var devOut=0,invAvail=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.holderId||d.assignedTo);}).length; invAvail=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.holderId||d.assignedTo);}).length; }catch(e){}
+    var devOut=0,invAvail=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; devOut=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&!(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; invAvail=pool.filter(function(d){return d&&!d.deletedAt&&d.status!=='sold'&&(d.status==='available'||d.status==='unassigned'||d.status==='uploaded'||!d.status);}).length; }catch(e){}
     var invReq=_od3Num(function(){return (typeof INVENTORY_REQUESTS!=='undefined'?INVENTORY_REQUESTS:[]).filter(function(r){return r&&(r.status==='pending'||!r.status);}).length;},0);
     var inact=_od3Num(function(){return (typeof INACTIVITY_FLAGS!=='undefined'?INACTIVITY_FLAGS:[]).filter(function(f){return f&&f.status!=='resolved'&&!f.acknowledgedAt;}).length;},0);
     var pend=_od3Num(function(){return (DB.agents||[]).filter(function(a){ return a && (String(a.username||'').indexOf('.pending')>=0||(a._meta&&a._meta.pending)); }).length;},0);
@@ -48531,6 +49060,8 @@ function _sendDenialNotification(opts){
   _resolveUplineForAgent(requesterId).forEach(function(u){
     if(recipients.indexOf(u.id) < 0) recipients.push(u.id);
   });
+  // Calvin 2026-07-07: notify the intended recipient of the denial too (all parties).
+  if(opts.recipientId && recipients.indexOf(opts.recipientId) < 0) recipients.push(opts.recipientId);
 
   // (1) In-app notification per recipient
   if(typeof pushNotification === 'function'){
@@ -48700,6 +49231,7 @@ function invDeptDeny(transferId, campaign, reason){
   if(typeof _sendDenialNotification === 'function'){
     _sendDenialNotification({
       requesterId: req.fromId,
+      recipientId: req.toId,
       denierUser:  u,
       reason:      reason.trim(),
       label:       campaign + ' Transfer',
@@ -55709,7 +56241,14 @@ if(typeof window !== 'undefined'){
 var ONBOARDING_GATE_BYPASS = ['makenzie.gibson', 'k.anna', 'kanna', 'k-anna'];
 if(typeof window !== 'undefined') window.ONBOARDING_GATE_BYPASS = ONBOARDING_GATE_BYPASS;
 
+// Calvin 2026-07-14: DOCUMENT/ONBOARDING GATE IS GLOBALLY OFF for testing.
+// Nobody is locked out for unsigned documents while this is true, so the full
+// inventory chain (agent -> TL -> MM/CM) can be tested end to end. Flip this
+// to false to re-arm the gate exactly as it was — no other logic was removed.
+var ONBOARDING_GATE_GLOBALLY_OFF = true;
+if(typeof window !== 'undefined') window.ONBOARDING_GATE_GLOBALLY_OFF = ONBOARDING_GATE_GLOBALLY_OFF;
 function isOnboardingLocked(agent){
+  if(ONBOARDING_GATE_GLOBALLY_OFF) return false;   // testing mode — no document blocks
   if(!agent) return false;
   // Grandfather: explicit flag
   if(agent.bypassOnboardingGate === true) return false;
@@ -56790,19 +57329,28 @@ function showInventoryAcceptanceModalIfNeeded(user){
     html += '<div style="font-family:Bebas Neue,sans-serif;font-size:.95rem;letter-spacing:1.5px;color:'+(p.cfg.color||'var(--blue)')+'">'+(p.cfg.icon||'📦')+' '+escHtml(p.cfg.label||p.campaign)+'</div>';
     html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">From: '+escHtml(p.transfer.fromName||'Inventory')+' · '+(p.transfer.imeis||[]).length+' device'+((p.transfer.imeis||[]).length===1?'':'s')+'</div>';
     html += '</div>';
+    var _phCt=(p.transfer.devices||[]).filter(function(d){return d.type!=='sim';}).length;
+    var _smCt=(p.transfer.devices||[]).filter(function(d){return d.type==='sim';}).length;
+    html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:6px">📱 '+_phCt+' phone'+(_phCt===1?'':'s')+' · 💳 '+_smCt+' SIM card'+(_smCt===1?'':'s')+'</div>';
     // Device table
     html += '<table style="width:100%;font-family:Barlow Condensed,sans-serif;font-size:.74rem;border-collapse:collapse">';
     html += '<thead><tr style="color:var(--muted);text-align:left">';
+    html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">Type</th>';
     html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">IMEI</th>';
+    html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">SIM / ICCID</th>';
+    html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">Make</th>';
     html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">Model</th>';
     html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border)">Type</th>';
     html += '<th style="padding:4px 6px;border-bottom:1px solid var(--border);text-align:right">Cost</th>';
     html += '</tr></thead><tbody>';
     (p.transfer.devices||[]).slice(0,30).forEach(function(d){
       html += '<tr>';
-      html += '<td style="padding:4px 6px;font-family:monospace;font-size:.7rem">'+escHtml(d.imei||'')+'</td>';
-      html += '<td style="padding:4px 6px">'+escHtml(d.model||'—')+'</td>';
-      html += '<td style="padding:4px 6px">'+escHtml(d.devType||'—')+'</td>';
+      var _isSim = (d.type==='sim');
+      html += '<td style="padding:4px 6px;white-space:nowrap">'+(_isSim?'💳 SIM card':('📱 Phone'+(d.sim?' + SIM':'')))+'</td>';
+      html += '<td style="padding:4px 6px;font-family:monospace;font-size:.7rem">'+escHtml(_isSim?'—':(d.imei||'—'))+'</td>';
+      html += '<td style="padding:4px 6px;font-family:monospace;font-size:.7rem">'+escHtml(d.sim||(_isSim?(d.imei||''):'')||'—')+'</td>';
+      html += '<td style="padding:4px 6px">'+escHtml(_isSim?'SIM':(d.make||'—'))+'</td>';
+      html += '<td style="padding:4px 6px">'+escHtml(_isSim?'SIM card':(d.model||'—'))+'</td>';
       html += '<td style="padding:4px 6px;text-align:right;font-weight:600">$'+(parseFloat(d.devCost)||0).toFixed(2)+'</td>';
       html += '</tr>';
     });
@@ -59129,13 +59677,14 @@ function gmProcessInventoryUpload(){
 
     // Market breakdown preview
     html += '<div style="background:rgba(5,150,105,.05);border:1px solid rgba(5,150,105,.25);border-radius:8px;padding:14px;margin-bottom:12px">';
+    html += _invReconcileBanner(result.reconciliation);
     html += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:3px;text-transform:uppercase;color:#059669;font-weight:700;margin-bottom:10px">📋 Upload Preview: '+nd.length+' New Devices</div>';
     Object.keys(mb).sort().forEach(function(market){
       html += '<div style="display:flex;justify-content:space-between;font-family:Barlow Condensed,sans-serif;font-size:.78rem;padding:4px 0;border-bottom:1px solid rgba(5,150,105,.1)">';
       html += '<span style="color:var(--brown)">'+market+'</span><span style="font-weight:700;color:var(--blue)">'+mb[market]+' devices</span></div>';
     });
     if(dupes.length-flagged.length>0){
-      html += '<div style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:#D97706">⚠️ '+(dupes.length-flagged.length)+' duplicate IMEI(s) skipped (already in system)</div>';
+      html += '<div style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:#2563eb">🔄 '+(dupes.length-flagged.length)+' existing device(s) reconciled to the vendor file</div>';
     }
     html += '</div>';
 
@@ -60971,7 +61520,31 @@ function _commitDartScan(code, type, method, imei2){
   var clean = validation.clean;
 
   var dupe = _checkInventoryDuplicate(clean, type);
-  if(dupe.duplicate) return { ok:false, error:'Already in inventory: '+dupe.location };
+  if(dupe.duplicate){
+    // v8600 (Calvin): fail-proof either order. If the match is a DART manifest
+    // unit not yet received (Intransit/available, never scanned), this scan is
+    // CONFIRMING receipt at FedEx -> flip it to received instead of rejecting.
+    var _rx = INVENTORY_DEVICES.find(function(d){
+      return d && String(d.campaign).toUpperCase()==='DART' && (type==='sim' ? d.sim===clean : d.imei===clean);
+    });
+    if(_rx && !_rx.scannedAt && ['intransit','available','uploaded','unassigned',''].indexOf(String(_rx.status||'').toLowerCase())>=0){
+      var _ru = DB.current;
+      _rx.status          = 'assigned';
+      _rx.scannedAt       = new Date().toISOString();
+      _rx.receivedAt      = _rx.scannedAt;
+      _rx.scannedBy       = _ru ? _ru.name : _rx.scannedBy;
+      _rx.scannedById     = _ru ? _ru.id   : _rx.scannedById;
+      _rx.scanMethod      = method || 'manual';
+      _rx.holderId        = _ru ? _ru.id   : _rx.holderId;
+      _rx.holderName      = _ru ? _ru.name : _rx.holderName;
+      _rx.assignedTo      = _ru ? _ru.id   : _rx.assignedTo;
+      _rx.marketManagerId = _ru ? _ru.id   : _rx.marketManagerId;
+      try{ var _rm=(typeof _dartPickerMarketName==='function')?_dartPickerMarketName(_ru):null; if(_rm) _rx.market=_rm; }catch(e){}
+      try{ if(typeof saveInventory==='function') saveInventory(); }catch(e){}
+      return { ok:true, received:true, device:_rx, message:'Received — confirmed against manifest.' };
+    }
+    return { ok:false, error:'Already in inventory: '+dupe.location };
+  }
 
   // ── Calvin 2026-06-11 v1130: optional IMEI 2 for dual-SIM phones ──
   // Box labels from the DART supplier print IMEI1 + IMEI2 side-by-side.
@@ -61311,7 +61884,7 @@ function _loadFlorenceAI(progressCb){
     var readyTimeout = setTimeout(function(){
       console.warn('[Florence-2] Transformers.js module load timed out after 30s');
       resolve(null);
-    }, 30000);
+    }, 600000); // Calvin 2026-07-27: realtime fallback 30s -> 10min (data saver)
 
     function onReady(){
       clearTimeout(readyTimeout);
@@ -63080,6 +63653,41 @@ function _dartInvBulkAssign(){
 }
 if(typeof window !== 'undefined') window._dartInvBulkAssign = _dartInvBulkAssign;
 
+function _carrierInvGroupedHTML(devices){
+  // v8000 (Calvin): every device for this campaign grouped by market, then by
+  // the individual holding it, so anyone can trace who has what. Available stock
+  // is listed per market too. Shows the full picture regardless of the search filter.
+  if(!Array.isArray(devices) || !devices.length) return '';
+  var byMarket = {};
+  devices.forEach(function(d){
+    if(!d || d.deletedAt) return;
+    var mkt = d.market || d.teamDd || 'Unassigned market';
+    var holder = (d.holderId && d.holderName) ? d.holderName : 'Available (unassigned)';
+    if(!byMarket[mkt]) byMarket[mkt] = { total:0, holders:{} };
+    byMarket[mkt].total++;
+    byMarket[mkt].holders[holder] = (byMarket[mkt].holders[holder]||0) + 1;
+  });
+  var markets = Object.keys(byMarket).sort();
+  var h = '<details open style="margin:10px 0 14px;border:1px solid var(--border);border-radius:8px;padding:0 14px">';
+  h += '<summary style="cursor:pointer;padding:12px 0;font-family:Bebas Neue,sans-serif;font-size:1rem;letter-spacing:1.5px;color:var(--blue)">Organized by market &amp; person (' + devices.length + ' devices)</summary>';
+  h += '<div style="padding:0 0 12px">';
+  markets.forEach(function(mkt){
+    var m = byMarket[mkt];
+    h += '<div style="margin-bottom:10px"><div style="font-family:Barlow Condensed,sans-serif;font-weight:700;font-size:.9rem;color:var(--blue);border-bottom:1px solid var(--border);padding:4px 0;text-transform:uppercase;letter-spacing:1px">' + escHtml(mkt) + ' <span style="color:var(--muted);font-weight:400">- ' + m.total + ' devices</span></div>';
+    var holders = Object.keys(m.holders).sort(function(a,b){
+      var aa = a.indexOf('Available')===0, bb = b.indexOf('Available')===0;
+      if(aa && !bb) return 1; if(bb && !aa) return -1;
+      return m.holders[b] - m.holders[a];
+    });
+    holders.forEach(function(hn){
+      var isAvail = hn.indexOf('Available')===0;
+      h += '<div style="display:flex;justify-content:space-between;padding:3px 8px;font-family:Barlow Condensed,sans-serif;font-size:.85rem' + (isAvail?';color:#0F6E56;font-weight:600':'') + '"><span>' + escHtml(hn) + '</span><strong>' + m.holders[hn] + '</strong></div>';
+    });
+    h += '</div>';
+  });
+  h += '</div></details>';
+  return h;
+}
 function panelDartInventory(){
   var u = DB.current;
   var isInv = (typeof canAccess === 'function' && canAccess(u,'inventory'))
@@ -63101,7 +63709,8 @@ function panelDartInventory(){
   var cAssigned   = all.filter(function(d){return d.status==='assigned';}).length;
   var cActivated  = all.filter(function(d){return d.status==='activated';}).length;
   var cChargeback = all.filter(function(d){return d.status==='chargeback';}).length;
-  var cUploaded   = all.length - cAssigned - cActivated - cChargeback;
+  var cTotal      = all.length;
+  var cAvailable  = cTotal - cAssigned - cActivated - cChargeback;
 
   var h = '';
   h += panelHeader('📱 DART Inventory');
@@ -63119,7 +63728,8 @@ function panelDartInventory(){
 
   // ── 4 stat counters ──
   h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px">';
-  h += '<div style="background:rgba(5,150,105,.08);border:1.5px solid rgba(5,150,105,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#0F6E56;font-weight:500">'+cUploaded+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#085041;letter-spacing:1.5px;text-transform:uppercase">Uploaded</div></div>';
+  h += '<div style="background:rgba(51,65,85,.08);border:1.5px solid rgba(51,65,85,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#334155;font-weight:500">'+cTotal+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#1e293b;letter-spacing:1.5px;text-transform:uppercase">Uploaded</div></div>';
+  h += '<div style="background:rgba(5,150,105,.08);border:1.5px solid rgba(5,150,105,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#0F6E56;font-weight:500">'+cAvailable+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#085041;letter-spacing:1.5px;text-transform:uppercase">Available</div></div>';
   h += '<div style="background:rgba(24,95,165,.08);border:1.5px solid rgba(24,95,165,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#185FA5;font-weight:500">'+cAssigned+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#0C447C;letter-spacing:1.5px;text-transform:uppercase">Assigned</div></div>';
   h += '<div style="background:rgba(133,79,11,.08);border:1.5px solid rgba(133,79,11,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#854F0B;font-weight:500">'+cActivated+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#633806;letter-spacing:1.5px;text-transform:uppercase">Activated</div></div>';
   h += '<div style="background:rgba(163,45,45,.08);border:1.5px solid rgba(163,45,45,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#A32D2D;font-weight:500">'+cChargeback+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#791F1F;letter-spacing:1.5px;text-transform:uppercase">Chargeback</div></div>';
@@ -63157,6 +63767,8 @@ function panelDartInventory(){
   h += '</div>';
 
   // ── Sort hint ──
+  h += _carrierInvReconcileBanner(all);
+  h += _carrierInvGroupedHTML(all);
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-bottom:6px">Showing '+filtered.length+' of '+all.length+' &middot; sorted oldest-first (expiring inventory at top)</div>';
 
   // ── Table ──
@@ -63505,7 +64117,18 @@ async function _carrierInvHandlePaste(campaign, mode){
       if(typeof gotoPanel === 'function') gotoPanel(route);
       return;
     }
-    // Inventory paste: parse digit runs, route to _commitDartScan
+    // DART inventory MANIFEST CSV (Store/Type/Unit Status/IMEI/ESN...) -> idempotent
+    // merge importer: phones by IMEI, SIMs by ESN, Intransit vs Available, never dupes,
+    // held by the DART CM, backup-before-merge. Works in either arrival order.
+    if(/unit\s*status/i.test(text) && /imei|esn/i.test(text) && typeof processDartInventoryUpload === 'function'){
+      var _mres = processDartInventoryUpload(text, 'dart-manifest-'+Date.now());
+      if(_mres && _mres.error){ alert('DART manifest error: '+_mres.error); return; }
+      alert('DART inventory manifest processed:\n' + _mres.created + ' new, ' + _mres.merged + ' merged (no duplicates)\n' + _mres.phones + ' phones, ' + _mres.sims + ' SIMs\nHeld by ' + (_mres.holder || 'DART CM') + '.');
+      ta.value = '';
+      if(typeof gotoPanel === 'function') gotoPanel(route);
+      return;
+    }
+    // Otherwise: parse digit runs, route to _commitDartScan
     if(typeof _commitDartScan !== 'function'){
       alert('DART scanner module not loaded — refresh the page and try again.'); return;
     }
@@ -63635,7 +64258,7 @@ function dartProcessSalesText(csvText){
   if(rows.length < 2){ result.summary='No data rows found.'; return result; }
   var header = rows[0].map(function(h){ return String(h).trim().toLowerCase(); });
   function col(name){ return header.indexOf(String(name).toLowerCase()); }
-  var ciStatus=col('Customer Status'), ciDate=col('Date Completed'), ciImei=col('IMEI'),
+  var ciStatus=col('Customer Status'), ciDate=col('Date Completed'), ciImei=col('IMEI'), ciEsn=col('Electronic Serial Number (ESN)'),
       ciAcct=col('Agent Account'), ciFirst=col('First Name'), ciLast=col('Last Name'),
       ciCompany=col('Agent Company Name');
   if(ciImei < 0){ result.summary='Not a DART orders report (no IMEI column).'; return result; }
@@ -63672,6 +64295,7 @@ function dartProcessSalesText(csvText){
     var status=String(ciStatus>=0?row[ciStatus]:'Active').trim();
     if(status && status.toLowerCase()!=='active') continue; // only active enrollments are sales
     var imei=String(row[ciImei]||'').replace(/\D/g,'');
+    var esn=String((ciEsn>=0?row[ciEsn]:'')||'').replace(/\D/g,'');
     if(!imei) continue;
     if(seen[imei]){ result.dupes++; continue; }
     var date=String((ciDate>=0?row[ciDate]:'')||'').trim();
@@ -63687,13 +64311,18 @@ function dartProcessSalesText(csvText){
     // Flip a matching DART inventory device to sold (keeps available/sold in sync)
     try{
       if(typeof INVENTORY_DEVICES!=='undefined' && Array.isArray(INVENTORY_DEVICES)){
-        var dev=INVENTORY_DEVICES.find(function(d){ return d && String(d.imei||'').replace(/\D/g,'')===imei; });
-        if(dev && dev.status!=='sold' && dev.status!=='activated'){
-          dev._statusBeforeSold=dev.status; dev.status='sold'; dev.soldAt=date;
-          dev.soldByAgentId=agent.id; dev.soldByAgentName=agent.name;
-          if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody=[];
-          dev.chainOfCustody.push({type:'sold', at:date, by:agent.name, byId:agent.id, source:'dart-sales-upload'});
-        }
+        // Flip BOTH the phone (IMEI) and the SIM (ESN) used in this activation.
+        INVENTORY_DEVICES.forEach(function(d){
+          if(!d) return;
+          var mI = imei && String(d.imei||'').replace(/\D/g,'')===imei;
+          var mE = esn  && String(d.sim ||'').replace(/\D/g,'')===esn;
+          if((mI||mE) && d.status!=='sold' && d.status!=='activated'){
+            d._statusBeforeSold=d.status; d.status='sold'; d.soldAt=date;
+            d.soldByAgentId=agent.id; d.soldByAgentName=agent.name;
+            if(!Array.isArray(d.chainOfCustody)) d.chainOfCustody=[];
+            d.chainOfCustody.push({type:'sold', at:date, by:agent.name, byId:agent.id, source:'dart-sales-upload'});
+          }
+        });
       }
     }catch(e){}
     seen[imei]=true;
@@ -63887,6 +64516,8 @@ function _carrierInvOpenUploadPanel(campaign, mode){
       alert('DART sales uploader not loaded — refresh and try again.');
       return;
     }
+    // Calvin 2026-07-07: DART inventory manifest CSV -> file picker -> merge importer.
+    if(typeof dartInvPickFile === 'function'){ dartInvPickFile(); return; }
     route = 'dart-scanner';
   }
   if(route && typeof gotoPanel === 'function') gotoPanel(route);
@@ -63909,7 +64540,8 @@ function panelCarrierInventory(campaign){
   var cAssigned   = all.filter(function(d){return d.status==='assigned';}).length;
   var cActivated  = all.filter(function(d){return d.status==='activated';}).length;
   var cChargeback = all.filter(function(d){return d.status==='chargeback';}).length;
-  var cUploaded   = all.length - cAssigned - cActivated - cChargeback;
+  var cTotal      = all.length;
+  var cAvailable  = cTotal - cAssigned - cActivated - cChargeback;
 
   var h = '';
   h += panelHeader('⬆ ' + campaign + ' Inventory');
@@ -63961,7 +64593,8 @@ function panelCarrierInventory(campaign){
 
   // 4 stat counters — same color scheme as DART
   h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px">';
-  h += '<div style="background:rgba(5,150,105,.08);border:1.5px solid rgba(5,150,105,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#0F6E56;font-weight:500">'+cUploaded+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#085041;letter-spacing:1.5px;text-transform:uppercase">Uploaded</div></div>';
+  h += '<div style="background:rgba(51,65,85,.08);border:1.5px solid rgba(51,65,85,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#334155;font-weight:500">'+cTotal+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#1e293b;letter-spacing:1.5px;text-transform:uppercase">Uploaded</div></div>';
+  h += '<div style="background:rgba(5,150,105,.08);border:1.5px solid rgba(5,150,105,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#0F6E56;font-weight:500">'+cAvailable+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#085041;letter-spacing:1.5px;text-transform:uppercase">Available</div></div>';
   h += '<div style="background:rgba(24,95,165,.08);border:1.5px solid rgba(24,95,165,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#185FA5;font-weight:500">'+cAssigned+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#0C447C;letter-spacing:1.5px;text-transform:uppercase">Assigned</div></div>';
   h += '<div style="background:rgba(133,79,11,.08);border:1.5px solid rgba(133,79,11,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#854F0B;font-weight:500">'+cActivated+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#633806;letter-spacing:1.5px;text-transform:uppercase">Activated</div></div>';
   h += '<div style="background:rgba(163,45,45,.08);border:1.5px solid rgba(163,45,45,.4);border-radius:6px;padding:12px;text-align:center"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;color:#A32D2D;font-weight:500">'+cChargeback+'</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;color:#791F1F;letter-spacing:1.5px;text-transform:uppercase">Chargeback</div></div>';
@@ -63995,6 +64628,8 @@ function panelCarrierInventory(campaign){
   }
   h += '</div>';
 
+  h += _carrierInvReconcileBanner(all);
+  h += _carrierInvGroupedHTML(all);
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-bottom:6px">Showing '+filtered.length+' of '+all.length+' &middot; sorted oldest-first (expiring inventory at top)</div>';
 
   // Table
@@ -64321,6 +64956,7 @@ function tcProcessInventoryUpload(){
         });
         html += '</ul>';
       }
+      html += _invReconcileBanner(r.reconciliation);
       if(r.routingBreakdown && Object.keys(r.routingBreakdown).length){
         html += '<div style="margin-top:8px"><strong>📍 Auto-routing:</strong></div><ul style="margin:4px 0 4px 20px">';
         Object.keys(r.routingBreakdown).forEach(function(k){
@@ -65739,14 +66375,16 @@ function invInitiateTransfer(campaign){
     invDeptDenialReason: null,
     agentSigned:false, agentSignedAt:null,
     devices: imeis.map(function(imei){
-      var d = pool.find(function(x){return x.imei===imei;})||{};
+      var d = pool.find(function(x){return x.imei===imei || (x.sim && x.sim===imei);})||{};
       var resolved = (typeof invDeviceInvoiceCost === 'function') ? invDeviceInvoiceCost(d) : {cost: d.devCost||0};
       return {
         imei:    imei,
         sim:     d.sim||'',
+        type:    ((d.type==='sim')||(!d.imei && !!d.sim)) ? 'sim' : 'phone',
         model:   d.model||'',
         sku:     d.sku||'',
         devType: d.devType||'',
+        make:    d.make||d.makeName||'',
         devCost: resolved.cost
       };
     })
@@ -65757,7 +66395,7 @@ function invInitiateTransfer(campaign){
   // Notification routing depends on initial status (Calvin 2026-05-14)
   if(initialStatus === 'pending-inv-dept-approval'){
     // NEW: notify every Inv Dept member (anyone with depts.inv=true OR role='Inventory')
-    DB.agents.filter(function(a){return a.active && isInventory(a);}).forEach(function(inv){
+    DB.agents.filter(function(a){return a.active && (isInventory(a) || /makenzie/i.test(a.name||''));}).forEach(function(inv){
       pushNotification({
         toIds:[inv.id], toRoles:[], icon:'🛡️',
         title:cfg.label+' Transfer — Inv Dept APPROVAL Needed',
@@ -66287,8 +66925,37 @@ function invModelAverageCost(modelName){
   return avg;
 }
 
+// ── SIM-card replacement cost by campaign (Calvin 2026-07-07) ──
+// A STANDALONE SIM card (no phone / no IMEI) is invoiced at this price.
+// Phones are invoiced at their own device cost. Update here if pricing changes.
+//   DART $5  ·  TruConnect free  ·  Assurance Wireless $2  ·  Gen Mobile free
+var SIM_REPLACEMENT_COST = {
+  'DART': 5,
+  'TruConnect': 0,
+  'TC (TruConnect)': 0,
+  'Assurance Wireless': 2,
+  'Gen Mobile': 0
+};
+function _simReplacementCost(campaign){
+  var c = String(campaign||'');
+  if(SIM_REPLACEMENT_COST.hasOwnProperty(c)) return SIM_REPLACEMENT_COST[c];
+  var up = c.toUpperCase();
+  if(up.indexOf('DART') >= 0) return 5;
+  if(up.indexOf('ASSURANCE') >= 0) return 2;
+  if(up.indexOf('TRUCONNECT') >= 0 || up.indexOf('TC') === 0) return 0;
+  if(up.indexOf('GEN MOBILE') >= 0) return 0;
+  return 0;
+}
+function _invIsStandaloneSim(d){
+  return !!d && ((d.type === 'sim') || (!d.imei && !!d.sim));
+}
+if(typeof window !== 'undefined'){ window._simReplacementCost = _simReplacementCost; window._invIsStandaloneSim = _invIsStandaloneSim; }
 function invDeviceInvoiceCost(d){
   if(!d) return {cost:0, source:'fallback', warning:'No device record'};
+  // Calvin 2026-07-07: a standalone SIM card is invoiced at the campaign SIM price.
+  if(typeof _invIsStandaloneSim==='function' && _invIsStandaloneSim(d)){
+    return {cost: _simReplacementCost(d.campaign), source:'sim-replacement', warning:null};
+  }
   // Aged-Out + Owned-by-Agency rule: use Purchase Cost
   var isAgedOut = (d.gmInvStatus === 'Aged-Out') ||
                   (d.invStatus === 'Aged-Out');
@@ -66372,21 +67039,25 @@ function resolveTransferExpiry(senderExpiryDate, recipientRole, todayMs, vendorD
     try {
       var vMs = new Date(vendorDueDate).getTime();
       if(!isNaN(vMs)){
-        vendorCapDays = Math.ceil((vMs - t0) / 86400000);
+        // Calvin 2026-07-07: 20-day buffer before the vendor's ORIGINAL expiration
+        // — inventory must clear at least 20 days before the carrier's return-by date.
+        vendorCapDays = Math.ceil((vMs - t0) / 86400000) - 20;
       }
     } catch(e){}
   }
 
   // ── Role cap (only for TL/FA — managers inherit AS-IS) ──
+  // Calvin 2026-07-07: max hold time by role — Manager 30d, TL 20d, Agent 14d.
   var ROLE_CAPS = {
-    'Campaign Manager': null, // no cap on inheritance for managers
-    'IBO':              null,
-    'Market Manager':   null,
-    'Team Leader':      14,
+    'Campaign Manager': 30,
+    'IBO':              30,
+    'Market Manager':   30,
+    'Team Leader':      20,
     'Field Agent':      14
   };
   var roleCap = ROLE_CAPS.hasOwnProperty(recipientRole) ? ROLE_CAPS[recipientRole] : 14;
-  var recipientIsManager = (roleCap === null);
+  // Manager status is by ROLE (they skip the reclaim gap/block), not by cap.
+  var recipientIsManager = (['Campaign Manager','IBO','Market Manager'].indexOf(recipientRole) >= 0);
 
   // ── Calvin 2026-05-15: 10-DAY GAP BUFFER ──
   // For TL/Field Agent recipients ONLY: subtract a 10-day buffer from
@@ -66511,7 +67182,7 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
   var to = DB.agents.find(function(a){return a.id===req.toId;});
   var recipientRole = to ? to.role : 'Field Agent';
   req.devices.forEach(function(rd){
-    var dev = pool.find(function(d){return d.imei===rd.imei;});
+    var dev = pool.find(function(d){return d.imei===rd.imei || (d.sim && (d.sim===rd.imei || d.sim===rd.sim));});
     if(!dev) return;
     // Snapshot sender's expiry BEFORE we overwrite anything — this is
     // the basis for the cap calculation.
@@ -66557,7 +67228,7 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
   // query "show me all devices locked to Tulsa OK".
   if(req.marketLocked){
     req.devices.forEach(function(rd){
-      var dev = pool.find(function(d){return d.imei===rd.imei;});
+      var dev = pool.find(function(d){return d.imei===rd.imei || (d.sim && (d.sim===rd.imei || d.sim===rd.sim));});
       if(dev){
         dev.lockedMarket   = req.marketLocked;
         dev.lockedAt       = now.toISOString();
@@ -66588,7 +67259,7 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
   if(typeof invDbUpsertDevice === 'function'){
     var poolKey = cfg.id; // 'gm','tc','aw','ex','legacy'
     req.devices.forEach(function(rd){
-      var dev = pool.find(function(d){return d.imei===rd.imei;});
+      var dev = pool.find(function(d){return d.imei===rd.imei || (d.sim && (d.sim===rd.imei || d.sim===rd.sim));});
       if(dev){
         invDbUpsertDevice(poolKey, dev).then(function(res){
           if(!res || !res.ok){
@@ -66641,6 +67312,7 @@ function invRejectTransfer(campaign, transferId, reason){
   if(typeof _sendDenialNotification === 'function'){
     _sendDenialNotification({
       requesterId: req.fromId,
+      recipientId: req.toId,
       denierUser:  u,
       reason:      req.denyReason,
       label:       cfg.label + ' Transfer (Rejected by Recipient)',
@@ -66763,6 +67435,7 @@ function gmDenyTransfer(transferId, reason){
   if(typeof _sendDenialNotification === 'function'){
     _sendDenialNotification({
       requesterId: req.fromId,
+      recipientId: req.toId,
       denierUser:  DB.current,
       reason:      req.denyReason,
       label:       'Gen Mobile Transfer',
@@ -82999,6 +83672,7 @@ function invDenyTransfer(campaign, transferId, reason){
   if(typeof _sendDenialNotification === 'function'){
     _sendDenialNotification({
       requesterId: req.fromId,
+      recipientId: req.toId,
       denierUser:  u,
       reason:      req.denyReason,
       label:       cfg.label + ' Transfer',
