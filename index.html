@@ -3463,7 +3463,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.08.11.0900';
+var BUILD_VERSION = '2026.08.11.1000';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13765,6 +13765,7 @@ function canAccess(u, area){
     // Payroll/Onboarding to be able to access calls and (admin-role only)
     // host them. Owner already passes via the isOwner bypass at line 9864.
     case 'meetings':         return true;
+    case 'my-meetings':      return true;
     case 'profile':          return !isOfficeRole(u);
 
     // ── Store: open to everyone (sales, office, IBO, managers) ──
@@ -39880,7 +39881,7 @@ function gotoPanel(id, params){
   }
 
   var titles = {
-    bo:'Back Office', owner:'Owner Dashboard', notifications:'Notifications', meetings:'Meetings', 'meeting-hosts':'Manage Hosts',
+    bo:'Back Office', owner:'Owner Dashboard', notifications:'Notifications', meetings:'Meetings', 'my-meetings':'My Meeting Notes', 'meeting-hosts':'Manage Hosts',
     'hr-dashboard':'HR Dashboard','training-scheduled':'Schedule Training',
     'training-complete':'Training Complete','training-acknowledge':'Acknowledge Training','onboarding-queue':'Onboarding Queue',
     'my-markets':'My Markets','market-breakdown':'Market Breakdown',
@@ -40047,6 +40048,7 @@ function gotoPanel(id, params){
     'payroll-owner':panelPayrollOwner,
     'notifications':panelNotifications,
     'meetings':panelMeetings,
+    'my-meetings':panelMyMeetings,
     'meeting-hosts':panelMeetingHosts,
     'my-documents':panelMyDocuments,
     'campaign-docs':panelCampaignDocs,
@@ -52781,6 +52783,7 @@ function panelMeetings(){
     +'</div>';
 
   // Room cards
+  h += '<div style="text-align:right;margin-bottom:12px"><button onclick="gotoPanel(\'my-meetings\')" style="background:rgba(230,0,126,.08);border:1px solid rgba(230,0,126,.3);color:var(--pink);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;padding:8px 16px;border-radius:6px;cursor:pointer">📋 My Meeting Notes →</button></div>';
   h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;margin-bottom:20px">';
 
   CALL_ROOMS.forEach(function(room){
@@ -83252,8 +83255,185 @@ async function endCallState(chId){
   if(supaClient) await supaClient.from('app_settings').upsert({key:'call_'+chId,value:JSON.stringify({active:false})},{onConflict:'key'}).catch(function(){});
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+//  MEETING FEATURES — Calvin 2026-08-11 (Option A)
+//  1) Live in-call chat (Supabase realtime broadcast)
+//  2) Auto notes & summary compiled from chat + a host Notes box on call end
+//  3) Attendance-gated "My Meeting Notes" dashboard (only attendees can read)
+// ═══════════════════════════════════════════════════════════════════════
+var MEETING_SUMMARIES = [];
+var _mtgChatLog = [];
+var _mtgCtx = null;
+var _mtgChatChannel = null;
+function _mtgEsc(s){ return (typeof escHtml === 'function') ? escHtml(String(s==null?'':s)) : String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+
+function _mtgLoadSummaries(){ try{ var raw=localStorage.getItem('wmam_meeting_summaries'); if(raw) MEETING_SUMMARIES=JSON.parse(raw)||[]; }catch(e){} }
+function _mtgSaveSummaries(){
+  try{ localStorage.setItem('wmam_meeting_summaries', JSON.stringify(MEETING_SUMMARIES)); }catch(e){}
+  try{ if(typeof supaClient!=='undefined' && supaClient) supaClient.from('app_settings').upsert({key:'meeting_summaries',value:JSON.stringify(MEETING_SUMMARIES)},{onConflict:'key'}); }catch(e){}
+}
+_mtgLoadSummaries();
+
+function _mtgAttKey(chId){ return 'meeting_att_'+chId; }
+async function _mtgRecordAttendee(chId, user){
+  if(!chId || !user) return;
+  var list=[]; try{ var raw=localStorage.getItem('wmam_'+_mtgAttKey(chId)); if(raw) list=JSON.parse(raw)||[]; }catch(e){}
+  if(!list.some(function(a){return a.id===user.id;})) list.push({id:user.id, name:user.name});
+  try{ localStorage.setItem('wmam_'+_mtgAttKey(chId), JSON.stringify(list)); }catch(e){}
+  try{ if(typeof supaClient!=='undefined' && supaClient) await supaClient.from('app_settings').upsert({key:_mtgAttKey(chId),value:JSON.stringify(list)},{onConflict:'key'}); }catch(e){}
+}
+async function _mtgGetAttendees(chId){
+  try{ if(typeof supaClient!=='undefined' && supaClient){ var res=await supaClient.from('app_settings').select('value').eq('key',_mtgAttKey(chId)).maybeSingle(); if(res&&res.data&&res.data.value) return JSON.parse(res.data.value)||[]; } }catch(e){}
+  try{ var raw=localStorage.getItem('wmam_'+_mtgAttKey(chId)); if(raw) return JSON.parse(raw)||[]; }catch(e){}
+  return [];
+}
+async function _mtgClearAttendees(chId){
+  try{ localStorage.removeItem('wmam_'+_mtgAttKey(chId)); }catch(e){}
+  try{ if(typeof supaClient!=='undefined' && supaClient) await supaClient.from('app_settings').delete().eq('key',_mtgAttKey(chId)); }catch(e){}
+}
+
+// ── CHAT ──
+function _mtgChatStart(chId, chName, isHost){
+  _mtgCtx = { chId:chId, chName:chName, startedAt:new Date().toISOString(), isHost:!!isHost };
+  _mtgChatLog = [];
+  try{
+    if(typeof supaClient!=='undefined' && supaClient){
+      _mtgChatChannel = supaClient.channel('mtg-chat-'+chId, { config:{ broadcast:{ self:false } } });
+      _mtgChatChannel.on('broadcast', { event:'msg' }, function(p){ if(p && p.payload) _mtgChatReceive(p.payload); });
+      _mtgChatChannel.subscribe();
+    }
+  }catch(e){ console.warn('[mtgChat] channel failed', e); }
+}
+function _mtgChatReceive(msg){ _mtgChatLog.push(msg); _mtgChatRender(); }
+function _mtgChatSend(){
+  var input=document.getElementById('mtgChatInput'); if(!input) return;
+  var text=(input.value||'').trim(); if(!text) return;
+  var u=DB.current; if(!u) return;
+  var msg={ id:'m'+Date.now()+Math.random().toString(36).slice(2,6), fromId:u.id, from:u.name, text:text, at:new Date().toISOString() };
+  input.value='';
+  _mtgChatLog.push(msg); _mtgChatRender();
+  try{ if(_mtgChatChannel) _mtgChatChannel.send({ type:'broadcast', event:'msg', payload:msg }); }catch(e){}
+}
+function _mtgChatRender(){
+  var box=document.getElementById('mtgChatMsgs'); if(!box) return; var u=DB.current;
+  box.innerHTML = _mtgChatLog.map(function(m){
+    var mine = u && m.fromId===u.id;
+    return '<div style="margin-bottom:8px;text-align:'+(mine?'right':'left')+'">'
+      + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.56rem;letter-spacing:.5px;color:rgba(255,255,255,.4);margin-bottom:2px">'+(mine?'You':_mtgEsc(m.from))+'</div>'
+      + '<div style="display:inline-block;max-width:85%;background:'+(mine?'rgba(0,53,148,.55)':'rgba(255,255,255,.12)')+';color:#fff;padding:6px 10px;border-radius:10px;font-family:Barlow Condensed,sans-serif;font-size:.82rem;text-align:left;word-break:break-word">'+_mtgEsc(m.text)+'</div>'
+      + '</div>';
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+function _mtgMountChatUI(){
+  if(document.getElementById('mtgChatPanel')) return;
+  var p=document.createElement('div');
+  p.id='mtgChatPanel';
+  p.style.cssText='position:fixed;top:0;right:0;width:320px;max-width:86vw;height:100%;background:#12121f;border-left:1px solid rgba(255,255,255,.12);z-index:100000;display:flex;flex-direction:column;box-shadow:-4px 0 20px rgba(0,0,0,.4)';
+  p.innerHTML =
+    '<div style="padding:12px 14px;background:rgba(0,53,148,.4);display:flex;align-items:center;justify-content:space-between">'
+      +'<div style="font-family:Bebas Neue,sans-serif;color:#fff;letter-spacing:2px;font-size:.95rem">\uD83D\uDCAC MEETING CHAT</div>'
+      +'<button onclick="_mtgToggleChat()" style="background:none;border:none;color:rgba(255,255,255,.6);font-size:1.1rem;cursor:pointer">\u2715</button>'
+    +'</div>'
+    +'<div id="mtgChatMsgs" style="flex:1;overflow-y:auto;padding:12px 14px"></div>'
+    +'<div style="padding:8px;border-top:1px solid rgba(255,255,255,.1)">'
+      +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.35);margin:2px 4px 4px">Meeting Notes (host \u2014 becomes the summary)</div>'
+      +'<textarea id="mtgNotesBox" placeholder="Topics, key points, action items\u2026 (e.g. \u201caction: Karma to follow up Fri\u201d)" style="width:100%;height:54px;box-sizing:border-box;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:6px;color:#fff;font-family:Barlow Condensed,sans-serif;font-size:.76rem;padding:6px 8px;resize:none;margin-bottom:6px"></textarea>'
+      +'<div style="display:flex;gap:6px">'
+        +'<input id="mtgChatInput" placeholder="Type a message\u2026" onkeydown="if(event.key===\'Enter\'){event.preventDefault();_mtgChatSend();}" style="flex:1;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:6px;color:#fff;font-family:Barlow Condensed,sans-serif;font-size:.82rem;padding:8px 10px">'
+        +'<button onclick="_mtgChatSend()" style="background:var(--pink,#E6007E);border:none;color:#fff;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1px;padding:8px 14px;border-radius:6px;cursor:pointer">Send</button>'
+      +'</div>'
+    +'</div>';
+  document.body.appendChild(p);
+  _mtgChatRender();
+}
+function _mtgToggleChat(){ var p=document.getElementById('mtgChatPanel'); if(p) p.style.display = (p.style.display==='none'?'flex':'none'); }
+function _mtgUnmountChatUI(){ var p=document.getElementById('mtgChatPanel'); if(p) p.parentNode.removeChild(p); }
+
+// ── SUMMARY GENERATION (from chat + host notes) ──
+function _mtgClassifyLine(t){
+  // Explicit prefixes win over soft keywords: 'important: ... deadline' is a KEY point.
+  if(/\b(action item|action:|todo:|to-?do:)/i.test(t)) return 'action';
+  if(/\b(key:|important:|note:|decision:)/i.test(t)) return 'key';
+  if(/\b(follow[- ]?up|will\s|needs?\s+to\s|assign|deadline|due\s|by\s+(mon|tue|wed|thu|fri|sat|sun|tomorrow|next\b))/i.test(t)) return 'action';
+  if(/\b(decided|remember|make sure|priority|must\s)/i.test(t)) return 'key';
+  return null;
+}
+function _mtgGenerateSummary(chatLog, notes){
+  chatLog = chatLog||[]; notes = String(notes||'');
+  var actionItems=[], keyPoints=[];
+  notes.split(/\r?\n/).forEach(function(line){
+    var t=line.trim(); if(!t) return; t=t.replace(/^[-*\u2022]\s*/,'');
+    if(_mtgClassifyLine(t)==='action') actionItems.push(t); else keyPoints.push(t);
+  });
+  chatLog.forEach(function(m){
+    var t=String(m.text||'').trim(); if(!t) return; var c=_mtgClassifyLine(t);
+    if(c==='action') actionItems.push((m.from?m.from+': ':'')+t);
+    else if(c==='key') keyPoints.push((m.from?m.from+': ':'')+t);
+  });
+  function uniq(a){ var s={},o=[]; a.forEach(function(x){ var k=x.toLowerCase(); if(!s[k]){s[k]=1;o.push(x);} }); return o; }
+  return { actionItems:uniq(actionItems), keyPoints:uniq(keyPoints), topics:[] };
+}
+
+async function _mtgFinalizeSummary(){
+  if(!_mtgCtx){ _mtgUnmountChatUI(); return; }
+  var ctx=_mtgCtx; var u=DB.current;
+  var notesEl=document.getElementById('mtgNotesBox'); var notes=notesEl?(notesEl.value||''):'';
+  try{
+    if(ctx.isHost && (_mtgChatLog.length>0 || notes.trim().length>0)){
+      var attendees = await _mtgGetAttendees(ctx.chId);
+      if(u && !attendees.some(function(a){return a.id===u.id;})) attendees.push({id:u.id,name:u.name});
+      var gen=_mtgGenerateSummary(_mtgChatLog, notes);
+      MEETING_SUMMARIES.unshift({
+        id:'ms'+Date.now(), chId:ctx.chId, chName:ctx.chName,
+        date:new Date().toISOString().slice(0,10), startedAt:ctx.startedAt, endedAt:new Date().toISOString(),
+        host:u?u.name:'', hostId:u?u.id:null,
+        attendees:attendees, attendeeIds:attendees.map(function(a){return a.id;}),
+        notes:notes.trim(), topics:gen.topics, keyPoints:gen.keyPoints, actionItems:gen.actionItems,
+        chatLog:_mtgChatLog.slice(), generatedAt:new Date().toISOString()
+      });
+      _mtgSaveSummaries();
+      try{ await _mtgClearAttendees(ctx.chId); }catch(e){}
+    }
+  }catch(e){ console.warn('[mtgSummary] finalize failed', e); }
+  try{ if(_mtgChatChannel){ _mtgChatChannel.unsubscribe(); _mtgChatChannel=null; } }catch(e){}
+  _mtgChatLog=[]; _mtgCtx=null; _mtgUnmountChatUI();
+}
+
+// ── DASHBOARD (attendance-gated) ──
+function _mtgMySummaries(){
+  var u=DB.current; if(!u) return [];
+  return MEETING_SUMMARIES.filter(function(s){
+    if(typeof isOwner==='function' && isOwner(u)) return true;                 // owner sees all
+    if(s.hostId===u.id) return true;                                          // host sees own
+    return (s.attendeeIds||[]).indexOf(u.id) >= 0;                            // else must have attended
+  });
+}
+function panelMyMeetings(){
+  var mine=_mtgMySummaries();
+  var h='<div style="max-width:920px;margin:0 auto">';
+  h+='<h2 style="font-family:Bebas Neue,sans-serif;color:var(--pink);letter-spacing:2px;margin-bottom:2px">\uD83D\uDCCB MY MEETING NOTES</h2>';
+  h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--muted);margin-bottom:18px">Summaries from meetings you attended. Attendance is required to access a meeting\u2019s notes.</div>';
+  if(!mine.length){ return h+'<div style="padding:34px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif;background:var(--white);border:1px solid var(--border);border-radius:12px">No meeting notes yet. Attend a meeting to see its summary here.</div></div>'; }
+  mine.forEach(function(s){
+    h+='<div style="background:var(--white);border:1px solid var(--border);border-radius:12px;padding:18px 22px;margin-bottom:16px">';
+    h+='<div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:var(--navy,#0a1a3a);letter-spacing:1px">'+_mtgEsc(s.chName||'Meeting')+'</div>';
+    h+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-bottom:12px">'+_mtgEsc(s.date)+' \u00B7 Host: '+_mtgEsc(s.host||'\u2014')+' \u00B7 '+((s.attendees&&s.attendees.length)||0)+' attended</div>';
+    if(s.notes){ h+='<div style="margin-bottom:10px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;color:var(--pink);margin-bottom:4px">Notes</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown);white-space:pre-wrap">'+_mtgEsc(s.notes)+'</div></div>'; }
+    if(s.keyPoints&&s.keyPoints.length){ h+='<div style="margin-bottom:10px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;color:var(--pink);margin-bottom:4px">Key Points</div><ul style="margin:0 0 0 18px;font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown)">'+s.keyPoints.map(function(k){return '<li>'+_mtgEsc(k)+'</li>';}).join('')+'</ul></div>'; }
+    if(s.actionItems&&s.actionItems.length){ h+='<div style="margin-bottom:6px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.6rem;letter-spacing:2px;text-transform:uppercase;color:#CC0000;margin-bottom:4px">Action Items</div><ul style="margin:0 0 0 18px;font-family:Barlow Condensed,sans-serif;font-size:.84rem;color:var(--brown)">'+s.actionItems.map(function(k){return '<li>'+_mtgEsc(k)+'</li>';}).join('')+'</ul></div>'; }
+    if(s.chatLog&&s.chatLog.length){ h+='<details style="margin-top:8px"><summary style="cursor:pointer;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--pink)">\uD83D\uDCAC Chat transcript ('+s.chatLog.length+' messages)</summary><div style="margin-top:8px;font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--brown)">'+s.chatLog.map(function(m){return '<div style="margin-bottom:3px"><strong>'+_mtgEsc(m.from)+':</strong> '+_mtgEsc(m.text)+'</div>';}).join('')+'</div></details>'; }
+    h+='</div>';
+  });
+  return h+'</div>';
+}
+if(typeof window!=='undefined'){
+  window.panelMyMeetings=panelMyMeetings; window._mtgChatSend=_mtgChatSend; window._mtgToggleChat=_mtgToggleChat;
+  window._mtgGenerateSummary=_mtgGenerateSummary; window._mtgMySummaries=_mtgMySummaries;
+}
 function closeVideoCall(){
   var _vm=document.getElementById('videoCallModal'); if(_vm) _vm.classList.remove('vc-min');
+  try{ if(typeof _mtgFinalizeSummary==='function') _mtgFinalizeSummary(); }catch(e){}
   // Dispose both old Jitsi frame (legacy) and new Daily frame, whichever is active.
   if(jitsiApi){ try{jitsiApi.dispose();}catch(e){} jitsiApi=null; }
   if(typeof dailyCallFrame !== 'undefined' && dailyCallFrame){
@@ -84453,6 +84633,9 @@ function launchJitsi(chId, chName, displayName, isModerator){
     if(waitDiv) waitDiv.style.display='none';
     container.style.display='block';
     container.innerHTML='';
+    try{ if(typeof _mtgChatStart==='function') _mtgChatStart(chId, chName, isModerator); }catch(e){}
+    try{ if(typeof _mtgRecordAttendee==='function') _mtgRecordAttendee(chId, DB.current); }catch(e){}
+    try{ if(typeof _mtgMountChatUI==='function') _mtgMountChatUI(); }catch(e){}
 
     // Resolve the room URL — prefer the exact mapping, fall back to National.
     var roomURL = DAILY_ROOMS[chId] || DAILY_FALLBACK_ROOM;
