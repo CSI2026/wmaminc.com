@@ -3463,7 +3463,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.08.05.0600';
+var BUILD_VERSION = '2026.08.11.0700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13924,6 +13924,58 @@ function _invSyncPoolForKey(poolKey){
     default: return null;
   }
 }
+// ── IMEI de-duplication (Calvin 2026-08-11) ──
+// A permanently-deleted device that is later RESTORED on a vendor manifest clears its
+// tombstone. If a stale copy of that device still sits in the cloud (old internal id,
+// same IMEI — deletes remove cloud rows by id, so a hidden duplicate can survive), it
+// can sync back a few minutes later as a PHANTOM duplicate on the same agent. Two rows
+// must never share an IMEI, so we collapse duplicates everywhere inventory is applied.
+function _invDedupePref(a, b){
+  var rank = function(x){
+    if(!x) return -1;
+    var s = String(x.status||'').toLowerCase();
+    if(s==='sold' || s==='activated') return 4;   // never drop a sold/activated record
+    if(s==='assigned') return 3;
+    if(s==='available' || s==='unassigned' || s==='') return 1;
+    return 2;
+  };
+  var ra = rank(a), rb = rank(b);
+  if(ra !== rb) return ra > rb ? a : b;
+  var t = function(x){ return (new Date((x && (x.assignedAt||x.uploadedAt||x.createdAt||x.receivedAt)) || 0)).getTime() || 0; };
+  return t(a) >= t(b) ? a : b;   // tie -> keep the newer record
+}
+function _invDedupeByImei(pool){
+  if(!Array.isArray(pool) || pool.length < 2) return 0;
+  var best = {}, order = [];
+  for(var i = 0; i < pool.length; i++){
+    var d = pool[i]; if(!d) continue;
+    var key = String(d.imei==null?'':d.imei).replace(/\D/g,'');
+    if(!key){ order.push({noKey:true, d:d}); continue; }   // keep IMEI-less rows (standalone SIMs) untouched
+    if(!(key in best)){ best[key] = d; order.push({k:key}); }
+    else { best[key] = _invDedupePref(d, best[key]); }
+  }
+  var out = [], used = {};
+  order.forEach(function(o){
+    if(o.noKey){ out.push(o.d); return; }
+    if(used[o.k]) return; used[o.k] = true; out.push(best[o.k]);
+  });
+  var removed = pool.length - out.length;
+  if(removed > 0){ pool.length = 0; Array.prototype.push.apply(pool, out); }
+  return removed;
+}
+function _invDedupeAllPools(){
+  var pools = [];
+  try{ if(typeof GM_INVENTORY     !== 'undefined') pools.push(['gm', GM_INVENTORY]); }catch(e){}
+  try{ if(typeof TC_INVENTORY     !== 'undefined') pools.push(['tc', TC_INVENTORY]); }catch(e){}
+  try{ if(typeof AW_INVENTORY     !== 'undefined') pools.push(['aw', AW_INVENTORY]); }catch(e){}
+  try{ if(typeof EX_INVENTORY     !== 'undefined') pools.push(['ex', EX_INVENTORY]); }catch(e){}
+  try{ if(typeof INVENTORY_DEVICES !== 'undefined') pools.push(['legacy', INVENTORY_DEVICES]); }catch(e){}
+  var total = 0;
+  pools.forEach(function(p){ var r = _invDedupeByImei(p[1]); if(r){ total += r; console.log('[dedupe] removed '+r+' duplicate IMEI(s) from '+p[0]); } });
+  if(total){ try{ if(typeof saveInventory === 'function') saveInventory(); }catch(e){} }
+  return total;
+}
+if(typeof window !== 'undefined'){ window._invDedupeByImei = _invDedupeByImei; window._invDedupeAllPools = _invDedupeAllPools; }
 function _invSyncReplacePool(poolKey, devices){
   if(!Array.isArray(devices)) return false;
   // Calvin 2026-08-03: NEVER re-add a permanently-deleted device from the cloud.
@@ -13940,6 +13992,9 @@ function _invSyncReplacePool(poolKey, devices){
     });
     if(_tombFiltered) console.log('[invSyncReplacePool] blocked '+_tombFiltered+' deleted device(s) from returning to '+poolKey);
   }
+  // Calvin 2026-08-11: collapse any duplicate IMEIs in the incoming set so a stale
+  // cloud copy can never re-appear alongside the real one.
+  if(typeof _invDedupeByImei === 'function'){ var _dd = _invDedupeByImei(devices); if(_dd) console.log('[invSyncReplacePool] collapsed '+_dd+' duplicate IMEI(s) in '+poolKey); }
   // Calvin 2026-06-30: an EMPTY incoming set must never wipe a non-empty pool.
   // An empty cloud/table read means "nothing to apply", not "delete everything".
   // NOTE: use the ORIGINAL incoming count for this guard — if our tombstone filter
@@ -27984,6 +28039,7 @@ function startTombstoneGuard(){
   if(WMAM_TOMB_GUARD_TIMER) return;
   WMAM_TOMB_GUARD_TIMER = setInterval(function(){
     try{ if(typeof _invPurgeTombstoned==='function') _invPurgeTombstoned(); }catch(e){}
+    try{ if(typeof _invDedupeAllPools==='function') _invDedupeAllPools(); }catch(e){}
   }, 30000);
 }
 if(typeof window!=='undefined') window.startTombstoneGuard = startTombstoneGuard;
@@ -27993,6 +28049,7 @@ try{ startTombstoneGuard(); }catch(e){}
 async function wmamSyncNow(){
   try{ if(typeof _autoRefreshTickGuarded==='function') await _autoRefreshTickGuarded('manual'); }catch(e){}
   try{ if(typeof _invPurgeTombstoned==='function') _invPurgeTombstoned(); }catch(e){}
+  try{ if(typeof _invDedupeAllPools==='function') _invDedupeAllPools(); }catch(e){}
   try{ if(typeof toast==='function') toast('Synced with the cloud'); }catch(e){}
   try{ if(typeof renderCurrentPanel==='function') renderCurrentPanel(); }catch(e){}
 }
