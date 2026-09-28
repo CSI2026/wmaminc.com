@@ -3724,7 +3724,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.09.28.1800';
+var BUILD_VERSION = '2026.09.28.1900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13813,9 +13813,10 @@ var GM_SALE_PRICING_DEFAULT = {"version": "2026-09", "note": "Gen Mobile Lifelin
 // Shared pricing math (identical in the website and the payment function)
 function gmNorm(s){ return String(s||'').toLowerCase().replace(/20(\d\d)\b/g,'$1').replace(/[^a-z0-9+]/g,''); }
 function gmFindDevice(pricing, model){ var n=gmNorm(model); if(!n) return null;
-  var d=(pricing.devices||[]).find(function(x){ return gmNorm(x.model)===n; });
-  if(!d) d=(pricing.devices||[]).find(function(x){ var m=gmNorm(x.model); return m.length>4 && (n.indexOf(m)===0 || m.indexOf(n)===0); });
-  return d||null; }
+  // Exact match only (name or an office-approved alias). No guessing: a close-but-wrong
+  // match could charge the wrong price.
+  return (pricing.devices||[]).find(function(x){ if(gmNorm(x.model)===n) return true;
+    return (x.aliases||[]).some(function(a){ return gmNorm(a)===n; }); }) || null; }
 function gmR2(x){ return Math.round(Number(x)*100)/100; }
 function gmComputeSale(pricing, input){
   var dev=gmFindDevice(pricing, input.model); if(!dev) return {error:'Unknown phone model. Pick the model from the list.'};
@@ -13835,7 +13836,7 @@ function gmComputeSale(pricing, input){
   return { model:dev.model, deviceFull:gmR2(dev.full), deviceCost:deviceCost, credited:!!plan, planId:plan?plan.id:null, planName:plan?plan.name:'No data plan', planPrice:planPrice,
            payer:payer, customerPhonePrice:customerPhonePrice, charge:charge, owedGenMobile:owedGenMobile, owedAgent:owedAgent };
 }
-var GMPAY = { pricing: null, imei:'', model:'', invModel:'', planId:'', payer:'agent', custPrice:'', custPhone:'', initials:'', busy:false, result:null, err:'' };
+var GMPAY = { pricing: null, imei:'', model:'', invModel:'', lookup:'', lookupFor:'', planId:'', payer:'agent', custPrice:'', custPhone:'', initials:'', busy:false, result:null, err:'' };
 function _gmPayEsc(v){ return (typeof _escapeHtml==='function') ? _escapeHtml(v==null?'':String(v)) : String(v==null?'':v); }
 function _gmMoney(x){ return '$'+(Number(x)||0).toFixed(2); }
 async function gmPayLoadPricing(){
@@ -13862,11 +13863,27 @@ function gmPaySet(field, val, rerender){
   GMPAY[field] = val; GMPAY.err = ''; GMPAY.result = null;
   if(field==='imei'){
     var digits = String(val||'').replace(/\D/g,'');
-    var inv = digits.length >= 14 ? _gmInvModelFor(digits) : '';
-    GMPAY.invModel = inv;
-    if(inv && gmFindDevice(GMPAY.pricing, inv)) GMPAY.model = gmFindDevice(GMPAY.pricing, inv).model;
+    if(digits !== GMPAY.lookupFor){ GMPAY.model=''; GMPAY.invModel=''; GMPAY.lookup=''; GMPAY.lookupFor=''; }
+    if(digits.length >= 14 && digits !== GMPAY.lookupFor) gmPayLookup(digits);
   }
-  if(rerender) gmPayRender(); else gmPaySummary();
+  if(rerender) gmPayRender(); else { gmPayModelHint(); gmPaySummary(); }
+}
+// The phone type ALWAYS comes from Gen Mobile inventory by IMEI. Agents can't pick it.
+async function gmPayLookup(digits){
+  GMPAY.lookup = 'searching'; GMPAY.lookupFor = digits; gmPayModelHint();
+  var inv = _gmInvModelFor(digits);
+  if(!inv){
+    try{
+      var r = await supaClient.from('gm_inventory').select('model').eq('imei', digits).limit(1);
+      if(r && Array.isArray(r.data) && r.data.length) inv = r.data[0].model || '';
+    }catch(e){}
+  }
+  if(GMPAY.lookupFor !== digits) return;           // they kept typing
+  GMPAY.invModel = inv || '';
+  var dev = inv ? gmFindDevice(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, inv) : null;
+  GMPAY.model = dev ? dev.model : '';
+  GMPAY.lookup = !inv ? 'notfound' : (dev ? 'found' : 'unpriced');
+  gmPayRender();
 }
 function _gmPayCalc(){
   return gmComputeSale(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, { model: GMPAY.model, planId: GMPAY.planId || null, payer: GMPAY.payer, customerPhonePrice: GMPAY.custPrice });
@@ -13874,7 +13891,7 @@ function _gmPayCalc(){
 function gmPaySummary(){
   var el = document.getElementById('gmPaySummary'); if(!el) return;
   var c = _gmPayCalc();
-  if(!GMPAY.model){ el.innerHTML = '<div style="color:#888">Enter the IMEI (or pick the phone model) to see the price.</div>'; return; }
+  if(!GMPAY.model){ el.innerHTML = '<div style="color:#888">Enter a valid IMEI to see the price.</div>'; return; }
   if(c.error){ el.innerHTML = '<div style="color:#CC0000;font-weight:700">'+_gmPayEsc(c.error)+'</div>'; return; }
   var line = function(k,v,b){ return '<div style="display:flex;justify-content:space-between;padding:5px 0;'+(b?'border-top:2px solid #003594;margin-top:6px;padding-top:9px;font-weight:800;font-size:1.15rem;color:#003594':'')+'"><span>'+k+'</span><span>'+v+'</span></div>'; };
   var h = '';
@@ -13894,7 +13911,7 @@ function gmPayRender(){
   var h = '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px">';
   h += '<label style="'+lab+'">Phone IMEI</label><input id="gmPayImei" inputmode="numeric" autocomplete="off" placeholder="15-digit IMEI" value="'+_gmPayEsc(GMPAY.imei)+'" oninput="gmPaySet(\'imei\',this.value,false);gmPayModelHint()" onblur="gmPayRender()" style="'+inp+'">';
   h += '<div id="gmPayModelHint" style="font-size:.8rem;margin-top:6px"></div>';
-  h += '<label style="'+lab+'">Phone model</label><select onchange="gmPaySet(\'model\',this.value,true)" style="'+inp+'"><option value="">\u2014 Pick the phone \u2014</option>'
+  h += '<label style="'+lab+'">Phone (from inventory \u2014 can\u2019t be changed)</label><div id="gmPayDevice"></div>';
     + P.devices.map(function(d){ return '<option value="'+_gmPayEsc(d.model)+'"'+(GMPAY.model===d.model?' selected':'')+'>'+_gmPayEsc(d.model)+' \u2014 '+_gmMoney(d.full)+' / '+_gmMoney(d.credited)+' with plan</option>'; }).join('') + '</select>';
   h += '<label style="'+lab+'">Data plan</label><select onchange="gmPaySet(\'planId\',this.value,true)" style="'+inp+'"><option value="">No data plan (full phone price)</option>'
     + P.plans.map(function(p){ return '<option value="'+_gmPayEsc(p.id)+'"'+(GMPAY.planId===p.id?' selected':'')+'>'+_gmPayEsc(p.name)+' \u2014 '+_gmMoney(p.price)+'</option>'; }).join('') + '</select>';
@@ -13933,14 +13950,22 @@ function gmPayRender(){
   gmPayModelHint(); gmPaySummary(); gmPayLoadMine();
 }
 function gmPayModelHint(){
-  var el = document.getElementById('gmPayModelHint'); if(!el) return;
+  var el = document.getElementById('gmPayModelHint'), card = document.getElementById('gmPayDevice');
   var d = String(GMPAY.imei||'').replace(/\D/g,'');
-  if(d.length < 14){ el.innerHTML = ''; return; }
-  if(GMPAY.invModel){
-    var m = gmFindDevice(GMPAY.pricing, GMPAY.invModel);
-    el.innerHTML = m ? '<span style="color:#166534;font-weight:700">\u2714 Found in inventory: '+_gmPayEsc(m.model)+'</span>'
-                     : '<span style="color:#92400e;font-weight:700">Inventory says \u201C'+_gmPayEsc(GMPAY.invModel)+'\u201D \u2014 pick the matching model below.</span>';
-  } else el.innerHTML = '<span style="color:#92400e">Not in inventory \u2014 pick the phone model below.</span>';
+  var msg = '', box = '';
+  var red = function(t){ return '<div style="background:#fdecec;border:2px solid #CC0000;color:#CC0000;border-radius:8px;padding:10px 12px;font-weight:700">'+t+'</div>'; };
+  if(d.length < 14){ box = '<div style="color:#888;padding:10px 0">Enter the IMEI \u2014 the phone fills in automatically.</div>'; }
+  else if(GMPAY.lookup==='searching' || GMPAY.lookupFor!==d){ box = '<div style="color:#888;padding:10px 0">Looking up this IMEI\u2026</div>'; }
+  else if(GMPAY.lookup==='notfound'){ box = red('\u26D4 This IMEI is not in Gen Mobile inventory. It can\u2019t be sold here. Check the number, or contact the office.'); }
+  else if(GMPAY.lookup==='unpriced'){ box = red('\u26D4 Inventory lists this phone as \u201C'+_gmPayEsc(GMPAY.invModel)+'\u201D, which isn\u2019t on the price list yet. Contact the office \u2014 they need to add it before it can be sold.'); }
+  else if(GMPAY.lookup==='found'){
+    var dv = gmFindDevice(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, GMPAY.model);
+    box = '<div style="background:#ecfdf3;border:2px solid #16a34a;border-radius:8px;padding:10px 12px">'
+      + '<div style="font-weight:800;color:#166534;font-size:1.05rem">\u2714 '+_gmPayEsc(dv.model)+'</div>'
+      + '<div style="font-size:.85rem;color:#333;margin-top:3px">Full price '+_gmMoney(dv.full)+' \u00b7 With a data plan '+_gmMoney(dv.credited)+'</div></div>';
+  }
+  if(el) el.innerHTML = msg;
+  if(card) card.innerHTML = box;
 }
 function gmPayCopy(){
   try{ navigator.clipboard.writeText(GMPAY.result.square_link_url); if(typeof showToast==='function') showToast('Link copied'); }catch(e){ prompt('Copy this link:', GMPAY.result.square_link_url); }
@@ -13949,11 +13974,12 @@ async function gmPayCreate(){
   if(GMPAY.busy) return;
   var d = String(GMPAY.imei||'').replace(/\D/g,'');
   if(d.length < 14){ GMPAY.err = 'Enter the full IMEI (15 digits).'; gmPayRender(); return; }
+  if(GMPAY.lookup!=='found' || GMPAY.lookupFor!==d || !GMPAY.model){ GMPAY.err = 'The IMEI must match a phone in Gen Mobile inventory before a link can be created.'; gmPayRender(); return; }
   var c = _gmPayCalc(); if(c.error){ GMPAY.err = c.error; gmPayRender(); return; }
   if(!/^[A-Za-z]{2,4}$/.test(String(GMPAY.initials||''))){ GMPAY.err = 'Read the required notice and enter your initials before creating the link.'; gmPayRender(); try{ document.getElementById('gmPayInitials').focus(); }catch(e){} return; }
   GMPAY.busy = true; GMPAY.err = ''; gmPayRender();
   try{
-    var res = await supaClient.functions.invoke('gm-pay-link', { body: { imei: d, model: GMPAY.model, planId: GMPAY.planId || null, payer: GMPAY.payer,
+    var res = await supaClient.functions.invoke('gm-pay-link', { body: { imei: d, planId: GMPAY.planId || null, payer: GMPAY.payer,
       customerPhonePrice: GMPAY.payer==='customer' ? Number(GMPAY.custPrice) : null, customerPhone: GMPAY.custPhone || null, ackInitials: String(GMPAY.initials).toUpperCase() } });
     var data = res && res.data, err = res && res.error;
     if(err){ try{ var j = err.context && typeof err.context.json==='function' ? await err.context.json() : null; GMPAY.err = (j && j.error) || String(err.message||err); }catch(e){ GMPAY.err = String(err.message||err); } }
@@ -14062,24 +14088,42 @@ function gmPriceRender(){
   var h = '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px">'
     + '<div style="font-weight:800;color:#003594;letter-spacing:1px">PRICE LIST (OWNER ONLY)</div>'
     + '<div style="font-size:.8rem;color:#666;margin:4px 0 10px">When Gen Mobile sends a new sheet, update the numbers here and save. \u201CWith plan\u201D = price after the 0 Non-CA credit.</div>'
-    + '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:.85rem"><tr style="text-align:left"><th style="padding:6px">Phone</th><th style="padding:6px">Full price</th><th style="padding:6px">With plan</th></tr>'
-    + P.devices.map(function(d,i){ return '<tr><td style="padding:4px 6px">'+_gmPayEsc(d.model)+'</td><td style="padding:4px 6px"><input id="gmPrF'+i+'" inputmode="decimal" value="'+d.full+'" style="'+num+'"></td><td style="padding:4px 6px"><input id="gmPrC'+i+'" inputmode="decimal" value="'+d.credited+'" style="'+num+'"></td></tr>'; }).join('')
+    + '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:.85rem"><tr style="text-align:left"><th style="padding:6px">Phone</th><th style="padding:6px">Full price</th><th style="padding:6px">With plan</th><th style="padding:6px">Other names in inventory (comma separated)</th></tr>'
+    + P.devices.map(function(d,i){ return '<tr><td style="padding:4px 6px">'+_gmPayEsc(d.model)+'</td><td style="padding:4px 6px"><input id="gmPrF'+i+'" inputmode="decimal" value="'+d.full+'" style="'+num+'"></td><td style="padding:4px 6px"><input id="gmPrC'+i+'" inputmode="decimal" value="'+d.credited+'" style="'+num+'"></td><td style="padding:4px 6px"><input id="gmPrA'+i+'" value="'+_gmPayEsc((d.aliases||[]).join(', '))+'" placeholder="e.g. Moto G Play 2024" style="width:260px;padding:6px 8px;border:1px solid #ccc;border-radius:6px;font-size:14px"></td></tr>'; }).join('')
     + '</table></div><div style="font-weight:700;margin:12px 0 6px">Data plans</div><table style="border-collapse:collapse;font-size:.85rem">'
     + P.plans.map(function(p,i){ return '<tr><td style="padding:4px 6px">'+_gmPayEsc(p.name)+'</td><td style="padding:4px 6px"><input id="gmPrP'+i+'" inputmode="decimal" value="'+p.price+'" style="'+num+'"></td></tr>'; }).join('')
     + '</table><button onclick="gmPriceSave()" style="margin-top:12px;padding:10px 18px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:700;cursor:pointer">Save price list</button><span id="gmPriceMsg" style="margin-left:10px;font-weight:700"></span></div>';
   box.innerHTML = h;
+  gmPriceUnmatched();
+}
+async function gmPriceUnmatched(){
+  var box = document.getElementById('gmPriceBox'); if(!box) return;
+  try{
+    var r = await supaClient.from('gm_inventory').select('model').limit(10000);
+    var seen = {}; ((r && r.data)||[]).forEach(function(x){ var m = String(x.model||'').trim(); if(m) seen[m] = (seen[m]||0)+1; });
+    var P = GMPAY.pricing || GM_SALE_PRICING_DEFAULT;
+    var bad = Object.keys(seen).filter(function(m){ return !gmFindDevice(P, m); }).sort();
+    var h = bad.length
+      ? '<div style="margin-top:12px;background:#fdecec;border:2px solid #CC0000;border-radius:10px;padding:12px"><div style="font-weight:800;color:#CC0000">\u26D4 '+bad.length+' phone name'+(bad.length===1?'':'s')+' in Gen Mobile inventory don\u2019t match the price list \u2014 agents can\u2019t sell these yet</div>'
+        + '<div style="font-size:.85rem;margin:6px 0">Type each name into the \u201COther names in inventory\u201D box of the matching phone above, then Save.</div>'
+        + bad.map(function(m){ return '<div style="font-family:monospace;padding:2px 0">\u201C'+_gmPayEsc(m)+'\u201D \u2014 '+seen[m]+' device'+(seen[m]===1?'':'s')+'</div>'; }).join('') + '</div>'
+      : '<div style="margin-top:12px;color:#166534;font-weight:700">\u2714 Every phone name in Gen Mobile inventory matches the price list.</div>';
+    box.insertAdjacentHTML('beforeend', h);
+  }catch(e){}
 }
 async function gmPriceSave(){
   var P = JSON.parse(JSON.stringify(GMPAY.pricing || GM_SALE_PRICING_DEFAULT)), bad = false;
   var val = function(id){ var v = parseFloat(String(document.getElementById(id).value).replace(/[^0-9.]/g,'')); if(!(v>=0)) bad = true; return Math.round(v*100)/100; };
-  P.devices.forEach(function(d,i){ d.full = val('gmPrF'+i); d.credited = val('gmPrC'+i); });
+  P.devices.forEach(function(d,i){ d.full = val('gmPrF'+i); d.credited = val('gmPrC'+i);
+    var al = String((document.getElementById('gmPrA'+i)||{}).value||'').split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+    if(al.length) d.aliases = al; else delete d.aliases; });
   P.plans.forEach(function(p,i){ p.price = val('gmPrP'+i); });
   var msg = document.getElementById('gmPriceMsg');
   if(bad){ msg.style.color='#CC0000'; msg.textContent='Every price must be a number.'; return; }
   P.updatedAt = new Date().toISOString(); P.updatedBy = (DB.current && DB.current.name) || '';
   var r = await supaClient.from('app_settings').upsert({ key:'gm_sale_pricing', value: JSON.stringify(P), updated_at: new Date().toISOString() }, { onConflict:'key' });
   if(r && r.error){ msg.style.color='#CC0000'; msg.textContent='Not saved: '+r.error.message; return; }
-  GMPAY.pricing = P; msg.style.color='#16a34a'; msg.textContent='Saved \u2714';
+  GMPAY.pricing = P; msg.style.color='#16a34a'; msg.textContent='Saved \u2714'; gmPriceRender();
 }
 if(typeof window!=='undefined'){ Object.assign(window, { panelGmPayLink:panelGmPayLink, panelGmSales:panelGmSales, gmPaySet:gmPaySet, gmPayCreate:gmPayCreate, gmPayCopy:gmPayCopy, gmPayRender:gmPayRender, gmPayModelHint:gmPayModelHint, gmSalesSetFilter:gmSalesSetFilter, gmSalesMarkAgentPaid:gmSalesMarkAgentPaid, gmPriceSave:gmPriceSave, gmComputeSale:gmComputeSale }); }
 
@@ -88284,3 +88328,4 @@ html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
 </style>
 </body>
 </html>
+  
