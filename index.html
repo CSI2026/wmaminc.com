@@ -3724,7 +3724,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.09.28.1600';
+var BUILD_VERSION = '2026.09.28.1800';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13801,6 +13801,288 @@ function isMgrRole(u)    { return u && (u.role==='Market Manager'||u.role==='Cam
 //  canAccess() is the single source of truth — use it in all
 //  panel guards and nav builders. Never bypass or override.
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════
+//  GEN MOBILE PAYMENT LINKS (Square)  — Calvin 2026-09-28 v1700
+//  Agent: IMEI + data plan (+ customer price) -> Square link for the exact
+//  amount. Office: every sale, what we owe Gen Mobile, what we owe agents.
+//  Pricing rule: no data plan = full September price; any data plan =
+//  price after the $40 Lifeline Non-CA credit.
+// ══════════════════════════════════════════════════════════════════════
+var GM_SALE_PRICING_DEFAULT = {"version": "2026-09", "note": "Gen Mobile Lifeline Device Pricing Sheet, September 2026. credited = price after the $40 Lifeline Non-CA credit (used whenever any data plan is sold).", "devices": [{"model": "Hot Pepper Tepin+", "full": 40, "credited": 0}, {"model": "Blu X5+", "full": 40, "credited": 0}, {"model": "Blu G35", "full": 55, "credited": 15}, {"model": "Hot Pepper Cascabel", "full": 55, "credited": 15}, {"model": "Nuu N21", "full": 55, "credited": 15}, {"model": "Maxwest Nitro A65", "full": 55, "credited": 15}, {"model": "Maxwest Nitro N67", "full": 65, "credited": 25}, {"model": "Hot Pepper Piri", "full": 65, "credited": 25}, {"model": "Celero 5G SC ('24)", "full": 80, "credited": 40}, {"model": "Moto G 5G ('22)", "full": 80, "credited": 40}, {"model": "Moto G 5G ('23)", "full": 80, "credited": 40}, {"model": "Moto G Play ('24)", "full": 80, "credited": 40}, {"model": "Moto G Stylus 5G ('23)", "full": 80, "credited": 40}, {"model": "Samsung Galaxy A14", "full": 110, "credited": 70}, {"model": "iPhone SE2", "full": 110, "credited": 70}, {"model": "iPhone 11", "full": 175, "credited": 135}], "plans": [{"id": "m10", "name": "$10 Plan (15GB) - monthly", "price": 10}, {"id": "m20", "name": "$20 Plan (25GB) - monthly", "price": 20}, {"id": "m30", "name": "$30 Unlimited - monthly", "price": 30}, {"id": "b10", "name": "$10 Plan (15GB) - 3-month bundle", "price": 25}, {"id": "b20", "name": "$20 Plan (25GB) - 3-month bundle", "price": 50}, {"id": "b30", "name": "$30 Unlimited - 3-month bundle", "price": 75}]};
+// Shared pricing math (identical in the website and the payment function)
+function gmNorm(s){ return String(s||'').toLowerCase().replace(/20(\d\d)\b/g,'$1').replace(/[^a-z0-9+]/g,''); }
+function gmFindDevice(pricing, model){ var n=gmNorm(model); if(!n) return null;
+  var d=(pricing.devices||[]).find(function(x){ return gmNorm(x.model)===n; });
+  if(!d) d=(pricing.devices||[]).find(function(x){ var m=gmNorm(x.model); return m.length>4 && (n.indexOf(m)===0 || m.indexOf(n)===0); });
+  return d||null; }
+function gmR2(x){ return Math.round(Number(x)*100)/100; }
+function gmComputeSale(pricing, input){
+  var dev=gmFindDevice(pricing, input.model); if(!dev) return {error:'Unknown phone model. Pick the model from the list.'};
+  var plan=null; if(input.planId){ plan=(pricing.plans||[]).find(function(p){ return p.id===input.planId; }); if(!plan) return {error:'Unknown data plan.'}; }
+  var payer = input.payer==='customer' ? 'customer' : 'agent';
+  var deviceCost = gmR2(plan ? dev.credited : dev.full);
+  var planPrice  = gmR2(plan ? plan.price : 0);
+  var owedGenMobile = gmR2(deviceCost + planPrice);
+  var charge = owedGenMobile, owedAgent = 0, customerPhonePrice = null;
+  if(payer==='customer'){
+    customerPhonePrice = gmR2(input.customerPhonePrice);
+    if(!(customerPhonePrice >= deviceCost)) return {error:'The customer\u2019s phone price must be at least $'+deviceCost.toFixed(2)+' (our cost for this phone).'};
+    charge = gmR2(customerPhonePrice + planPrice);
+    owedAgent = gmR2(customerPhonePrice - deviceCost);
+  }
+  if(charge < 1) return {error:'The total must be at least $1.00.'};
+  return { model:dev.model, deviceFull:gmR2(dev.full), deviceCost:deviceCost, credited:!!plan, planId:plan?plan.id:null, planName:plan?plan.name:'No data plan', planPrice:planPrice,
+           payer:payer, customerPhonePrice:customerPhonePrice, charge:charge, owedGenMobile:owedGenMobile, owedAgent:owedAgent };
+}
+var GMPAY = { pricing: null, imei:'', model:'', invModel:'', planId:'', payer:'agent', custPrice:'', custPhone:'', initials:'', busy:false, result:null, err:'' };
+function _gmPayEsc(v){ return (typeof _escapeHtml==='function') ? _escapeHtml(v==null?'':String(v)) : String(v==null?'':v); }
+function _gmMoney(x){ return '$'+(Number(x)||0).toFixed(2); }
+async function gmPayLoadPricing(){
+  if(GMPAY.pricing) return GMPAY.pricing;
+  GMPAY.pricing = GM_SALE_PRICING_DEFAULT;
+  try{
+    var r = await supaClient.from('app_settings').select('value').eq('key','gm_sale_pricing').maybeSingle();
+    if(r && r.data && r.data.value){ var p = JSON.parse(r.data.value); if(p && Array.isArray(p.devices) && p.devices.length) GMPAY.pricing = p; }
+  }catch(e){}
+  return GMPAY.pricing;
+}
+function _gmInvModelFor(imei){
+  try{ var d = (typeof GM_INVENTORY!=='undefined' ? GM_INVENTORY : []).find(function(x){ return x && String(x.imei||'').replace(/\D/g,'') === imei; }); return d ? (d.model||'') : ''; }catch(e){ return ''; }
+}
+function panelGmPayLink(){
+  setTimeout(function(){ gmPayLoadPricing().then(gmPayRender); }, 0);
+  return '<div style="max-width:620px;margin:0 auto;padding:12px">'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.6rem;font-weight:800;color:#003594;letter-spacing:1px;margin-bottom:4px">\uD83D\uDCB3 GEN MOBILE PAYMENT LINK</div>'
+    + '<div style="font-size:.85rem;color:#666;margin-bottom:14px">Enter the IMEI, pick the data plan, and send the link. Payment goes straight to WMAMinc.</div>'
+    + '<div id="gmPayBox"><div style="padding:30px;text-align:center;color:#888">Loading prices\u2026</div></div>'
+    + '<div id="gmPayMine" style="margin-top:22px"></div></div>';
+}
+function gmPaySet(field, val, rerender){
+  GMPAY[field] = val; GMPAY.err = ''; GMPAY.result = null;
+  if(field==='imei'){
+    var digits = String(val||'').replace(/\D/g,'');
+    var inv = digits.length >= 14 ? _gmInvModelFor(digits) : '';
+    GMPAY.invModel = inv;
+    if(inv && gmFindDevice(GMPAY.pricing, inv)) GMPAY.model = gmFindDevice(GMPAY.pricing, inv).model;
+  }
+  if(rerender) gmPayRender(); else gmPaySummary();
+}
+function _gmPayCalc(){
+  return gmComputeSale(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, { model: GMPAY.model, planId: GMPAY.planId || null, payer: GMPAY.payer, customerPhonePrice: GMPAY.custPrice });
+}
+function gmPaySummary(){
+  var el = document.getElementById('gmPaySummary'); if(!el) return;
+  var c = _gmPayCalc();
+  if(!GMPAY.model){ el.innerHTML = '<div style="color:#888">Enter the IMEI (or pick the phone model) to see the price.</div>'; return; }
+  if(c.error){ el.innerHTML = '<div style="color:#CC0000;font-weight:700">'+_gmPayEsc(c.error)+'</div>'; return; }
+  var line = function(k,v,b){ return '<div style="display:flex;justify-content:space-between;padding:5px 0;'+(b?'border-top:2px solid #003594;margin-top:6px;padding-top:9px;font-weight:800;font-size:1.15rem;color:#003594':'')+'"><span>'+k+'</span><span>'+v+'</span></div>'; };
+  var h = '';
+  if(c.payer==='customer') h += line('Phone (customer price)', _gmMoney(c.customerPhonePrice));
+  else h += line('Phone \u2014 '+_gmPayEsc(c.model)+(c.credited?' (with plan credit)':' (full price, no plan)'), _gmMoney(c.deviceCost));
+  h += line(_gmPayEsc(c.planName), _gmMoney(c.planPrice));
+  h += line(c.payer==='customer' ? 'Customer pays' : 'You pay', _gmMoney(c.charge), true);
+  if(c.payer==='customer') h += '<div style="margin-top:8px;background:#ecfdf3;color:#166534;border-radius:6px;padding:8px 10px;font-weight:700">You get back: '+_gmMoney(c.owedAgent)+'</div>';
+  if(!c.credited && GMPAY.model) h += '<div style="margin-top:8px;font-size:.8rem;color:#92400e">No data plan = no credit. Add any data plan to get the lower phone price.</div>';
+  el.innerHTML = h;
+}
+function gmPayRender(){
+  var box = document.getElementById('gmPayBox'); if(!box) return;
+  var P = GMPAY.pricing || GM_SALE_PRICING_DEFAULT;
+  var inp = 'width:100%;box-sizing:border-box;padding:12px;border:1px solid #ccc;border-radius:8px;font-size:16px;background:#fff';
+  var lab = 'display:block;font-size:.75rem;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#444;margin:14px 0 6px';
+  var h = '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px">';
+  h += '<label style="'+lab+'">Phone IMEI</label><input id="gmPayImei" inputmode="numeric" autocomplete="off" placeholder="15-digit IMEI" value="'+_gmPayEsc(GMPAY.imei)+'" oninput="gmPaySet(\'imei\',this.value,false);gmPayModelHint()" onblur="gmPayRender()" style="'+inp+'">';
+  h += '<div id="gmPayModelHint" style="font-size:.8rem;margin-top:6px"></div>';
+  h += '<label style="'+lab+'">Phone model</label><select onchange="gmPaySet(\'model\',this.value,true)" style="'+inp+'"><option value="">\u2014 Pick the phone \u2014</option>'
+    + P.devices.map(function(d){ return '<option value="'+_gmPayEsc(d.model)+'"'+(GMPAY.model===d.model?' selected':'')+'>'+_gmPayEsc(d.model)+' \u2014 '+_gmMoney(d.full)+' / '+_gmMoney(d.credited)+' with plan</option>'; }).join('') + '</select>';
+  h += '<label style="'+lab+'">Data plan</label><select onchange="gmPaySet(\'planId\',this.value,true)" style="'+inp+'"><option value="">No data plan (full phone price)</option>'
+    + P.plans.map(function(p){ return '<option value="'+_gmPayEsc(p.id)+'"'+(GMPAY.planId===p.id?' selected':'')+'>'+_gmPayEsc(p.name)+' \u2014 '+_gmMoney(p.price)+'</option>'; }).join('') + '</select>';
+  h += '<label style="'+lab+'">Who is paying?</label><div style="display:flex;gap:8px">'
+    + ['agent','customer'].map(function(w){ var on = GMPAY.payer===w; return '<button onclick="gmPaySet(\'payer\',\''+w+'\',true)" style="flex:1;padding:12px;border-radius:8px;font-weight:700;font-size:15px;cursor:pointer;border:2px solid #003594;background:'+(on?'#003594':'#fff')+';color:'+(on?'#fff':'#003594')+'">'+(w==='agent'?'I\u2019m paying':'Customer is paying')+'</button>'; }).join('') + '</div>';
+  if(GMPAY.payer==='customer'){
+    h += '<label style="'+lab+'">Phone price the customer is paying</label><input inputmode="decimal" placeholder="0.00" value="'+_gmPayEsc(GMPAY.custPrice)+'" oninput="gmPaySet(\'custPrice\',this.value,false)" style="'+inp+'">';
+    h += '<label style="'+lab+'">Customer\u2019s cell (optional, to text the link)</label><input inputmode="tel" placeholder="(555) 555-5555" value="'+_gmPayEsc(GMPAY.custPhone)+'" oninput="gmPaySet(\'custPhone\',this.value,false)" style="'+inp+'">';
+  }
+  var _noPlan = !GMPAY.planId;
+  var _dv = GMPAY.model ? gmFindDevice(P, GMPAY.model) : null;
+  h += '<div style="margin-top:16px;border:2px solid '+(_noPlan?'#CC0000':'#d97706')+';background:'+(_noPlan?'#fdecec':'#fffbeb')+';border-radius:10px;padding:12px 14px">'
+    + '<div style="font-weight:800;color:'+(_noPlan?'#CC0000':'#92400e')+';margin-bottom:6px">\u26A0 REQUIRED NOTICE</div>'
+    + '<div style="font-size:.92rem;color:#222;line-height:1.45">A <b>data plan must be selected and added to this order</b> to get the discounted phone price. '
+    + 'If no data plan is added, the phone is charged at the <b>FULL price with no discount</b>.</div>'
+    + (_noPlan && _dv ? '<div style="margin-top:8px;font-weight:800;color:#CC0000">No data plan selected \u2014 this phone will be charged the full '+_gmMoney(_dv.full)+'.</div>' : '')
+    + '<label style="'+lab+'">Your initials (required every sale)</label>'
+    + '<input id="gmPayInitials" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="e.g. JD" value="'+_gmPayEsc(GMPAY.initials)+'" oninput="this.value=this.value.replace(/[^A-Za-z]/g,\'\').toUpperCase();gmPaySet(\'initials\',this.value,false)" style="'+inp+';max-width:140px;text-transform:uppercase;letter-spacing:3px;font-weight:700">'
+    + '<div style="font-size:.78rem;color:#555;margin-top:6px">By initialing, I confirm I read this notice and the plan choice above is correct.</div></div>';
+  h += '<div id="gmPaySummary" style="margin-top:16px;background:#f5f8ff;border-radius:10px;padding:12px 14px;font-size:.95rem"></div>';
+  if(GMPAY.err) h += '<div style="margin-top:12px;background:#fdecec;color:#CC0000;border-radius:8px;padding:10px;font-weight:700">'+_gmPayEsc(GMPAY.err)+'</div>';
+  if(GMPAY.result){
+    var s = GMPAY.result, url = s.square_link_url, ph = String(GMPAY.custPhone||s.customer_phone||'').replace(/[^0-9+]/g,'');
+    var msg = encodeURIComponent('Your Gen Mobile phone payment ('+_gmMoney(s.amount_charged)+'): '+url);
+    h += '<div style="margin-top:14px;background:#ecfdf3;border:2px solid #16a34a;border-radius:10px;padding:14px">'
+      + '<div style="font-weight:800;color:#166534;margin-bottom:8px">\u2705 Payment link ready \u2014 '+_gmMoney(s.amount_charged)+' (sale #'+s.id+')</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+      + '<a href="'+_gmPayEsc(url)+'" target="_blank" rel="noopener" style="flex:1 1 130px;text-align:center;background:#16a34a;color:#fff;padding:12px;border-radius:8px;font-weight:700;text-decoration:none">Open &amp; pay now</a>'
+      + '<a href="sms:'+_gmPayEsc(ph)+'?&body='+msg+'" style="flex:1 1 130px;text-align:center;background:#0891b2;color:#fff;padding:12px;border-radius:8px;font-weight:700;text-decoration:none">Text to customer</a>'
+      + '<button onclick="gmPayCopy()" style="flex:1 1 130px;background:#fff;color:#003594;border:2px solid #003594;padding:12px;border-radius:8px;font-weight:700;cursor:pointer">Copy link</button></div>'
+      + '<div style="font-size:.8rem;color:#555;margin-top:8px">It shows as paid here automatically once the card goes through.</div></div>';
+  }
+  h += '<button id="gmPayGo" onclick="gmPayCreate()" '+(GMPAY.busy?'disabled':'')+' style="margin-top:16px;width:100%;padding:15px;border:none;border-radius:10px;background:#CC0000;color:#fff;font-size:16px;font-weight:800;letter-spacing:1px;cursor:pointer">'+(GMPAY.busy?'Creating link\u2026':'CREATE PAYMENT LINK')+'</button>';
+  h += '</div>';
+  box.innerHTML = h;
+  gmPayModelHint(); gmPaySummary(); gmPayLoadMine();
+}
+function gmPayModelHint(){
+  var el = document.getElementById('gmPayModelHint'); if(!el) return;
+  var d = String(GMPAY.imei||'').replace(/\D/g,'');
+  if(d.length < 14){ el.innerHTML = ''; return; }
+  if(GMPAY.invModel){
+    var m = gmFindDevice(GMPAY.pricing, GMPAY.invModel);
+    el.innerHTML = m ? '<span style="color:#166534;font-weight:700">\u2714 Found in inventory: '+_gmPayEsc(m.model)+'</span>'
+                     : '<span style="color:#92400e;font-weight:700">Inventory says \u201C'+_gmPayEsc(GMPAY.invModel)+'\u201D \u2014 pick the matching model below.</span>';
+  } else el.innerHTML = '<span style="color:#92400e">Not in inventory \u2014 pick the phone model below.</span>';
+}
+function gmPayCopy(){
+  try{ navigator.clipboard.writeText(GMPAY.result.square_link_url); if(typeof showToast==='function') showToast('Link copied'); }catch(e){ prompt('Copy this link:', GMPAY.result.square_link_url); }
+}
+async function gmPayCreate(){
+  if(GMPAY.busy) return;
+  var d = String(GMPAY.imei||'').replace(/\D/g,'');
+  if(d.length < 14){ GMPAY.err = 'Enter the full IMEI (15 digits).'; gmPayRender(); return; }
+  var c = _gmPayCalc(); if(c.error){ GMPAY.err = c.error; gmPayRender(); return; }
+  if(!/^[A-Za-z]{2,4}$/.test(String(GMPAY.initials||''))){ GMPAY.err = 'Read the required notice and enter your initials before creating the link.'; gmPayRender(); try{ document.getElementById('gmPayInitials').focus(); }catch(e){} return; }
+  GMPAY.busy = true; GMPAY.err = ''; gmPayRender();
+  try{
+    var res = await supaClient.functions.invoke('gm-pay-link', { body: { imei: d, model: GMPAY.model, planId: GMPAY.planId || null, payer: GMPAY.payer,
+      customerPhonePrice: GMPAY.payer==='customer' ? Number(GMPAY.custPrice) : null, customerPhone: GMPAY.custPhone || null, ackInitials: String(GMPAY.initials).toUpperCase() } });
+    var data = res && res.data, err = res && res.error;
+    if(err){ try{ var j = err.context && typeof err.context.json==='function' ? await err.context.json() : null; GMPAY.err = (j && j.error) || String(err.message||err); }catch(e){ GMPAY.err = String(err.message||err); } }
+    else if(!data || !data.ok){ GMPAY.err = (data && data.error) || 'Could not create the link.'; }
+    else { GMPAY.result = data.sale; GMPAY.initials = ''; }
+  }catch(e){ GMPAY.err = 'Could not reach the server. Check your connection and try again.'; }
+  GMPAY.busy = false; gmPayRender();
+}
+function _gmStatusChip(s){
+  var map = { paid:['#16a34a','PAID'], link_created:['#d97706','WAITING FOR PAYMENT'], link_failed:['#CC0000','LINK FAILED'], replaced:['#6b7280','REPLACED'], creating:['#6b7280','CREATING'], canceled:['#6b7280','CANCELED'] };
+  var m = map[s] || ['#6b7280', String(s||'').toUpperCase()];
+  return '<span style="display:inline-block;background:'+m[0]+';color:#fff;border-radius:999px;padding:2px 9px;font-size:.7rem;font-weight:800;letter-spacing:.5px">'+m[1]+'</span>';
+}
+async function gmPayLoadMine(){
+  var el = document.getElementById('gmPayMine'); if(!el || !DB.current) return;
+  try{
+    var r = await supaClient.from('gm_sales').select('*').eq('agent_id', DB.current.id).order('created_at',{ascending:false}).limit(20);
+    var rows = (r && r.data) || [];
+    if(!rows.length){ el.innerHTML = ''; return; }
+    el.innerHTML = '<div style="font-weight:800;color:#003594;margin-bottom:8px;letter-spacing:1px">MY RECENT GEN MOBILE SALES</div>'
+      + rows.map(function(s){
+          return '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin-bottom:8px;font-size:.9rem">'
+            + '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><b>'+_gmPayEsc(s.model)+' \u00b7 '+_gmMoney(s.amount_charged)+'</b>'+_gmStatusChip(s.status)+'</div>'
+            + '<div style="color:#666;font-size:.8rem;margin-top:3px">IMEI '+_gmPayEsc(s.imei)+' \u00b7 '+_gmPayEsc(s.plan_name)+' \u00b7 '+(s.payer==='customer'?'customer paid':'you paid')+' \u00b7 '+new Date(s.created_at).toLocaleString()+'</div>'
+            + (Number(s.owed_agent)>0 ? '<div style="margin-top:4px;font-weight:700;color:'+(s.agent_payback_status==='paid'?'#166534':'#92400e')+'">Your payback: '+_gmMoney(s.owed_agent)+' \u2014 '+(s.agent_payback_status==='paid'?'paid to you':'owed to you')+'</div>' : '')
+            + (s.status==='link_created' && s.square_link_url ? '<a href="'+_gmPayEsc(s.square_link_url)+'" target="_blank" rel="noopener" style="display:inline-block;margin-top:6px;color:#003594;font-weight:700">Open payment link \u2192</a>' : '')
+            + '</div>';
+        }).join('');
+  }catch(e){}
+}
+// ── Office: every sale + paybacks + price list ─────────────────────────
+var GMSALES = { rows:[], filter:'all', loading:false };
+function panelGmSales(){
+  if(!canAccess(DB.current,'gm-sales')) return '<div style="padding:40px;text-align:center;color:#888">This screen is for the office.</div>';
+  setTimeout(gmSalesLoad, 0);
+  return '<div style="max-width:1100px;margin:0 auto;padding:12px">'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.6rem;font-weight:800;color:#003594;letter-spacing:1px;margin-bottom:12px">\uD83D\uDCB3 GEN MOBILE SALES &amp; PAYBACKS</div>'
+    + '<div id="gmSalesBox"><div style="padding:30px;text-align:center;color:#888">Loading\u2026</div></div>'
+    + (isOwner(DB.current) ? '<div id="gmPriceBox" style="margin-top:26px"></div>' : '') + '</div>';
+}
+async function gmSalesLoad(){
+  try{
+    var r = await supaClient.from('gm_sales').select('*').order('created_at',{ascending:false}).limit(1000);
+    GMSALES.rows = (r && r.data) || [];
+  }catch(e){ GMSALES.rows = []; }
+  gmSalesRender();
+  if(isOwner(DB.current)){ await gmPayLoadPricing(); gmPriceRender(); }
+}
+function gmSalesSetFilter(f){ GMSALES.filter = f; gmSalesRender(); }
+function gmSalesRender(){
+  var box = document.getElementById('gmSalesBox'); if(!box) return;
+  var all = GMSALES.rows, paid = all.filter(function(s){ return s.status==='paid'; });
+  var sum = function(a,k){ return a.reduce(function(t,s){ return t + (Number(s[k])||0); }, 0); };
+  var owedAgentsUnpaid = paid.filter(function(s){ return s.agent_payback_status==='unpaid'; });
+  var card = function(k,v,c){ return '<div style="flex:1 1 180px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px"><div style="font-size:.72rem;font-weight:700;letter-spacing:1px;color:#666;text-transform:uppercase">'+k+'</div><div style="font-size:1.5rem;font-weight:800;color:'+(c||'#003594')+'">'+v+'</div></div>'; };
+  var h = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'
+    + card('Collected (paid)', _gmMoney(sum(paid,'amount_paid') || sum(paid,'amount_charged')), '#16a34a')
+    + card('Owed to Gen Mobile', _gmMoney(sum(paid,'owed_gen_mobile')))
+    + card('Owed to agents (unpaid)', _gmMoney(sum(owedAgentsUnpaid,'owed_agent')), '#d97706')
+    + card('Waiting for payment', String(all.filter(function(s){ return s.status==='link_created'; }).length), '#6b7280')
+    + '</div>';
+  var tabs = [['all','All'],['paid','Paid'],['waiting','Waiting'],['payback','Agent paybacks due']];
+  h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">' + tabs.map(function(t){ var on = GMSALES.filter===t[0]; return '<button onclick="gmSalesSetFilter(\''+t[0]+'\')" style="padding:8px 14px;border-radius:999px;border:1px solid #003594;background:'+(on?'#003594':'#fff')+';color:'+(on?'#fff':'#003594')+';font-weight:700;cursor:pointer">'+t[1]+'</button>'; }).join('') + '</div>';
+  var rows = all.filter(function(s){
+    if(GMSALES.filter==='paid') return s.status==='paid';
+    if(GMSALES.filter==='waiting') return s.status==='link_created';
+    if(GMSALES.filter==='payback') return s.status==='paid' && s.agent_payback_status==='unpaid';
+    return s.status!=='replaced';
+  });
+  if(!rows.length){ box.innerHTML = h + '<div style="padding:30px;text-align:center;color:#888;background:#fff;border-radius:12px">No sales here yet.</div>'; return; }
+  h += '<div style="overflow-x:auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px"><table style="width:100%;border-collapse:collapse;font-size:.85rem;min-width:900px">'
+    + '<tr style="background:#003594;color:#fff;text-align:left">' + ['Date','Agent','IMEI / Phone','Plan','Paid by','Charged','Owed Gen Mobile','Owed agent','Status',''].map(function(x){ return '<th style="padding:8px 10px;white-space:nowrap">'+x+'</th>'; }).join('') + '</tr>';
+  rows.forEach(function(s,i){
+    var pay = '';
+    if(Number(s.owed_agent)>0){
+      pay = s.agent_payback_status==='paid' ? '<span style="color:#166534;font-weight:700">Paid'+(s.agent_paid_by?' by '+_gmPayEsc(s.agent_paid_by):'')+'</span>'
+          : (s.status==='paid' ? '<button onclick="gmSalesMarkAgentPaid('+s.id+')" style="padding:6px 10px;border:none;border-radius:6px;background:#d97706;color:#fff;font-weight:700;cursor:pointer;white-space:nowrap">Mark agent paid</button>' : '<span style="color:#888">after payment</span>');
+    }
+    h += '<tr style="border-top:1px solid #f0f0f0;background:'+(i%2?'#fafafa':'#fff')+'">'
+      + '<td style="padding:8px 10px;white-space:nowrap">'+new Date(s.created_at).toLocaleDateString()+'</td>'
+      + '<td style="padding:8px 10px">'+_gmPayEsc(s.agent_name)+'</td>'
+      + '<td style="padding:8px 10px">'+_gmPayEsc(s.imei)+'<div style="color:#666">'+_gmPayEsc(s.model)+'</div></td>'
+      + '<td style="padding:8px 10px">'+_gmPayEsc(s.plan_name)+'</td>'
+      + '<td style="padding:8px 10px">'+(s.payer==='customer'?'Customer':'Agent')+(s.ack_initials?'<div style="color:#666;font-size:.75rem">Initialed: '+_gmPayEsc(s.ack_initials)+'</div>':'')+'</td>'
+      + '<td style="padding:8px 10px;font-weight:700">'+_gmMoney(s.amount_charged)+'</td>'
+      + '<td style="padding:8px 10px">'+_gmMoney(s.owed_gen_mobile)+'</td>'
+      + '<td style="padding:8px 10px">'+(Number(s.owed_agent)>0?_gmMoney(s.owed_agent):'\u2014')+'</td>'
+      + '<td style="padding:8px 10px">'+_gmStatusChip(s.status)+'</td>'
+      + '<td style="padding:8px 10px">'+pay+'</td></tr>';
+  });
+  h += '</table></div>';
+  box.innerHTML = h;
+}
+async function gmSalesMarkAgentPaid(id){
+  var s = GMSALES.rows.find(function(x){ return x.id===id; }); if(!s) return;
+  if(!confirm('Mark '+_gmMoney(s.owed_agent)+' as paid to '+(s.agent_name||'the agent')+'?')) return;
+  var who = (DB.current && DB.current.name) || '';
+  var r = await supaClient.from('gm_sales').update({ agent_payback_status:'paid', agent_paid_at:new Date().toISOString(), agent_paid_by:who }).eq('id', id).select();
+  if(r && r.error){ alert('Could not save: '+r.error.message); return; }
+  s.agent_payback_status='paid'; s.agent_paid_by=who; gmSalesRender();
+}
+function gmPriceRender(){
+  var box = document.getElementById('gmPriceBox'); if(!box) return;
+  var P = GMPAY.pricing || GM_SALE_PRICING_DEFAULT;
+  var num = 'width:90px;padding:6px 8px;border:1px solid #ccc;border-radius:6px;font-size:14px';
+  var h = '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px">'
+    + '<div style="font-weight:800;color:#003594;letter-spacing:1px">PRICE LIST (OWNER ONLY)</div>'
+    + '<div style="font-size:.8rem;color:#666;margin:4px 0 10px">When Gen Mobile sends a new sheet, update the numbers here and save. \u201CWith plan\u201D = price after the 0 Non-CA credit.</div>'
+    + '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:.85rem"><tr style="text-align:left"><th style="padding:6px">Phone</th><th style="padding:6px">Full price</th><th style="padding:6px">With plan</th></tr>'
+    + P.devices.map(function(d,i){ return '<tr><td style="padding:4px 6px">'+_gmPayEsc(d.model)+'</td><td style="padding:4px 6px"><input id="gmPrF'+i+'" inputmode="decimal" value="'+d.full+'" style="'+num+'"></td><td style="padding:4px 6px"><input id="gmPrC'+i+'" inputmode="decimal" value="'+d.credited+'" style="'+num+'"></td></tr>'; }).join('')
+    + '</table></div><div style="font-weight:700;margin:12px 0 6px">Data plans</div><table style="border-collapse:collapse;font-size:.85rem">'
+    + P.plans.map(function(p,i){ return '<tr><td style="padding:4px 6px">'+_gmPayEsc(p.name)+'</td><td style="padding:4px 6px"><input id="gmPrP'+i+'" inputmode="decimal" value="'+p.price+'" style="'+num+'"></td></tr>'; }).join('')
+    + '</table><button onclick="gmPriceSave()" style="margin-top:12px;padding:10px 18px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:700;cursor:pointer">Save price list</button><span id="gmPriceMsg" style="margin-left:10px;font-weight:700"></span></div>';
+  box.innerHTML = h;
+}
+async function gmPriceSave(){
+  var P = JSON.parse(JSON.stringify(GMPAY.pricing || GM_SALE_PRICING_DEFAULT)), bad = false;
+  var val = function(id){ var v = parseFloat(String(document.getElementById(id).value).replace(/[^0-9.]/g,'')); if(!(v>=0)) bad = true; return Math.round(v*100)/100; };
+  P.devices.forEach(function(d,i){ d.full = val('gmPrF'+i); d.credited = val('gmPrC'+i); });
+  P.plans.forEach(function(p,i){ p.price = val('gmPrP'+i); });
+  var msg = document.getElementById('gmPriceMsg');
+  if(bad){ msg.style.color='#CC0000'; msg.textContent='Every price must be a number.'; return; }
+  P.updatedAt = new Date().toISOString(); P.updatedBy = (DB.current && DB.current.name) || '';
+  var r = await supaClient.from('app_settings').upsert({ key:'gm_sale_pricing', value: JSON.stringify(P), updated_at: new Date().toISOString() }, { onConflict:'key' });
+  if(r && r.error){ msg.style.color='#CC0000'; msg.textContent='Not saved: '+r.error.message; return; }
+  GMPAY.pricing = P; msg.style.color='#16a34a'; msg.textContent='Saved \u2714';
+}
+if(typeof window!=='undefined'){ Object.assign(window, { panelGmPayLink:panelGmPayLink, panelGmSales:panelGmSales, gmPaySet:gmPaySet, gmPayCreate:gmPayCreate, gmPayCopy:gmPayCopy, gmPayRender:gmPayRender, gmPayModelHint:gmPayModelHint, gmSalesSetFilter:gmSalesSetFilter, gmSalesMarkAgentPaid:gmSalesMarkAgentPaid, gmPriceSave:gmPriceSave, gmComputeSale:gmComputeSale }); }
+
 function canAccess(u, area){
   if(!u) return false;
   if(isOwner(u)) return true;  // Owner always has full access — permanent, never override
@@ -13825,6 +14107,8 @@ function canAccess(u, area){
     // These system-critical panels are the owner's exclusive domain. The only
     // way anyone else gets access is if they ARE the owner.
     case 'owner-control':    return false;
+    case 'gm-pay-link':      return !!u.active;
+    case 'gm-sales':         return hasGrant('payroll') || hasGrant('inventory') || hasGrant('gm-pricelist');
     case 'owner':            return false;
     case 'settings':         return false;
     case 'alerts':           return false;
@@ -38340,6 +38624,8 @@ function buildNav(u){
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>'
       +boDropBtn('imei-search','🔍 IMEI / SIM Search')
       +boDropBtn('sold-reports','💵 Sold Reports')
+      +boDropBtn('gm-pay-link','\uD83D\uDCB3 GM Payment Link')
+      +(canAccess(u,'gm-sales') ? boDropBtn('gm-sales','\uD83D\uDCB3 GM Sales & Paybacks') : '')
       +(canAccess(u,'gm-pricelist') ? boDropBtn('gm-pricelist','💲 GM Pricelist') : '')
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
     activeCampaigns().forEach(function(c){
@@ -38370,6 +38656,7 @@ function buildNav(u){
     }
     if(typeof isSalesRole === 'function' && isSalesRole(u)){
       campaignNavItems += boDropBtn('inv-my-inventory','📱 My Inventory & Transfer Tool');
+      campaignNavItems += boDropBtn('gm-pay-link','\uD83D\uDCB3 GM Payment Link');
       if(canAccess(u,'pending-transfers')) campaignNavItems += boDropBtn('pending-transfers','🔄 Pending Transfers');
       campaignNavItems += '<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
     }
@@ -40311,6 +40598,7 @@ function gotoPanel(id, params){
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
     'gm-pricelist':'GM Pricelist',
+    'gm-pay-link':'GM Payment Link','gm-sales':'GM Sales & Paybacks',
     'inv-hub':'Inventory Hub',
     'aw-inventory':'Assurance Wireless Inventory','aw-upload':'Assurance Upload','aw-transfers':'Assurance Transfers',
     'aw-payfile':'Assurance Pay-File',
@@ -40348,6 +40636,7 @@ function gotoPanel(id, params){
     'inv-export':panelInvExport,'inv-my-inventory':panelMyInventory,
     'inv-distribute':panelDistribute,
     'inv-hub':panelInvHub,
+    'gm-pay-link':panelGmPayLink,'gm-sales':panelGmSales,
     'dart-scanner':panelDartScanner,
     'dart-inventory':panelDartInventory,
     // Calvin 2026-06-11 v2930: new DART-style carrier panels.
