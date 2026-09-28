@@ -3,6 +3,262 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<script>
+/* =====================================================================
+   WMAM CLOUD STORAGE + SECURE LOGIN SESSION   (build 2026.09.28.1200)
+   Everything the back office used to save on the phone/computer now
+   lives in Supabase (table wmam_store, private per person). The only
+   things kept on the device are the login session and tiny device
+   settings (language choice, device session id, force-reload flag).
+   Phones' old local data is uploaded (never overwritten) and only
+   then cleared off the device.
+   ===================================================================== */
+(function(){
+  'use strict';
+  var URL  = 'https://eyryqzlxnsvhhjwutqpd.supabase.co';
+  var KEY  = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV5cnlxemx4bnN2aGhqd3V0cXBkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYyOTAxNzksImV4cCI6MjA5MTg2NjE3OX0.mZaJzmPJVsZhI2KkUMpFeOun_9w3d2Qfke0VJnMBZaE';
+  var AUTH = 'sb-eyryqzlxnsvhhjwutqpd-auth-token';
+  var P = window.Storage && Storage.prototype;
+  var LS = null; try{ LS = window.localStorage; }catch(e){}
+  if(!P || !LS) return;
+  var rGet = P.getItem, rSet = P.setItem, rRem = P.removeItem, rKey = P.key, rClear = P.clear;
+  var lenDesc = Object.getOwnPropertyDescriptor(P, 'length');
+  function realLen(){ try{ return lenDesc.get.call(LS); }catch(e){ return 0; } }
+
+  // Stays on the device (tiny, needed before login or per-device by design)
+  function isDeviceKey(k){
+    return /^(__|sb-)/.test(k) || k === 'wmam_session_id' || /^wmam_lang/.test(k) || /^wmam_force_reload/.test(k);
+  }
+  function isCloudKey(k){ return typeof k === 'string' && /^_?wmam_/.test(k) && !isDeviceKey(k); }
+  // Never stored anywhere as a blob: these already live in their own Supabase tables
+  var TABLE_BACKED = /^wmam_(agents|gm_inventory|tc_inventory|aw_inventory|ex_inventory|inv_devices)$/;
+  var INV_KEYS = {gm:'wmam_gm_inventory', tc:'wmam_tc_inventory', aw:'wmam_aw_inventory', ex:'wmam_ex_inventory', legacy:'wmam_inv_devices'};
+
+  var cache = {};          // key -> string (the person's cloud data)
+  var sent  = {};          // key -> last value confirmed in the cloud
+  var dirty = {};          // key -> true (needs upload)
+  var dels  = {};          // key -> true (needs delete)
+  var rescueQ = [];        // [{key,value}] old device copies to archive
+  var deviceKeysToClear = [];
+  var state = { mode: 'guest', uid: null, token: null, agentId: null, lastError: null };
+  window.WMAM_CLOUD = state;
+
+  function hdr(tok){
+    var h = { 'apikey': KEY, 'Content-Type': 'application/json' };
+    h['Authorization'] = 'Bearer ' + (tok || KEY);
+    return h;
+  }
+  function readSession(){ try{ var s = rGet.call(LS, AUTH); return s ? JSON.parse(s) : null; }catch(e){ return null; } }
+  function currentToken(){ var s = readSession(); return (s && s.access_token) || state.token; }
+  function syncXhr(method, path, body, tok){
+    var x = new XMLHttpRequest();
+    x.open(method, URL + path, false);
+    var h = hdr(tok); for(var k in h) x.setRequestHeader(k, h[k]);
+    try{ x.send(body ? JSON.stringify(body) : null); }catch(e){ return { status: 0, text: '' }; }
+    return { status: x.status, text: x.responseText };
+  }
+
+  // ---- 1. Session (refresh if expired) ------------------------------
+  var sess = readSession();
+  if(sess && sess.refresh_token){
+    var exp = (sess.expires_at || 0) * 1000;
+    if(!sess.access_token || exp < Date.now() + 60000){
+      var r = syncXhr('POST', '/auth/v1/token?grant_type=refresh_token', { refresh_token: sess.refresh_token });
+      if(r.status === 200){
+        try{
+          var ns = JSON.parse(r.text);
+          if(!ns.expires_at) ns.expires_at = Math.floor(Date.now()/1000) + (ns.expires_in || 3600);
+          rSet.call(LS, AUTH, JSON.stringify(ns)); sess = ns;
+        }catch(e){ sess = null; }
+      } else if(r.status === 400 || r.status === 401 || r.status === 403){
+        try{ rRem.call(LS, AUTH); }catch(e){} sess = null;          // expired login -> log in again
+      } else { state.lastError = 'offline'; }
+    }
+  } else { sess = null; }
+
+  // ---- 2. Load this person's data from the cloud --------------------
+  if(sess && sess.access_token && sess.user && sess.user.id){
+    state.uid = sess.user.id; state.token = sess.access_token;
+    var g = syncXhr('GET', '/rest/v1/wmam_store?select=key,value&limit=5000', null, sess.access_token);
+    if(g.status === 200){
+      try{ JSON.parse(g.text).forEach(function(row){ if(row && row.key != null){ cache[row.key] = row.value; sent[row.key] = row.value; } }); }catch(e){}
+      state.mode = 'cloud';
+    } else {
+      state.mode = 'readonly';                                          // could not load -> never save over the cloud
+      state.lastError = 'load-' + g.status;
+    }
+  }
+
+  // ---- 3. Rescue old data sitting on this device --------------------
+  var deviceInventory = {};
+  try{
+    var n = realLen(), k, v, i, keys = [];
+    for(i = 0; i < n; i++){ k = rKey.call(LS, i); if(isCloudKey(k)) keys.push(k); }
+    for(i = 0; i < keys.length; i++){
+      k = keys[i]; v = rGet.call(LS, k);
+      if(v == null) continue;
+      if(state.mode !== 'cloud'){
+        if(!TABLE_BACKED.test(k) && !Object.prototype.hasOwnProperty.call(cache, k)) cache[k] = v;   // guest/offline: use in memory only
+        continue;
+      }
+      deviceKeysToClear.push(k);
+      if(k === 'wmam_agents') continue;                                 // agents table is the source of truth
+      if(TABLE_BACKED.test(k)){
+        rescueQ.push({ key: k, value: v });                             // archive + checked against inventory tables after load
+        for(var pk in INV_KEYS){ if(INV_KEYS[pk] === k) deviceInventory[pk] = v; }
+        continue;
+      }
+      if(!Object.prototype.hasOwnProperty.call(cache, k)){ cache[k] = v; dirty[k] = true; }   // cloud didn't have it -> adopt
+      else if(cache[k] !== v){ rescueQ.push({ key: k, value: v }); }  // cloud has newer -> keep cloud, archive device copy
+    }
+  }catch(e){ console.warn('[WMAM cloud] device scan failed', e); }
+  window._wmamDeviceInventory = deviceInventory;
+
+  // ---- 4. Storage shim: wmam_* keys go to the cloud cache ------------
+  P.getItem = function(k){
+    if(this === LS && isCloudKey(k = String(k))){
+      if(TABLE_BACKED.test(k)) return null;
+      return Object.prototype.hasOwnProperty.call(cache, k) ? cache[k] : null;
+    }
+    return rGet.apply(this, arguments);
+  };
+  P.setItem = function(k, v){
+    if(this === LS && isCloudKey(k = String(k))){
+      if(TABLE_BACKED.test(k)) return;                                  // lives in its own Supabase table
+      v = String(v);
+      if(cache[k] === v) return;
+      cache[k] = v; delete dels[k]; dirty[k] = true; schedule();
+      return;
+    }
+    return rSet.apply(this, arguments);
+  };
+  P.removeItem = function(k){
+    if(this === LS && isCloudKey(k = String(k))){
+      if(Object.prototype.hasOwnProperty.call(cache, k)){ delete cache[k]; delete dirty[k]; dels[k] = true; schedule(); }
+      return;
+    }
+    return rRem.apply(this, arguments);
+  };
+  P.clear = function(){
+    if(this === LS){
+      Object.keys(cache).forEach(function(k){ rescueQ.push({ key: k, value: cache[k] }); dels[k] = true; delete dirty[k]; delete cache[k]; });
+      schedule();
+      return;                                                           // login + device settings are kept
+    }
+    return rClear.apply(this, arguments);
+  };
+  function listKeys(){
+    var out = [], n = realLen(), i, k;
+    for(i = 0; i < n; i++){ k = rKey.call(LS, i); if(!isCloudKey(k)) out.push(k); }
+    return out.concat(Object.keys(cache));
+  }
+  P.key = function(i){ if(this === LS){ var a = listKeys(); return i < a.length ? a[i] : null; } return rKey.apply(this, arguments); };
+  try{
+    Object.defineProperty(P, 'length', { configurable: true, enumerable: true,
+      get: function(){ return this === LS ? listKeys().length : lenDesc.get.call(this); } });
+  }catch(e){}
+
+  // ---- 5. Upload queue -------------------------------------------------
+  var timer = null, busy = false, fails = 0, banner = null;
+  function schedule(){ if(state.mode !== 'cloud') return; if(!timer) timer = setTimeout(flush, 1200); }
+  function pending(){ return Object.keys(dirty).length + Object.keys(dels).length + rescueQ.length; }
+  function showBanner(on){
+    try{
+      if(on){
+        if(!banner){
+          banner = document.createElement('div');
+          banner.id = 'wmamCloudBanner';
+          banner.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:calc(14px + env(safe-area-inset-bottom,0px));z-index:2147483647;background:#CC0000;color:#fff;padding:10px 16px;border-radius:10px;font:600 14px/1.3 system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.25);max-width:92vw;text-align:center';
+          banner.textContent = '\u26A0 Not saved yet \u2014 no connection to the server. Keep this page open; retrying\u2026';
+          (document.body || document.documentElement).appendChild(banner);
+        }
+      } else if(banner){ banner.remove(); banner = null; }
+    }catch(e){}
+  }
+  function post(path, rows, prefer){
+    return fetch(URL + path, { method: 'POST', headers: Object.assign(hdr(currentToken()), { 'Prefer': prefer }), body: JSON.stringify(rows) })
+      .then(function(res){ if(!res.ok) return res.text().then(function(t){ throw new Error(res.status + ' ' + t); }); });
+  }
+  function flush(){
+    timer = null;
+    if(state.mode !== 'cloud' || busy) return Promise.resolve();
+    if(!pending()) { maybeClearDevice(); return Promise.resolve(); }
+    busy = true;
+    var up = Object.keys(dirty), rm = Object.keys(dels), rq = rescueQ.splice(0);
+    var snap = {}; up.forEach(function(k){ snap[k] = cache[k]; });
+    var jobs = [];
+    // upsert in ~900KB batches
+    var batch = [], size = 0;
+    function push(){ if(batch.length){ var b = batch; jobs.push(post('/rest/v1/wmam_store?on_conflict=user_id,key', b, 'resolution=merge-duplicates,return=minimal')); batch = []; size = 0; } }
+    up.forEach(function(k){
+      var row = { user_id: state.uid, key: k, value: snap[k], updated_at: new Date().toISOString() };
+      var sz = (snap[k] || '').length + k.length + 80;
+      if(size + sz > 900000) push();
+      batch.push(row); size += sz;
+    });
+    push();
+    if(rm.length){
+      jobs.push(fetch(URL + '/rest/v1/wmam_store?user_id=eq.' + state.uid + '&key=in.(' + rm.map(function(k){ return '"' + k.replace(/"/g,'') + '"'; }).join(',') + ')',
+        { method: 'DELETE', headers: hdr(currentToken()) }).then(function(res){ if(!res.ok) throw new Error('delete ' + res.status); }));
+    }
+    if(rq.length){
+      rq.forEach(function(x){
+        jobs.push(post('/rest/v1/wmam_rescue?on_conflict=user_id,key,value_md5',
+          [{ user_id: state.uid, agent_id: state.agentId, key: x.key, value: x.value }], 'resolution=ignore-duplicates,return=minimal'));
+      });
+    }
+    return Promise.all(jobs).then(function(){
+      up.forEach(function(k){ sent[k] = snap[k]; if(cache[k] === snap[k]) delete dirty[k]; });
+      rm.forEach(function(k){ if(!Object.prototype.hasOwnProperty.call(cache, k)) delete dels[k]; });
+      fails = 0; busy = false; showBanner(false);
+      if(pending()) schedule(); else maybeClearDevice();
+    }, function(err){
+      rescueQ = rq.concat(rescueQ);
+      fails++; busy = false; state.lastError = String(err && err.message || err);
+      console.warn('[WMAM cloud] save failed, retrying:', state.lastError);
+      if(fails >= 2) showBanner(true);
+      timer = setTimeout(flush, Math.min(30000, 3000 * fails));
+    });
+  }
+  var inventoryChecked = false;
+  function maybeClearDevice(){
+    if(state.mode !== 'cloud' || pending() || !deviceKeysToClear.length) return;
+    if(Object.keys(deviceInventory).length && !inventoryChecked) return;       // wait for inventory check
+    deviceKeysToClear.forEach(function(k){ try{ rRem.call(LS, k); }catch(e){} });
+    console.log('[WMAM cloud] device copy uploaded + confirmed; cleared ' + deviceKeysToClear.length + ' items from this device');
+    deviceKeysToClear = [];
+  }
+
+  window.WMAM_CLOUD_API = {
+    flush: function(){ return flush(); },
+    pending: pending,
+    isDeviceKey: isDeviceKey,
+    realGet: function(k){ return rGet.call(LS, k); },
+    inventoryChecked: function(){ inventoryChecked = true; if(!pending()) maybeClearDevice(); else schedule(); },
+    setAgentId: function(id){ state.agentId = id; },
+    forget: function(){ cache = {}; sent = {}; dirty = {}; dels = {}; rescueQ = []; state.mode = 'guest'; }
+  };
+  window._wmamAuthed = function(){ return state.mode !== 'guest' && !!state.uid; };
+
+  window.addEventListener('beforeunload', function(e){
+    if(state.mode === 'cloud' && pending()){ flush(); e.preventDefault(); e.returnValue = ''; return ''; }
+  });
+  window.addEventListener('pagehide', function(){ if(state.mode === 'cloud' && pending()) flush(); });
+  window.addEventListener('online', function(){ if(pending()) flush(); });
+  if(state.mode === 'readonly'){
+    window.addEventListener('DOMContentLoaded', function(){
+      try{
+        var b = document.createElement('div');
+        b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#CC0000;color:#fff;padding:10px;text-align:center;font:600 14px system-ui,sans-serif';
+        b.textContent = '\u26A0 Could not reach the server. Nothing you change will be saved. Refresh when you have signal.';
+        document.body.appendChild(b);
+      }catch(e){}
+    });
+  }
+  if(state.mode === 'cloud' && pending()) schedule();
+})();
+
+</script>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
@@ -3463,7 +3719,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.09.28.0600';
+var BUILD_VERSION = '2026.09.28.1200';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14796,7 +15052,7 @@ function saveInventory(localOnly){
         console.warn('Inventory save: quota hit — dropped disposable backups and re-saved all inventory pools.');
       }catch(e2){
         console.error('Inventory save FAILED even after pruning — change may not persist locally:', e2);
-        try{ if(typeof alert==='function') alert('⚠ Local storage is full — this inventory change saved to the cloud but could NOT save locally. Refresh the page; if it reverts, tell Calvin (storage needs clearing).'); }catch(_a){}
+        try{ if(typeof alert==='function') alert('⚠ This inventory change could not be saved. Check your connection and try again.'); }catch(_a){}
       }
     } else { console.warn('Inventory save:',e); }
   }
@@ -19857,7 +20113,11 @@ function initSupabase(){
 async function sbSelect(table, filters){
   if(!supaClient) return null;
   try{
-    var q = supaClient.from(table).select('*');
+    // v2026.09.28.1200: visitors (not logged in) only get public-safe agent columns
+    var _cols = (table === 'agents' && !(window._wmamAuthed && window._wmamAuthed()))
+      ? 'id,name,role,email,programs,program,carrier,team,active,sales,start_date,category,team_leader_id,market_manager_id,campaign_manager_id,profile_pic,links,channels'
+      : '*';
+    var q = supaClient.from(table).select(_cols);
     if(filters) Object.keys(filters).forEach(function(k){ q = q.eq(k, filters[k]); });
     var r = await q;
     return r.error ? null : r.data;
@@ -19936,7 +20196,7 @@ async function syncPullFreshAgent(agentId){
     }
     var a = result.data;
     var refreshed = {
-      id: a.id, name: a.name, username: a.username, password: a.password,
+      id: a.id, name: a.name, username: a.username||'', password: a.password, authUserId: a.auth_user_id||null,
       role: a.role, email: a.email||'',
       programs: safeJSON(a.programs, []),
       program: a.program||'', carrier: a.carrier||'',
@@ -20006,7 +20266,7 @@ async function syncPullFreshAllAgents(){
     }
     DB.agents = result.data.map(function(a){
       return {
-        id: a.id, name: a.name, username: a.username, password: a.password,
+        id: a.id, name: a.name, username: a.username||'', password: a.password, authUserId: a.auth_user_id||null,
         role: a.role, email: a.email||'',
         programs: safeJSON(a.programs, []),
         program: a.program||'', carrier: a.carrier||'',
@@ -21725,7 +21985,7 @@ async function loadFromSupabase(){
     if(agents && agents.length > 0){
       var supaList = agents.map(function(a){
         return {
-          id: a.id, name: a.name, username: a.username, password: a.password,
+          id: a.id, name: a.name, username: a.username||'', password: a.password, authUserId: a.auth_user_id||null,
           role: a.role, email: a.email||'',
           programs: safeJSON(a.programs, []),
           program: a.program||'', carrier: a.carrier||'',
@@ -22983,7 +23243,7 @@ function _mergeServerAgentIntoLocal(serverRow){
     return (v == null) ? d : v;
   };
   var mapped = {
-    id: serverRow.id, name: serverRow.name, username: serverRow.username,
+    id: serverRow.id, name: serverRow.name, username: serverRow.username||'', authUserId: serverRow.auth_user_id||null,
     password: serverRow.password, role: serverRow.role, email: serverRow.email||'',
     programs: safeJSONLocal(serverRow.programs, []),
     program: serverRow.program||'', carrier: serverRow.carrier||'',
@@ -24156,7 +24416,16 @@ async function saveApplicant(applicantData){
     raw:               applicantData
   };
   try{
-    var res = await supaClient.from('applicants').insert(row).select().single();
+    var res;
+    if(!(window._wmamAuthed && window._wmamAuthed())){
+      // v2026.09.28.1200: visitors can submit an application but can't read the applicants table
+      try{ row.id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : undefined; }catch(e){}
+      if(!row.id) delete row.id;
+      var _ins = await supaClient.from('applicants').insert(row);
+      res = _ins && _ins.error ? _ins : { data: Object.assign({ submitted_at: new Date().toISOString() }, row), error: null };
+    } else {
+      res = await supaClient.from('applicants').insert(row).select().single();
+    }
     if(res && res.error){
       console.warn('[saveApplicant] insert failed:', res.error);
       return null;
@@ -25504,6 +25773,17 @@ function isAgentPendingBgReview(agent){
 if(typeof window !== 'undefined') window.isAgentPendingBgReview = isAgentPendingBgReview;
 
 function saveApplicants(){
+  // v2026.09.28.1200: a visitor on a signing link can only update THEIR OWN record.
+  if(!(window._wmamAuthed && window._wmamAuthed())){
+    var _tok = window._wmamSigningToken;
+    if(!_tok || typeof supaClient === 'undefined' || !supaClient) return Promise.resolve({ok:false, cloudWrite:false, error:'not signed in'});
+    var _mine = (APPLICANTS_PRE_BG||[]).find(function(a){ return a && a.tokens && (a.tokens.auth===_tok || a.tokens.pii===_tok); });
+    if(!_mine) return Promise.resolve({ok:false, cloudWrite:false, error:'record not found'});
+    return supaClient.rpc('wmam_applicant_put', { p_token: _tok, p_app: _mine }).then(function(r){
+      if(r && !r.error && r.data === true) return {ok:true, cloudWrite:true};
+      return {ok:false, cloudWrite:false, error:(r && r.error) || 'rejected'};
+    }, function(e){ return {ok:false, cloudWrite:false, error:e}; });
+  }
   // Calvin 2026-06-10 v1930: saveApplicants now returns a Promise so the public
   // signing page can await the cloud write before showing the success page.
   // Without this guarantee, the applicant might submit, see "all done", but the
@@ -32914,14 +33194,27 @@ function testBrevoConnection(){
 }
 
 /* EmailJS removed - using Brevo */
-function changePassword(){
+// v2026.09.28.1200: check a password against the secure login service using a
+// throw-away connection (never switches who is logged in).
+async function _wmamVerifyPassword(agent, pw){
+  try{
+    if(!agent || !pw || typeof supabase === 'undefined' || !supabase.createClient) return false;
+    var tmp = supabase.createClient(SUPA_URL, SUPA_KEY, { auth: { persistSession:false, autoRefreshToken:false, detectSessionInUrl:false, storageKey:'wmam-verify-'+Date.now() } });
+    var r = await tmp.auth.signInWithPassword({ email: _wmamLoginEmail(agent.username), password: pw });
+    var ok = !!(r && r.data && r.data.user && !r.error);
+    try{ await tmp.auth.signOut(); }catch(e){}
+    return ok;
+  }catch(e){ return false; }
+}
+if(typeof window !== 'undefined') window._wmamVerifyPassword = _wmamVerifyPassword;
+async function changePassword(){
   const cur = document.getElementById('pwCurrent').value;
   const nw  = document.getElementById('pwNew').value;
   const cf  = document.getElementById('pwConfirm').value;
   const msg = document.getElementById('pwMsg');
   const u   = DB.current;
   if(!cur||!nw||!cf){showPwMsg('Please fill all fields.','#CC0000');return;}
-  if(cur !== u.password){showPwMsg('Current password is incorrect.','#CC0000');return;}
+  if(!(await _wmamVerifyPassword(u, cur))){showPwMsg('Current password is incorrect.','#CC0000');return;}
   if(nw.length < 6){showPwMsg('New password must be at least 6 characters.','#CC0000');return;}
   if(nw !== cf){showPwMsg('Passwords do not match.','#CC0000');return;}
   // Update in DB
@@ -36220,15 +36513,36 @@ function clearAllLinks() {
 // ══════════════════════════════════════════════
 //  LOGIN / SESSION
 // ══════════════════════════════════════════════
-function doLogin(){
+// v2026.09.28.1200 SECURE LOGIN: passwords are checked by Supabase's login
+// service on the server. The browser never sees anyone's password.
+function _wmamLoginEmail(u){
+  u = String(u||'').trim().toLowerCase();
+  return u ? u.replace(/[^a-z0-9._-]/g,'_') + '@login.wmaminc.com' : '';
+}
+if(typeof window !== 'undefined') window._wmamLoginEmail = _wmamLoginEmail;
+async function doLogin(){
   var u = document.getElementById('lgUser').value.trim().toLowerCase();
   var p = document.getElementById('lgPass').value;
   var errEl = document.getElementById('loginErr');
-  // v2026.09.28 LOCKDOWN: never allow a blank password to match (seed accounts
-  // no longer carry passwords in this file; real ones come from Supabase).
-  if(!u || !p){ if(errEl) errEl.style.display='block'; return; }
-  var found = DB.agents.find(function(a){ return a.username.toLowerCase()===u && !!a.password && a.password===p && a.active; });
-  if(!found){ if(errEl) errEl.style.display='block'; return; }
+  var showErr = function(msg){ if(errEl){ errEl.textContent = msg || 'Incorrect username or password.'; errEl.style.display='block'; } };
+  if(!u || !p){ showErr(); return; }
+  if(typeof supaClient === 'undefined' || !supaClient || !supaClient.auth){ showErr('Cannot reach the server. Check your connection and try again.'); return; }
+  if(errEl) errEl.style.display='none';
+  var res;
+  try{ res = await supaClient.auth.signInWithPassword({ email: _wmamLoginEmail(u), password: p }); }
+  catch(e){ res = { error: e }; }
+  if(!res || res.error || !res.data || !res.data.user){
+    var m = res && res.error && String(res.error.message||res.error);
+    if(m && /fetch|network|failed to/i.test(m)) showErr('Cannot reach the server. Check your connection and try again.');
+    else showErr();
+    return;
+  }
+  try{ sessionStorage.setItem('wmam_just_logged_in','1'); sessionStorage.removeItem('wmam_session'); }catch(e){}
+  window.location.reload();   // reload so this person's cloud data loads before the app starts
+}
+// Everything that used to happen right after a successful login.
+function _wmamCompleteLogin(found){
+  var errEl = document.getElementById('loginErr');
   // ── Calvin 2026-06-11 v0430: PENDING AGENT LOGIN GUARD ──
   // Pending agents (added via "Add Pending Agent" but not yet approved
   // through the BG flow) are in DB.agents for payroll matching and team
@@ -36239,6 +36553,8 @@ function doLogin(){
       errEl.textContent = 'Your account is pending approval. Please complete the onboarding forms sent to your email. Contact your office staff if you need a new invitation.';
       errEl.style.display='block';
     }
+    try{ _wmamSignOutQuiet(); }catch(e){}
+    try{ showPage('login'); }catch(e){}
     return;
   }
   if(errEl) errEl.style.display='none';
@@ -36413,7 +36729,15 @@ function doLogin(){
   // v7200 (Calvin): removed owner bounce to panelOwner — Owner now lands and
 }
 
+async function _wmamSignOutQuiet(){
+  try{ if(window.WMAM_CLOUD_API) await window.WMAM_CLOUD_API.flush(); }catch(e){}
+  try{ if(supaClient && supaClient.auth) await supaClient.auth.signOut(); }catch(e){}
+  try{ sessionStorage.removeItem('wmam_session'); sessionStorage.removeItem('wmam_just_logged_in'); }catch(e){}
+  try{ if(window.WMAM_CLOUD_API) window.WMAM_CLOUD_API.forget(); }catch(e){}
+}
 function doLogout(){
+  // v2026.09.28.1200: real sign-out (save anything pending first, then reload clean)
+  try{ _wmamSignOutQuiet().then(function(){ window.location.hash=''; window.location.reload(); }); }catch(e){}
   DB.current = null;
   if(typeof applyPersonalTheme === 'function') applyPersonalTheme();
   try{ sessionStorage.removeItem('wmam_session'); }catch(e){}
@@ -49803,6 +50127,10 @@ function invHandleMagicLink(){
   });
   var token = params.t;
   if(!token) return;
+  // v2026.09.28.1200: must be logged in first; wait for the account to finish loading
+  if(!(window._wmamAuthed && window._wmamAuthed())){ try{ showPage('login'); }catch(e){} return; }
+  if(!DB.current){ window._wmamMagicTries = (window._wmamMagicTries||0)+1; if(window._wmamMagicTries < 30) setTimeout(invHandleMagicLink, 1000); return; }
+  if(window._wmamMagicDone) return; window._wmamMagicDone = true;
   var result = invConsumeApprovalToken(token);
   if(!result.ok){
     if(result.reason === 'expired') alert('This approval link has expired (72-hour limit). Please open the app and approve from the notification bell.');
@@ -49811,9 +50139,16 @@ function invHandleMagicLink(){
     try{ history.replaceState(null, '', window.location.pathname); }catch(e){}
     return;
   }
-  // Auto-login if needed
+  // v2026.09.28.1200: no more auto-login from a link. The right person must be logged in.
   if(!DB.current || DB.current.id !== result.agentId){
+    if(!(window._wmamAuthed && window._wmamAuthed())){ try{ showPage('login'); }catch(e){} return; }
+    alert('This approval link belongs to a different account. Log out and log in as that person to approve it.');
+    try{ history.replaceState(null, '', window.location.pathname); }catch(e){}
+    return;
+  }
+  if(false){
     var target = DB.agents.find(function(a){ return a.id === result.agentId && a.active; });
+
     if(!target){
       alert('The account this approval link belongs to is no longer active.');
       return;
@@ -54505,6 +54840,15 @@ function _appLastModified(app){
 }
 
 async function refreshApplicantsFromSupabase(){
+  if(!(window._wmamAuthed && window._wmamAuthed())){
+    try{
+      var _tok = window._wmamSigningToken;
+      if(!_tok || typeof supaClient === 'undefined' || !supaClient) return;
+      var _r = await supaClient.rpc('wmam_applicant_get', { p_token: _tok });
+      if(_r && !_r.error && _r.data && _r.data.id != null) APPLICANTS_PRE_BG = [_r.data];
+    }catch(e){ console.warn('[applicant signing] secure lookup failed:', e); }
+    return;
+  }
   try{
     if(typeof supaClient === 'undefined' || !supaClient){ return false; }
     var res = await supaClient.from('app_settings').select('value').eq('key','applicants_pre_bg').maybeSingle();
@@ -77561,7 +77905,7 @@ async function myProfileChangePassword(){
       if(errEl){ errEl.textContent = '⚠ Fill in all three password fields.'; errEl.style.display = 'block'; }
       return;
     }
-    if(current !== u.password){
+    if(!(await _wmamVerifyPassword(u, current))){
       if(errEl){ errEl.textContent = '⚠ Current password doesn\'t match.'; errEl.style.display = 'block'; }
       return;
     }
@@ -85649,7 +85993,7 @@ initSupabase();
 // ── Calvin 2026-05-08: inventory custody — periodic timeout escalation ──
 // Every 15 minutes, scan pending transfers and fire escalation notifications
 // for any older than 48 hours.
-if(typeof invCheckTimeouts === 'function'){
+if(typeof invCheckTimeouts === 'function' && (!window._wmamAuthed || window._wmamAuthed())){
   setTimeout(function(){ try{ invCheckTimeouts(); }catch(e){ console.warn('[invCheckTimeouts initial]', e); } }, 8000);
   setInterval(function(){ try{ invCheckTimeouts(); }catch(e){ console.warn('[invCheckTimeouts interval]', e); } }, 15 * 60 * 1000);
 }
@@ -85691,6 +86035,10 @@ function _handleApplicantSigningPage(){
     if(m) token = m[1];
   }catch(e){}
   if(!token) return false;  // not a signing URL
+  window._wmamSigningToken = token;
+  if(!(window._wmamAuthed && window._wmamAuthed()) && typeof refreshApplicantsFromSupabase === 'function'){
+    refreshApplicantsFromSupabase().then(function(){ try{ tryLookup(); }catch(e){} });
+  }
   console.log('[applicant signing] token detected:', token.slice(0,8)+'...');
 
   // ── Calvin 2026-06-10 v0030: IMMEDIATE LOADING PLACEHOLDER ──
@@ -86380,6 +86728,7 @@ function _publicSignSubmit(applicantId, token, formType){
 // Shows "✓ Form 1 signed!" + a big "Continue to Form 2 →" button + a
 // 1.5-second auto-advance so they don't have to click anything.
 function _renderApplicantContinueToNextForm(app, otherToken, otherType, justFinishedType){
+  if(otherToken) window._wmamSigningToken = otherToken;
   var nextLabel = otherType === 'auth' ? 'Background Check Authorization' : 'Personal Information Intake';
   var nextStepNum = otherType === 'auth' ? '1 of 2' : '2 of 2';
   var justFinishedLabel = justFinishedType === 'auth' ? 'Background Check Authorization' : 'Personal Information Intake';
@@ -86478,12 +86827,14 @@ setTimeout(function(){
 }, 600);
 window.addEventListener('hashchange', _handleLoginHash);
 // Calvin 2026-06-10 v1330: applicant reminder + auto-cancel scan
+if((!window._wmamAuthed || window._wmamAuthed())){
 setTimeout(function(){ try{ if(typeof applicantRemindAndCancelScan==='function') applicantRemindAndCancelScan(); }catch(e){} }, 12000);
-setInterval(function(){ try{ if(typeof applicantRemindAndCancelScan==='function') applicantRemindAndCancelScan(); }catch(e){} }, 60*60*1000);  // hourly
+setInterval(function(){ try{ if(typeof applicantRemindAndCancelScan==='function') applicantRemindAndCancelScan(); }catch(e){} }, 60*60*1000);
+}  // hourly
 // ── Calvin 2026-05-08: training-flow auto-advance ──
 // Every 30 seconds, scan pending-bg-check completions and float them up
 // to pending-code-approval if BG check + agreements are now done.
-if(typeof trainingAutoAdvancePending === 'function'){
+if(typeof trainingAutoAdvancePending === 'function' && (!window._wmamAuthed || window._wmamAuthed())){
   setTimeout(function(){ try{ trainingAutoAdvancePending(); }catch(e){} }, 10000);
   setInterval(function(){ try{ trainingAutoAdvancePending(); }catch(e){} }, 30 * 1000);
 }
@@ -86492,6 +86843,7 @@ if(typeof trainingAutoAdvancePending === 'function'){
   // Calvin 2026-05-14: DIRECT-SUPABASE INIT
   // Just load from Supabase and subscribe to realtime. No queue to flush.
   await loadFromSupabase();
+  var _wmamIsMember = (!window._wmamAuthed || window._wmamAuthed());
 
   // ── Calvin 2026-05-18 — Path B inventory bootstrap ──
   // Try to load inventory from the real Supabase tables. If they exist
@@ -86513,7 +86865,7 @@ if(typeof trainingAutoAdvancePending === 'function'){
   //  - If tables empty AND localStorage has data, restore in-memory from
   //    localStorage first, then migrate. Re-load tables after.
   try{
-    if(typeof invDbLoadAllFromTables === 'function'){
+    if(_wmamIsMember && typeof invDbLoadAllFromTables === 'function'){
       // 1. Snapshot localStorage counts (these are pre-load, so they're
       //    the truth before we touch anything)
       function _lsCount(key){
@@ -86563,42 +86915,106 @@ if(typeof trainingAutoAdvancePending === 'function'){
     }
   }catch(e){ console.warn('[init] Path B bootstrap failed (safe to ignore — Path A still active):', e); }
 
+  // v2026.09.28.1200 INVENTORY RESCUE: this device used to keep its own copy of
+  // inventory. Devices the cloud tables have never seen (id AND IMEI missing
+  // everywhere, and not deleted/tombstoned) are uploaded. Everything was also
+  // archived to wmam_rescue first. Then the device copy is cleared.
+  try{
+    var _devInv = window._wmamDeviceInventory || {};
+    if(_wmamIsMember && Object.keys(_devInv).length && typeof invDbUpsertDevices === 'function'){
+      var _pools = { gm: (typeof GM_INVENTORY!=='undefined')?GM_INVENTORY:null, tc: (typeof TC_INVENTORY!=='undefined')?TC_INVENTORY:null,
+                     aw: (typeof AW_INVENTORY!=='undefined')?AW_INVENTORY:null, ex: (typeof EX_INVENTORY!=='undefined')?EX_INVENTORY:null,
+                     legacy: (typeof INVENTORY_DEVICES!=='undefined')?INVENTORY_DEVICES:null };
+      var _ids = {}, _imeis = {};
+      Object.keys(_pools).forEach(function(k){ (_pools[k]||[]).forEach(function(d){ if(!d) return; if(d.id!=null) _ids[String(d.id)] = 1; if(d.imei) _imeis[String(d.imei)] = 1; }); });
+      var _tomb = {};
+      try{ var _t = JSON.parse(localStorage.getItem('wmam_inv_tombstones')||'[]');
+           (Array.isArray(_t)?_t:Object.keys(_t||{})).forEach(function(x){ if(x && typeof x==='object'){ if(x.id!=null) _tomb[String(x.id)]=1; if(x.imei) _tomb[String(x.imei)]=1; } else if(x!=null) _tomb[String(x)]=1; }); }catch(e){}
+      var _restored = 0;
+      for(var _pk in _devInv){
+        var _arr = []; try{ _arr = JSON.parse(_devInv[_pk]) || []; }catch(e){}
+        if(!Array.isArray(_arr) || !_pools[_pk]) continue;
+        var _missing = _arr.filter(function(d){
+          return d && d.id != null && !_ids[String(d.id)] && !(d.imei && _imeis[String(d.imei)])
+              && !_tomb[String(d.id)] && !(d.imei && _tomb[String(d.imei)]) && !d.deletedAt && !d.deleted_at;
+        });
+        if(_missing.length){
+          _missing.forEach(function(d){ _pools[_pk].push(d); _ids[String(d.id)] = 1; if(d.imei) _imeis[String(d.imei)] = 1; });
+          await invDbUpsertDevices(_pk, _missing); _restored += _missing.length;
+        }
+      }
+      if(_restored) console.log('[rescue] uploaded '+_restored+' inventory device(s) that only existed on this device');
+    }
+    if(window.WMAM_CLOUD_API) window.WMAM_CLOUD_API.inventoryChecked();
+  }catch(e){ console.warn('[rescue] inventory check failed (device copy kept, retries next load):', e); }
+
+
   // ── Subscribe to realtime changes on agents + app_settings ──
   // K-Anna's edits appear on Calvin's screen within ~1 sec (and vice versa)
   // without anyone refreshing. Falls back gracefully if Realtime isn't enabled.
-  if(typeof subscribeAgentsRealtime === 'function'){
+  if(_wmamIsMember && typeof subscribeAgentsRealtime === 'function'){
     try{ subscribeAgentsRealtime(); }catch(e){ console.warn('[init] realtime subscribe failed (safe to ignore):', e); }
   }
   // Calvin 2026-05-19: inventory realtime + conflict queue + notify framework
-  if(typeof subscribeInventoryRealtime === 'function'){
+  if(_wmamIsMember && typeof subscribeInventoryRealtime === 'function'){
     try{ subscribeInventoryRealtime(); }catch(e){ console.warn('[init] inventory realtime subscribe failed:', e); }
   }
   // Calvin 2026-06-01: applicant reminder timer (hourly check; daily emails)
-  if(typeof startApplicantReminderTimer === 'function'){
+  if(_wmamIsMember && typeof startApplicantReminderTimer === 'function'){
     try{ startApplicantReminderTimer(); }catch(e){ console.warn('[init] applicant reminder timer failed:', e); }
   }
   // Calvin 2026-06-03: birthday + work anniversary scanner (boots once + every 6h)
-  if(typeof startCelebrationScanner === 'function'){
+  if(_wmamIsMember && typeof startCelebrationScanner === 'function'){
     try{ startCelebrationScanner(); }catch(e){ console.warn('[init] celebration scanner failed:', e); }
   }
   // Calvin 2026-06-03: onboarding reminder scanner — 24h then every 72h
   // until agent signs OR admin clears. Retroactive: scans all existing
   // packets, not just new ones.
-  if(typeof startOnboardingReminderScanner === 'function'){
+  if(_wmamIsMember && typeof startOnboardingReminderScanner === 'function'){
     try{ startOnboardingReminderScanner(); }catch(e){ console.warn('[init] onboarding reminder scanner failed:', e); }
   }
   // Calvin 2026-05-14: auto-refresh for tables not on realtime (notifications,
   // sales, transfers). Polls every 15s. This is what makes notifications
   // appear without anyone manually refreshing.
-  if(typeof startAutoRefresh === 'function'){
+  if(_wmamIsMember && typeof startAutoRefresh === 'function'){
     try{ startAutoRefresh(); }catch(e){ console.warn('[init] startAutoRefresh failed:', e); }
   }
   // Restore session if user was already logged in
   try{
-    var savedId = sessionStorage.getItem('wmam_session');
-    if(savedId){
-      var restoredUser = DB.agents.find(function(a){ return a.id===parseInt(savedId) && a.active; });
+    // v2026.09.28.1200: a session comes ONLY from a real login (not from a value
+    // anyone could type into the browser). The Owner's "view as" is kept.
+    var restoredUser = null;
+    if(window._wmamAuthed && window._wmamAuthed()){
+      var _au = window.WMAM_CLOUD.uid;
+      var _loaded = (DB.agents||[]).some(function(a){ return a && a.authUserId; });
+      var _me = (DB.agents||[]).find(function(a){ return a && a.authUserId === _au; });
+      var _just = false; try{ _just = sessionStorage.getItem('wmam_just_logged_in') === '1'; sessionStorage.removeItem('wmam_just_logged_in'); }catch(e){}
+      if(!_loaded){
+        alert('Could not load your account from the server. Please check your connection and refresh.');
+      } else if(!_me || !_me.active || _me.pendingAgent === true){
+        await _wmamSignOutQuiet();
+        showPage('login');
+        var _le = document.getElementById('loginErr');
+        if(_le){ _le.textContent = (_me && _me.pendingAgent === true)
+          ? 'Your account is pending approval. Please complete the onboarding forms sent to your email. Contact your office staff if you need a new invitation.'
+          : 'This account is not active. Contact your office staff.'; _le.style.display='block'; }
+        return;
+      } else {
+        if(window.WMAM_CLOUD_API) window.WMAM_CLOUD_API.setAgentId(_me.id);
+        if(_just){ _wmamCompleteLogin(_me); return; }
+        restoredUser = _me;
+        var savedId = sessionStorage.getItem('wmam_session');
+        if(savedId && parseInt(savedId) !== _me.id && isOwner(_me)){
+          var _imp = DB.agents.find(function(a){ return a.id===parseInt(savedId) && a.active; });
+          if(_imp) restoredUser = _imp;
+        }
+      }
+    } else {
+      try{ sessionStorage.removeItem('wmam_session'); }catch(e){}
+    }
+    {
       if(restoredUser){
+
         DB.current = restoredUser;
         if(typeof applyPersonalTheme === 'function') applyPersonalTheme();
         launchBO(restoredUser);
