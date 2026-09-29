@@ -3724,7 +3724,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.09.29.1600';
+var BUILD_VERSION = '2026.09.29.1700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15512,12 +15512,25 @@ function _invRowToDevice(row){
   ['imei','sim','msisdn','model','status','market'].forEach(function(k){
     if(dev[k] === null || dev[k] === undefined) dev[k] = '';
   });
+  try{ _invSnapSet(dev); }catch(e){}
   return dev;
 }
 
 // Upsert MANY devices in one shot (chunked). Calvin 2026-06-30 — used by every
 // upload so freshly-added devices become real per-row SQL immediately and show
 // up for every user (owner/office/manager/agent), not just the uploader.
+// v2026.09.29 SAFE SAVES: only send devices this person actually changed. The old
+// code re-sent EVERY device in memory on every save, so one out-of-date screen
+// could overwrite everyone else's work.
+var _invSnap = {};
+function _invSigOf(d){
+  var r = _invDeviceToRow(d, ''); if(!r) return '';
+  delete r.campaign;
+  if(r.raw){ ['_lastEditAt','_lastEditBy','_lastEditByName','_lastEditSession','_lastChangeType'].forEach(function(k){ delete r.raw[k]; }); }
+  return JSON.stringify(r);
+}
+function _invSnapSet(d){ if(d && d.id != null) _invSnap[String(d.id)] = _invSigOf(d); }
+if(typeof window!=='undefined'){ window._invSnapSet = _invSnapSet; window._invSigOf = _invSigOf; }
 async function invDbUpsertDevices(poolKey, devices){
   try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
   if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
@@ -15525,11 +15538,14 @@ async function invDbUpsertDevices(poolKey, devices){
   if(!table) return {ok:false, error:'unknown-pool'};
   var poolDef = INV_SYNC_POOLS.find(function(p){return p.key===poolKey;}) || {};
   var rows = [];
+  var _sent = [];
   (devices || []).forEach(function(d){
     if(!d) return;
+    var _sig = _invSigOf(d);
+    if(d.id != null && _invSnap[String(d.id)] === _sig) return;          // unchanged -> never re-send
     if(typeof stampDeviceEdit === 'function') stampDeviceEdit(d);
     var row = _invDeviceToRow(d, poolDef.label);
-    if(row && row.id) rows.push(row);
+    if(row && row.id){ rows.push(row); _sent.push([String(d.id), _sig]); }
   });
   if(!rows.length) return {ok:true, count:0};
   var okAll = true, lastErr = null;
@@ -15540,6 +15556,8 @@ async function invDbUpsertDevices(poolKey, devices){
       if(res && res.error){ okAll=false; lastErr=res.error; window._invPathBLastError=res.error; console.warn('[invDbUpsertDevices] '+table+' chunk failed:', res.error); }
     }
   }catch(e){ okAll=false; lastErr=e; window._invPathBLastError=e; console.warn('[invDbUpsertDevices] '+table+' threw:', e); }
+  if(okAll) _sent.forEach(function(x){ _invSnap[x[0]] = x[1]; });
+  else if(lastErr && /out of date/i.test(String(lastErr.message||lastErr))){ try{ wmamShowUpdateBanner(true); }catch(e){} }
   return {ok:okAll, count:rows.length, error:lastErr};
 }
 if(typeof window !== 'undefined'){ window.invDbUpsertDevices = invDbUpsertDevices; }
@@ -15666,6 +15684,31 @@ async function invDbLoadPool(poolKey){
 // On success, replaces the in-memory arrays and sets window._invPathBReady = true.
 // v2026.09.29 911 FIX: one way to (re)load inventory - the LIVE tables. Never old copies.
 var _wmamInvLiveAt = null, _wmamInvLiveBusy = false;
+// v2026.09.29 AUTO-UPDATE: checks for a newer version every 5 minutes. When one is out,
+// it shows a banner and updates by itself as soon as the person isn't typing.
+function wmamShowUpdateBanner(urgent){
+  if(document.getElementById('wmamUpdateBar')) return;
+  var b = document.createElement('div'); b.id = 'wmamUpdateBar';
+  b.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:2147483000;background:#003594;color:#fff;border-radius:12px;padding:12px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25);font-family:Arial,sans-serif;display:flex;gap:12px;align-items:center;max-width:92vw';
+  b.innerHTML = '<span style="font-weight:700">'+(urgent?'⚠ This page is out of date — your last inventory change was not saved.':'✨ A new version of the back office is ready.')+'</span>'
+    + '<button onclick="location.reload()" style="background:#16a34a;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:800;cursor:pointer">Update now</button>';
+  document.body.appendChild(b);
+}
+var _wmamLastInputAt = Date.now();
+['keydown','input','pointerdown'].forEach(function(ev){ try{ window.addEventListener(ev, function(){ _wmamLastInputAt = Date.now(); }, true); }catch(e){} });
+async function wmamCheckForUpdate(){
+  try{
+    var r = await fetch(location.pathname + '?_v=' + Date.now(), { cache:'no-store' });
+    if(!r.ok) return; var t = await r.text();
+    var m = t.match(/var BUILD_VERSION = '([0-9.]+)'/); if(!m) return;
+    if(typeof BUILD_VERSION === 'undefined' || m[1] <= BUILD_VERSION) return;
+    wmamShowUpdateBanner(false);
+    var typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+    if(document.visibilityState === 'hidden' || (!typing && Date.now() - _wmamLastInputAt > 120000)) location.reload();
+  }catch(e){}
+}
+if(typeof window!=='undefined' && location && /^https?:/.test(location.protocol)){ setInterval(wmamCheckForUpdate, 300000); document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='visible') wmamCheckForUpdate(); }); }
+if(typeof window!=='undefined'){ window.wmamCheckForUpdate = wmamCheckForUpdate; window.wmamShowUpdateBanner = wmamShowUpdateBanner; }
 async function wmamInvReloadLive(rerender){
   if(_wmamInvLiveBusy) return true; _wmamInvLiveBusy = true;
   try{
@@ -21000,7 +21043,7 @@ function loadProgGoalsFromSupabase(settings){
 
 function initSupabase(){
   if(typeof supabase !== 'undefined' && supabase.createClient){
-    supaClient = supabase.createClient(SUPA_URL, SUPA_KEY);
+    supaClient = supabase.createClient(SUPA_URL, SUPA_KEY, { global: { headers: { 'x-wmam-build': (typeof BUILD_VERSION!=='undefined' ? BUILD_VERSION : '') } } });
     console.log('Supabase connected');
     // v2026.09.28 LOCKDOWN: passwords were removed from this file. Guarantee
     // that no save can ever overwrite a real password in Supabase with a blank
