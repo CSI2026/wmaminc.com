@@ -3724,7 +3724,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.09.29.1400';
+var BUILD_VERSION = '2026.09.29.1600';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -6331,7 +6331,7 @@ function obStatusBadgeHTML(agent){
 }
 
 function obProgramOptions(){
-  return ['Lifeline','Internet','ACA','Universal'];
+  return wmamProgramNames().concat(['Universal']);
 }
 
 function ppDefaultContractTemplate(role){
@@ -13151,7 +13151,7 @@ function canSeeChannel(user, channel){
 function agentVisibleCampaigns(agent){
   if(!agent) return [];
   if(isOwner(agent) || agent.role==='admin' || isInventory(agent)){
-    return EXD(['Gen Mobile','TruConnect','Assurance','Excess','Chuzo','Astound','ACA']);
+    return wmamAllCodeKeys();
   }
   // Campaign Manager — see only their assigned campaign
   if(agent.role==='Campaign Manager'){
@@ -14408,10 +14408,16 @@ function panelInvExplorer(params){
     + '<div style="display:flex;gap:8px;margin:10px 0 14px;flex-wrap:wrap">'
     + '<input id="invxSearch" placeholder="Search any IMEI or SIM (ICCID)\u2026" autocomplete="off" inputmode="numeric" onkeydown="if(event.key===\'Enter\')invxSearch(this.value)" style="flex:1;min-width:220px;padding:12px 14px;border:2px solid #003594;border-radius:10px;font-size:16px">'
     + '<button onclick="invxSearch(document.getElementById(\'invxSearch\').value)" style="padding:12px 18px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:800;cursor:pointer">\uD83D\uDD0D Search</button></div>'
+    + '<div id="invxLive" style="font-size:.78rem;margin:-4px 0 10px;display:flex;gap:10px;align-items:center"></div>'
     + '<div id="invxSearchOut"></div><div id="invxBox"></div></div>';
 }
 function invxRender(){
   var box = document.getElementById('invxBox'); if(!box) return;
+  try{ var lv = document.getElementById('invxLive'); if(lv){ var ok = !!window._invPathBReady;
+    lv.innerHTML = (ok ? '<span style="color:#16a34a;font-weight:700">\u25CF Live inventory'+(_wmamInvLiveAt?' \u00b7 updated '+_wmamInvLiveAt.toLocaleTimeString():'')+'</span>'
+                       : '<span style="color:#CC0000;font-weight:700">\u26A0 Inventory not loaded yet \u2014 retrying\u2026</span>')
+      + ' <button onclick="wmamInvReloadLive(true)" style="padding:3px 10px;border:1px solid #003594;border-radius:6px;background:#fff;color:#003594;font-weight:700;cursor:pointer">\u21BB Reload</button>'; } }catch(e){}
+  try{ if(typeof wmamInvVerify==='function') wmamInvVerify(); }catch(e){}
   var all = _invxRows(), esc = _escapeHtml;
   var crumbs = ['<a href="javascript:void(0)" onclick="invxGo(\'top\')" style="color:#003594;font-weight:700">All inventory</a>'];
   if(INVX.campaign) crumbs.push('<a href="javascript:void(0)" onclick="invxGo(\'campaign\','+JSON.stringify(INVX.campaign).replace(/"/g,'&quot;')+')" style="color:#003594;font-weight:700">'+esc(INVX.campaign)+'</a>');
@@ -15249,7 +15255,10 @@ async function inventorySyncPull(){
       // version (e.g., they saved on another tab — no point warning).
       var meIsWriter = (typeof DB !== 'undefined' && DB.current
                        && DB.current.id === conflictDetected.remoteWriterId);
-      if(!meIsWriter){
+      if(!meIsWriter && window._invPathBReady && typeof wmamInvReloadLive === 'function'){
+        // Live tables: just pull the latest rows quietly (no banner, no old copies)
+        INV_SYNC_LOCAL_VERSION[conflictDetected.pool] = conflictDetected.remoteVersion; wmamInvReloadLive(false);
+      } else if(!meIsWriter){
         INV_SYNC_CONFLICT = conflictDetected;
         // Re-render so the banner appears immediately
         try{
@@ -15274,6 +15283,9 @@ async function inventorySyncPull(){
 // replace local arrays, persist to localStorage, and re-render.
 async function inventorySyncRefreshFromRemote(){
   if(typeof supaClient === 'undefined' || !supaClient){ alert('Sync unavailable.'); return; }
+  // v2026.09.29 911 FIX: always reload from the LIVE inventory tables. The old code pulled a
+  // stale backup copy (app_settings) and replaced everyone's inventory with it.
+  if(typeof wmamInvReloadLive === 'function'){ var _ok = await wmamInvReloadLive(true); if(_ok) return; alert('Could not reach the inventory database. Please check your connection and try again.'); return; }
   try{
     // Fetch both data + meta keys in one call
     var keys = [];
@@ -15362,6 +15374,7 @@ function renderInventoryConflictBanner(){
 // Pre-save guard. Returns true if save should proceed, false to abort.
 function inventorySyncPreSaveCheck(){
   if(!INV_SYNC_CONFLICT) return true;
+  if(window._invPathBReady){ INV_SYNC_CONFLICT = null; return true; }   // live tables save row by row: no overwrite risk
   var c = INV_SYNC_CONFLICT;
   var poolLabel = c.poolLabel || c.pool;
   var msg = '⚠ Inventory conflict\n\n'
@@ -15651,6 +15664,49 @@ async function invDbLoadPool(poolKey){
 
 // Load all 5 pools from the new tables. Returns {ok, counts:{gm,tc,aw,ex,legacy}}.
 // On success, replaces the in-memory arrays and sets window._invPathBReady = true.
+// v2026.09.29 911 FIX: one way to (re)load inventory - the LIVE tables. Never old copies.
+var _wmamInvLiveAt = null, _wmamInvLiveBusy = false;
+async function wmamInvReloadLive(rerender){
+  if(_wmamInvLiveBusy) return true; _wmamInvLiveBusy = true;
+  try{
+    var r = await invDbLoadAllFromTables();
+    if(r && r.ok){ _wmamInvLiveAt = new Date(); INV_SYNC_CONFLICT = null;
+      if(rerender !== false && window._currentPanelId && typeof gotoPanel === 'function'){ try{ gotoPanel(window._currentPanelId); }catch(e){} }
+      else { try{ if(document.getElementById('invxBox') && typeof invxRender==='function') invxRender(); }catch(e){} }
+      return true; }
+    return false;
+  }catch(e){ return false; } finally { _wmamInvLiveBusy = false; }
+}
+if(typeof window!=='undefined'){
+  window.wmamInvReloadLive = wmamInvReloadLive;
+  // keep every screen current: reload when the window comes back into focus and every 2 minutes
+  window.addEventListener('focus', function(){ if(window._wmamAuthed && window._wmamAuthed() && (!_wmamInvLiveAt || Date.now()-_wmamInvLiveAt > 30000)) wmamInvReloadLive(false); });
+  setInterval(function(){ if(window._wmamAuthed && window._wmamAuthed() && document.visibilityState !== 'hidden') wmamInvReloadLive(false); }, 120000);
+}
+// v2026.09.29: PROOF, not assumption. Count every table in the database and compare
+// with what this screen has loaded. Any difference -> reload automatically.
+var _wmamInvVerifyAt = 0, _wmamInvVerifyRetried = false;
+async function wmamInvVerify(){
+  if(Date.now() - _wmamInvVerifyAt < 5000) return; _wmamInvVerifyAt = Date.now();
+  var el = document.getElementById('invxVerify'); var lv = document.getElementById('invxLive');
+  if(!el && lv){ el = document.createElement('span'); el.id = 'invxVerify'; lv.appendChild(el); }
+  if(!el || typeof supaClient==='undefined' || !supaClient) return;
+  var pools = {gm:GM_INVENTORY, tc:TC_INVENTORY, aw:AW_INVENTORY, ex:EX_INVENTORY, legacy:INVENTORY_DEVICES};
+  var db = 0, screen = 0, bad = [];
+  try{
+    for(var i=0;i<INV_SYNC_POOLS.length;i++){
+      var p = INV_SYNC_POOLS[i];
+      var r = await supaClient.from(p.tableName).select('id', { count:'exact', head:true });
+      if(!r || r.error || typeof r.count !== 'number'){ el.innerHTML = ' <span style="color:#b45309;font-weight:700">(could not double-check the database just now)</span>'; return; }
+      var have = (pools[p.key]||[]).length; db += r.count; screen += have;
+      if(r.count !== have) bad.push(p.label+': database '+r.count+', screen '+have);
+    }
+  }catch(e){ return; }
+  if(!bad.length){ _wmamInvVerifyRetried = false; el.innerHTML = ' <span style="color:#16a34a;font-weight:700">\u2714 Matches the database ('+db+' records)</span>'; return; }
+  el.innerHTML = ' <span style="color:#CC0000;font-weight:700">\u26A0 Out of date \u2014 reloading ('+bad.join('; ')+')</span>';
+  if(!_wmamInvVerifyRetried){ _wmamInvVerifyRetried = true; _wmamInvVerifyAt = 0; await wmamInvReloadLive(false); try{ invxRender(); }catch(e){} }
+}
+if(typeof window!=='undefined') window.wmamInvVerify = wmamInvVerify;
 async function invDbLoadAllFromTables(){
   if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
   var counts = {};
@@ -15668,7 +15724,8 @@ async function invDbLoadAllFromTables(){
     _invSyncReplacePool(p.key, devices);
     counts[p.key] = devices.length;
   }
-  if(!failed) window._invPathBReady = true;
+  if(!failed){ window._invPathBReady = true; _wmamInvLiveAt = new Date(); }
+  else { setTimeout(function(){ try{ wmamInvReloadLive(false); }catch(e){} }, 15000); }
   console.log('[invDbLoadAllFromTables] loaded:', counts, 'pathB ready:', window._invPathBReady);
   // Persist to localStorage so panels reading from the local cache get fresh data
   try{ _invSyncWriteLocalOnly(); }catch(e){}
@@ -22012,7 +22069,7 @@ function _repairBareSavedSuggest(agent){
   // ── Source 5: Derive programs from agentCodes ──
   // If agentCodes has Gen Mobile/TruConnect/etc, programs should include 'Lifeline'
   if(suggestion.agentCodes && Object.keys(suggestion.agentCodes).length && !suggestion.programs.length){
-    var lifelineCampaigns = EXD(['Gen Mobile','TruConnect','Assurance Wireless','Excess Telecom']);
+    var lifelineCampaigns = wmamCampaignsFor('Lifeline');
     var hasLifeline = Object.keys(suggestion.agentCodes).some(function(c){ return lifelineCampaigns.indexOf(c) >= 0; });
     if(hasLifeline){
       suggestion.programs = ['Lifeline'];
@@ -22083,7 +22140,7 @@ function panelRepairBareSaved(){
     h += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;letter-spacing:1.5px;color:var(--brown)">'+_escapeHtml(a.name)+' — '+_escapeHtml(a.role||'(no role)')+'</div>';
     h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">Agent #'+a.id+' · username: '+_escapeHtml(a.username||'')+'</div></div>';
     h += '<div style="display:flex;gap:6px">';
-    h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+a.id+'})" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">Open Profile</button>';
+    h += '<button onclick="openAgentMasterProfile('+a.id+')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">Open Profile</button>';
     h += '</div></div></div>';
     h += '<div style="padding:14px 18px">';
     if(hasSuggestion){
@@ -22102,10 +22159,10 @@ function panelRepairBareSaved(){
       sug.sources.forEach(function(s){ h += '<li>'+_escapeHtml(s)+'</li>'; });
       h += '</ul>';
       h += '<button onclick="_repairBareSavedApply('+a.id+', '+JSON.stringify(sug).replace(/'/g,"&#39;")+'); alert(\'Applied to '+_escapeAttr(a.name)+'. Re-render the panel to refresh.\'); gotoPanel(\'repair-bare-saved\');" class="btn-fire" style="padding:10px 18px;font-size:.74rem">✓ Apply Suggested Fields</button>';
-      h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+a.id+'})" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;margin-left:8px">Edit Manually Instead</button>';
+      h += '<button onclick="openAgentMasterProfile('+a.id+')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase;padding:10px 18px;border-radius:5px;cursor:pointer;margin-left:8px">Edit Manually Instead</button>';
     } else {
       h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted);margin-bottom:10px">No backup snapshot or signals found for this agent. You will need to set their placement / programs / campaigns manually.</div>';
-      h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+a.id+'})" class="btn-fire" style="padding:10px 18px;font-size:.74rem">Edit Profile →</button>';
+      h += '<button onclick="openAgentMasterProfile('+a.id+')" class="btn-fire" style="padding:10px 18px;font-size:.74rem">Edit Profile →</button>';
     }
     h += '</div></div>';
   });
@@ -22490,7 +22547,7 @@ function panelMultiTeamCleanup(){
     h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
     h += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:1.5px;color:var(--brown)">'+_escapeHtml(row.agentName)+' — '+_escapeHtml(row.agentRole||'(no role)')+'</div>';
     h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted);margin-top:2px">Agent #'+row.agentId+' · '+row.teams.length+' teams</div></div>';
-    h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+row.agentId+'})" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">Open Profile</button>';
+    h += '<button onclick="openAgentMasterProfile('+row.agentId+')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">Open Profile</button>';
     h += '</div></div>';
     h += '<div style="padding:14px 18px">';
     row.teams.forEach(function(entry, idx){
@@ -23383,23 +23440,23 @@ async function loadFromSupabase(){
         //    visible to every user with permission, not just the device
         //    that scanned them in. Each block is wrapped in its own try
         //    so one malformed row can't tear down the rest of the load.
-        if(s.key==='inv_devices'    && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_DEVICES   = _invUnionMerge(INVENTORY_DEVICES, v);}catch(e){console.warn('[load] inv_devices:',e);} }
+        if(false /* v2026.09.29: inventory comes ONLY from the live tables, never old copies */ && s.key==='inv_devices'    && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_DEVICES   = _invUnionMerge(INVENTORY_DEVICES, v);}catch(e){console.warn('[load] inv_devices:',e);} }
         if(s.key==='inv_batches'    && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_BATCHES   = v;}catch(e){console.warn('[load] inv_batches:',e);} }
         if(s.key==='inv_transfers'  && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_TRANSFERS = v;}catch(e){console.warn('[load] inv_transfers:',e);} }
         if(s.key==='inv_requests'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) INVENTORY_REQUESTS  = v;}catch(e){console.warn('[load] inv_requests:',e);} }
         if(s.key==='inv_nextid'     && s.value){ try{var v=JSON.parse(s.value); if(typeof v==='number') INV_NEXT_ID = v;}catch(e){} }
-        if(s.key==='gm_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_INVENTORY        = _invUnionMerge(GM_INVENTORY, v);}catch(e){console.warn('[load] gm_inventory:',e);} }
+        if(false /* v2026.09.29: inventory comes ONLY from the live tables, never old copies */ && s.key==='gm_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_INVENTORY        = _invUnionMerge(GM_INVENTORY, v);}catch(e){console.warn('[load] gm_inventory:',e);} }
         if(s.key==='gm_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_ACTIVATIONS      = _invUnionMerge(GM_ACTIVATIONS, v);}catch(e){} }
         if(s.key==='gm_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) GM_TRANSFERS        = v;}catch(e){} }
         if(s.key==='inv_markets'    && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object') INV_MARKETS = v;}catch(e){} }
         if(s.key==='inv_upsell_pct' && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object') INV_UPSELL_REQUIREMENTS = v;}catch(e){} }
-        if(s.key==='aw_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_INVENTORY        = _invUnionMerge(AW_INVENTORY, v);}catch(e){} }
+        if(false /* v2026.09.29: inventory comes ONLY from the live tables, never old copies */ && s.key==='aw_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_INVENTORY        = _invUnionMerge(AW_INVENTORY, v);}catch(e){} }
         if(s.key==='aw_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_ACTIVATIONS      = _invUnionMerge(AW_ACTIVATIONS, v);}catch(e){} }
         if(s.key==='aw_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) AW_TRANSFERS        = v;}catch(e){} }
-        if(s.key==='tc_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_INVENTORY        = _invUnionMerge(TC_INVENTORY, v);}catch(e){} }
+        if(false /* v2026.09.29: inventory comes ONLY from the live tables, never old copies */ && s.key==='tc_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_INVENTORY        = _invUnionMerge(TC_INVENTORY, v);}catch(e){} }
         if(s.key==='tc_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_ACTIVATIONS      = _invUnionMerge(TC_ACTIVATIONS, v);}catch(e){} }
         if(s.key==='tc_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) TC_TRANSFERS        = v;}catch(e){} }
-        if(s.key==='ex_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_INVENTORY        = _invUnionMerge(EX_INVENTORY, v);}catch(e){} }
+        if(false /* v2026.09.29: inventory comes ONLY from the live tables, never old copies */ && s.key==='ex_inventory'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_INVENTORY        = _invUnionMerge(EX_INVENTORY, v);}catch(e){} }
         if(s.key==='ex_activations' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_ACTIVATIONS      = _invUnionMerge(EX_ACTIVATIONS, v);}catch(e){} }
         if(s.key==='ex_transfers'   && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) EX_TRANSFERS        = v;}catch(e){} }
         // Ship A3 — pickup + discrepancy data
@@ -31606,7 +31663,7 @@ function panelFormBuilder(){
   h += '<div id="fb-assign-campaigns" style="margin-bottom:12px;display:'+(aTo.mode==='campaigns'?'block':'none')+'">';
   h += '<label class="f-label">Select Campaigns (check all that apply)</label>';
   h += '<div style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--offwhite)">';
-  var allCampaigns = EXD(['Gen Mobile','TruConnect','Assurance','Excess','Astound','Chuzo','ACA']);
+  var allCampaigns = wmamAllCodeKeys();
   // Add any custom campaigns from WMAM_CAMPAIGNS too if available
   if(typeof WMAM_CAMPAIGNS !== 'undefined' && Array.isArray(WMAM_CAMPAIGNS)){
     WMAM_CAMPAIGNS.forEach(function(c){
@@ -32310,7 +32367,7 @@ function onBgAuthSigned(agentId){
   }catch(e){ console.warn('[onBgAuthSigned] could not read CAMPAIGNS_REGISTRY:', e); }
   if(!lifelineCampaigns.length){
     // Fallback to the standard Lifeline carrier list
-    lifelineCampaigns = EXD(['TruConnect','Gen Mobile','Assurance','Excess']);
+    lifelineCampaigns = wmamCodeKeysFor('Lifeline');
   }
 
   // Narrow further: if agent has any coded campaigns, ONLY queue those
@@ -32517,7 +32574,7 @@ function fbDefaultForms(){
         {id:'f6', type:'phone',     label:'Phone Number',       placeholder:'(XXX) XXX-XXXX',      required:true,  width:'half'},
         {id:'f7', type:'email',     label:'Email Address (No Gmail)', placeholder:'No Gmail',      required:true},
         {id:'f8', type:'heading',   label:'Programs & Position'},
-        {id:'f9', type:'checkbox',  label:'Program(s) Applying For', required:true, options:['Lifeline','Internet','ACA Health']},
+        {id:'f9', type:'checkbox',  label:'Program(s) Applying For', required:true, options:wmamProgramNames()},
         {id:'f10',type:'dropdown',  label:'Desired Position',   placeholder:'-- Select Position --', required:true, options:['Entry Level / Field Agent','Team Lead','Business Owner']},
         {id:'f11',type:'dropdown',  label:'How Did You Hear About Us?', placeholder:'-- Select --', required:true, options:['Agent Referral','Facebook Ad','Instagram Ad','Craigslist Ad','Google Ad','Company Email','Text Message','Walk In']},
         {id:'f12',type:'heading',   label:'Background & Availability'},
@@ -32543,7 +32600,7 @@ function fbDefaultForms(){
         {id:'t4', type:'email',    label:'Candidate Email',       placeholder:'Personal email',  required:true,  width:'half'},
         {id:'t5', type:'date',     label:'Training Date',         placeholder:'',                required:true,  width:'half'},
         {id:'t6', type:'time',     label:'Training Time',         placeholder:'',                required:true,  width:'half'},
-        {id:'t7', type:'checkbox', label:'Program(s) Training For', required:true, options:['Lifeline','Internet','ACA Health']},
+        {id:'t7', type:'checkbox', label:'Program(s) Training For', required:true, options:wmamProgramNames()},
         {id:'t8', type:'text',     label:'Training Location',     placeholder:'Address or TBD',  required:false},
         {id:'t9', type:'textarea', label:'Additional Notes',      placeholder:'Anything the candidate should know or bring...', required:false},
       ]
@@ -33896,7 +33953,7 @@ function panelReports() {
   function rptAgentActiveForProg(a, prog){
     var ac = a.agentCodes||{};
     var isLdrRole = ['Market Manager','Team Leader','Campaign Manager'].indexOf(a.role)>=0;
-    if(prog==='Lifeline') return isLdrRole || EXD(['TruConnect','Gen Mobile','Assurance','Excess']).some(function(c){ return !!(ac[c]&&ac[c].trim()); });
+    if(prog==='Lifeline') return isLdrRole || wmamCodeKeysFor('Lifeline').some(function(c){ return !!(ac[c]&&ac[c].trim()); });
     if(prog==='Internet') return isLdrRole || !!(ac['Chuzo']&&ac['Chuzo'].trim()) || !!(ac['Astound']&&ac['Astound'].trim());
     // Custom programs — check if agent has any code for campaigns under this program
     var campNames = WMAM_CAMPAIGNS.filter(function(c){ var wp=WMAM_PROGRAMS.find(function(p){return p.id===c.programId;}); return wp&&wp.name===prog&&c.active; }).map(function(c){return c.name;});
@@ -40990,6 +41047,12 @@ function _renderDenialBannersForCurrentUser(){
 }
 if(typeof window !== 'undefined') window._renderDenialBannersForCurrentUser = _renderDenialBannersForCurrentUser;
 function gotoPanel(id, params){
+  // v2026.09.29: 'agent-master-profile' links (buttons + notification clicks) used to
+  // land on the dashboard. Open the agent's profile (and tab) instead.
+  if(id === 'agent-master-profile' && typeof openAgentMasterProfile === 'function'){
+    var _aid = (params && typeof params === 'object') ? (params.agentId || params.id) : params;
+    if(_aid != null && _aid !== ''){ openAgentMasterProfile(isNaN(+_aid) ? _aid : +_aid); try{ if(params && params.openTab && typeof ampShowTab === 'function') setTimeout(function(){ ampShowTab(params.openTab); }, 0); }catch(e){} return; }
+  }
   // Calvin 2026-05-14: track current panel so realtime/polling can re-render it
   window._currentPanelId = id;
   // Calvin 2026-07-02: inactivity lock — a direct manager with open flags
@@ -41957,7 +42020,7 @@ function panelBO(){
       ? u.programs
       : (u.program&&u.program!==''?[u.program]:[]);
     // For Lifeline carriers, only show ones the agent is coded for
-    var LIFELINE_PROG_NAMES = EXD(['Lifeline','Gen Mobile','TruConnect','Assurance','Excess Telecom']);
+    var LIFELINE_PROG_NAMES = EXD(['Lifeline'].concat(wmamCodeKeysFor('Lifeline')));
     var sbProgs = [];
     // Add coded Lifeline carriers first
     codedForSB.forEach(function(c){ if(sbProgs.indexOf(c)<0) sbProgs.push(c); });
@@ -42252,7 +42315,7 @@ function panelBO(){
 
     // ── Rank within own program(s) — peer-to-peer only, coded agents only ──
     var myPrimaryProg = sbProgs[0]||'';
-    var LIFELINE_PROG_NAMES2 = EXD(['Lifeline','Gen Mobile','TruConnect','Assurance','Excess Telecom']);
+    var LIFELINE_PROG_NAMES2 = EXD(['Lifeline'].concat(wmamCodeKeysFor('Lifeline')));
     function baseProg(p){
       if(LIFELINE_PROG_NAMES2.indexOf(p)>=0) return 'Lifeline';
       return p;
@@ -42264,7 +42327,7 @@ function panelBO(){
       var aCodes = a.agentCodes||{};
       if(bp==='Lifeline'){
         // Must have at least one Lifeline carrier code
-        return EXD(['TruConnect','Gen Mobile','Assurance','Excess']).some(function(c){ return !!(aCodes[c]&&aCodes[c].trim()); })
+        return wmamCodeKeysFor('Lifeline').some(function(c){ return !!(aCodes[c]&&aCodes[c].trim()); })
           || ['Market Manager','Team Leader','Campaign Manager'].indexOf(a.role)>=0;
       }
       if(bp==='Internet'){
@@ -44164,7 +44227,7 @@ function _wmamProgramTotals(){
     function activeForProg(a,prog){
       var ac=a.agentCodes||{};
       var isLdr=['Market Manager','Team Leader','Campaign Manager'].indexOf(a.role)>=0;
-      if(prog==='Lifeline') return isLdr || (typeof EXD==='function'?EXD(['TruConnect','Gen Mobile','Assurance','Excess']):['TruConnect','Gen Mobile','Assurance','Excess']).some(function(c){return !!(ac[c]&&ac[c].trim());});
+      if(prog==='Lifeline') return isLdr || wmamCodeKeysFor('Lifeline').some(function(c){return !!(ac[c]&&ac[c].trim());});
       if(prog==='Internet') return isLdr || !!(ac['Chuzo']&&ac['Chuzo'].trim()) || !!(ac['Astound']&&ac['Astound'].trim());
       var campNames=WMAM_CAMPAIGNS.filter(function(c){ var wp=WMAM_PROGRAMS.find(function(p){return p.id===c.programId;}); return wp&&wp.name===prog&&c.active; }).map(function(c){return c.name;});
       if(campNames.length) return isLdr || campNames.some(function(cn){ return !!(ac[cn]&&ac[cn].trim()); });
@@ -44356,7 +44419,7 @@ function panelOwner(){
     if(p.indexOf('Lifeline')<0) return false;
     var ac=a.agentCodes||{};
     var isLdrRole=['Market Manager','Team Leader','Campaign Manager'].indexOf(a.role)>=0;
-    return isLdrRole||EXD(['TruConnect','Gen Mobile','Assurance','Excess']).some(function(c){return !!(ac[c]&&ac[c].trim());});
+    return isLdrRole||wmamCodeKeysFor('Lifeline').some(function(c){return !!(ac[c]&&ac[c].trim());});
   });
   var intAgents = salesActive.filter(function(a){
     var p=Array.isArray(a.programs)?a.programs:[a.program||''];
@@ -48745,7 +48808,7 @@ function panelOnboardTracking(){
   }
 
   // Group agents by program
-  ['Lifeline','Internet','ACA'].forEach(function(prog){
+  wmamProgramNames().forEach(function(prog){
     var inProg = DB.agents.filter(function(a){
       if(!a.active || isOwner(a)) return false;
       var ap = Array.isArray(a.programs) ? a.programs : (a.program?[a.program]:[]);
@@ -52881,7 +52944,7 @@ function panelGoalSettings(){
   var u = DB.current;
   if(!isOwner(u)) return '<div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Owner access only.</div>';
   var h = '<div class="bo-card"><div class="bo-card-head"><div class="bo-card-title">Goals & Minimums</div></div><div style="padding:20px">';
-  var progs = ['Lifeline','Internet','ACA'];
+  var progs = wmamProgramNames();
   progs.forEach(function(prog){
     var g = PROG_GOALS[prog]||{weeklyMin:1,weeklyGoal:6};
     h += '<div style="margin-bottom:16px;background:#fafafa;border:1px solid var(--border);border-radius:8px;padding:14px 18px">'
@@ -55113,7 +55176,7 @@ function panelOnboarding(){
   if(!allSales.length){
     h+='<div class="bo-card"><div style="padding:30px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">No active sales agents found.</div></div>';
   } else {
-    var progToCamps={Lifeline:EXD(['TruConnect','Gen Mobile','Assurance','Excess']),Internet:['Chuzo','Astound'],ACA:['ACA']};
+    var progToCamps={}; wmamProgramNames().forEach(function(p){ progToCamps[p]=wmamCodeKeysFor(p); });
     var typeColors={'standard':'#059669','custom-standard':'#fb923c','tribal':'#d97706','custom-tribal':'#b45309'};
     var typeLabels={'standard':'Standard','custom-standard':'Custom Std','tribal':'Tribal','custom-tribal':'Custom Tribal'};
 
@@ -55548,7 +55611,7 @@ function panelBgCheckQueue(){
   });
   h += '</select></div>';
   h += '<div><label class="f-label">Campaign</label><select id="bgSubmitCamp" class="f-select">';
-  var allCamps = EXD(['Gen Mobile','TruConnect','Assurance','Excess','Astound','Chuzo','ACA']);
+  var allCamps = wmamAllCodeKeys();
   if(typeof WMAM_CAMPAIGNS !== 'undefined' && Array.isArray(WMAM_CAMPAIGNS)){
     WMAM_CAMPAIGNS.forEach(function(c){
       if(c && c.active && c.name && allCamps.indexOf(c.name) < 0) allCamps.push(c.name);
@@ -55973,12 +56036,9 @@ function panelAgentsPending(){
     ensureProgram(prog).programWide.push({type:'legacy', data:a});
   });
 
-  var progOrder = ['Lifeline','Internet','ACA','Other'];
+  var progOrder = wmamProgramNames().concat(['Other']);
   var progColors = {Lifeline:'#FF8C5A',Internet:'#60A5FA',ACA:'#6EE7B7',Other:'#6b7280'};
-  var campOrder = {
-    Lifeline: EXD(['TruConnect','Gen Mobile','Assurance','Excess']),
-    Internet: ['Chuzo','Astound']
-  };
+  var campOrder = {}; wmamProgramNames().forEach(function(p){ campOrder[p] = wmamCodeKeysFor(p); });
 
   progOrder.forEach(function(prog){
     if(!byProgram[prog]) return;
@@ -56112,7 +56172,7 @@ function _renderLegacyPendingCard(agent){
   h += '</div>';
   h += '</div>';
   h += '<div style="display:flex;gap:6px;flex-wrap:wrap">';
-  h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+agent.id+'})" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">→ Open Profile</button>';
+  h += '<button onclick="openAgentMasterProfile('+agent.id+')" style="background:#7c3aed;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">→ Open Profile</button>';
   h += '<button onclick="_uiOverridePassLegacy('+agent.id+')" style="background:#16a34a;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">✓ Pass BG (Override)</button>';
   h += '</div>';
   h += '</div>';
@@ -56429,7 +56489,7 @@ function _openInviteApplicantModal(){
       .map(function(a){return '<option value="'+a.id+'">'+escHtml(a.name)+'</option>';}).join('');
   }
   // Campaign checkboxes for Lifeline (default selection state)
-  var lifelineCamps = EXD(['TruConnect','Gen Mobile','Assurance','Excess']);
+  var lifelineCamps = wmamCodeKeysFor('Lifeline');
   var h = '';
   h += '<div style="background:linear-gradient(135deg,#003594,#0050b3);color:white;padding:18px 22px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">';
   h += '<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:2px">📧 Invite New Applicant</div>';
@@ -56684,7 +56744,7 @@ function _uiShowAddPendingAgentModal(){
       return '<option value="'+r+'"'+sel+'>'+r+'</option>';
     }).join('');
   }
-  var lifelineCamps = EXD(['TruConnect','Gen Mobile','Assurance','Excess']);
+  var lifelineCamps = wmamCodeKeysFor('Lifeline');
 
   var h = '';
   h += '<div style="background:linear-gradient(135deg,#0e7490,#0891b2);color:white;padding:18px 22px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">';
@@ -57511,9 +57571,9 @@ function panelOnboardingActions(){
         h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+r.agentId+',openTab:\'documents\'})" style="background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">📥 Open Profile + Download Docs</button>';
         h += '<button onclick="gotoPanel(\'bg-check-queue\')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer">→ BG Queue</button>';
       } else if(stage === 'codes-pending'){
-        h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+r.agentId+'})" style="background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">🔑 Open Profile + Enter Codes</button>';
+        h += '<button onclick="openAgentMasterProfile('+r.agentId+')" style="background:#0891b2;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer;font-weight:700">🔑 Open Profile + Enter Codes</button>';
       } else {
-        h += '<button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+r.agentId+'})" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer">Open Profile</button>';
+        h += '<button onclick="openAgentMasterProfile('+r.agentId+')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:8px 14px;border-radius:5px;cursor:pointer">Open Profile</button>';
       }
       h += '</div>';
       h += '</div>';
@@ -60712,7 +60772,7 @@ function panelMarketBreakdown(){
         h += '<td style="padding:10px 14px;color:var(--muted);font-size:.78rem">'+_escapeHtml(holder.role)+'</td>';
         h += '<td style="padding:10px 14px"><span style="background:rgba(124,58,237,.1);color:#7c3aed;padding:3px 10px;border-radius:10px;font-weight:700">'+holder.total+'</span></td>';
         h += '<td style="padding:10px 14px;color:var(--muted);font-size:.78rem">'+campBreakdownStr+'</td>';
-        h += '<td style="padding:10px 14px"><button onclick="gotoPanel(\'agent-master-profile\',{agentId:'+holder.agentId+'})" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">View →</button></td>';
+        h += '<td style="padding:10px 14px"><button onclick="openAgentMasterProfile('+holder.agentId+')" style="background:white;border:1px solid var(--sand);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;padding:6px 12px;border-radius:4px;cursor:pointer">View →</button></td>';
         h += '</tr>';
       });
       h += '</tbody></table></div>';
@@ -69770,7 +69830,7 @@ function rankSnapshotToday(){
     var today = new Date().toISOString().slice(0,10);
     if(RANK_HISTORY[today]) return; // once per day
     var snap = {};
-    ['Lifeline','Internet','ACA'].forEach(function(pg){
+    wmamProgramNames().forEach(function(pg){
       var ranked = (DB.agents||[]).filter(function(a){
         if(!rankEligible(a)) return false;
         var ps = Array.isArray(a.programs)&&a.programs.length ? a.programs : [a.program||''];
@@ -70022,14 +70082,14 @@ function panelLB(){
   // ── Determine which program boards this user is allowed to see ──
   // Owner / Admin / Campaign Manager = all programs
   // Everyone else = only programs they are personally coded/assigned to
-  var RANK_PROGRAMS = ['Lifeline','Internet','ACA'];
+  var RANK_PROGRAMS = wmamProgramNames();
   var visiblePrograms;
   if(isFullAccess){
     visiblePrograms = RANK_PROGRAMS; // see everything
   } else {
     // Build from agent's programs array + carrier coding
     var uRawProgs = Array.isArray(u.programs)&&u.programs.length ? u.programs : (u.program?[u.program]:[]);
-    var LIFELINE_PROG_NAMES_LB = EXD(['Lifeline','Gen Mobile','TruConnect','Assurance','Excess Telecom']);
+    var LIFELINE_PROG_NAMES_LB = EXD(['Lifeline'].concat(wmamCodeKeysFor('Lifeline')));
     var uVisible = [];
     var isLeader = u.role==='Market Manager'||u.role==='Team Leader';
 
@@ -70070,7 +70130,7 @@ function panelLB(){
     var role = a.role||'';
     var isLdrRole = ['Market Manager','Team Leader','Campaign Manager'].indexOf(role)>=0;
     if(prog==='Lifeline'){
-      return isLdrRole || EXD(['TruConnect','Gen Mobile','Assurance','Excess']).some(function(c){ return !!(ac[c]&&ac[c].trim()); });
+      return isLdrRole || wmamCodeKeysFor('Lifeline').some(function(c){ return !!(ac[c]&&ac[c].trim()); });
     }
     if(prog==='Internet'){
       return isLdrRole || !!(ac['Chuzo']&&ac['Chuzo'].trim()) || !!(ac['Astound']&&ac['Astound'].trim());
@@ -76724,9 +76784,21 @@ function _buildAPProgramCampaigns(){
       if(!map[prog.name]) map[prog.name] = [];
       if(map[prog.name].indexOf(c.name) < 0) map[prog.name].push(c.name);
     });
+    // v2026.09.29: a program added in Owner Control shows everywhere right away (even with no campaigns yet);
+    // a program switched off in Owner Control disappears everywhere.
+    WMAM_PROGRAMS.forEach(function(p){ if(!p || !p.name) return; if(p.active === false){ delete map[p.name]; return; } if(!map[p.name]) map[p.name] = []; });
   }
   return map;
 }
+// ── One source of truth for program / campaign lists (Owner Control) ──
+function wmamProgramNames(){ try{ return Object.keys(_buildAPProgramCampaigns()); }catch(e){ return ['Lifeline','Internet','ACA']; } }
+function wmamCampaignsFor(prog){ try{ return (_buildAPProgramCampaigns()[prog]||[]).slice(); }catch(e){ return []; } }
+function wmamAllCampaigns(){ var out=[]; try{ var m=_buildAPProgramCampaigns(); Object.keys(m).forEach(function(k){ m[k].forEach(function(c){ if(out.indexOf(c)<0) out.push(c); }); }); }catch(e){} return out; }
+// Agent codes use short names for two carriers; include both spellings when matching codes
+var WMAM_CODE_ALIASES = { 'Assurance Wireless':'Assurance', 'Excess Telecom':'Excess', 'ACA Marketplace':'ACA' };
+function wmamCodeKeysFor(prog){ var out=[]; wmamCampaignsFor(prog).forEach(function(c){ if(out.indexOf(c)<0) out.push(c); var al=WMAM_CODE_ALIASES[c]; if(al && out.indexOf(al)<0) out.push(al); }); return (typeof EXD==='function') ? EXD(out) : out; }
+function wmamAllCodeKeys(){ var out=[]; wmamProgramNames().forEach(function(p){ wmamCodeKeysFor(p).forEach(function(c){ if(out.indexOf(c)<0) out.push(c); }); }); return out; }
+if(typeof window!=='undefined'){ Object.assign(window,{ wmamProgramNames:wmamProgramNames, wmamCampaignsFor:wmamCampaignsFor, wmamAllCampaigns:wmamAllCampaigns, wmamCodeKeysFor:wmamCodeKeysFor, wmamAllCodeKeys:wmamAllCodeKeys }); }
 if(typeof window !== 'undefined'){
   // Live getter — every access returns the freshly-merged map. This means
   // the moment Calvin adds a campaign in Owner Control, every panel that
