@@ -3724,7 +3724,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.09.29.0500';
+var BUILD_VERSION = '2026.09.29.0800';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14078,13 +14078,43 @@ async function gmPayLoadMine(){
 }
 // ── Office: every sale + paybacks + price list ─────────────────────────
 var GMSALES = { rows:[], filter:'all', loading:false };
+// v2026.09.29: "Paid Device Sales" = every phone sold through the payment link (PAID).
+function panelGmPaid(){
+  GMSALES.filter = 'paid'; GMSALES._title = 'PAID DEVICE SALES';
+  var h = panelGmSales();
+  GMSALES._title = null;
+  return h;
+}
+if(typeof window!=='undefined') window.panelGmPaid = panelGmPaid;
 function panelGmSales(){
   if(!canAccess(DB.current,'gm-sales')) return '<div style="padding:40px;text-align:center;color:#888">This screen is for the office.</div>';
+  GMSALES._titleWasPaid = !!GMSALES._title;
+  if(!GMSALES._title) GMSALES.filter = 'all';
   setTimeout(gmSalesLoad, 0);
   return '<div style="max-width:1100px;margin:0 auto;padding:12px">'
-    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.6rem;font-weight:800;color:#003594;letter-spacing:1px;margin-bottom:12px">\uD83D\uDCB3 GEN MOBILE SALES &amp; PAYBACKS</div>'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.6rem;font-weight:800;color:#003594;letter-spacing:1px;margin-bottom:4px">\uD83D\uDCB3 '+(GMSALES._title || 'GEN MOBILE SALES &amp; PAYBACKS')+'</div>'
+    + '<div id="gmSalesLive" style="font-size:.78rem;color:#16a34a;font-weight:700;margin-bottom:10px">\u25CF Live \u2014 new payments appear here automatically</div>'
     + '<div id="gmSalesBox"><div style="padding:30px;text-align:center;color:#888">Loading\u2026</div></div>'
     + (isOwner(DB.current) ? '<div id="gmPriceBox" style="margin-top:26px"></div>' : '') + '</div>';
+}
+var _gmSalesLiveT = null;
+function _gmSalesLiveTick(){
+  clearTimeout(_gmSalesLiveT);
+  _gmSalesLiveT = setTimeout(async function(){
+    if(!document.getElementById('gmSalesBox')) return;           // screen closed: stop
+    try{
+      var before = (GMSALES.rows||[]).filter(function(x){ return x.status==='paid'; }).length;
+      var r = await supaClient.from('gm_sales').select('*').order('created_at',{ascending:false}).limit(1000);
+      if(r && Array.isArray(r.data)){
+        GMSALES.rows = r.data;
+        var after = r.data.filter(function(x){ return x.status==='paid'; }).length;
+        var busy = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+        if(!busy) gmSalesRender();
+        if(after > before){ try{ if(typeof showToast==='function') showToast('\uD83D\uDCB3 New payment received'); }catch(e){} }
+      }
+    }catch(e){}
+    _gmSalesLiveTick();
+  }, 20000);
 }
 async function gmSalesLoad(){
   try{
@@ -14092,7 +14122,8 @@ async function gmSalesLoad(){
     GMSALES.rows = (r && r.data) || [];
   }catch(e){ GMSALES.rows = []; }
   gmSalesRender();
-  if(isOwner(DB.current)){ await gmPayLoadPricing(); gmPriceRender(); }
+  _gmSalesLiveTick();
+  if(isOwner(DB.current) && !GMSALES._titleWasPaid){ await gmPayLoadPricing(); gmPriceRender(); }
 }
 function gmSalesSetFilter(f){ GMSALES.filter = f; gmSalesRender(); }
 function gmSalesRender(){
@@ -14307,6 +14338,176 @@ function gmViewSignature(id){
 }
 if(typeof window!=='undefined'){ Object.assign(window, { gmPayCancel:gmPayCancel, gmPayCopyText:gmPayCopyText, gmViewSignature:gmViewSignature }); }
 
+
+// ══════════════════════════════════════════════════════════════════════
+//  INVENTORY EXPLORER — Calvin 2026-09-29 v0700
+//  Company -> campaign -> market -> person -> every IMEI / SIM, plus a
+//  search that finds any IMEI or ICCID (SIM) and shows its full story.
+// ══════════════════════════════════════════════════════════════════════
+var INVX = { campaign:null, market:null, holder:null, showSold:false, q:'' };
+function _invxPools(){
+  var out = [];
+  var add = function(arr, camp){ (Array.isArray(arr)?arr:[]).forEach(function(d){ if(d) out.push({ d:d, campaign: camp || d.campaign || 'Other' }); }); };
+  add(typeof GM_INVENTORY!=='undefined' ? GM_INVENTORY : [], 'Gen Mobile');
+  add(typeof TC_INVENTORY!=='undefined' ? TC_INVENTORY : [], 'TruConnect');
+  add(typeof AW_INVENTORY!=='undefined' ? AW_INVENTORY : [], 'Assurance Wireless');
+  add(typeof EX_INVENTORY!=='undefined' ? EX_INVENTORY : [], 'Excess Telecom');
+  add(typeof INVENTORY_DEVICES!=='undefined' ? INVENTORY_DEVICES : [], null);   // Legacy pool: DART etc. use their own label
+  return out;
+}
+function _invxIsSim(d){ return !String(d.imei||'').replace(/\D/g,'') || /\bsim\b|sim card/i.test(String(d.model||'')); }
+function _invxSold(d){ return d.status==='sold' || d.status==='activated' || !!d.soldAt; }
+function _invxGone(d){ return !!d.deletedAt || d.status==='deleted'; }
+function _invxHolderId(d){ return d.assignedTo != null ? d.assignedTo : (d.holderId != null ? d.holderId : null); }
+function _invxHasHolder(d){ return _invxHolderId(d) != null || !!String(d.holderName||'').trim(); }
+function _invxHolderName(d){
+  var id = _invxHolderId(d);
+  if(id != null){ var a = (DB.agents||[]).find(function(x){ return x && x.id === id; }); if(a) return a.name; if(d.holderName) return d.holderName; return 'Agent #'+id; }
+  return d.holderName || 'Warehouse (not assigned)';
+}
+function _invxDaysLeft(d){
+  if(!d.expiryDate) return null;
+  var t = new Date(String(d.expiryDate).slice(0,10)+'T12:00:00'), n = new Date(_ctToday()+'T12:00:00');
+  if(isNaN(t)) return null; return Math.round((t - n) / 86400000);
+}
+function _invxRows(){
+  return _invxPools().filter(function(x){ return !_invxGone(x.d) && (INVX.showSold || !_invxSold(x.d)); });
+}
+function _invxGroup(list, keyFn){
+  var m = {};
+  list.forEach(function(x){ var k = keyFn(x); if(!m[k]) m[k] = { key:k, total:0, phones:0, sims:0, assigned:0, available:0, sold:0, expiring:0 };
+    var g = m[k]; g.total++; if(_invxIsSim(x.d)) g.sims++; else g.phones++;
+    if(_invxSold(x.d)) g.sold++; else if(_invxHasHolder(x.d)) g.assigned++; else g.available++;
+    var dl = _invxDaysLeft(x.d); if(dl != null && dl <= 7 && !_invxSold(x.d)) g.expiring++; });
+  return Object.keys(m).map(function(k){ return m[k]; }).sort(function(a,b){ return b.total - a.total; });
+}
+function invxGo(level, val){
+  if(level==='top'){ INVX.campaign=null; INVX.market=null; INVX.holder=null; }
+  else if(level==='campaign'){ INVX.campaign=val; INVX.market=null; INVX.holder=null; }
+  else if(level==='market'){ INVX.market=val; INVX.holder=null; }
+  else if(level==='holder'){ INVX.holder=val; }
+  invxRender(); try{ window.scrollTo(0,0); }catch(e){}
+}
+function invxToggleSold(on){ INVX.showSold = !!on; invxRender(); }
+function panelInvExplorer(params){
+  if(params && params.campaign){ INVX.campaign = params.campaign; INVX.market = null; INVX.holder = null; }
+  else if(!params || !params.keep){ INVX.campaign = null; INVX.market = null; INVX.holder = null; }
+  setTimeout(invxRender, 0);
+  return '<div style="max-width:1100px;margin:0 auto;padding:12px">'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.6rem;font-weight:800;color:#003594;letter-spacing:1px">\uD83D\uDCE6 INVENTORY</div>'
+    + '<div style="display:flex;gap:8px;margin:10px 0 14px;flex-wrap:wrap">'
+    + '<input id="invxSearch" placeholder="Search any IMEI or SIM (ICCID)\u2026" autocomplete="off" inputmode="numeric" onkeydown="if(event.key===\'Enter\')invxSearch(this.value)" style="flex:1;min-width:220px;padding:12px 14px;border:2px solid #003594;border-radius:10px;font-size:16px">'
+    + '<button onclick="invxSearch(document.getElementById(\'invxSearch\').value)" style="padding:12px 18px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:800;cursor:pointer">\uD83D\uDD0D Search</button></div>'
+    + '<div id="invxSearchOut"></div><div id="invxBox"></div></div>';
+}
+function invxRender(){
+  var box = document.getElementById('invxBox'); if(!box) return;
+  var all = _invxRows(), esc = _escapeHtml;
+  var crumbs = ['<a href="javascript:void(0)" onclick="invxGo(\'top\')" style="color:#003594;font-weight:700">All inventory</a>'];
+  if(INVX.campaign) crumbs.push('<a href="javascript:void(0)" onclick="invxGo(\'campaign\','+JSON.stringify(INVX.campaign).replace(/"/g,'&quot;')+')" style="color:#003594;font-weight:700">'+esc(INVX.campaign)+'</a>');
+  if(INVX.market!=null) crumbs.push('<a href="javascript:void(0)" onclick="invxGo(\'market\','+JSON.stringify(INVX.market).replace(/"/g,'&quot;')+')" style="color:#003594;font-weight:700">'+esc(INVX.market)+'</a>');
+  if(INVX.holder!=null) crumbs.push('<span style="font-weight:700">'+esc(INVX.holder)+'</span>');
+  var h = '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px"><div style="font-size:.9rem">'+crumbs.join(' \u203A ')+'</div>'
+    + '<label style="font-size:.82rem;color:#444;cursor:pointer"><input type="checkbox" '+(INVX.showSold?'checked':'')+' onchange="invxToggleSold(this.checked)"> include sold</label></div>';
+  var scope = all.filter(function(x){ return (!INVX.campaign || x.campaign===INVX.campaign) && (INVX.market==null || (x.d.market||'(no market)')===INVX.market) && (INVX.holder==null || _invxHolderName(x.d)===INVX.holder); });
+  var sum = _invxGroup(scope, function(){ return 'all'; })[0] || {total:0,phones:0,sims:0,assigned:0,available:0,sold:0,expiring:0};
+  var card = function(k,v,c){ return '<div style="flex:1 1 130px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px"><div style="font-size:.7rem;font-weight:700;letter-spacing:1px;color:#666;text-transform:uppercase">'+k+'</div><div style="font-size:1.6rem;font-weight:800;color:'+(c||'#003594')+'">'+v+'</div></div>'; };
+  h += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'
+    + card(INVX.showSold?'Total (incl. sold)':'In stock', sum.total) + card('Phones', sum.phones, '#1d4ed8') + card('SIM cards', sum.sims, '#0f766e')
+    + card('With agents', sum.assigned, '#7c3aed') + card('Not assigned', sum.available, '#6b7280')
+    + (INVX.showSold ? card('Sold', sum.sold, '#16a34a') : '') + card('Expired or expiring \u2264 7 days', sum.expiring, sum.expiring?'#CC0000':'#6b7280') + '</div>';
+  var table = function(title, rows, onclick){
+    var th = function(t){ return '<th style="padding:9px 10px;text-align:left;white-space:nowrap;color:#fff!important;opacity:1;font-weight:700">'+t+'</th>'; };
+    var out = '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin:6px 0 8px">'+title+'</div>'
+      + '<div style="overflow-x:auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px"><table style="width:100%;border-collapse:collapse;font-size:.88rem;min-width:620px"><tr style="background:#003594;color:#fff">'
+      + th('')+th('Total')+th('Phones')+th('SIM cards')+th('With agents')+th('Not assigned')+(INVX.showSold?th('Sold'):'')+th('Expired / \u2264 7d')+'</tr>';
+    rows.forEach(function(g,i){
+      out += '<tr onclick="'+onclick(g.key)+'" style="cursor:pointer;border-top:1px solid #f0f0f0;background:'+(i%2?'#fafafa':'#fff')+'">'
+        + '<td style="padding:9px 10px;font-weight:700;color:#003594">'+esc(g.key)+' \u203A</td><td style="padding:9px 10px;font-weight:800">'+g.total+'</td><td style="padding:9px 10px">'+g.phones+'</td><td style="padding:9px 10px">'+g.sims+'</td>'
+        + '<td style="padding:9px 10px">'+g.assigned+'</td><td style="padding:9px 10px">'+g.available+'</td>'+(INVX.showSold?'<td style="padding:9px 10px">'+g.sold+'</td>':'')
+        + '<td style="padding:9px 10px;color:'+(g.expiring?'#CC0000':'#999')+';font-weight:'+(g.expiring?'800':'400')+'">'+g.expiring+'</td></tr>';
+    });
+    if(!rows.length) out += '<tr><td colspan="8" style="padding:20px;text-align:center;color:#888">Nothing here.</td></tr>';
+    return out + '</table></div>';
+  };
+  var q = function(v){ return JSON.stringify(v).replace(/"/g,'&quot;'); };
+  if(!INVX.campaign){
+    var _grads = {'Gen Mobile':'#003594,#1b56c9','TruConnect':'#0f6e56,#1d9e75','DART':'#0e7490,#22b8cf','Assurance Wireless':'#7c3aed,#a78bfa','Excess Telecom':'#b45309,#f59e0b'};
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px">'
+      + _invxGroup(scope, function(x){ return x.campaign; }).map(function(g){ var gr = _grads[g.key] || '#374151,#6b7280';
+          return '<div onclick="invxGo(\'campaign\','+q(g.key)+')" style="cursor:pointer;border-radius:14px;padding:14px 16px;color:#fff;background:linear-gradient(140deg,'+gr+');box-shadow:0 6px 16px rgba(0,0,0,.12)">'
+            + '<div style="font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;opacity:.9;font-weight:700">'+esc(g.key)+'</div>'
+            + '<div style="font-size:2rem;font-weight:800;line-height:1.1;margin-top:4px">'+g.total+'</div>'
+            + '<div style="font-size:.78rem;opacity:.92">'+g.phones+' phones \u00b7 '+g.sims+' SIMs</div></div>'; }).join('') + '</div>';
+    h += table('BY CAMPAIGN', _invxGroup(scope, function(x){ return x.campaign; }), function(k){ return 'invxGo(\'campaign\','+q(k)+')'; });
+  } else if(INVX.market==null){
+    h += table(esc(INVX.campaign).toUpperCase()+' \u2014 BY MARKET', _invxGroup(scope, function(x){ return x.d.market || '(no market)'; }), function(k){ return 'invxGo(\'market\','+q(k)+')'; });
+  } else if(INVX.holder==null){
+    h += table(esc(INVX.market).toUpperCase()+' \u2014 WHO HAS WHAT', _invxGroup(scope, function(x){ return _invxHolderName(x.d); }), function(k){ return 'invxGo(\'holder\','+q(k)+')'; });
+  } else {
+    var list = scope.slice().sort(function(a,b){ return (_invxIsSim(a.d)?1:0)-(_invxIsSim(b.d)?1:0) || String(a.d.imei||a.d.sim).localeCompare(String(b.d.imei||b.d.sim)); });
+    h += '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin:6px 0 8px">'+esc(INVX.holder).toUpperCase()+' \u2014 EVERY DEVICE ('+list.length+')</div>'
+      + '<div style="overflow-x:auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px"><table style="width:100%;border-collapse:collapse;font-size:.85rem;min-width:760px"><tr style="background:#003594;color:#fff;text-align:left">'
+      + ['Type','IMEI','SIM (ICCID)','Model','Status','Assigned','Expires','Sold'].map(function(t){ return '<th style="padding:8px 10px;white-space:nowrap;color:#fff!important;opacity:1;font-weight:700">'+t+'</th>'; }).join('') + '</tr>';
+    list.forEach(function(x,i){
+      var d = x.d, dl = _invxDaysLeft(d), exp = d.expiryDate ? String(d.expiryDate).slice(0,10)+(dl!=null&&!_invxSold(d)?' ('+(dl<0?'EXPIRED':dl+'d')+')':'') : '\u2014';
+      out = '<tr onclick="invxSearch('+q(String(d.imei||d.sim))+')" style="cursor:pointer;border-top:1px solid #f0f0f0;background:'+(i%2?'#fafafa':'#fff')+'">'
+        + '<td style="padding:8px 10px">'+(_invxIsSim(d)?'SIM':'Phone')+'</td><td style="padding:8px 10px;font-family:monospace">'+esc(d.imei||'\u2014')+'</td><td style="padding:8px 10px;font-family:monospace">'+esc(d.sim||'\u2014')+'</td>'
+        + '<td style="padding:8px 10px">'+esc(d.model||'')+'</td><td style="padding:8px 10px">'+esc(d.status||'')+'</td><td style="padding:8px 10px">'+esc(String(d.assignedDate||'').slice(0,10)||'\u2014')+'</td>'
+        + '<td style="padding:8px 10px;color:'+(dl!=null&&dl<=7&&!_invxSold(d)?'#CC0000':'inherit')+'">'+esc(exp)+'</td><td style="padding:8px 10px">'+(_invxSold(d)?esc(String(d.soldAt||'').slice(0,10)):'\u2014')+'</td></tr>';
+      h += out;
+    });
+    h += '</table></div><div style="font-size:.78rem;color:#666;margin-top:6px">Tap any device for its full history.</div>';
+  }
+  if(INVX.campaign && INVX.market==null){
+    var tool = {'Gen Mobile':'gm-inv2','TruConnect':'tc-inv2','Assurance Wireless':'aw-inv2','Excess Telecom':'ex-inv2','DART':'dart-inv2'}[INVX.campaign];
+    if(tool) h += '<div style="margin-top:12px"><button onclick="gotoPanel(\''+tool+'\')" style="padding:9px 14px;border:1px solid #003594;border-radius:8px;background:#fff;color:#003594;font-weight:700;cursor:pointer">Open '+esc(INVX.campaign)+' tools (transfers, uploads) \u2192</button></div>';
+  }
+  box.innerHTML = h;
+}
+async function invxSearch(raw){
+  var out = document.getElementById('invxSearchOut'); if(!out) return;
+  var qn = String(raw||'').replace(/[^0-9A-Za-z]/g,'').toUpperCase(), esc = _escapeHtml;
+  if(qn.length < 6){ out.innerHTML = '<div style="color:#CC0000;font-weight:700;margin-bottom:10px">Type at least 6 digits of the IMEI or SIM.</div>'; return; }
+  var inp = document.getElementById('invxSearch'); if(inp && inp.value !== raw) inp.value = raw;
+  var norm = function(v){ return String(v||'').replace(/[^0-9A-Za-z]/g,'').toUpperCase(); };
+  var hits = _invxPools().filter(function(x){ var i = norm(x.d.imei), s = norm(x.d.sim);
+    return i === qn || s === qn || (qn.length >= 8 && (i.indexOf(qn) >= 0 || s.indexOf(qn) >= 0)); });
+  hits.sort(function(a,b){ return (norm(b.d.imei)===qn||norm(b.d.sim)===qn) - (norm(a.d.imei)===qn||norm(a.d.sim)===qn); });
+  if(!hits.length){ out.innerHTML = '<div style="background:#fdecec;border:2px solid #CC0000;border-radius:10px;padding:12px;color:#CC0000;font-weight:700;margin-bottom:12px">No device found for \u201C'+esc(raw)+'\u201D in any company\u2019s inventory.</div>'; return; }
+  var row = function(k,v,c){ return (v==null||v==='') ? '' : '<div style="display:flex;gap:10px;padding:6px 0;border-bottom:1px solid #f3f4f6;font-size:.9rem"><div style="width:38%;color:#666">'+k+'</div><div style="flex:1;font-weight:700;color:'+(c||'#111')+';word-break:break-word">'+v+'</div></div>'; };
+  var html = '';
+  hits.slice(0,10).forEach(function(x){
+    var d = x.d, dl = _invxDaysLeft(d), sold = _invxSold(d), gone = _invxGone(d);
+    var status = gone ? 'REMOVED' : sold ? 'SOLD' : (_invxHasHolder(d) ? 'WITH AGENT (not sold)' : 'AVAILABLE (not assigned)');
+    var color = gone ? '#6b7280' : sold ? '#16a34a' : (_invxHasHolder(d) ? '#7c3aed' : '#1d4ed8');
+    var sale = null; try{ sale = _wmamFindSaleByImei(norm(d.imei)); }catch(e){}
+    html += '<div style="background:#fff;border:2px solid '+color+';border-radius:12px;padding:14px 16px;margin-bottom:12px">'
+      + '<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px"><div style="font-weight:800;font-size:1.05rem;color:#003594">'+esc(d.model|| (_invxIsSim(d)?'SIM card':'Device'))+'</div>'
+      + '<span style="background:'+color+';color:#fff;border-radius:999px;padding:3px 12px;font-size:.75rem;font-weight:800">'+status+'</span></div>'
+      + row('Campaign', esc(x.campaign)) + row('Type', _invxIsSim(d)?'SIM card':'Phone') + row('IMEI', esc(d.imei||'')) + row('SIM (ICCID)', esc(d.sim||'')) + row('Phone number', esc(d.msisdn||''))
+      + row('Market', esc(d.market||'(no market)')) + row(sold?'Held by (when sold)':'Held by', esc(_invxHolderName(d))) + row('Assigned on', esc(String(d.assignedDate||'').slice(0,10)))
+      + row('Expires', d.expiryDate ? esc(String(d.expiryDate).slice(0,10))+(dl!=null&&!sold?(dl<0?' \u2014 EXPIRED '+(-dl)+' days ago':' \u2014 '+dl+' days left'):'') : '', dl!=null&&dl<=7&&!sold?'#CC0000':null)
+      + (sold ? row('Sold on', esc(String(d.soldAt||'').slice(0,10))) + row('Sold by', esc(d.soldByAgentName||'')) + row('Order #', esc(d.soldOrderNumber||'')) + row('Customer', esc(d.customerName||'')) : '')
+      + (sale ? row('Counted as a sale', esc(sale.agentName)+' \u00b7 '+esc(sale.date)+' \u00b7 '+esc(sale.campaign||'')+(sale.source?' ('+esc(sale.source)+')':''), '#16a34a') : '')
+      + (gone ? row('Removed', esc(String(d.deletedAt||'').slice(0,10))+' by '+esc(d.deletedByName||'')+(d.deletedReason?' \u2014 '+esc(d.deletedReason):'')) : '')
+      + '<div id="invxPay_'+esc(norm(d.imei)||norm(d.sim))+'"></div></div>';
+  });
+  if(hits.length > 10) html += '<div style="color:#666;font-size:.85rem;margin-bottom:10px">Showing 10 of '+hits.length+' matches \u2014 type more digits to narrow it down.</div>';
+  out.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div style="font-weight:800;color:#003594">SEARCH RESULT'+(hits.length>1?'S ('+hits.length+')':'')+'</div><button onclick="document.getElementById(\'invxSearchOut\').innerHTML=\'\'" style="background:none;border:none;color:#003594;font-weight:700;cursor:pointer">Clear \u2715</button></div>' + html;
+  // payment-link record for the phone (if any)
+  hits.slice(0,10).forEach(async function(x){
+    var im = norm(x.d.imei); if(!im) return;
+    try{
+      var r = await supaClient.from('gm_sales').select('id,status,amount_charged,payer,agent_name,created_at,paid_at').eq('imei', im).order('created_at',{ascending:false}).limit(3);
+      var el = document.getElementById('invxPay_'+im); if(!el || !r || !Array.isArray(r.data) || !r.data.length) return;
+      el.innerHTML = r.data.map(function(s){ return row('Payment link (GM-'+s.id+')', esc(s.status.toUpperCase())+' \u00b7 '+_gmMoney(s.amount_charged)+' \u00b7 '+(s.payer==='customer'?'customer paid':'agent paid')+' \u00b7 '+esc(s.agent_name||'')+' \u00b7 '+esc(String(s.paid_at||s.created_at).slice(0,10)), s.status==='paid'?'#16a34a':null); }).join('');
+    }catch(e){}
+  });
+}
+function invxQuick(v){ v = String(v||'').trim(); if(!v) return; window._invxParams = null; gotoPanel('inv-explorer'); setTimeout(function(){ invxSearch(v); }, 60); }
+if(typeof window!=='undefined'){ Object.assign(window, { panelInvExplorer:panelInvExplorer, invxGo:invxGo, invxToggleSold:invxToggleSold, invxSearch:invxSearch, invxRender:invxRender, invxQuick:invxQuick }); }
+
 function canAccess(u, area){
   if(!u) return false;
   if(isOwner(u)) return true;  // Owner always has full access — permanent, never override
@@ -14333,6 +14534,8 @@ function canAccess(u, area){
     case 'owner-control':    return false;
     case 'gm-pay-link':      return !!u.active;
     case 'gm-sales':         return hasGrant('payroll') || hasGrant('inventory') || hasGrant('gm-pricelist');
+    case 'gm-paid':          return canAccess(u,'gm-sales');
+    case 'inv-explorer':     return hasGrant('inventory') || canAccess(u,'inventory');
     case 'owner':            return false;
     case 'settings':         return false;
     case 'alerts':           return false;
@@ -38835,6 +39038,7 @@ function buildNav(u){
     // Legacy data already in INVENTORY_DEVICES stays visible — only the
     // entry points that would create NEW legacy data are hidden.
     var invDrop = boDropBtn('inv-hub','📦 Inventory Hub')
+      +boDropBtn('inv-explorer','\uD83D\uDCE6 All Inventory & Search')
       +boDropBtn('inv-dashboard','📊 All Inventory (All Campaigns)')
       +boDropBtn('inv-my-inventory','📱 My Inventory & Transfer Tool')
       +boDropBtn('inv-requests','📋 Pending Requests')
@@ -38849,6 +39053,7 @@ function buildNav(u){
       +boDropBtn('imei-search','🔍 IMEI / SIM Search')
       +boDropBtn('sold-reports','💵 Sold Reports')
       +boDropBtn('gm-pay-link','\uD83D\uDCB3 GM Payment Link')
+      +(canAccess(u,'gm-sales') ? boDropBtn('gm-paid','\uD83D\uDCB3 Paid Device Sales') : '')
       +(canAccess(u,'gm-sales') ? boDropBtn('gm-sales','\uD83D\uDCB3 GM Sales & Paybacks') : '')
       +(canAccess(u,'gm-pricelist') ? boDropBtn('gm-pricelist','💲 GM Pricelist') : '')
       +'<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>';
@@ -40822,7 +41027,7 @@ function gotoPanel(id, params){
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
     'gm-pricelist':'GM Pricelist',
-    'gm-pay-link':'GM Payment Link','gm-sales':'GM Sales & Paybacks',
+    'gm-pay-link':'GM Payment Link','gm-sales':'GM Sales & Paybacks','gm-paid':'Paid Device Sales','inv-explorer':'Inventory',
     'inv-hub':'Inventory Hub',
     'aw-inventory':'Assurance Wireless Inventory','aw-upload':'Assurance Upload','aw-transfers':'Assurance Transfers',
     'aw-payfile':'Assurance Pay-File',
@@ -40860,7 +41065,7 @@ function gotoPanel(id, params){
     'inv-export':panelInvExport,'inv-my-inventory':panelMyInventory,
     'inv-distribute':panelDistribute,
     'inv-hub':panelInvHub,
-    'gm-pay-link':panelGmPayLink,'gm-sales':panelGmSales,
+    'gm-pay-link':panelGmPayLink,'gm-sales':panelGmSales,'gm-paid':panelGmPaid,'inv-explorer':function(){ return panelInvExplorer(window._invxParams||null); },
     'dart-scanner':panelDartScanner,
     'dart-inventory':panelDartInventory,
     // Calvin 2026-06-11 v2930: new DART-style carrier panels.
@@ -65848,6 +66053,10 @@ function panelInvHub(){
   };
   var sec = function(t, extra){ return '<div style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:3px;color:#7684a3;font-weight:700;margin:20px 0 10px;text-transform:uppercase">'+t+(extra||'')+'</div>'; };
   var h = panelHeader('📦 Inventory Hub');
+  // v2026.09.29: quick search - type any IMEI or SIM and jump straight to its full details
+  h += '<div style="display:flex;gap:8px;margin:0 0 16px;flex-wrap:wrap">'
+    + '<input id="invHubQuick" placeholder="Quick search: any IMEI or SIM (ICCID)\u2026" autocomplete="off" inputmode="numeric" onkeydown="if(event.key===\'Enter\')invxQuick(this.value)" style="flex:1;min-width:220px;padding:13px 15px;border:2px solid #003594;border-radius:12px;font-size:16px;background:#fff">'
+    + '<button onclick="invxQuick(document.getElementById(\'invHubQuick\').value)" style="padding:13px 20px;border:none;border-radius:12px;background:#003594;color:#fff;font-weight:800;cursor:pointer">\uD83D\uDD0D Search</button></div>';
   h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:4px">';
   h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:1px;color:#16213b">Everything inventory, one place</div>';
   h += '<div style="display:flex;gap:10px">';
@@ -65858,10 +66067,10 @@ function panelInvHub(){
   var grid = 'display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px';
   h += sec('Stock & Devices');
   h += '<div style="'+grid+'">'
-    + tile('inv-dashboard','📊','linear-gradient(140deg,#003594,#1b56c9)','All Inventory','every campaign')
+    + tile('inv-explorer','📊','linear-gradient(140deg,#003594,#1b56c9)','All Inventory','campaign \u203A market \u203A person')
     + tile('inv-my-inventory','📱','linear-gradient(140deg,#534ab7,#7f77dd)','My Inventory','+ transfer tool')
     + tile('sold-reports','💵','linear-gradient(140deg,#0f6e56,#1d9e75)','Sold Reports','archive + exports')
-    + tile('imei-search','🔍','linear-gradient(140deg,#993c1d,#d85a30)','IMEI / SIM Search','find any device')
+    + tile('inv-explorer','🔍','linear-gradient(140deg,#993c1d,#d85a30)','IMEI / SIM Search','full history of any device')
     + '</div>';
   h += sec('Requests & Transfers', needAction? ' <span style="background:#fdeaea;color:#a32d2d;border-radius:100px;padding:2px 10px;font-size:.62rem;margin-left:8px;letter-spacing:1px">'+needAction+' NEED ACTION</span>' : '');
   h += '<div style="'+grid+'">'
