@@ -3724,7 +3724,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.09.30.1600';
+var BUILD_VERSION = '2026.09.30.1700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15042,7 +15042,11 @@ function _gmHolderOf(d){ var id = d.assignedTo != null ? d.assignedTo : d.holder
 function wmamGMDates(d){
   var up = _gmIso(d.uploadedAt) || _gmIso(d.uploadDate) || _gmIso(d.assignedDate) || _gmIso(d.createdAt) || _ctToday();
   var vendor = _gmIso(d.vendorDueDate) || _gmIso(d.gmDueDate);
-  var company = _gmMinDate(vendor, _gmAddDays(up, 30));
+  // v2026.09.30: company expiration = the ACTUAL carrier (Gen Mobile) date. If the file has none, 30 days from upload.
+  var company = vendor || _gmAddDays(up, 30);
+  // Always keep at least a 21-day gap before the actual carrier date
+  var gapCap = vendor ? _gmAddDays(vendor, -21) : null;
+  var needsManual = !!(vendor && gapCap <= up && !d.chargeOverride);
   var holder = _gmHolderOf(d);
   var role = holder ? holder.role : '';
   var agentLevel = (role === 'Field Agent' || role === 'Team Leader');
@@ -15059,9 +15063,14 @@ function wmamGMDates(d){
   var ar = holder && GM_DATE_RULES.agents && GM_DATE_RULES.agents[holder.id];
   if(ar){ if(ar.date){ fixed = _gmIso(ar.date); } else if(ar.days){ days = +ar.days; fixed = null; } source = 'Custom for ' + holder.name; }
   if(d.chargeOverride){ fixed = _gmIso(d.chargeOverride); source = 'Custom date for this device'; }
-  var charge = _gmMinDate(company, fixed || _gmAddDays(base, days));
-  if(agentLevel && !d.chargeOverride) charge = _gmMinDate(charge, _gmAddDays(up, 30));   // never past the manager's 30 days
-  return { uploadedAt: up, companyExpiry: company, chargeDate: charge, source: source, holder: holder, receivedAt: received, holderKey: hid };
+  var charge;
+  if(d.chargeOverride){ charge = _gmMinDate(company, fixed); }
+  else {
+    charge = _gmMinDate(fixed || _gmAddDays(base, days), _gmAddDays(up, 30));   // nobody past 30 days from upload
+    if(gapCap) charge = _gmMinDate(charge, gapCap);                               // 21-day gap before the actual date
+    if(needsManual) source = 'NEEDS A DATE \u2014 within 21 days of the actual Gen Mobile expiration';
+  }
+  return { uploadedAt: up, companyExpiry: company, chargeDate: charge, source: source, holder: holder, receivedAt: received, holderKey: hid, needsManual: needsManual };
 }
 function wmamGMCost(d){
   if(d.deviceCost != null && d.deviceCost !== '') return +d.deviceCost;
@@ -15072,7 +15081,7 @@ function wmamGMCost(d){
 function wmamApplyGMDates(d){
   if(!d || d.deletedAt || d.status === 'sold' || d.soldAt) return d;
   var r = wmamGMDates(d);
-  d.uploadedAt = r.uploadedAt; d.uploadDate = r.uploadedAt; d.companyExpiry = r.companyExpiry; d.chargeDate = r.chargeDate;
+  d.uploadedAt = r.uploadedAt; d.uploadDate = r.uploadedAt; d.companyExpiry = r.companyExpiry; d.chargeDate = r.chargeDate; d.needsManualDate = !!r.needsManual;
   d.receivedAt = r.receivedAt; d.dateHolderId = r.holderKey || null;
   d.expiryDate = r.chargeDate; d.mmExpiresAt = r.chargeDate; d.tlExpiresAt = r.chargeDate; d.agentExpiresAt = r.chargeDate;
   var c = wmamGMCost(d); if(c != null && (d.deviceCost == null || d.deviceCost === '')) d.deviceCost = c;
@@ -15095,17 +15104,36 @@ function wmamDatePill(ymd){
 // upload preview: what each new device will get
 function wmamGMDatesPreview(list){
   if(!Array.isArray(list) || !list.length) return '';
-  var rows = list.slice(0, 60).map(function(d){ var r = wmamGMDates(d), c = wmamGMCost(d);
+  var flagged = [];
+  list.forEach(function(d, i){ var rr = wmamGMDates(d); if(rr.needsManual || d.chargeOverride && d._manualAtUpload) flagged.push(i); });
+  var shown = flagged.map(function(i){ return i; }).concat(list.map(function(_, i){ return i; }).filter(function(i){ return flagged.indexOf(i) < 0; })).slice(0, 80);
+  var rows = shown.map(function(idx){ var d = list[idx]; var r = wmamGMDates(d), c = wmamGMCost(d); var need = r.needsManual || (d.chargeOverride && d._manualAtUpload);
     return '<tr style="border-top:1px solid #f0f0f0"><td style="padding:6px 8px;font-family:monospace">'+_escapeHtml(d.imei||'')+'</td><td style="padding:6px 8px">'+_escapeHtml(d.model||'')+'</td>'
       + '<td style="padding:6px 8px">'+_escapeHtml(r.holder ? r.holder.name : (d.market ? d.market+' (market)' : 'Unassigned'))+'</td>'
-      + '<td style="padding:6px 8px">'+wmamDatePill(r.companyExpiry)+'</td><td style="padding:6px 8px">'+wmamDatePill(r.chargeDate)+'</td>'
+      + '<td style="padding:6px 8px">'+wmamDatePill(r.companyExpiry)+'</td><td style="padding:6px 8px">'+(need ? '<div style="color:#b91c1c;font-weight:800;font-size:.72rem;margin-bottom:3px">\u26A0 NEEDS A DATE</div><input type="date" data-gmidx="'+idx+'" value="'+(d.chargeOverride||'')+'" max="'+(r.companyExpiry||'')+'" onchange="wmamUploadSetDate('+idx+',this.value)" style="padding:5px;border:2px solid #b91c1c;border-radius:6px">' : wmamDatePill(r.chargeDate))+'</td>'
       + '<td style="padding:6px 8px">'+(c != null ? _gmMoney(c) : '\u2014')+'</td></tr>'; }).join('');
-  return '<div style="background:#fff;border:2px solid #003594;border-radius:10px;padding:12px;margin-bottom:12px">'
-    + '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin-bottom:4px">\uD83D\uDCC5 EXPIRATION &amp; CHARGE DATES FOR THIS UPLOAD</div>'
-    + '<div style="font-size:.8rem;color:#555;margin-bottom:8px">Company expiration = carrier date, max 30 days from today. Charge date: managers / markets 30 days from upload; team leaders 21 days and agents 14 days from the day they receive it, never past 30 days from upload (or custom dates).</div>'
+  var needBox = flagged.length ? '<div style="background:#fdecec;border:2px solid #b91c1c;border-radius:8px;padding:10px 12px;margin-bottom:10px"><div style="font-weight:800;color:#b91c1c">\u26A0 '+flagged.length+' device'+(flagged.length===1?'':'s')+' expire at Gen Mobile within 21 days \u2014 each needs a date before you can confirm</div>'
+      + '<div style="font-size:.8rem;color:#7f1d1d;margin:4px 0 8px">Pick a charge date for each one below (red boxes), or set them all at once:</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><input type="date" id="gmNeedAll" style="padding:6px;border:2px solid #b91c1c;border-radius:6px"><button onclick="wmamUploadSetAll(document.getElementById(\'gmNeedAll\').value)" style="padding:7px 12px;border:none;border-radius:6px;background:#b91c1c;color:#fff;font-weight:700;cursor:pointer">Set all '+flagged.length+' to this date</button></div></div>' : '';
+  return '<div id="gmDatesPreviewBox" style="background:#fff;border:2px solid #003594;border-radius:10px;padding:12px;margin-bottom:12px">'
+    + '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin-bottom:4px">\uD83D\uDCC5 EXPIRATION &amp; CHARGE DATES FOR THIS UPLOAD</div>' + needBox
+    + '<div style="font-size:.8rem;color:#555;margin-bottom:8px">Company expiration = the ACTUAL Gen Mobile date. Charge date: managers / markets 30 days from upload; team leaders 21 days and agents 14 days from the day they receive it; never past 30 days from upload, and always at least 21 days before the actual Gen Mobile date.</div>'
     + '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.8rem;min-width:640px"><tr style="text-align:left;background:#eef3ff"><th style="padding:6px 8px">IMEI</th><th style="padding:6px 8px">Model</th><th style="padding:6px 8px">Assigned to</th><th style="padding:6px 8px">Company expires</th><th style="padding:6px 8px">Charge date</th><th style="padding:6px 8px">Device cost</th></tr>'+rows+'</table></div>'
-    + (list.length > 60 ? '<div style="font-size:.75rem;color:#666;margin-top:4px">Showing 60 of '+list.length+'.</div>' : '') + '</div>';
+    + (list.length > 80 ? '<div style="font-size:.75rem;color:#666;margin-top:4px">Showing 80 of '+list.length+' (devices that need a date are always shown first).</div>' : '') + '</div>';
 }
+function wmamUploadSetDate(idx, v){
+  var p = window._gmPendingBatch; if(!p || !p.devices[idx]) return;
+  var d = p.devices[idx]; d.chargeOverride = v || null; d._manualAtUpload = !!v || d._manualAtUpload;
+}
+function wmamUploadSetAll(v){
+  if(!v){ alert('Pick a date first.'); return; }
+  var p = window._gmPendingBatch; if(!p) return; var n = 0;
+  p.devices.forEach(function(d){ var r = wmamGMDates(d); if(r.needsManual || (d._manualAtUpload)){ d.chargeOverride = v; d._manualAtUpload = true; n++; } });
+  document.querySelectorAll('#gmDatesPreviewBox input[data-gmidx]').forEach(function(i){ i.value = v; });
+  try{ showToast('Date set on '+n+' device'+(n===1?'':'s')); }catch(e){}
+}
+function wmamUploadMissingDates(devs){ return (devs||[]).filter(function(d){ return wmamGMDates(d).needsManual; }); }
+if(typeof window!=='undefined'){ Object.assign(window, { wmamUploadSetDate:wmamUploadSetDate, wmamUploadSetAll:wmamUploadSetAll, wmamUploadMissingDates:wmamUploadMissingDates }); }
 // ---- shared rules (saved for everyone) ----
 // Apply the date rules to every device on screen; the Inventory department's
 // browser also saves any corrections (only changed devices are sent).
@@ -19675,6 +19703,7 @@ function gmGetUnassignedDevices(market){
   return GM_INVENTORY.filter(function(d){ return d.market===market && d.status==='unassigned'; });
 }
 function gmDeviceDaysLeft(device){
+  if(device && device.needsManualDate) return null;
   if(device && device.chargeDate && typeof wmamDaysUntil==='function') return wmamDaysUntil(device.chargeDate);
   var u = DB.current;
   if(!u) return null;
@@ -19719,6 +19748,7 @@ function _invVendorExpiryHTML(device){
 }
 if(typeof window !== 'undefined'){ window._invVendorExpiryHTML=_invVendorExpiryHTML; window._invVendorDaysLeft=_invVendorDaysLeft; }
 function gmDaysLeftDisplay(device){
+  if(device && device.needsManualDate) return '<span style="color:#b45309;font-weight:700">Date coming from the office</span>';
   if(device && device.chargeDate && typeof wmamDatePill==='function') return wmamDatePill(device.chargeDate);
   var days = gmDeviceDaysLeft(device);
   if(days===null) return '<span style="color:var(--muted)">—</span>';
@@ -61875,6 +61905,8 @@ function gmProcessInventoryUpload(){
 function gmConfirmInventoryUpload(batchId){
   var pending = window._gmPendingBatch;
   if(!pending||pending.batchId!==batchId){ alert('Session expired. Please re-upload the file.'); return; }
+  // v2026.09.30: devices within 21 days of the actual Gen Mobile date must each have a date
+  try{ var _miss = wmamUploadMissingDates(pending.devices); if(_miss.length){ alert(_miss.length+' device'+(_miss.length===1?'':'s')+' expire at Gen Mobile within 21 days and still need a date.\n\nPick a date in the red boxes (or use "Set all") before confirming.\n\nFirst: '+_miss.slice(0,5).map(function(d){ return d.imei; }).join(', ')); var _b = document.getElementById('gmDatesPreviewBox'); if(_b && _b.scrollIntoView) _b.scrollIntoView({behavior:'smooth'}); return; } }catch(e){}
   pending.devices.forEach(function(d){ GM_INVENTORY.push(d); });
 
   // ── Calvin 2026-06-04: every recipient gets an acceptance-signature transfer ──
@@ -66820,7 +66852,8 @@ function panelCarrierInventory(campaign){
       var _dl = (typeof wmamDaysUntil==='function' && d.chargeDate) ? wmamDaysUntil(d.chargeDate) : null, _c = (typeof wmamExpColor==='function' && _dl!=null) ? wmamExpColor(_dl) : null;
       h += '<td style="padding:6px 10px;color:var(--muted);font-size:.76rem">'+(d.uploadedAt || d.uploadDate || '—')+'</td>';
       if(_seeCo) h += '<td style="padding:6px 10px;font-size:.76rem;color:#0e7490">'+(d.companyExpiry || '')+'</td>';
-      h += '<td style="padding:6px 10px;font-size:.76rem;font-weight:700">'+(d.chargeDate || d.expiryDate || '<em style="color:var(--muted)">not set</em>')+(d.chargeOverride?' <span style="font-size:.66rem;color:#555">(custom)</span>':'')+'</td>';
+      h += '<td style="padding:6px 10px;font-size:.76rem;font-weight:700">'+(d.needsManualDate ? '<span style="background:#fee2e2;color:#b91c1c;padding:2px 8px;border-radius:999px;font-weight:800">\u26A0 NEEDS A DATE</span>' : (d.chargeDate || d.expiryDate || '<em style="color:var(--muted)">not set</em>'))+(d.chargeOverride?' <span style="font-size:.66rem;color:#555">(custom)</span>':'')+'</td>';
+      if(d.needsManualDate){ _c = null; }
       h += '<td style="padding:6px 10px">'+(_c ? '<span style="display:inline-block;padding:2px 9px;border-radius:999px;background:'+_c.bg+';color:'+_c.fg+';font-weight:800;font-size:.74rem;white-space:nowrap">'+(_dl<0?'EXPIRED':_dl+' days')+'</span>' : '')+'</td>';
       h += '<td style="padding:6px 10px;text-align:right;white-space:nowrap">';
       if(isInv){
