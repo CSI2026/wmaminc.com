@@ -3724,7 +3724,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.09.30.1300';
+var BUILD_VERSION = '2026.09.30.1500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15037,18 +15037,28 @@ function wmamGMDates(d){
   var vendor = d.vendorDueDate ? String(d.vendorDueDate).slice(0,10) : null;
   var company = _gmMinDate(vendor, _gmAddDays(up, 30));
   var holder = _gmHolderOf(d);
-  var isAgentLevel = !!(holder && (holder.role === 'Field Agent' || holder.role === 'Team Leader'));
-  var days = isAgentLevel ? 21 : 30, source = isAgentLevel ? 'Agents & Team Leaders: 21 days from upload' : 'Markets: 30 days from upload', fixed = null;
+  var role = holder ? holder.role : '';
+  var agentLevel = (role === 'Field Agent' || role === 'Team Leader');
+  // Agents / Team Leaders count from the day THEY received it (never past the manager's 30 days)
+  var hid = holder ? String(holder.id) : '';
+  var received = (d.dateHolderId != null && String(d.dateHolderId) === hid && d.receivedAt) ? String(d.receivedAt).slice(0,10)
+               : (d.dateHolderId != null && String(d.dateHolderId) !== hid) ? _ctToday()
+               : String(d.receivedAt || d.assignedDate || up).slice(0,10);
+  var base = agentLevel ? received : up;
+  var days = role === 'Field Agent' ? 14 : (role === 'Team Leader' ? 21 : 30);
+  var source = role === 'Field Agent' ? 'Agents: 14 days from receiving it' : (role === 'Team Leader' ? 'Team Leaders: 21 days from receiving it' : 'Managers / markets: 30 days from upload'), fixed = null;
   var mr = d.market && GM_DATE_RULES.markets && GM_DATE_RULES.markets[d.market];
   if(mr){ if(mr.date) fixed = mr.date; else if(mr.days) days = +mr.days; source = 'Custom for market ' + d.market; }
   var ar = holder && GM_DATE_RULES.agents && GM_DATE_RULES.agents[holder.id];
   if(ar){ if(ar.date){ fixed = ar.date; } else if(ar.days){ days = +ar.days; fixed = null; } source = 'Custom for ' + holder.name; }
   if(d.chargeOverride){ fixed = String(d.chargeOverride).slice(0,10); source = 'Custom date for this device'; }
-  var charge = _gmMinDate(company, fixed || _gmAddDays(up, days));
-  return { uploadedAt: up, companyExpiry: company, chargeDate: charge, source: source, holder: holder };
+  var charge = _gmMinDate(company, fixed || _gmAddDays(base, days));
+  if(agentLevel && !d.chargeOverride) charge = _gmMinDate(charge, _gmAddDays(up, 30));   // never past the manager's 30 days
+  return { uploadedAt: up, companyExpiry: company, chargeDate: charge, source: source, holder: holder, receivedAt: received, holderKey: hid };
 }
 function wmamGMCost(d){
   if(d.deviceCost != null && d.deviceCost !== '') return +d.deviceCost;
+  if(d.campaign && d.campaign !== 'Gen Mobile' && GM_INVENTORY.indexOf(d) < 0) return (d.devCost != null && d.devCost !== '') ? +d.devCost : null;
   try{ var pd = gmFindDevice(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, d.model); if(pd) return +pd.full; }catch(e){}
   return (d.devCost != null && d.devCost !== '') ? +d.devCost : null;
 }
@@ -15056,6 +15066,7 @@ function wmamApplyGMDates(d){
   if(!d || d.deletedAt || d.status === 'sold' || d.soldAt) return d;
   var r = wmamGMDates(d);
   d.uploadedAt = r.uploadedAt; d.companyExpiry = r.companyExpiry; d.chargeDate = r.chargeDate;
+  d.receivedAt = r.receivedAt; d.dateHolderId = r.holderKey || null;
   d.expiryDate = r.chargeDate; d.mmExpiresAt = r.chargeDate; d.tlExpiresAt = r.chargeDate; d.agentExpiresAt = r.chargeDate;
   var c = wmamGMCost(d); if(c != null && (d.deviceCost == null || d.deviceCost === '')) d.deviceCost = c;
   return d;
@@ -15084,11 +15095,23 @@ function wmamGMDatesPreview(list){
       + '<td style="padding:6px 8px">'+(c != null ? _gmMoney(c) : '\u2014')+'</td></tr>'; }).join('');
   return '<div style="background:#fff;border:2px solid #003594;border-radius:10px;padding:12px;margin-bottom:12px">'
     + '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin-bottom:4px">\uD83D\uDCC5 EXPIRATION &amp; CHARGE DATES FOR THIS UPLOAD</div>'
-    + '<div style="font-size:.8rem;color:#555;margin-bottom:8px">Company expiration = carrier date, max 30 days from today. Charge date: agents &amp; team leaders 21 days, markets 30 days (or custom dates).</div>'
+    + '<div style="font-size:.8rem;color:#555;margin-bottom:8px">Company expiration = carrier date, max 30 days from today. Charge date: managers / markets 30 days from upload; team leaders 21 days and agents 14 days from the day they receive it, never past 30 days from upload (or custom dates).</div>'
     + '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.8rem;min-width:640px"><tr style="text-align:left;background:#eef3ff"><th style="padding:6px 8px">IMEI</th><th style="padding:6px 8px">Model</th><th style="padding:6px 8px">Assigned to</th><th style="padding:6px 8px">Company expires</th><th style="padding:6px 8px">Charge date</th><th style="padding:6px 8px">Device cost</th></tr>'+rows+'</table></div>'
     + (list.length > 60 ? '<div style="font-size:.75rem;color:#666;margin-top:4px">Showing 60 of '+list.length+'.</div>' : '') + '</div>';
 }
 // ---- shared rules (saved for everyone) ----
+// Apply the date rules to every device on screen; the Inventory department's
+// browser also saves any corrections (only changed devices are sent).
+function wmamNormalizeAllDates(){
+  var pools = { gm:GM_INVENTORY, tc:TC_INVENTORY, aw:AW_INVENTORY, ex:EX_INVENTORY, legacy:INVENTORY_DEVICES };
+  Object.keys(pools).forEach(function(k){ (pools[k]||[]).forEach(function(d){ try{ wmamApplyGMDates(d); }catch(e){} }); });
+  var u = DB.current;
+  if(u && (isOwner(u) || canAccess(u,'inventory'))){
+    Object.keys(pools).forEach(function(k){ if((pools[k]||[]).length){ try{ invDbUpsertDevices(k, pools[k]); }catch(e){} } });
+  }
+  try{ if(document.getElementById('invxBox')) invxRender(); }catch(e){}
+}
+if(typeof window!=='undefined') window.wmamNormalizeAllDates = wmamNormalizeAllDates;
 async function wmamGMRulesLoad(){
   try{ var r = await supaClient.from('app_settings').select('value').eq('key','gm_date_rules').maybeSingle(); var v = r && r.data && r.data.value ? JSON.parse(r.data.value) : null; if(v && typeof v === 'object'){ GM_DATE_RULES = { agents: v.agents||{}, markets: v.markets||{} }; } }catch(e){}
   return GM_DATE_RULES;
@@ -15112,7 +15135,7 @@ function gmDatesRender(){
   var agents = (DB.agents||[]).filter(function(a){ return a && a.active && !isOwner(a); }).sort(function(a,b){ return String(a.name).localeCompare(String(b.name)); });
   var markets = {}; GM_INVENTORY.forEach(function(d){ if(d && d.market) markets[d.market] = true; }); Object.keys(GM_DATE_RULES.markets||{}).forEach(function(m){ markets[m] = true; });
   var ruleTxt = function(r){ return r.date ? 'charge on '+r.date : 'charge '+r.days+' days after upload'; };
-  var h = '<div style="background:#eef3ff;border-radius:10px;padding:10px 12px;font-size:.86rem;margin:8px 0 14px"><b>Standard rules:</b> company expiration = carrier date, max <b>30 days</b> from upload \u00b7 agents &amp; team leaders charged <b>21 days</b> after upload \u00b7 markets charged <b>30 days</b> after upload \u00b7 never later than the company expiration.</div>';
+  var h = '<div style="background:#eef3ff;border-radius:10px;padding:10px 12px;font-size:.86rem;margin:8px 0 14px"><b>Standard rules (every campaign):</b> company expiration = carrier date, max <b>30 days</b> from upload \u00b7 <b>managers / markets 30 days</b> from upload \u00b7 <b>team leaders 21 days</b> and <b>agents 14 days</b> from the day they receive it (never past the manager\u2019s 30 days) \u00b7 never later than the company expiration.</div>';
   h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px">';
   var form = function(kind){
     var opts = kind==='agent' ? agents.map(function(a){ return '<option value="'+a.id+'">'+esc(a.name)+' ('+esc(a.role||'')+')</option>'; }).join('') : Object.keys(markets).sort().map(function(m){ return '<option>'+esc(m)+'</option>'; }).join('');
@@ -16069,7 +16092,7 @@ async function invDbUpsertDevices(poolKey, devices){
   var poolDef = INV_SYNC_POOLS.find(function(p){return p.key===poolKey;}) || {};
   var rows = [];
   var _sent = [];
-  if(poolKey === 'gm' && typeof wmamApplyGMDates === 'function'){ (devices || []).forEach(function(d){ try{ wmamApplyGMDates(d); }catch(e){} }); }
+  if(typeof wmamApplyGMDates === 'function'){ (devices || []).forEach(function(d){ try{ wmamApplyGMDates(d); }catch(e){} }); }
   (devices || []).forEach(function(d){
     if(!d) return;
     var _sig = _invSigOf(d);
@@ -16262,10 +16285,10 @@ if(typeof window!=='undefined'){
 // with what this screen has loaded. Any difference -> reload automatically.
 var _wmamInvVerifyAt = 0, _wmamInvVerifyRetried = false;
 async function wmamInvVerify(){
-  if(Date.now() - _wmamInvVerifyAt < 5000) return; _wmamInvVerifyAt = Date.now();
-  var el = document.getElementById('invxVerify'); var lv = document.getElementById('invxLive');
-  if(!el && lv){ el = document.createElement('span'); el.id = 'invxVerify'; lv.appendChild(el); }
-  if(!el || typeof supaClient==='undefined' || !supaClient) return;
+  var _put = function(html){ window._wmamInvVerifyHtml = html; var lv2 = document.getElementById('invxLive'); if(!lv2) return; var e2 = document.getElementById('invxVerify'); if(!e2){ e2 = document.createElement('span'); e2.id = 'invxVerify'; lv2.appendChild(e2); } e2.innerHTML = html; };
+  if(Date.now() - _wmamInvVerifyAt < 5000){ if(window._wmamInvVerifyHtml) _put(window._wmamInvVerifyHtml); return; } _wmamInvVerifyAt = Date.now();
+  var el = { set innerHTML(v){ _put(v); } };
+  if(typeof supaClient==='undefined' || !supaClient) return;
   var pools = {gm:GM_INVENTORY, tc:TC_INVENTORY, aw:AW_INVENTORY, ex:EX_INVENTORY, legacy:INVENTORY_DEVICES};
   var db = 0, screen = 0, bad = [];
   try{
@@ -16299,7 +16322,8 @@ async function invDbLoadAllFromTables(){
     _invSyncReplacePool(p.key, devices);
     counts[p.key] = devices.length;
   }
-  if(!failed){ window._invPathBReady = true; _wmamInvLiveAt = new Date(); try{ if(typeof wmamGMRulesLoad==='function') wmamGMRulesLoad(); }catch(e){} }
+  if(!failed){ window._invPathBReady = true; _wmamInvLiveAt = new Date();
+    try{ if(typeof wmamGMRulesLoad==='function') wmamGMRulesLoad().then(function(){ try{ wmamNormalizeAllDates(); }catch(e){} }); }catch(e){} }
   else { setTimeout(function(){ try{ wmamInvReloadLive(false); }catch(e){} }, 15000); }
   console.log('[invDbLoadAllFromTables] loaded:', counts, 'pathB ready:', window._invPathBReady);
   // Persist to localStorage so panels reading from the local cache get fresh data
