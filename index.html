@@ -2854,8 +2854,17 @@ async function saveAppSettingToSupabase(key, value){
   // Awaits the upsert and returns the outcome. Caller can check result.ok.
   // No more silent queueing.
   var payload = (typeof value === 'string') ? value : JSON.stringify(value);
+  // v2026.10.01: merge with what's in the database (by id) so one person's save never wipes another's work
+  try{
+    if(value && typeof value === 'object' && typeof wmamMergeShared === 'function'){
+      var _cur = await supaClient.from('app_settings').select('value').eq('key', key).maybeSingle();
+      var _srv = _cur && _cur.data ? _cur.data.value : null, _snap = (typeof _wmamSetSnap !== 'undefined') ? _wmamSetSnap[key] : null;
+      if(_srv != null && _srv !== payload && _srv !== _snap){ var _m = wmamMergeShared(_snap != null ? JSON.parse(_snap) : null, JSON.parse(_srv), value); _wmamApplyInPlace(value, _m); payload = JSON.stringify(_m); }
+    }
+  }catch(e){ console.warn('[saveAppSetting merge]', e); }
   try{
     var res = await supaClient.from('app_settings').upsert({ key: key, value: payload }, { onConflict: 'key' });
+    if(res && !res.error && typeof _wmamSetSnap !== 'undefined') _wmamSetSnap[key] = payload;
     if(res && res.error){
       console.error('[saveAppSetting] ✗ '+key+':', res.error.message || res.error);
       try{ _showSaveErrorBanner('Setting "'+key+'" failed to save: '+(res.error.message||res.error), function(){ saveAppSettingToSupabase(key, value); }); }catch(e){}
@@ -3780,7 +3789,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.01.1400';
+var BUILD_VERSION = '2026.10.01.1500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15744,6 +15753,7 @@ function wmamTeamInvData(user){
   var markets = {};
   var mkOf = function(k, name){ return markets[k] = markets[k] || { key:k, name:name || 'No market set', total:0, people:{} }; };
   var local = _wmamMktKey(user.team || user.market || '');
+  if(user.role === 'Market Manager' && S.marketBased && !S.markets[local]){ var _mk0 = Object.keys(S.markets)[0]; if(_mk0) local = _mk0; }   // MM's home = their assigned market
   S.available.forEach(function(d){
     try{ if(typeof wmamApplyGMDates === 'function') wmamApplyGMDates(d); }catch(e){}
     var k = _wmamMktKey(d.market) || 'nomarket', M = mkOf(k, d.market || 'No market set');
@@ -15752,12 +15762,15 @@ function wmamTeamInvData(user){
     P.devs.push(d); M.total++;
   });
   // add every active coded person in each market (zero inventory included)
+  var _placed = {}; Object.keys(markets).forEach(function(k){ Object.keys(markets[k].people).forEach(function(h){ _placed[h] = 1; }); });
   (S.roster||[]).forEach(function(a){
-    var k = _wmamMktKey(a.team) || (String(a.id)===String(user.id) ? (local || 'nomarket') : '');
+    if(_placed[String(a.id)]) return;                                   // already listed with their phones
+    var k = _wmamMktKey(a.team);
+    if(S.marketBased && !S.markets[k]) k = (String(a.id) === String(user.id)) ? local : '';   // outside this scope -> not listed (the manager goes in their own market)
+    if(!k) k = (String(a.id) === String(user.id)) ? (local || 'nomarket') : '';
     if(!k) return;
-    if(!markets[k] && !(String(a.id)===String(user.id))){ if(!S.markets[k]) return; }
     var M = mkOf(k, (S.markets && S.markets[k]) || a.team || 'No market set');
-    if(!M.people[String(a.id)]) M.people[String(a.id)] = { id:String(a.id), devs:[] };
+    M.people[String(a.id)] = { id:String(a.id), devs:[] }; _placed[String(a.id)] = 1;
   });
   var list = Object.keys(markets).map(function(k){ var M = markets[k];
     M.list = Object.keys(M.people).map(function(h){ var P = M.people[h];
@@ -17184,6 +17197,69 @@ if(typeof window !== 'undefined' && typeof window._sbNoteResult !== 'function'){
   };
 }
 
+
+// ══════════════════════════════════════════════════════════════════════
+//  SHARED OFFICE DATA SYNC — Calvin 2026-10-01 v1500
+//  Markets, inventory requests/transfers/batches, pickups, tickets, training…
+//  are shared lists in app_settings. BEFORE: every browser wrote its WHOLE
+//  copy on every save, so an older copy (e.g. 11 markets) wiped newer work
+//  (Makenzie's 14). NOW:
+//   • a list is written only if THIS browser changed it since it last synced
+//   • the write MERGES with what's in the database (by id): your edits win for
+//     the items you touched, everyone else's items are kept, deletions you made
+//     are honored, next-id counters never go backwards
+//   • live updates from other people are merged into memory as they happen
+// ══════════════════════════════════════════════════════════════════════
+var _wmamSetSnap = {};   // key -> JSON last known to match the database
+var _wmamSetRef  = {};   // key -> the live array/object in memory
+function _wmamIdOf(x){ return (x && typeof x === 'object') ? (x.id != null ? 'i:'+x.id : (x.key != null ? 'k:'+x.key : (x.imei ? 'm:'+x.imei : null))) : null; }
+function wmamMergeShared(base, server, mine){
+  if(Array.isArray(server) && Array.isArray(mine)){
+    var b = {}, s = {}, m = {}, order = [], seen = {}, noId = false;
+    (Array.isArray(base) ? base : []).forEach(function(x){ var k = _wmamIdOf(x); if(k) b[k] = JSON.stringify(x); });
+    server.forEach(function(x){ var k = _wmamIdOf(x); if(!k){ noId = true; return; } s[k] = x; if(!seen[k]){ seen[k] = 1; order.push(k); } });
+    mine.forEach(function(x){ var k = _wmamIdOf(x); if(!k){ noId = true; return; } m[k] = x; if(!seen[k]){ seen[k] = 1; order.push(k); } });
+    if(noId) return mine;                                        // plain lists: keep my version
+    var out = [];
+    order.forEach(function(k){
+      var inB = k in b, inS = k in s, inM = k in m;
+      if(inM && inS){ out.push(inB && JSON.stringify(m[k]) === b[k] ? s[k] : m[k]); }   // I changed it -> mine; else theirs
+      else if(inM && !inS){ if(!inB) out.push(m[k]); }            // new from me (if it was in base, someone else deleted it)
+      else if(!inM && inS){ if(!inB || JSON.stringify(s[k]) !== b[k]) out.push(s[k]); }   // new/changed by them (I deleted an unchanged one -> stays deleted)
+    });
+    return out;
+  }
+  if(typeof server === 'number' && typeof mine === 'number') return Math.max(server, mine);
+  if(server && mine && typeof server === 'object' && typeof mine === 'object' && !Array.isArray(server) && !Array.isArray(mine)){
+    var o = {}, bb = (base && typeof base === 'object') ? base : {};
+    Object.keys(server).forEach(function(k){ o[k] = server[k]; });
+    Object.keys(mine).forEach(function(k){ if(!(k in bb) || JSON.stringify(mine[k]) !== JSON.stringify(bb[k])) o[k] = mine[k]; });
+    Object.keys(bb).forEach(function(k){ if(!(k in mine) && JSON.stringify(server[k]) === JSON.stringify(bb[k])) delete o[k]; });
+    return o;
+  }
+  return mine;
+}
+function _wmamApplyInPlace(ref, val){
+  if(Array.isArray(ref) && Array.isArray(val)){ ref.length = 0; Array.prototype.push.apply(ref, val); return true; }
+  if(ref && val && typeof ref === 'object' && typeof val === 'object' && !Array.isArray(ref)){ Object.keys(ref).forEach(function(k){ delete ref[k]; }); Object.keys(val).forEach(function(k){ ref[k] = val[k]; }); return true; }
+  return false;
+}
+function wmamNoteServerSetting(key, rawValue){ if(rawValue != null) _wmamSetSnap[key] = String(rawValue); }
+// a live update from someone else
+function wmamOnRemoteSetting(key, rawValue){
+  var ref = _wmamSetRef[key]; if(rawValue == null) return;
+  var remote; try{ remote = JSON.parse(rawValue); }catch(e){ return; }
+  var base = null; try{ base = _wmamSetSnap[key] != null ? JSON.parse(_wmamSetSnap[key]) : null; }catch(e){}
+  if(key === 'markets' && Array.isArray(remote) && typeof MARKETS !== 'undefined'){ ref = ref || MARKETS; }
+  if(ref && typeof ref === 'object'){
+    var mineChanged = _wmamSetSnap[key] != null && JSON.stringify(ref) !== _wmamSetSnap[key];
+    var merged = mineChanged ? wmamMergeShared(base, remote, ref) : remote;
+    _wmamApplyInPlace(ref, merged);
+  }
+  _wmamSetSnap[key] = String(rawValue);
+}
+if(typeof window!=='undefined'){ Object.assign(window, { wmamMergeShared:wmamMergeShared, wmamNoteServerSetting:wmamNoteServerSetting, wmamOnRemoteSetting:wmamOnRemoteSetting, _wmamSetSnap:_wmamSetSnap }); }
+
 function saveInventory(localOnly){
   // Calvin 2026-07-01: localOnly=true writes localStorage but SKIPS all cloud
   // writes. Used by the realtime handler so a change RECEIVED from another
@@ -17326,12 +17402,23 @@ function saveInventory(localOnly){
       window._appSettingsWrite = {fails:0, pausedUntil:0, warned:false};
     }
     var pushKey = function(key, val){
-      try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
+      // v2026.10.01: only write what THIS browser changed, merged with the database (never overwrite others' work)
+      if(val && typeof val === 'object') _wmamSetRef[key] = val;
+      var _mine = JSON.stringify(val);
+      if(_wmamSetSnap[key] != null && _wmamSetSnap[key] === _mine) return;   // unchanged here -> nothing to write
       var st = window._appSettingsWrite;
-      if(Date.now() < st.pausedUntil){ return; } // breaker open — skip quietly
-      if(typeof window._sbIsDown === 'function' && window._sbIsDown()){ return; } // backend down — skip
+      if(Date.now() < st.pausedUntil){ return; }
+      if(typeof window._sbIsDown === 'function' && window._sbIsDown()){ return; }
+      try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
       try{
-        supaClient.from('app_settings').upsert({key:key, value:JSON.stringify(val)}, {onConflict:'key'})
+        supaClient.from('app_settings').select('value').eq('key', key).maybeSingle().then(function(cur){
+          var srvRaw = cur && cur.data ? cur.data.value : null, out = val;
+          if(srvRaw != null && srvRaw !== _wmamSetSnap[key] && srvRaw !== _mine){
+            try{ var _base = _wmamSetSnap[key] != null ? JSON.parse(_wmamSetSnap[key]) : null; out = wmamMergeShared(_base, JSON.parse(srvRaw), val); if(val && typeof val === 'object') _wmamApplyInPlace(val, out); }catch(e){ out = val; }
+          }
+          var _raw = JSON.stringify(out);
+          return supaClient.from('app_settings').upsert({key:key, value:_raw}, {onConflict:'key'}).then(function(res){ if(res && !res.error) _wmamSetSnap[key] = _raw; return res; });
+        })
           .then(function(res){
             if(res && res.error){ window._appSettingsWriteFail(key, res.error); if(window._sbNoteResult) window._sbNoteResult(res.error); }
             else { window._appSettingsWrite.fails = 0; window._appSettingsWrite.warned = false; if(window._sbNoteResult) window._sbNoteResult(null); }
@@ -22054,13 +22141,18 @@ function invDashSetStatusFilter(value){
 
 // v2026.10.01: a Market Manager's dashboard counts only devices in THEIR market(s) —
 // the same numbers Makenzie sees per market in the Inventory Center.
-function _wmamMktKey(m){ return String(m||'').toLowerCase().replace(/^team\s+/,'').replace(/[^a-z0-9]/g,''); }
+var _WMAM_STATES = {al:1,ak:1,az:1,ar:1,ca:1,co:1,ct:1,de:1,fl:1,ga:1,hi:1,id:1,il:1,in:1,ia:1,ks:1,ky:1,la:1,me:1,md:1,ma:1,mi:1,mn:1,ms:1,mo:1,mt:1,ne:1,nv:1,nh:1,nj:1,nm:1,ny:1,nc:1,nd:1,oh:1,ok:1,or:1,pa:1,ri:1,sc:1,sd:1,tn:1,tx:1,ut:1,vt:1,va:1,wa:1,wv:1,wi:1,wy:1,dc:1};
+// v2026.10.01: "Team Lafayette C LA" = "Lafayette C" = "lafayette c, LA" (drops 'Team' and state codes; keeps the A/B/C letter)
+function _wmamMktKey(m){ var w = String(m||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim().split(' ').filter(Boolean); if(w[0] === 'team') w.shift(); if(w.length > 1) w = w.filter(function(t, i){ return !(_WMAM_STATES[t] && i > 0); }); return w.join(''); }
 function wmamManagerMarkets(user, pool){
   var set = {}; if(!user) return set;
   var add = function(m){ var k = _wmamMktKey(m); if(k) set[k] = m; };
+  // 1. the market(s) this person is ASSIGNED to manage on the Markets screen — the source of truth
+  try{ (MARKETS||[]).forEach(function(m){ if(!m || m.active===false || !m.programs) return; Object.keys(m.programs).forEach(function(k){ var sec = m.programs[k]; if(sec && String(sec.mmId)===String(user.id)) add(m.name); }); }); }catch(e){}
+  if(Object.keys(set).length) return set;        // assigned markets only — never the whole city
+  // 2. fallback when not assigned on the Markets screen yet
   add(user.team); add(user.market);
-  try{ (MARKETS||[]).forEach(function(m){ if(!m || m.active===false || !m.programs) return; Object.keys(m.programs).forEach(function(k){ var sec = m.programs[k]; if(sec && String(sec.mmId)===String(user.id)){ add(m.name); add(m.city); } }); }); }catch(e){}
-  try{ (LIFELINE_TEAMS||[]).forEach(function(t){ if(t && t.active && String(t.marketManager)===String(user.id)){ add(t.market); add(t.name); } }); }catch(e){}
+  // (old Teams-screen links are NOT used to widen a manager's market — the Markets screen is the source of truth)
   (pool||[]).forEach(function(d){ if(!d) return; var h = (typeof deviceHolderId==='function' ? deviceHolderId(d) : null) || d.holderId; if(String(h)===String(user.id) && d.market) add(d.market); });
   return set;
 }
@@ -22114,7 +22206,7 @@ function wmamInvScope(user){
       add(user.team); add(user.market);
       (user.iboMarkets||[]).forEach(add);
       Object.keys(org).forEach(function(id){ var a = byId[id]; if(a && a.active !== false){ add(a.team); } });
-      try{ (MARKETS||[]).forEach(function(m){ if(!m || m.active===false || !m.programs) return; Object.keys(m.programs).forEach(function(k){ var s = m.programs[k]; if(s && (String(s.cmId)===String(user.id) || String(s.iboId)===String(user.id))){ add(m.name); add(m.city); } }); }); }catch(e){}
+      try{ (MARKETS||[]).forEach(function(m){ if(!m || m.active===false || !m.programs) return; Object.keys(m.programs).forEach(function(k){ var s = m.programs[k]; if(s && (String(s.cmId)===String(user.id) || String(s.iboId)===String(user.id))) add(m.name); }); }); }catch(e){}
       pool.forEach(function(d){ var h = _wmamHolderOf(d); if(h != null && org[String(h)] && d.market) add(d.market); });
     }
   }
@@ -24655,6 +24747,7 @@ async function loadFromSupabase(){
     if(settings){
       // Calvin 2026-05-14: app_settings load is direct now — no queue check needed
       settings.forEach(function(s){
+        try{ if(s && s.key) wmamNoteServerSetting(s.key, s.value); }catch(e){}
         if(s.key==='brevo_key' && s.value) BREVO_API_KEY=s.value;
         if(s.key==='prog_thresholds' && s.value){ try{PROG_THRESHOLDS=JSON.parse(s.value);}catch(e){} }
         if(s.key==='departments_cfg' && s.value){ try{var dc=JSON.parse(s.value);if(dc&&Array.isArray(dc))WMAM_DEPARTMENTS=dc;}catch(e){} }
@@ -24845,7 +24938,7 @@ async function loadFromSupabase(){
         if(s.key==='carrier_tickets'      && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) CARRIER_TICKETS = v;}catch(e){} }
         if(s.key==='ticket_nextid'        && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) TICKET_NEXT_ID = n;}catch(e){} }
         // Ship A8 — Markets roster
-        if(s.key==='markets'              && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) MARKETS = v;}catch(e){} }
+        if(s.key==='markets'              && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)){ var _loc = Array.isArray(MARKETS) ? MARKETS : []; var _ids = {}; v.forEach(function(m){ if(m && m.id != null) _ids[m.id] = 1; }); var _lost = _loc.filter(function(m){ return m && m.id != null && !_ids[m.id]; }); MARKETS = v.concat(_lost); if(_lost.length){ console.log('[markets] restoring '+_lost.length+' market(s) missing from the database'); setTimeout(function(){ try{ saveInventory(); }catch(e){} }, 2500); } } }catch(e){} }
         if(s.key==='market_nextid'        && s.value){ try{var v=JSON.parse(s.value); var n=parseInt(v,10); if(!isNaN(n)) MARKET_NEXT_ID = n;}catch(e){} }
         // ── Markets richer fields (marketManager, campaignManager, payModel) ──
         // The lifeline_teams TABLE only has limited columns (id, name, color, leader, etc).
@@ -25748,6 +25841,7 @@ function subscribeAgentsRealtime(){
       .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, function(payload){
         try{
           if(payload.new && payload.new.key){
+            try{ wmamOnRemoteSetting(payload.new.key, payload.new.value); }catch(e){ console.warn('[realtime merge]', e); }
             console.log('[realtime] app_setting "'+payload.new.key+'" updated');
             // Calvin 2026-06-08: if assigned_doc_status changed remotely,
             // re-load it into memory so this device's signed-status view
