@@ -80,6 +80,7 @@
   if(sess && sess.access_token && sess.user && sess.user.id){
     state.uid = sess.user.id; state.token = sess.access_token;
     var g = syncXhr('GET', '/rest/v1/wmam_store?select=key,value&limit=5000', null, sess.access_token);
+    if(g.status !== 200){ g = syncXhr('GET', '/rest/v1/wmam_store?select=key,value&limit=5000', null, sess.access_token); }   // v2026.10.01: one quick retry before going read-only
     if(g.status === 200){
       try{ JSON.parse(g.text).forEach(function(row){ if(row && row.key != null){ cache[row.key] = row.value; sent[row.key] = row.value; } }); }catch(e){}
       state.mode = 'cloud';
@@ -251,14 +252,26 @@
   window.addEventListener('pagehide', function(){ if(state.mode === 'cloud' && pending()) flush(); });
   window.addEventListener('online', function(){ if(pending()) flush(); });
   if(state.mode === 'readonly'){
-    window.addEventListener('DOMContentLoaded', function(){
+    var _wmamRO = (function(){
       try{
         var b = document.createElement('div');
         b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#CC0000;color:#fff;padding:10px;text-align:center;font:600 14px system-ui,sans-serif';
-        b.textContent = '\u26A0 Could not reach the server. Nothing you change will be saved. Refresh when you have signal.';
+        b.textContent = '\u26A0 Could not reach the server. Nothing you change will be saved. Reconnecting automatically\u2026';
         document.body.appendChild(b);
+        // v2026.10.01: keep trying; as soon as the server answers, reload so everything saves again
+        var _tries = 0;
+        var _retry = function(){
+          _tries++;
+          var tok = state.token; try{ var ss = JSON.parse(rGet.call(LS, AUTH) || 'null'); if(ss && ss.access_token) tok = ss.access_token; }catch(e){}
+          fetch(URL + '/rest/v1/wmam_store?select=key&limit=1', { headers: { apikey: KEY, Authorization: 'Bearer ' + (tok || KEY) } })
+            .then(function(r){ if(r.ok){ b.style.background = '#16a34a'; b.textContent = '\u2714 Reconnected \u2014 reloading\u2026'; setTimeout(function(){ location.reload(); }, 600); } else if(r.status === 401 || r.status === 403){ b.textContent = '\u26A0 Your login expired. Reloading so you can sign in again\u2026'; setTimeout(function(){ location.reload(); }, 1200); } else { setTimeout(_retry, Math.min(30000, 5000 + _tries*2000)); } })
+            .catch(function(){ setTimeout(_retry, Math.min(30000, 5000 + _tries*2000)); });
+        };
+        setTimeout(_retry, 4000);
+        window.addEventListener('online', function(){ setTimeout(_retry, 500); });
       }catch(e){}
     });
+    if(document.readyState === 'loading') window.addEventListener('DOMContentLoaded', _wmamRO); else _wmamRO();
   }
   if(state.mode === 'cloud' && pending()) schedule();
 })();
@@ -3767,7 +3780,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.01.1200';
+var BUILD_VERSION = '2026.10.01.1300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15375,7 +15388,10 @@ function wmamBackfillGMSales(){
 }
 if(typeof window!=='undefined') window.wmamBackfillGMSales = wmamBackfillGMSales;
 
+var _wmamUnameCleaned = false;
+function wmamNormalizeAllDatesAndNames(){ try{ if(!_wmamUnameCleaned && Array.isArray(DB.agents) && DB.agents.length){ _wmamUnameCleaned = true; var f = wmamCleanupUsernames(); if(f.length && typeof showToast === 'function') showToast('Fixed '+f.length+' username'+(f.length===1?'':'s')+' to first.last'); } }catch(e){} }
 function wmamNormalizeAllDates(){
+  try{ wmamNormalizeAllDatesAndNames(); }catch(e){}
   var pools = { gm:GM_INVENTORY, tc:TC_INVENTORY, aw:AW_INVENTORY, ex:EX_INVENTORY, legacy:INVENTORY_DEVICES };
   Object.keys(pools).forEach(function(k){ (pools[k]||[]).forEach(function(d){ try{ wmamApplyGMDates(d); }catch(e){} }); });
   var u = DB.current;
@@ -15713,15 +15729,13 @@ if(typeof window!=='undefined'){ Object.assign(window, { WMAM_TI_OPEN:WMAM_TI_OP
 //  check status is NOT changed. The ONLY signature required at login is the
 //  Gen Mobile Pay Link agreement (agents who already signed it are not asked again).
 // ══════════════════════════════════════════════════════════════════════
-function wmamPendingAgents(){ return (DB.agents||[]).filter(function(a){ return a && a.active !== false && (a.pendingAgent === true || /\.pending$/i.test(String(a.username||''))); }); }
+function wmamPendingAgents(){ return (DB.agents||[]).filter(function(a){ return a && a.active !== false && (a.pendingAgent === true || /pending/i.test(String(a.username||''))); }); }
 async function wmamGrantLoginNow(ids){
   var me = DB.current || {}; if(!(isOwner(me) || canEditAgentProfiles(me))){ alert('Only the owner and office staff can do this.'); return []; }
   var out = [];
   (ids||[]).forEach(function(id){
     var a = (DB.agents||[]).find(function(x){ return x && String(x.id) === String(id); }); if(!a) return;
-    var base = String(a.username||'').replace(/\.pending$/i,'') || String(a.email||'').split('@')[0] || String(a.name||'agent').toLowerCase().replace(/[^a-z0-9]+/g,'.');
-    base = base.toLowerCase().replace(/[^a-z0-9.\-_]/g,'') || ('agent'+a.id);
-    var uname = base, n = 1; while((DB.agents||[]).some(function(x){ return x && x !== a && String(x.username||'').toLowerCase() === uname; })) uname = base + '.' + (++n);
+    var uname = _wmamBadUsername(a) ? wmamMakeUsername(a.name, a.id) : a.username;
     var pw = 'wmam' + Math.floor(10000 + Math.random()*89999) + '!';
     a.pendingAgent = false; a.username = uname; a.password = pw;
     try{ if(a.depts && a.depts._meta) delete a.depts._meta.pendingAgent; }catch(e){}
@@ -15754,6 +15768,55 @@ async function wmamGrantAllPending(){
   try{ if(typeof renderCurrentPanel==='function') renderCurrentPanel(); }catch(e){}
 }
 if(typeof window!=='undefined'){ Object.assign(window, { wmamPendingAgents:wmamPendingAgents, wmamGrantLoginNow:wmamGrantLoginNow, wmamGrantAllPending:wmamGrantAllPending, wmamShowGrantedLogins:wmamShowGrantedLogins }); }
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  USERNAMES — Calvin 2026-10-01 v1300
+//  Always first.last (lowercase). If that's taken: first.last.01, .02 …
+//  NEVER ".pending" or anything else in a username — pending is a status,
+//  kept separately, and never shown in the username.
+// ══════════════════════════════════════════════════════════════════════
+function wmamMakeUsername(name, excludeId){
+  var parts = String(name||'').trim().toLowerCase().replace(/[^a-z\s'-]/g,' ').replace(/['-]/g,'').split(/\s+/).filter(Boolean);
+  var base = parts.length >= 2 ? (parts[0] + '.' + parts[parts.length-1]) : (parts[0] || 'agent');
+  base = base.replace(/[^a-z.]/g,'') || 'agent';
+  var taken = function(u){ return (DB.agents||[]).some(function(a){ return a && String(a.id) !== String(excludeId) && String(a.username||'').toLowerCase() === u; }); };
+  if(!taken(base)) return base;
+  for(var n = 1; n < 100; n++){ var c = base + '.' + (n < 10 ? '0' + n : String(n)); if(!taken(c)) return c; }
+  return base + '.' + Date.now().toString().slice(-4);
+}
+function _wmamBadUsername(a){ var u = String(a && a.username || ''); return !u || /pending/i.test(u); }
+// Office/owner browser: fix any username that has "pending" in it (or is blank) → first.last
+function wmamCleanupUsernames(){
+  var me = DB.current; if(!me || !(isOwner(me) || (typeof isOfficeRole === 'function' && isOfficeRole(me)))) return [];
+  var fixed = [];
+  (DB.agents||[]).forEach(function(a){
+    if(!a || !a.name || !_wmamBadUsername(a)) return;
+    var old = a.username || '';
+    a.username = wmamMakeUsername(a.name, a.id);
+    try{ saveAgentToSupabase(a); }catch(e){}
+    fixed.push({ id:a.id, name:a.name, from:old, to:a.username });
+  });
+  if(fixed.length){ try{ saveToStorage(); }catch(e){} console.log('[wmamCleanupUsernames] fixed', fixed); }
+  return fixed;
+}
+// Approved (background check passed or office approval) → access right away
+function wmamEnsureAccess(a, why){
+  if(!a || a.active === false) return null;
+  a.pendingAgent = false;
+  try{ if(a.depts && a.depts._meta) delete a.depts._meta.pendingAgent; }catch(e){}
+  if(_wmamBadUsername(a)) a.username = wmamMakeUsername(a.name, a.id);
+  if(!a.authUserId){
+    var pw = 'wmam' + Math.floor(10000 + Math.random()*89999) + '!';
+    a.password = pw;
+    try{ saveAgentToSupabase(a); }catch(e){}
+    try{ if(a.email && typeof notifyByEmail === 'function'){ var origin = (location.origin||'https://wmaminc.com') + '/'; notifyByEmail({ toAgent:{id:a.id,name:a.name,email:a.email}, eventType:'agent.login_ready', payload:{ firstName:(a.name||'').split(' ')[0], fullName:a.name, username:a.username, tempPassword:pw, loginUrl:origin+'#login', appUrl:origin } }); } }catch(e){}
+    return { id:a.id, name:a.name, email:a.email||'', username:a.username, password:pw };
+  }
+  try{ saveAgentToSupabase(a); }catch(e){}
+  return { id:a.id, name:a.name, email:a.email||'', username:a.username, password:null };
+}
+if(typeof window!=='undefined'){ Object.assign(window, { wmamMakeUsername:wmamMakeUsername, wmamCleanupUsernames:wmamCleanupUsernames, wmamEnsureAccess:wmamEnsureAccess }); }
 
 function canAccess(u, area){
   if(!u) return false;
@@ -27424,6 +27487,7 @@ function bgDecide(agentId, campaign, newStatus, opts){
   }
 
   // Persist
+  if(newStatus === 'passed'){ try{ var _acc = wmamEnsureAccess(agent, 'bg-passed'); if(_acc && _acc.password && typeof wmamShowGrantedLogins === 'function') wmamShowGrantedLogins([_acc]); }catch(e){ console.warn('[bgDecide] access', e); } }
   try { if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); } catch(e){}
   try { if(typeof saveToStorage === 'function') saveToStorage(); } catch(e){}
 
@@ -28339,12 +28403,8 @@ function approveApplicant(applicantId){
   var u = DB.current || {};
 
   // Generate a username from name + email if not already in use
-  var baseUsername = (app.email.split('@')[0] || app.name.toLowerCase().replace(/\s+/g,'.')).replace(/[^a-z0-9.\-_]/g,'');
+  var baseUsername = wmamMakeUsername(app.name, app.linkedAgentId || null);
   var username = baseUsername;
-  var n = 1;
-  while((DB.agents||[]).some(function(a){return a && a.username === username;})){
-    username = baseUsername + '.' + (++n);
-  }
   // Generate temp password
   var tempPw = 'wmam' + Math.floor(Math.random()*100000) + '!';
 
@@ -34008,10 +34068,8 @@ function autoGenCreds(){
       setTimeout(function(){if(el){el.style.border='';el.placeholder='First Last';}},2500);}
     return;
   }
-  var base=name.toLowerCase().replace(/[^a-z ]/g,'').split(' ').join('.');
-  var uname=base; var i=1;
   var eid=parseInt((document.getElementById('aaId')||{value:'0'}).value||'0');
-  while(DB.agents.find(function(a){return a.username===uname&&a.id!==eid;})){ uname=base+i; i++; }
+  var uname=wmamMakeUsername(name, eid);
   var chars='ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#';
   var pw=''; for(var j=0;j<10;j++) pw+=chars[Math.floor(Math.random()*chars.length)];
   var unEl=document.getElementById('aaUser');
@@ -57884,21 +57942,8 @@ function _createPendingAgentRecord(opts){
   // guard still blocks login via the pendingAgent flag, so this username
   // can't actually be used to sign in. On approval, approveApplicant
   // regenerates the proper username from the applicant's email.
-  var baseUsername;
-  if(opts.email && opts.email.trim()){
-    baseUsername = opts.email.trim().toLowerCase().split('@')[0]
-      .replace(/[^a-z0-9.\-_]/g,'');
-  } else {
-    baseUsername = opts.name.trim().toLowerCase().replace(/\s+/g,'.')
-      .replace(/[^a-z0-9.\-_]/g,'');
-  }
-  if(!baseUsername) baseUsername = 'pending';
-  baseUsername = baseUsername + '.pending';
-  var pendingUsername = baseUsername;
-  var n = 1;
-  while((DB.agents||[]).some(function(a){return a && a.username === pendingUsername;})){
-    pendingUsername = baseUsername + '.' + (++n);
-  }
+  // v2026.10.01: username is ALWAYS first.last (never '.pending' — pending is a separate status)
+  var pendingUsername = wmamMakeUsername(opts.name, null);
 
   var newAgent = {
     id:                nextId,
@@ -78790,9 +78835,7 @@ function apMaybeAutoFillUsername(){
   if(!nm) { apFormSetIdentity(); return; }
   var parts = nm.split(/\s+/);
   if(parts.length < 2){ apFormSetIdentity(); return; }
-  var firstName = parts[0].toLowerCase().replace(/[^a-z0-9]/g,'');
-  var lastName  = parts.slice(1).join('').toLowerCase().replace(/[^a-z0-9]/g,'');
-  if(firstName && lastName) userEl.value = firstName + '.' + lastName;
+  userEl.value = wmamMakeUsername(nm, null);
   apFormSetIdentity();
 }
 
