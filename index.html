@@ -3767,7 +3767,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.01.0700';
+var BUILD_VERSION = '2026.10.01.0900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13886,6 +13886,33 @@ function gmComputeSale(pricing, input){
 var GMPAY = { pricing: null, imei:'', model:'', invModel:'', lookup:'', lookupFor:'', planId:'', payer:'', custPrice:'', custPhone:'', initials:'', busy:false, result:null, err:'' };
 function _gmPayEsc(v){ return (typeof _escapeHtml==='function') ? _escapeHtml(v==null?'':String(v)) : String(v==null?'':v); }
 function _gmMoney(x){ return '$'+(Number(x)||0).toFixed(2); }
+
+// v2026.10.01 911 FIX: server functions are called with ONLY the standard headers they accept.
+// (The extra page-version header the database uses was being sent to the Pay Link function too;
+// the browser blocked the request: "Failed to send a request to the Edge Function".)
+// Also retries once on a network hiccup and shows a clear message instead of hanging.
+async function wmamInvoke(name, opts){
+  var body = (opts && opts.body) || {};
+  var token = null;
+  try{ var ses = await supaClient.auth.getSession(); token = ses && ses.data && ses.data.session && ses.data.session.access_token; }catch(e){}
+  var url = (typeof SUPA_URL !== 'undefined' ? SUPA_URL : '') + '/functions/v1/' + name;
+  var headers = { 'Content-Type':'application/json', 'apikey': SUPA_KEY, 'Authorization': 'Bearer ' + (token || SUPA_KEY) };
+  var lastErr = null;
+  for(var attempt = 0; attempt < 2; attempt++){
+    try{
+      var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var to = ctl ? setTimeout(function(){ try{ ctl.abort(); }catch(e){} }, 30000) : null;
+      var r = await fetch(url, { method:'POST', headers: headers, body: JSON.stringify(body), signal: ctl ? ctl.signal : undefined });
+      if(to) clearTimeout(to);
+      var data = null; try{ data = await r.json(); }catch(e){}
+      if(!r.ok){ return { data: data, error: { message: (data && data.error) || ('Server returned '+r.status), context: { status: r.status } } }; }
+      return { data: data, error: null };
+    }catch(e){ lastErr = e; await new Promise(function(res){ setTimeout(res, 800); }); }
+  }
+  return { data: null, error: { message: 'Could not reach the payment server. Check the internet connection and try again.', cause: lastErr } };
+}
+if(typeof window!=='undefined') window.wmamInvoke = wmamInvoke;
+
 async function gmPayLoadPricing(){
   if(GMPAY.pricing) return GMPAY.pricing;
   if(GMPAY.token){ GMPAY.pricing = GMPAY.tokenPricing || GM_SALE_PRICING_DEFAULT; return GMPAY.pricing; }
@@ -14137,7 +14164,7 @@ async function gmPayCreate(){
   if(!/^[A-Za-z]{2,4}$/.test(String(GMPAY.initials||''))){ GMPAY.err = 'Read the required notice and enter your initials before creating the link.'; gmPayRender(); try{ document.getElementById('gmPayInitials').focus(); }catch(e){} return; }
   GMPAY.busy = true; GMPAY.err = ''; gmPayRender();
   try{
-    var res = await supaClient.functions.invoke('gm-pay-link', { body: { imei: d, planId: GMPAY.planId || null, payer: GMPAY.payer,
+    var res = await wmamInvoke('gm-pay-link', { body: { imei: d, planId: GMPAY.planId || null, payer: GMPAY.payer,
       customerPhonePrice: GMPAY.payer==='customer' ? Number(GMPAY.custPrice) : null, customerPhone: GMPAY.custPhone || null, customerEmail: GMPAY.custEmail || null, ackInitials: String(GMPAY.initials).toUpperCase(), payToken: GMPAY.token || undefined } });
     var data = res && res.data, err = res && res.error;
     if(err){ try{ var j = err.context && typeof err.context.json==='function' ? await err.context.json() : null; GMPAY.err = (j && j.error) || String(err.message||err); }catch(e){ GMPAY.err = String(err.message||err); } }
@@ -14154,7 +14181,7 @@ function _gmStatusChip(s){
 async function gmPayLoadMine(){
   var el = document.getElementById('gmPayMine'); if(!el || (!DB.current && !GMPAY.token)) return;
   try{
-    var r = GMPAY.token ? await (async function(){ var x = await supaClient.functions.invoke('gm-pay-link', { body: { payToken: GMPAY.token, action:'list' } }); return { data: x && x.data && x.data.sales }; })()
+    var r = GMPAY.token ? await (async function(){ var x = await wmamInvoke('gm-pay-link', { body: { payToken: GMPAY.token, action:'list' } }); return { data: x && x.data && x.data.sales }; })()
                         : await supaClient.from('gm_sales').select('*').eq('agent_id', DB.current.id).order('created_at',{ascending:false}).limit(500);
     var allRows = (r && r.data) || [];
     var rows = allRows.slice(0, 20);
@@ -14434,7 +14461,7 @@ if(typeof window!=='undefined'){ window.gmSignPageHandle = gmSignPageHandle; set
 async function gmPayCancel(id){
   if(!confirm('Cancel this unpaid order? The payment link will stop working.')) return;
   try{
-    var res = await supaClient.functions.invoke('gm-pay-link', { body: { action:'cancel', saleId:id, payToken: GMPAY.token || undefined } });
+    var res = await wmamInvoke('gm-pay-link', { body: { action:'cancel', saleId:id, payToken: GMPAY.token || undefined } });
     var d = res && res.data, e = res && res.error;
     if(e){ var j = null; try{ j = e.context && e.context.json ? await e.context.json() : null; }catch(_){} alert((j && j.error) || 'Could not cancel.'); return; }
     if(!d || !d.ok){ alert((d && d.error) || 'Could not cancel.'); return; }
@@ -15151,6 +15178,7 @@ if(typeof window!=='undefined') window._gmAgentSummaryHtml = _gmAgentSummaryHtml
 var GM_DATE_RULES = { agents:{}, markets:{} };   // {agents:{id:{days:n}|{date:'YYYY-MM-DD'}}, markets:{name:{...}}}
 function _gmIso(v){
   if(v == null || v === '') return null; var t = String(v).trim(), m;
+  if(/^\d{5}(\.\d+)?$/.test(t)){ var xs = new Date(Date.UTC(1899,11,30) + Math.floor(+t)*86400000); return xs.toISOString().slice(0,10); }   // Excel date number
   if((m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/))) return m[1]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[3]).slice(-2);
   if((m = t.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/))) return m[3]+'-'+('0'+m[1]).slice(-2)+'-'+('0'+m[2]).slice(-2);
   if((m = t.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2})$/))) return '20'+m[3]+'-'+('0'+m[1]).slice(-2)+'-'+('0'+m[2]).slice(-2);
@@ -15262,6 +15290,46 @@ if(typeof window!=='undefined'){ Object.assign(window, { wmamUploadSetDate:wmamU
 // report must count as a sale for the person who sold it (or held it). Sales that were
 // missed earlier (agent name didn't match / date not read) are credited now. One IMEI
 // can only ever count once (recordSale's duplicate guard), so this is safe to run any time.
+
+// v2026.10.01: who held this phone/SIM in our inventory (used when a report's agent name doesn't match a code)
+function wmamHolderAgentForImei(imei, esn){
+  var k1 = String(imei||'').replace(/\D/g,''), k2 = String(esn||'').replace(/\D/g,'');
+  if(!k1 && !k2) return null;
+  var pool = (typeof unionAllInventoryPools === 'function') ? unionAllInventoryPools() : [];
+  var d = pool.find(function(x){ if(!x || x.status==='deleted' || x.deletedAt) return false; var a = String(x.imei||'').replace(/\D/g,''), b = String(x.sim||x.iccid||'').replace(/\D/g,''); return (k1 && (a===k1 || b===k1)) || (k2 && (a===k2 || b===k2)); });
+  if(!d) return null;
+  var h = d.assignedTo != null ? d.assignedTo : d.holderId; if(h == null) return null;
+  return (DB.agents||[]).find(function(a){ return a && String(a.id) === String(h); }) || null;
+}
+// SAFETY NET for every campaign: a phone marked sold/activated by any sales report that was never
+// credited (name didn't match, etc.) is credited to whoever sold/held it, on its sale date. One IMEI
+// can only count once, so this is safe to run any time.
+function wmamBackfillAllSales(){
+  var u = DB.current; if(!u || !(isOwner(u) || canAccess(u,'inventory'))) return 0;
+  var counted = {};
+  (DB.agents||[]).forEach(function(a){ (a.monthlySales||[]).forEach(function(m){ (m.entries||[]).forEach(function(e){ if(e && e.imei) counted[String(e.imei).replace(/\D/g,'')] = true; }); }); });
+  var n = 0, pools = { 'Gen Mobile':GM_INVENTORY, 'TruConnect':TC_INVENTORY, 'Assurance Wireless':AW_INVENTORY, 'Excess Telecom':EX_INVENTORY, '':INVENTORY_DEVICES };
+  Object.keys(pools).forEach(function(camp){ (pools[camp]||[]).forEach(function(d){
+    if(!d || d.deletedAt || d.status === 'deleted') return;
+    if(!(d.status === 'activated' || d.status === 'sold' || d.soldAt)) return;
+    if(d._phantomFromActivation && !d.activatedById && !d.soldByAgentId) return;
+    var campaign = d.campaign || camp || 'DART';
+    if(campaign === 'Gen Mobile' && d.commEligible === false) return;
+    var im = String(d.imei || d.sim || '').replace(/\D/g,''); if(!im || counted[im]) return;
+    var day = _gmIso(d.activatedAt) || _gmIso(d.soldAt); if(!day) return;
+    if(d.disconnectDate){ var dd = _gmIso(d.disconnectDate); if(dd && (new Date(dd) - new Date(day)) / 86400000 <= 7) return; }   // chargeback
+    var who = d.activatedById || d.soldByAgentId || (d.assignedTo != null ? d.assignedTo : d.holderId); if(who == null) return;
+    var a = (DB.agents||[]).find(function(x){ return x && String(x.id) === String(who); }); if(!a) return;
+    var r = recordSale({ agentId:a.id, campaign:campaign, program:'Lifeline', date:day, tribal:!!d.tribal, imei:(d.imei || d.sim), source:'sales-backfill', deferSave:true });
+    if(r){ n++; counted[im] = true; }
+  }); });
+  if(n){ console.log('[wmamBackfillAllSales] credited '+n+' sale(s)'); try{ saveToStorage(); }catch(e){} try{ wmamSyncCurrent(); }catch(e){} }
+  return n;
+}
+var _wmamBackfillTimer = null;
+function wmamScheduleBackfill(){ clearTimeout(_wmamBackfillTimer); _wmamBackfillTimer = setTimeout(function(){ try{ if(wmamBackfillAllSales() > 0 && typeof renderCurrentPanel === 'function') renderCurrentPanel(); }catch(e){} }, 1500); }
+if(typeof window!=='undefined'){ window.wmamHolderAgentForImei = wmamHolderAgentForImei; window.wmamBackfillAllSales = wmamBackfillAllSales; window.wmamScheduleBackfill = wmamScheduleBackfill; }
+
 function wmamBackfillGMSales(){
   var u = DB.current; if(!u || !(isOwner(u) || canAccess(u,'inventory'))) return 0;
   var counted = {};
@@ -15290,7 +15358,7 @@ function wmamNormalizeAllDates(){
     Object.keys(pools).forEach(function(k){ if((pools[k]||[]).length){ try{ invDbUpsertDevices(k, pools[k]); }catch(e){} } });
   }
   try{ if(document.getElementById('invxBox')) invxRender(); }catch(e){}
-  try{ if(wmamBackfillGMSales() > 0 && typeof renderCurrentPanel === 'function') renderCurrentPanel(); }catch(e){}
+  try{ var _b = wmamBackfillGMSales() + wmamBackfillAllSales(); if(_b > 0 && typeof renderCurrentPanel === 'function') renderCurrentPanel(); }catch(e){}
 }
 if(typeof window!=='undefined') window.wmamNormalizeAllDates = wmamNormalizeAllDates;
 async function wmamGMRulesLoad(){
@@ -15922,6 +15990,13 @@ function assignedCampaigns(agent){
   var add = function(c){ c = canonicalCampaign(c); if(c && out.indexOf(c)<0) out.push(c); };
   try{ agentCodedCampaigns(agent).forEach(add); }catch(e){}
   if(Array.isArray(agent.campaigns)) agent.campaigns.forEach(add);
+  // v2026.10.01: every campaign the person has a CODE for, or a SALE in (this or last month), always shows
+  var _fromCodesAndSales = function(a){
+    try{ var c = a.agentCodes; if(typeof c === 'string') c = JSON.parse(c); Object.keys(c||{}).forEach(function(k){ var v = c[k]; if(v && String(v).trim() && String(v).trim() !== '0') add(k); }); }catch(e){}
+    try{ var m0 = _ctToday().slice(0,7), d1 = new Date(_ctToday().slice(0,7)+'-15T12:00:00'); d1.setMonth(d1.getMonth()-1); var m1 = d1.toISOString().slice(0,7);
+      (a.monthlySales||[]).forEach(function(b){ if(b && b.campaign && (b.month===m0 || b.month===m1) && (b.sales||0) > 0) add(b.campaign); }); }catch(e){}
+  };
+  _fromCodesAndSales(agent);
   var isLdr = ['Team Leader','Market Manager','Campaign Manager','IBO'].indexOf(agent.role)>=0;
   if(isLdr){
     try{
@@ -15930,6 +16005,7 @@ function assignedCampaigns(agent){
         if(!m || !m.active || m.id===agent.id || ids.indexOf(m.id)<0) return;
         try{ agentCodedCampaigns(m).forEach(add); }catch(e){}
         if(Array.isArray(m.campaigns)) m.campaigns.forEach(add);
+        _fromCodesAndSales(m);
       });
     }catch(e){}
   }
@@ -16511,6 +16587,7 @@ async function invDbUpsertDevices(poolKey, devices){
     }
   }catch(e){ okAll=false; lastErr=e; window._invPathBLastError=e; console.warn('[invDbUpsertDevices] '+table+' threw:', e); }
   if(okAll) _sent.forEach(function(x){ _invSnap[x[0]] = x[1]; });
+  if(okAll && rows.some(function(r){ return r && (r.status === 'activated' || r.status === 'sold'); })){ try{ wmamScheduleBackfill(); }catch(e){} }
   else if(lastErr && /out of date/i.test(String(lastErr.message||lastErr))){ try{ wmamShowUpdateBanner(true); }catch(e){} }
   else if(lastErr && /locked from receiving inventory/i.test(String(lastErr.message||lastErr))){ try{ alert(String(lastErr.message||lastErr).replace(/^WMAM:\s*/,'')); }catch(e){} try{ wmamInvReloadLive(true); }catch(e){} }
   return {ok:okAll, count:rows.length, error:lastErr};
@@ -19774,7 +19851,8 @@ function processGMActivationCSV(csvText){
     var devCost    = row['Dev. Cost']||'';
     var sim        = row['SIM']||'';
     var model      = row['Model']||'';
-    var commElig   = (row['Comm. Elig.']||'').toLowerCase()==='yes';
+    var _ceKey = ['Comm. Elig.','Comm Elig','Comm. Elig','Commission Eligible','Comm. Eligible','Comm Eligible'].find(function(k){ return Object.prototype.hasOwnProperty.call(row,k); });
+    var commElig   = _ceKey ? (String(row[_ceKey]||'').trim().toLowerCase()==='yes' || String(row[_ceKey]||'').trim().toLowerCase()==='y') : true;
     var tribal     = (row['Tribal']||'').toLowerCase()==='yes';
     var disconnDate= row['Disconnect Date']||'';
     var disconnRsn = row['Disconnect Reason']||'';
@@ -43594,7 +43672,7 @@ function panelBO(){
           return m[c] || {bd:'rgba(120,160,255,.3)', left:'#378add', lbl:'#b8d6ff', bD:'#185fa5', bL:'#8fc2ff', glow:'rgba(56,138,221,.6)'};
         }
       };
-      var teamWord = (u.role==='Team Leader') ? 'team' : 'market';
+      var teamWord = (u.role==='Team Leader') ? 'team' : ((u.role==='Campaign Manager' || u.role==='IBO') ? 'all markets' : 'market');
       // Campaign assignment law: only campaigns this manager actually runs
       // (assigned + coded + what their org's people run). No fallbacks.
       var myCamps = assignedCampaigns(u);
@@ -66898,9 +66976,9 @@ function dartProcessSalesText(csvText){
     if(!imei) continue;
     if(seen[imei]){ result.dupes++; continue; }
     var date=String((ciDate>=0?row[ciDate]:'')||'').trim();
-    if(!/^\d{4}-\d{2}-\d{2}/.test(date)) date=new Date().toISOString().slice(0,10);
+    date=(typeof _gmIso==='function' && _gmIso(date)) || _ctToday();
     var company=ciCompany>=0?row[ciCompany]:'';
-    var agent=findAgent(company);
+    var agent=findAgent(company) || (typeof wmamHolderAgentForImei==='function' ? wmamHolderAgentForImei(imei, esn) : null);
     if(!agent){
       var lbl=String(company||'').trim()||'?';
       if(result.unmatched.indexOf(lbl)<0) result.unmatched.push(lbl);
@@ -67011,12 +67089,7 @@ function awProcessSalesText(csvText){
       return k && _awNorm(k)===c;
     }) || null;
   }
-  function _mdy(s){ // MM/DD/YYYY -> YYYY-MM-DD
-    var m=String(s||'').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-    if(m) return m[3]+'-'+('0'+m[1]).slice(-2)+'-'+('0'+m[2]).slice(-2);
-    if(/^\d{4}-\d{2}-\d{2}/.test(String(s||''))) return String(s).slice(0,10);
-    return new Date().toISOString().slice(0,10);
-  }
+  function _mdy(s){ return (typeof _gmIso==='function' && _gmIso(s)) || _ctToday(); }
 
   for(var r=1;r<rows.length;r++){
     var row=rows[r]; if(!row || !row.length) continue;
@@ -67027,7 +67100,7 @@ function awProcessSalesText(csvText){
     if(!esn){ result.skipped++; continue; }                                                                   // approved but no device serial
     if(seen[esn]){ result.dupes++; continue; }
     var code=ciCode>=0?row[ciCode]:'';
-    var agent=findAgent(code);
+    var agent=findAgent(code) || (typeof wmamHolderAgentForImei==='function' ? wmamHolderAgentForImei(esn, esn) : null);
     if(!agent){
       var lbl=String(code||'').trim()||'?';
       if(result.unmatched.indexOf(lbl)<0) result.unmatched.push(lbl);
@@ -70758,7 +70831,7 @@ function recordSale(opts){
   if(!agent){ console.warn('[recordSale] no agent #'+opts.agentId); return null; }
   var campaign = opts.campaign || '';
   var program  = opts.program || campaignProgram(campaign);
-  var dateStr  = (opts.date && /^\d{4}-\d{2}-\d{2}/.test(String(opts.date))) ? String(opts.date).slice(0,10) : _ctToday();
+  var dateStr  = (opts.date && typeof _gmIso === 'function' && _gmIso(opts.date)) || ((opts.date && /^\d{4}-\d{2}-\d{2}/.test(String(opts.date))) ? String(opts.date).slice(0,10) : _ctToday());
   // v2026.09.29 ONE SALE PER IMEI: the same phone can arrive from more than one
   // upload (activation report, sold report, re-uploads). It only counts once.
   var _imeiN = String(opts.imei||'').replace(/\D/g,'');
@@ -80704,6 +80777,7 @@ function srImportManualRows(rows, carrier, uploadedBy){
     //    4. Add to agent.monthlySales[] (month bucket)
     //    5. Append to chainOfCustody for traceability
     // ════════════════════════════════════════════════════════════════════
+    if(!agent && typeof wmamHolderAgentForImei === 'function'){ agent = wmamHolderAgentForImei(r.imei, r.sim || ''); }
     var _marked = false;
     if(typeof invMarkAsSold === 'function'){
       _marked = invMarkAsSold({
@@ -80788,7 +80862,7 @@ function invMarkAsSold(opts){
   // ── Update device ──
   dev._statusBeforeSold = dev.status; // for potential rollback
   dev.status = 'sold';
-  dev.soldAt = opts.soldAt || new Date().toISOString().slice(0,10);
+  dev.soldAt = (typeof _gmIso==='function' && _gmIso(opts.soldAt)) || opts.soldAt || _ctToday();
   dev.soldByAgentId = opts.agentId || null;
   dev.soldByAgentName = opts.agentName || '';
   if(opts.orderNumber) dev.soldOrderNumber = opts.orderNumber;
@@ -80812,7 +80886,7 @@ function invMarkAsSold(opts){
   // the weekly + daily buckets and the campaign tag like every other path.
   if(opts.agentId){
     recordSale({ agentId:opts.agentId, campaign:(opts.carrier || dev.campaign || ''),
-                 date:(opts.soldAt && /^\d{4}-\d{2}-\d{2}/.test(opts.soldAt)) ? opts.soldAt : dev.soldAt,
+                 date:((typeof _gmIso==='function' && _gmIso(opts.soldAt)) || dev.soldAt),
                  imei:dev.imei, source:(opts.source||'sold-report') });
   }
   return true;
