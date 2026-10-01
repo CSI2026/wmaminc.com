@@ -3767,7 +3767,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.01.0400';
+var BUILD_VERSION = '2026.10.01.0700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14158,7 +14158,7 @@ async function gmPayLoadMine(){
                         : await supaClient.from('gm_sales').select('*').eq('agent_id', DB.current.id).order('created_at',{ascending:false}).limit(500);
     var allRows = (r && r.data) || [];
     var rows = allRows.slice(0, 20);
-    if(!allRows.length){ el.innerHTML = ''; return; }
+    if(!allRows.length){ el.innerHTML = _gmAgentSummaryHtml([]) + '<div style="color:#888;font-size:.88rem">No Pay Link sales yet.</div>'; return; }
     el.innerHTML = _gmAgentSummaryHtml(allRows) + '<div style="font-weight:800;color:#003594;margin-bottom:8px;letter-spacing:1px">MY RECENT GEN MOBILE SALES</div>'
       + rows.map(function(s){
           return '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin-bottom:8px;font-size:.9rem">'
@@ -14227,6 +14227,16 @@ async function gmSalesLoad(){
   if(isOwner(DB.current) && !GMSALES._titleWasPaid){ await gmPayLoadPricing(); gmPriceRender(); }
 }
 function gmSalesSetFilter(f){ GMSALES.filter = f; gmSalesRender(); }
+async function gmSalesRemoveCanceled(){
+  var ids = (GMSALES.rows||[]).filter(function(s){ return (s.status==='canceled' || s.status==='replaced') && !s.paid_at; }).map(function(s){ return s.id; });
+  if(!ids.length) return;
+  if(!confirm('Remove '+ids.length+' canceled order(s) that never took a payment?\n\nThey disappear from every list (a backup copy is kept). Paid orders are never removed.')) return;
+  var r = await supaClient.rpc('wmam_gm_remove_unpaid', { p_ids: ids });
+  if(r && r.error){ alert('Could not remove: '+(r.error.message||r.error)); return; }
+  try{ showToast('Removed '+((r && r.data) || ids.length)+' canceled order(s)'); }catch(e){}
+  gmSalesLoad();
+}
+if(typeof window!=='undefined') window.gmSalesRemoveCanceled = gmSalesRemoveCanceled;
 function gmSalesRender(){
   var box = document.getElementById('gmSalesBox'); if(!box) return;
   var all = GMSALES.rows, paid = all.filter(function(s){ return s.status==='paid'; });
@@ -14239,6 +14249,8 @@ function gmSalesRender(){
     + card('Owed to agents (unpaid)', _gmMoney(sum(owedAgentsUnpaid,'owed_agent')), '#d97706')
     + card('Waiting for payment', String(all.filter(function(s){ return s.status==='link_created'; }).length), '#6b7280')
     + '</div>';
+  var _unpaidCanceled = all.filter(function(s){ return (s.status==='canceled' || s.status==='replaced') && !s.paid_at; });
+  if(_unpaidCanceled.length) h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:10px 12px;margin-bottom:12px"><span style="color:#9a3412;font-weight:700">'+_unpaidCanceled.length+' canceled order'+(_unpaidCanceled.length===1?'':'s')+' never took a payment</span><button onclick="gmSalesRemoveCanceled()" style="padding:8px 14px;border:none;border-radius:8px;background:#b91c1c;color:#fff;font-weight:800;cursor:pointer">Remove them</button></div>';
   var tabs = [['all','All'],['paid','Paid'],['waiting','Waiting'],['payback','Agent paybacks due']];
   h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">' + tabs.map(function(t){ var on = GMSALES.filter===t[0]; return '<button onclick="gmSalesSetFilter(\''+t[0]+'\')" style="padding:8px 14px;border-radius:999px;border:1px solid #003594;background:'+(on?'#003594':'#fff')+';color:'+(on?'#fff':'#003594')+';font-weight:700;cursor:pointer">'+t[1]+'</button>'; }).join('') + '</div>';
   var rows = all.filter(function(s){
@@ -15085,17 +15097,44 @@ function aclRemove(){
 if(typeof window!=='undefined'){ Object.assign(window, { ACL:ACL, panelAgentCleanup:panelAgentCleanup, aclRender:aclRender, aclSelectAll:aclSelectAll, aclClearPending:aclClearPending, aclResend:aclResend, aclRemove:aclRemove, _aclPending:_aclPending }); }
 
 // ── Agent's Pay Link tab: every sale they made + what the company owes them ──
+// v2026.10.01: PAY WEEKS — sales Thursday → Wednesday; the surplus (amount charged above the
+// company cost on paid customer sales) is paid out the FOLLOWING FRIDAY by payroll direct deposit.
+function _gmPayWeekStart(ymd){ var d = new Date(String(ymd).slice(0,10)+'T12:00:00'); var back = (d.getDay() - 4 + 7) % 7; d.setDate(d.getDate() - back); return d.toISOString().slice(0,10); }
+function _gmShort(ymd){ var d = new Date(String(ymd).slice(0,10)+'T12:00:00'); return ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()]+' '+(d.getMonth()+1)+'/'+d.getDate(); }
+function _gmSaleDay(s){ var t = s.paid_at || s.created_at; if(!t) return null; try{ return _ctToday(new Date(t)); }catch(e){ return String(t).slice(0,10); } }
 function _gmAgentSummaryHtml(rows){
-  var paid = rows.filter(function(s){ return s.status === 'paid'; });
-  var coll = paid.reduce(function(t,s){ return t + (Number(s.amount_paid!=null?s.amount_paid:s.amount_charged)||0); }, 0);
-  var owed = paid.filter(function(s){ return s.agent_payback_status !== 'paid'; }).reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0);
-  var paidOut = paid.filter(function(s){ return s.agent_payback_status === 'paid'; }).reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0);
-  var waiting = rows.filter(function(s){ return s.status === 'link_created'; }).length;
-  var card = function(k,v,c){ return '<div style="flex:1 1 130px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:.68rem;font-weight:700;letter-spacing:1px;color:#666;text-transform:uppercase">'+k+'</div><div style="font-size:1.35rem;font-weight:800;color:'+(c||'#003594')+'">'+v+'</div></div>'; };
-  return '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin:4px 0 8px">MY PAY LINK SALES</div>'
-    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">' + card('Paid sales', paid.length) + card('Collected', _gmMoney(coll), '#166534') + card('Owed to you', _gmMoney(owed), owed>0?'#7c3aed':'#6b7280') + card('Already paid to you', _gmMoney(paidOut), '#166534') + card('Waiting for payment', waiting, waiting?'#b45309':'#6b7280') + '</div>'
-    + '<div style="font-size:.76rem;color:#666;margin-bottom:10px">"Owed to you" = on paid customer sales, the amount you charged above the company cost, not paid out to you yet. Canceled or refunded orders don\u2019t count.</div>';
+  rows = rows || [];
+  var today = _ctToday(), wk = _gmPayWeekStart(today), wkEnd = _gmAddDays(wk, 6), payDay = _gmAddDays(wk, 8);
+  var esc = _escapeHtml, money = _gmMoney;
+  var weeks = {};
+  rows.forEach(function(s){ var day = _gmSaleDay(s); if(!day) return; var k = _gmPayWeekStart(day); (weeks[k] = weeks[k] || []).push(s); });
+  var stat = function(list){ var paid = list.filter(function(s){ return s.status === 'paid'; });
+    return { paid: paid.length, surplus: paid.reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0),
+      paidOut: paid.filter(function(s){ return s.agent_payback_status === 'paid'; }).reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0),
+      waiting: list.filter(function(s){ return s.status === 'link_created'; }).length,
+      canceled: list.filter(function(s){ return s.status === 'canceled' || s.status === 'replaced' || s.status === 'refunded'; }).length }; };
+  var cur = stat(weeks[wk] || []);
+  var allPaid = rows.filter(function(s){ return s.status === 'paid'; });
+  var owedAll = allPaid.filter(function(s){ return s.agent_payback_status !== 'paid'; }).reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0);
+  var card = function(k,v,c,sub){ return '<div style="flex:1 1 140px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:.66rem;font-weight:800;letter-spacing:1px;color:#6b7280;text-transform:uppercase">'+k+'</div><div style="font-size:1.4rem;font-weight:900;color:'+(c||'#003594')+'">'+v+'</div>'+(sub?'<div style="font-size:.72rem;color:#6b7280">'+sub+'</div>':'')+'</div>'; };
+  var h = '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin:4px 0 4px">MY PAY LINK SALES</div>'
+    + '<div style="font-size:.82rem;color:#374151;margin-bottom:8px">This pay week: <b>'+_gmShort(wk)+' \u2013 '+_gmShort(wkEnd)+'</b> \u00b7 surplus paid <b>Friday '+(new Date(payDay+'T12:00:00').getMonth()+1)+'/'+new Date(payDay+'T12:00:00').getDate()+'</b> by direct deposit</div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">'
+    + card('Paid sales this week', cur.paid) + card('Surplus this week', money(cur.surplus), cur.surplus>0?'#7c3aed':'#6b7280', 'paid Friday')
+    + card('Waiting for payment', cur.waiting, cur.waiting?'#b45309':'#6b7280') + card('Canceled this week', cur.canceled, cur.canceled?'#b91c1c':'#6b7280')
+    + card('Total still owed to you', money(owedAll), owedAll>0?'#7c3aed':'#6b7280', 'all weeks, not paid out yet') + '</div>';
+  var keys = Object.keys(weeks).sort().reverse().slice(0, 8);
+  if(keys.length){
+    h += '<div style="overflow-x:auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;margin-bottom:6px"><table style="width:100%;border-collapse:collapse;font-size:.84rem;min-width:520px"><tr style="text-align:left;background:#003594">'
+      + ['Pay week','Paid sales','Surplus','Canceled','Payout'].map(function(t){ return '<th style="padding:7px 10px;color:#fff!important">'+t+'</th>'; }).join('') + '</tr>'
+      + keys.map(function(k){ var st = stat(weeks[k]), pd = _gmAddDays(k, 8), done = st.surplus > 0 && st.paidOut >= st.surplus - 0.001;
+          var payout = st.surplus <= 0 ? '<span style="color:#9ca3af">\u2014</span>' : (done ? '<span style="color:#166534;font-weight:700">\u2714 Paid '+_gmShort(pd)+'</span>' : '<span style="color:#7c3aed;font-weight:700">'+(pd >= today ? 'Pays '+_gmShort(pd) : 'Due ('+_gmShort(pd)+')')+'</span>');
+          return '<tr style="border-top:1px solid #f1f5f9;'+(k===wk?'background:#f5f8ff;':'')+'"><td style="padding:7px 10px;font-weight:700">'+_gmShort(k)+' \u2013 '+_gmShort(_gmAddDays(k,6))+(k===wk?' <span style="font-size:.7rem;color:#6b7280">(this week)</span>':'')+'</td><td style="padding:7px 10px">'+st.paid+'</td><td style="padding:7px 10px;font-weight:700">'+money(st.surplus)+'</td><td style="padding:7px 10px;color:'+(st.canceled?'#b91c1c':'#9ca3af')+'">'+st.canceled+'</td><td style="padding:7px 10px">'+payout+'</td></tr>'; }).join('')
+      + '</table></div>';
+  }
+  return h + '<div style="font-size:.74rem;color:#666;margin-bottom:12px">Surplus = on paid customer sales, the amount you charged above the company cost. Sales Thursday\u2013Wednesday are paid the next Friday by payroll direct deposit. Canceled or refunded orders don\u2019t count. Only your own sales are shown.</div>';
 }
+
 if(typeof window!=='undefined') window._gmAgentSummaryHtml = _gmAgentSummaryHtml;
 
 
@@ -15218,6 +15257,31 @@ if(typeof window!=='undefined'){ Object.assign(window, { wmamUploadSetDate:wmamU
 // ---- shared rules (saved for everyone) ----
 // Apply the date rules to every device on screen; the Inventory department's
 // browser also saves any corrections (only changed devices are sent).
+
+// v2026.10.01: BACKFILL — every activated, commission-eligible Gen Mobile phone on a sold
+// report must count as a sale for the person who sold it (or held it). Sales that were
+// missed earlier (agent name didn't match / date not read) are credited now. One IMEI
+// can only ever count once (recordSale's duplicate guard), so this is safe to run any time.
+function wmamBackfillGMSales(){
+  var u = DB.current; if(!u || !(isOwner(u) || canAccess(u,'inventory'))) return 0;
+  var counted = {};
+  (DB.agents||[]).forEach(function(a){ (a.monthlySales||[]).forEach(function(m){ (m.entries||[]).forEach(function(e){ if(e && e.imei) counted[String(e.imei).replace(/\D/g,'')] = true; }); }); });
+  var n = 0, touched = {};
+  (GM_INVENTORY||[]).forEach(function(d){
+    if(!d || d.status !== 'activated' || d.deletedAt || !d.commEligible) return;
+    var im = String(d.imei||'').replace(/\D/g,''); if(!im || counted[im]) return;
+    var day = _gmIso(d.activatedAt) || null; if(!day) return;
+    if(d.disconnectDate){ var dd = _gmIso(d.disconnectDate); if(dd && (new Date(dd) - new Date(day)) / 86400000 <= 7) return; }   // chargeback
+    var who = d.activatedById || d.assignedTo || d.holderId; if(who == null) return;
+    var a = (DB.agents||[]).find(function(x){ return x && String(x.id) === String(who); }); if(!a) return;
+    var r = recordSale({ agentId:a.id, campaign:'Gen Mobile', program:'Lifeline', date:day, tribal:!!d.tribal, imei:d.imei, source:'gm-activation-backfill', deferSave:true });
+    if(r){ n++; counted[im] = true; touched[a.id] = true; }
+  });
+  if(n){ console.log('[wmamBackfillGMSales] credited '+n+' missed sale(s)'); try{ saveToStorage(); }catch(e){} try{ wmamSyncCurrent(); }catch(e){} }
+  return n;
+}
+if(typeof window!=='undefined') window.wmamBackfillGMSales = wmamBackfillGMSales;
+
 function wmamNormalizeAllDates(){
   var pools = { gm:GM_INVENTORY, tc:TC_INVENTORY, aw:AW_INVENTORY, ex:EX_INVENTORY, legacy:INVENTORY_DEVICES };
   Object.keys(pools).forEach(function(k){ (pools[k]||[]).forEach(function(d){ try{ wmamApplyGMDates(d); }catch(e){} }); });
@@ -15226,6 +15290,7 @@ function wmamNormalizeAllDates(){
     Object.keys(pools).forEach(function(k){ if((pools[k]||[]).length){ try{ invDbUpsertDevices(k, pools[k]); }catch(e){} } });
   }
   try{ if(document.getElementById('invxBox')) invxRender(); }catch(e){}
+  try{ if(wmamBackfillGMSales() > 0 && typeof renderCurrentPanel === 'function') renderCurrentPanel(); }catch(e){}
 }
 if(typeof window!=='undefined') window.wmamNormalizeAllDates = wmamNormalizeAllDates;
 async function wmamGMRulesLoad(){
@@ -15420,17 +15485,13 @@ function wmamWhyLinked(user, a){
 function wmamInvBreakdown(userId){
   var u = userId != null ? (DB.agents||[]).find(function(x){ return String(x.id)===String(userId); }) : DB.current;
   if(!u) return;
-  var ids = (typeof agentIdsInMyOrgEffective === 'function') ? agentIdsInMyOrgEffective(u) : [u.id];
-  var pool = (typeof unionAllInventoryPools === 'function') ? unionAllInventoryPools() : [];
-  var cnt = {}, mk = {}, outside = {};
-  var mm = (u.role === 'Market Manager') ? wmamManagerMarkets(u, pool) : null, mmHas = !!(mm && Object.keys(mm).length);
-  pool.forEach(function(d){ if(!d || d.status==='deleted' || d.deletedAt || d.status==='sold' || d.status==='activated' || d.soldAt) return;
-    var h = (typeof deviceHolderId==='function' ? deviceHolderId(d) : null) || d.holderId; if(h == null) return; if(ids.map(String).indexOf(String(h))<0) return;
-    var out = mmHas && String(h) !== String(u.id) && !mm[_wmamMktKey(d.market)];
-    if(out){ outside[h] = (outside[h]||0) + 1; } else { cnt[h] = (cnt[h]||0) + 1; }
-    (mk[h] = mk[h] || {})[d.market || 'no market'] = 1; });
-  Object.keys(outside).forEach(function(h){ if(!cnt[h]) cnt[h] = 0; });
-  var rows = Object.keys(cnt).map(function(h){ var a = (DB.agents||[]).find(function(x){ return String(x.id)===String(h); }) || {id:h, name:'Agent #'+h, role:''}; return { a:a, n:cnt[h], out: outside[h]||0, mk: Object.keys(mk[h]||{}), why: wmamWhyLinked(u, a) }; })
+  var _S = wmamInvScope(u), cnt = {}, mk = {}, outside = {};
+  _S.available.forEach(function(d){ var h = _wmamHolderOf(d); var hk = h == null ? 'unassigned' : String(h); cnt[hk] = (cnt[hk]||0) + 1; (mk[hk] = mk[hk] || {})[d.market || 'no market'] = 1; });
+  var rows = Object.keys(cnt).map(function(h){ var a = h === 'unassigned' ? {id:'unassigned', name:'Unassigned (market stock)', role:''} : ((DB.agents||[]).find(function(x){ return String(x.id)===String(h); }) || {id:h, name:'Agent #'+h, role:''});
+      var why = h === 'unassigned' ? ['Phones in your market(s) not given to anyone yet'] : wmamWhyLinked(u, a);
+      if(_S.marketBased && h !== 'unassigned' && String(h) !== String(u.id)) why = ['Their phones are located in your market ('+Object.keys(mk[h]||{}).join(', ')+')'].concat(why.filter(function(w){ return !/Linked through the org chain/.test(w); }));
+      if(h !== 'unassigned' && _S.isFlagged(h)) why.unshift('\u26A0 No longer active / not coded \u2014 reassign these phones');
+      return { a:a, n:cnt[h], out:0, mk: Object.keys(mk[h]||{}), why: why }; })
     .sort(function(x,y){ return (x.a.id===u.id?-1:0) - (y.a.id===u.id?-1:0) || y.n - x.n; });
   var tot = rows.reduce(function(t,r){ return t + r.n; }, 0), esc = _escapeHtml;
   var canFix = isOwner(DB.current) || (typeof canEditAgentProfiles==='function' && canEditAgentProfiles(DB.current));
@@ -15444,7 +15505,7 @@ function wmamInvBreakdown(userId){
         + '<div style="font-size:.8rem;color:#555;margin-top:2px">Market: '+esc(r.mk.join(', ')||'\u2014')+'</div>'
         + (r.out ? '<div style="font-size:.82rem;color:#b45309;font-weight:700;margin-top:2px">'+r.out+' device'+(r.out===1?'':'s')+' in another market \u2014 NOT counted on this dashboard</div>' : '')
         + '<div style="font-size:.82rem;color:#374151;margin-top:4px">'+r.why.map(function(w){ return '\u2022 '+esc(w); }).join('<br>')+'</div>'
-        + ((canFix && r.a.id!==u.id) ? '<div style="margin-top:6px"><button onclick="document.getElementById(\'wmamWhyOv\').remove();openEditPerson('+r.a.id+')" style="padding:5px 10px;border:1px solid #003594;border-radius:8px;background:#fff;color:#003594;font-weight:700;cursor:pointer">Fix their placement</button></div>' : '')
+        + ((canFix && r.a.id!==u.id && r.a.id!=='unassigned') ? '<div style="margin-top:6px"><button onclick="document.getElementById(\'wmamWhyOv\').remove();openEditPerson('+r.a.id+')" style="padding:5px 10px;border:1px solid #003594;border-radius:8px;background:#fff;color:#003594;font-weight:700;cursor:pointer">Fix their placement</button></div>' : '')
         + '</div>'; }).join('')
     + (rows.length ? '' : '<div style="color:#888">No devices.</div>') + '</div>';
   document.body.appendChild(ov);
@@ -15464,30 +15525,38 @@ function _tiAvail(d){ return d && d.status!=='deleted' && !d.deletedAt && d.stat
 function _tiHolder(d){ return (typeof deviceHolderId==='function' ? deviceHolderId(d) : null) || d.holderId || d.assignedTo || null; }
 function wmamTeamInvData(user){
   if(!user) return null;
-  var multi = (user.role === 'Campaign Manager' || user.role === 'IBO');
-  var ids = (typeof agentIdsInMyOrgEffective === 'function') ? agentIdsInMyOrgEffective(user).map(String) : [String(user.id)];
-  if(ids.indexOf(String(user.id)) < 0) ids.push(String(user.id));
-  var pool = (typeof unionAllInventoryPools === 'function') ? unionAllInventoryPools() : [];
-  var mmMk = (user.role === 'Market Manager') ? wmamManagerMarkets(user, pool) : null, mmHas = !!(mmMk && Object.keys(mmMk).length);
+  var S = wmamInvScope(user);
+  var byId = function(id){ return (DB.agents||[]).find(function(x){ return x && String(x.id)===String(id); }) || null; };
+  var markets = {};
+  var mkOf = function(k, name){ return markets[k] = markets[k] || { key:k, name:name || 'No market set', total:0, people:{} }; };
   var local = _wmamMktKey(user.team || user.market || '');
-  if(!local){ var own = pool.filter(function(d){ return _tiAvail(d) && String(_tiHolder(d))===String(user.id) && d.market; }); if(own.length) local = _wmamMktKey(own[0].market); }
-  var markets = {}, total = 0;
-  pool.forEach(function(d){
-    if(!_tiAvail(d)) return; var h = _tiHolder(d); if(h == null || ids.indexOf(String(h)) < 0) return;
-    if(mmHas && String(h) !== String(user.id) && !mmMk[_wmamMktKey(d.market)]) return;
+  S.available.forEach(function(d){
     try{ if(typeof wmamApplyGMDates === 'function') wmamApplyGMDates(d); }catch(e){}
-    var mk = multi ? (_wmamMktKey(d.market) || 'nomarket') : 'all';
-    var M = markets[mk] = markets[mk] || { key:mk, name:(d.market||'No market set'), total:0, people:{} };
-    var P = M.people[h] = M.people[h] || { id:h, devs:[] };
-    P.devs.push(d); M.total++; total++;
+    var k = _wmamMktKey(d.market) || 'nomarket', M = mkOf(k, d.market || 'No market set');
+    var h = _wmamHolderOf(d), hk = h == null ? 'unassigned' : String(h);
+    var P = M.people[hk] = M.people[hk] || { id:hk, devs:[] };
+    P.devs.push(d); M.total++;
   });
-  var byId = function(id){ return (DB.agents||[]).find(function(x){ return String(x.id)===String(id); }) || { id:id, name:'Agent #'+id, role:'' }; };
+  // add every active coded person in each market (zero inventory included)
+  (S.roster||[]).forEach(function(a){
+    var k = _wmamMktKey(a.team) || (String(a.id)===String(user.id) ? (local || 'nomarket') : '');
+    if(!k) return;
+    if(!markets[k] && !(String(a.id)===String(user.id))){ if(!S.markets[k]) return; }
+    var M = mkOf(k, (S.markets && S.markets[k]) || a.team || 'No market set');
+    if(!M.people[String(a.id)]) M.people[String(a.id)] = { id:String(a.id), devs:[] };
+  });
   var list = Object.keys(markets).map(function(k){ var M = markets[k];
-    M.list = Object.keys(M.people).map(function(h){ var P = M.people[h]; P.a = byId(h); P.devs.sort(wmamSoonestFirst); P.soon = P.devs[0]; return P; })
-      .sort(function(x,y){ return (String(x.id)===String(user.id)?-1:0) - (String(y.id)===String(user.id)?-1:0) || y.devs.length - x.devs.length; });
-    M.local = (k === local || k === 'all'); return M; })
+    M.list = Object.keys(M.people).map(function(h){ var P = M.people[h];
+      P.a = (h === 'unassigned') ? { id:'unassigned', name:'Unassigned (market stock)', role:'Not given to anyone yet' } : (byId(h) || { id:h, name:'Agent #'+h, role:'' });
+      P.flag = (h !== 'unassigned') && S.isFlagged(h) && P.devs.length > 0;
+      P.devs.sort(wmamSoonestFirst); P.soon = P.devs[0]; return P; })
+      .sort(function(x,y){ return (String(x.id)===String(user.id)?-1:0) - (String(y.id)===String(user.id)?-1:0) || (x.id==='unassigned'?1:0) - (y.id==='unassigned'?1:0) || y.devs.length - x.devs.length || String(x.a.name).localeCompare(String(y.a.name)); });
+    M.local = (k === local); return M; })
     .sort(function(x,y){ return (y.local?1:0) - (x.local?1:0) || y.total - x.total; });
-  return { user:user, multi:multi, total:total, markets:list, mine: list.reduce(function(n,M){ var p = M.people[user.id]; return n + (p ? p.devs.length : 0); }, 0) };
+  var multi = (user.role === 'Campaign Manager' || user.role === 'IBO' || list.length > 1);
+  var total = S.available.length;
+  var mine = S.available.filter(function(d){ return String(_wmamHolderOf(d)) === String(user.id); }).length;
+  return { user:user, multi:multi, total:total, markets:list, mine:mine, expired:S.expired, sold:S.sold };
 }
 function _tiSoonPill(d){
   if(!d) return ''; if(d.needsManualDate) return '<span style="background:#fee2e2;color:#b91c1c;padding:2px 8px;border-radius:999px;font-size:.72rem;font-weight:800">needs a date</span>';
@@ -15510,7 +15579,8 @@ function wmamTeamInvHtml(userId, boxId){
       var key = bid+'|'+M.key+'|'+P.id, open = !!WMAM_TI_OPEN[key], me = String(P.id)===String(u.id);
       h += '<div onclick="WMAM_TI_OPEN[\''+key.replace(/'/g,'')+'\']=!WMAM_TI_OPEN[\''+key.replace(/'/g,'')+'\'];wmamTeamInvRefresh(\''+bid+'\','+u.id+')" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:10px 12px;'+(i?'border-top:1px solid #f1f5f9;':'')+(me?'background:#f5f8ff;':'')+'">'
         + '<div style="width:18px;color:#6b7280">'+(open?'\u25BE':'\u25B8')+'</div>'
-        + '<div style="flex:1;min-width:0"><div style="font-weight:800;color:#0b1b3f;line-height:1.2;word-break:break-word">'+esc(P.a.name)+(me?' (you)':'')+'</div><div style="font-size:.74rem;color:#6b7280">'+esc(P.a.role||'')+'</div></div>'
+        + '<div style="flex:1;min-width:0"><div style="font-weight:800;color:#0b1b3f;line-height:1.2;word-break:break-word">'+esc(P.a.name)+(me?' (you)':'')+'</div><div style="font-size:.74rem;color:#6b7280">'+esc(P.a.role||'')+'</div>'
+        + (P.flag ? '<div style="font-size:.74rem;color:#b91c1c;font-weight:800">\u26A0 No longer active / not coded \u2014 reassign these phones</div>' : '') + '</div>'
         + _tiSoonPill(P.soon)
         + '<div style="font-weight:900;font-size:1.15rem;color:#003594;min-width:48px;text-align:right">'+P.devs.length+'</div></div>';
       if(open){
@@ -19795,6 +19865,13 @@ function applyGMActivations(activations, uploadBatchId){
   activations.forEach(function(act){
     // Mark device as activated in GM_INVENTORY
     var dev = GM_INVENTORY.find(function(d){return d.imei===act.imei;});
+    // v2026.10.01: report agent name didn't match anyone's Gen Mobile code / username ->
+    // credit the person who was holding this phone in our inventory.
+    if(!act.agentId && dev){
+      var _hid = dev.assignedTo != null ? dev.assignedTo : dev.holderId;
+      var _ha = _hid != null ? (DB.agents||[]).find(function(a){ return a && String(a.id) === String(_hid); }) : null;
+      if(_ha){ act.agentId = _ha.id; act.agentName = _ha.name; act.creditedVia = 'inventory-holder'; }
+    }
     if(dev){
       dev.status      = 'activated';
       dev.activatedAt = act.activationDate;
@@ -19874,7 +19951,7 @@ function applyGMActivations(activations, uploadBatchId){
       // are tagged with campaign + program and feed day/week/month + ranking
       // identically to every other path. deferSave: bulk loop persists below.
       recordSale({ agentId:act.agentId, campaign:'Gen Mobile', program:'Lifeline',
-                   date:act.activationDate, tribal:!!act.tribal, imei:act.imei,
+                   date:((typeof _gmIso==='function' && _gmIso(act.activationDate)) || act.activationDate), tribal:!!act.tribal, imei:act.imei,
                    source:'gm-activation-upload', deferSave:true });
     }
   });
@@ -21668,91 +21745,99 @@ function wmamManagerMarkets(user, pool){
 }
 if(typeof window!=='undefined'){ window.wmamManagerMarkets = wmamManagerMarkets; window._wmamMktKey = _wmamMktKey; }
 
-function scoreboardInventory(user){
-  var out = {available:0, sold:0, total:0, expired:0, byCampaign:{}, expiredWorst:null, expiringSoon:null, _today:new Date().toISOString().slice(0,10)};
-  if(!user) return out;
 
-  var pool = (typeof unionAllInventoryPools === 'function')
-    ? unionAllInventoryPools()
-    : (Array.isArray(INVENTORY_DEVICES) ? INVENTORY_DEVICES.slice() : []);
-  if(!pool || !pool.length) return out;
-
-  // ── Determine the set of agent IDs the scoreboard should aggregate ──
-  // Owner / Inv Dept see everything (no filter).
-  var seeAll = isOwner(user) || user.role === 'admin' || isInventory(user)
-            || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(user,'inv-dashboard'));
-
-  var includeUnassigned = false;
-  var scopeIds = null;  // null = no filter (see all)
-  if(!seeAll){
-    if(user.role === 'Campaign Manager' || user.role === 'IBO'){
-      // CM/IBO sees their entire org PLUS unassigned pool
-      scopeIds = (typeof agentIdsInMyOrgEffective === 'function')
-        ? agentIdsInMyOrgEffective(user) : [user.id];
-      includeUnassigned = true;
-    } else if(user.role === 'Market Manager'){
-      // MM sees themselves + everyone reporting to them (whole market)
-      scopeIds = (typeof agentIdsInMyOrgEffective === 'function')
-        ? agentIdsInMyOrgEffective(user) : [user.id];
-      includeUnassigned = false;
-    } else if(user.role === 'Team Leader'){
-      // TL sees themselves + their team's agents
-      scopeIds = (typeof agentIdsInMyOrgEffective === 'function')
-        ? agentIdsInMyOrgEffective(user) : [user.id];
-      includeUnassigned = false;
-    } else {
-      // Field Agent / sales role — only their own
-      scopeIds = [user.id];
-      includeUnassigned = false;
+// ══════════════════════════════════════════════════════════════════════
+//  ONE SOURCE OF TRUTH FOR DASHBOARD INVENTORY — Calvin 2026-10-01 v0700
+//  Every dashboard number (Available / Sold / Expired at the top, My Team's
+//  Inventory by market and person, the IMEI lists, "Who's counted here?")
+//  comes from this one function, so they always agree:
+//   • each IMEI counted ONCE (duplicates across lists collapse to one)
+//   • Available = not sold/activated, not deleted, not past its charge date
+//   • scope: Field Agent = own phones · Team Leader = their team ·
+//     Market Manager = every phone located in their market(s) ·
+//     Campaign Manager / IBO = every phone in every market of their downline
+//   • a transfer only changes holder/market; it never adds or removes a phone
+//   • phones held by someone who is no longer active/coded stay counted and
+//     are FLAGGED for reassignment (they never disappear)
+// ══════════════════════════════════════════════════════════════════════
+function _wmamDevKey(d){ var i = String(d && (d.imei || d.sim || d.iccid) || '').replace(/\D/g,''); return i || ('id:' + (d && d.id)); }
+function wmamUniqPool(){
+  var pool = (typeof unionAllInventoryPools === 'function') ? unionAllInventoryPools() : [];
+  var rank = function(d){ if(!d) return -1; if(d.status === 'deleted' || d.deletedAt) return 0; if(d.status === 'sold' || d.status === 'activated' || d.soldAt) return 3; return 2; };
+  var map = {};
+  pool.forEach(function(d){ if(!d) return; var k = _wmamDevKey(d), cur = map[k]; if(!cur || rank(d) > rank(cur)) map[k] = d; });
+  return Object.keys(map).map(function(k){ return map[k]; });
+}
+function wmamDevState(d, today){
+  if(!d) return 'none';
+  if(d.status === 'deleted' || d.deletedAt) return 'deleted';
+  if(d.status === 'sold' || d.status === 'activated' || d.soldAt) return 'sold';
+  if(!d.needsManualDate){ var ex = (typeof _gmIso === 'function' ? _gmIso(d.chargeDate || d.expiryDate) : String(d.chargeDate || d.expiryDate || '').slice(0,10)); if(ex && ex < (today || _ctToday())) return 'expired'; }
+  return 'available';
+}
+function _wmamHolderOf(d){ var h = (typeof deviceHolderId === 'function' ? deviceHolderId(d) : null); if(h == null) h = (d.assignedTo != null ? d.assignedTo : d.holderId); return (h == null || h === '') ? null : h; }
+function _wmamCoded(a){ if(!a) return false; var c = a.agentCodes; if(typeof c === 'string'){ try{ c = JSON.parse(c); }catch(e){ c = {}; } } return !!(c && Object.keys(c).some(function(k){ var v = c[k]; return v && String(v).trim() && String(v).trim() !== '0'; })); }
+function wmamInvScope(user){
+  var today = _ctToday(), byId = {};
+  (DB.agents||[]).forEach(function(a){ if(a) byId[String(a.id)] = a; });
+  var role = user ? (user.role || '') : '';
+  var seeAll = !!(user && (isOwner(user) || role === 'admin' || (typeof isInventory === 'function' && isInventory(user)) || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(user,'inv-dashboard'))));
+  var pool = wmamUniqPool();
+  var org = {}; var mk = {};
+  if(user && !seeAll){
+    var ids = (typeof agentIdsInMyOrgEffective === 'function') ? agentIdsInMyOrgEffective(user) : [user.id];
+    ids.concat([user.id]).forEach(function(id){ org[String(id)] = true; });
+    if(role === 'Market Manager'){ var mm = wmamManagerMarkets(user, pool); Object.keys(mm).forEach(function(k){ mk[k] = mm[k]; }); }
+    if(role === 'Campaign Manager' || role === 'IBO'){
+      var add = function(m){ var k = _wmamMktKey(m); if(k && !mk[k]) mk[k] = m; };
+      add(user.team); add(user.market);
+      (user.iboMarkets||[]).forEach(add);
+      Object.keys(org).forEach(function(id){ var a = byId[id]; if(a && a.active !== false){ add(a.team); } });
+      try{ (MARKETS||[]).forEach(function(m){ if(!m || m.active===false || !m.programs) return; Object.keys(m.programs).forEach(function(k){ var s = m.programs[k]; if(s && (String(s.cmId)===String(user.id) || String(s.iboId)===String(user.id))){ add(m.name); add(m.city); } }); }); }catch(e){}
+      pool.forEach(function(d){ var h = _wmamHolderOf(d); if(h != null && org[String(h)] && d.market) add(d.market); });
     }
   }
-
-  var scopeSet = scopeIds ? scopeIds.reduce(function(m,id){m[id]=true;return m;}, {}) : null;
-  var _mmMarkets = (!seeAll && user.role === 'Market Manager') ? wmamManagerMarkets(user, pool) : null;
-  var _mmHasMarkets = !!(_mmMarkets && Object.keys(_mmMarkets).length);
-
+  var marketBased = (role === 'Market Manager' || role === 'Campaign Manager' || role === 'IBO') && Object.keys(mk).length > 0;
+  var inScope = function(d){
+    if(seeAll) return true; if(!user) return false;
+    var h = _wmamHolderOf(d);
+    if(h != null && String(h) === String(user.id)) return true;
+    if(role === 'Field Agent' || !role) return false;
+    if(marketBased) return !!mk[_wmamMktKey(d.market)] || (h != null && org[String(h)] && (role === 'Campaign Manager' || role === 'IBO'));
+    return h != null && !!org[String(h)];
+  };
+  var out = { user:user, seeAll:seeAll, marketBased:marketBased, markets:mk, available:[], sold:0, expired:0, expiredList:[], total:0 };
   pool.forEach(function(d){
-    if(!d) return;
-    var holderId = (typeof deviceHolderId === 'function' ? deviceHolderId(d) : null) || d.holderId || null;
-    // MM: devices held by people outside their market(s) are not theirs to count
-    if(_mmHasMarkets && String(holderId) !== String(user.id) && !_mmMarkets[_wmamMktKey(d.market)]) return;
-    var inScope = false;
-    if(seeAll){
-      inScope = true;
-    } else if(holderId && scopeSet && scopeSet[holderId]){
-      inScope = true;
-    } else if(!holderId && includeUnassigned){
-      // Unassigned pool — only CM/IBO get this
-      inScope = true;
-    }
-    if(!inScope) return;
-
-    var st = d.status;
-    // Calvin 2026-05-18: soft-deleted devices are excluded from all
-    // scoreboard counts (total, sold, available) — they're "in the trash"
-    // and shouldn't influence any visible metric. Owner can still see them
-    // in panelInvTrash for restore/empty-trash actions.
-    if(st === 'deleted') return;
-    var isSold = (st === 'sold' || st === 'activated' || d.soldAt);
+    if(!inScope(d)) return; var st = wmamDevState(d, today); if(st === 'deleted' || st === 'none') return;
     out.total++;
-    if(isSold) out.sold++;
-    else {
-      out.available++;
-      // ── Calvin 2026-07-02: campaign split + expiry triage (same scope) ──
-      var camp = d.campaign || d.carrier || 'Other';
-      out.byCampaign[camp] = (out.byCampaign[camp]||0) + 1;
-      var exp = (d.expiryDate||'').slice(0,10);
-      if(exp){
-        if(exp < out._today){
-          out.expired++;
-          if(!out.expiredWorst || exp < (out.expiredWorst.expiryDate||'').slice(0,10)) out.expiredWorst = d;
-        } else {
-          if(!out.expiringSoon || exp < (out.expiringSoon.expiryDate||'').slice(0,10)) out.expiringSoon = d;
-        }
-      }
-    }
+    if(st === 'sold') out.sold++;
+    else if(st === 'expired'){ out.expired++; out.expiredList.push(d); }
+    else out.available.push(d);
   });
+  // roster: every ACTIVE person CODED to a campaign and placed in one of the markets (zero inventory included)
+  out.roster = (DB.agents||[]).filter(function(a){
+    if(!a || a.active === false || !_wmamCoded(a) || isOwner(a)) return false;
+    if(seeAll) return false;
+    if(String(a.id) === String(user.id)) return true;
+    if(marketBased) return !!mk[_wmamMktKey(a.team)] && (role !== 'Market Manager' || !!org[String(a.id)] || true);
+    return !!org[String(a.id)];
+  });
+  out.isFlagged = function(holderId){ var a = byId[String(holderId)]; return !a || a.active === false || !_wmamCoded(a); };
+  return out;
+}
+if(typeof window!=='undefined'){ Object.assign(window, { wmamUniqPool:wmamUniqPool, wmamDevState:wmamDevState, wmamInvScope:wmamInvScope, _wmamDevKey:_wmamDevKey }); }
 
+function scoreboardInventory(user){
+  // v2026.10.01: computed from wmamInvScope() — the same records My Team's Inventory uses.
+  var out = {available:0, sold:0, total:0, expired:0, byCampaign:{}, expiredWorst:null, expiringSoon:null, _today:_ctToday()};
+  if(!user) return out;
+  var S = wmamInvScope(user);
+  out.available = S.available.length; out.sold = S.sold; out.expired = S.expired; out.total = S.total;
+  S.available.forEach(function(d){
+    var camp = d.campaign || d.carrier || 'Other'; out.byCampaign[camp] = (out.byCampaign[camp]||0) + 1;
+    var ex = _gmIso(d.chargeDate || d.expiryDate); if(ex && (!out.expiringSoon || ex < _gmIso(out.expiringSoon.chargeDate || out.expiringSoon.expiryDate))) out.expiringSoon = d;
+  });
+  S.expiredList.forEach(function(d){ var ex = _gmIso(d.chargeDate || d.expiryDate); if(ex && (!out.expiredWorst || ex < _gmIso(out.expiredWorst.chargeDate || out.expiredWorst.expiryDate))) out.expiredWorst = d; });
   return out;
 }
 
