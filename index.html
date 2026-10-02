@@ -921,6 +921,8 @@ tr:hover td { background:rgba(0,53,148,.02); }
 /* MODAL */
 .modal-bg { position:fixed; inset:0; background:rgba(58,31,13,.6); z-index:5000; display:none; align-items:center; justify-content:center; }
 .modal-bg.open { display:flex; }
+/* v2026.10.02: transfer invoice fits phones (Tier column hidden, full cost always visible) */
+@media (max-width: 600px){ #invAcceptModal [style*="grid-template-columns:1.6fr 1fr 80px 90px"]{ grid-template-columns:1.7fr 1fr 76px !important; } #invAcceptModal [style*="grid-template-columns:1.6fr 1fr 80px 90px"] > :nth-child(3){ display:none !important; } }
 
 /* v2026.09.30: Add / Edit Person — clean, readable on desktop AND phones (no cut-off sections) */
 #addPersonModal.modal-bg{ align-items:center; padding:16px; }
@@ -3789,7 +3791,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.02.0600';
+var BUILD_VERSION = '2026.10.02.0900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14482,6 +14484,7 @@ function _gmStatusChip(s){
   return '<span style="display:inline-block;background:'+m[0]+';color:#fff;border-radius:999px;padding:2px 9px;font-size:.7rem;font-weight:800;letter-spacing:.5px">'+m[1]+'</span>';
 }
 async function gmPayLoadMine(){
+  try{ if(!GMPAY.token && DB.current && Date.now() - GMPAYOUTS.loadedAt > 60000) await gmPayoutsLoad(DB.current.id); }catch(e){}   // this agent's recorded surplus payments
   var el = document.getElementById('gmPayMine'); if(!el || (!DB.current && !GMPAY.token)) return;
   try{
     var r = GMPAY.token ? await (async function(){ var x = await wmamInvoke('gm-pay-link', { body: { payToken: GMPAY.token, action:'list' } }); return { data: x && x.data && x.data.sales }; })()
@@ -14567,6 +14570,83 @@ async function gmSalesRemoveCanceled(){
   gmSalesLoad();
 }
 if(typeof window!=='undefined') window.gmSalesRemoveCanceled = gmSalesRemoveCanceled;
+
+// ══════════════════════════════════════════════════════════════════════
+//  SURPLUS PAYOUTS — Calvin 2026-10-02 v0700
+//  Surplus = on paid customer sales, what the agent charged above the cost
+//  of the phone + plan. Pay week = Thursday → Wednesday (Gen Mobile).
+//  Payroll (K-Anna / office) records each payment — full or partial — with a
+//  note. The surplus balance clears by what was paid; every sale and every
+//  payment stays on record; any unpaid balance carries forward.
+// ══════════════════════════════════════════════════════════════════════
+var GMPAYOUTS = { rows:[], loadedAt:0 };
+async function gmPayoutsLoad(agentId){
+  try{ var q = supaClient.from('gm_agent_payouts').select('*').order('paid_at', { ascending:false }); if(agentId != null) q = q.eq('agent_id', agentId);
+    var r = await q; GMPAYOUTS.rows = (r && Array.isArray(r.data)) ? r.data : []; GMPAYOUTS.loadedAt = Date.now(); }catch(e){ GMPAYOUTS.rows = GMPAYOUTS.rows || []; }
+  return GMPAYOUTS.rows;
+}
+function _gmSurplusOf(s){ return (s && s.status === 'paid' && s.payer === 'customer') ? (Number(s.owed_agent)||0) : 0; }
+function gmAgentLedger(agentId, sales, payouts){
+  var mine = (sales||[]).filter(function(s){ return String(s.agent_id) === String(agentId); });
+  var pays = (payouts||[]).filter(function(p){ return String(p.agent_id) === String(agentId); });
+  var weeks = {};
+  mine.forEach(function(s){ var day = _gmSaleDay(s); if(!day) return; var k = _gmPayWeekStart(day); var w = weeks[k] = weeks[k] || { start:k, surplus:0, paid:0, sales:0 }; w.surplus += _gmSurplusOf(s); if(s.status === 'paid') w.sales++; });
+  pays.forEach(function(p){ var k = p.week_start ? String(p.week_start).slice(0,10) : _gmPayWeekStart(_ctToday()); var w = weeks[k] = weeks[k] || { start:k, surplus:0, paid:0, sales:0 }; w.paid += Number(p.paid)||0; });
+  var keys = Object.keys(weeks).sort(), carry = 0;
+  var list = keys.map(function(k){ var w = weeks[k]; w.carriedIn = carry; w.balance = Math.round((carry + w.surplus - w.paid)*100)/100; carry = w.balance; return w; });
+  var totalSurplus = list.reduce(function(t,w){ return t + w.surplus; }, 0), totalPaid = pays.reduce(function(t,p){ return t + (Number(p.paid)||0); }, 0);
+  return { weeks:list.reverse(), payouts:pays, totalSurplus:Math.round(totalSurplus*100)/100, totalPaid:Math.round(totalPaid*100)/100, balance:Math.round((totalSurplus - totalPaid)*100)/100 };
+}
+function gmPayoutsHtml(){
+  var all = GMSALES.rows || [], esc = _escapeHtml;
+  var ids = {}; all.forEach(function(s){ if(_gmSurplusOf(s) > 0 || (GMPAYOUTS.rows||[]).some(function(p){ return String(p.agent_id) === String(s.agent_id); })) ids[s.agent_id] = s.agent_name || ids[s.agent_id] || ''; });
+  (GMPAYOUTS.rows||[]).forEach(function(p){ if(!(p.agent_id in ids)) ids[p.agent_id] = p.agent_name || ''; });
+  var wk = _gmPayWeekStart(_ctToday()), lastWk = _gmAddDays(wk, -7), payDay = _gmAddDays(lastWk, 8);
+  var h = '<div style="font-size:.86rem;color:#374151;margin:4px 0 10px">Pay weeks run <b>Thursday \u2192 Wednesday</b>. Last week (<b>'+_gmShort(lastWk)+' \u2013 '+_gmShort(_gmAddDays(lastWk,6))+'</b>) pays <b>Friday '+_gmShort(payDay).slice(4)+'</b>. Record what you paid each agent \u2014 full or partial. Any unpaid balance carries forward; nothing is erased.</div>';
+  var agents = Object.keys(ids);
+  if(!agents.length) return h + '<div style="color:#888;padding:20px">No surplus yet.</div>';
+  h += agents.map(function(id){
+    var L = gmAgentLedger(id, all, GMPAYOUTS.rows), name = ids[id] || ((DB.agents||[]).find(function(a){ return String(a.id) === String(id); })||{}).name || ('Agent #'+id);
+    var rows = L.weeks.slice(0, 8).map(function(w){ return '<tr style="border-top:1px solid #eef0f4;'+(w.start===lastWk?'background:#fffbeb;':'')+'"><td style="padding:6px 8px">'+_gmShort(w.start)+' \u2013 '+_gmShort(_gmAddDays(w.start,6))+(w.start===wk?' <span style="font-size:.7rem;color:#6b7280">(this week)</span>':'')+'</td><td style="padding:6px 8px">'+w.sales+'</td><td style="padding:6px 8px">'+_gmMoney(w.surplus)+'</td><td style="padding:6px 8px">'+(w.carriedIn ? _gmMoney(w.carriedIn) : '\u2014')+'</td><td style="padding:6px 8px;color:#166534;font-weight:700">'+(w.paid ? _gmMoney(w.paid) : '\u2014')+'</td><td style="padding:6px 8px;font-weight:900;color:'+(w.balance>0?'#b45309':'#166534')+'">'+_gmMoney(w.balance)+'</td></tr>'; }).join('');
+    var hist = L.payouts.slice(0, 5).map(function(p){ return '<div style="font-size:.78rem;color:#374151">\u2714 '+_gmMoney(p.paid)+' paid '+new Date(p.paid_at).toLocaleDateString()+' by '+esc(p.paid_by||'')+(p.week_start?' (week of '+_gmShort(String(p.week_start).slice(0,10))+')':'')+(Number(p.owed) > Number(p.paid) ? ' \u2014 <b>'+_gmMoney(Number(p.owed)-Number(p.paid))+' not paid</b>' : '')+(p.note?' \u00b7 '+esc(p.note):'')+'</div>'; }).join('');
+    return '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:12px">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><b style="font-size:1.05rem">'+esc(name)+'</b><div style="font-size:.8rem;color:#6b7280">Surplus all-time '+_gmMoney(L.totalSurplus)+' \u00b7 paid '+_gmMoney(L.totalPaid)+'</div></div>'
+      + '<div style="display:flex;gap:8px;align-items:center"><div style="text-align:right"><div style="font-size:.7rem;color:#6b7280;font-weight:800;letter-spacing:1px">OWED NOW</div><div style="font-size:1.3rem;font-weight:900;color:'+(L.balance>0?'#b45309':'#166534')+'">'+_gmMoney(L.balance)+'</div></div>'
+      + (L.balance > 0 ? '<button onclick="gmPayoutRecord('+id+','+L.balance+')" style="padding:10px 14px;border:none;border-radius:8px;background:#16a34a;color:#fff;font-weight:900;cursor:pointer">Record payment</button>' : '<span style="font-weight:800;color:#166534">\u2714 Paid up</span>') + '</div></div>'
+      + '<div style="overflow-x:auto;margin-top:8px"><table style="width:100%;border-collapse:collapse;font-size:.84rem;min-width:560px"><tr style="text-align:left;background:#003594">'+['Pay week','Paid sales','Surplus','Carried in','Paid','Balance'].map(function(t){ return '<th style="padding:6px 8px;color:#fff!important">'+t+'</th>'; }).join('')+'</tr>'+rows+'</table></div>'
+      + (hist ? '<div style="margin-top:8px">'+hist+'</div>' : '') + '</div>';
+  }).join('');
+  return h;
+}
+async function gmPayoutRecord(agentId, balance){
+  var a = (DB.agents||[]).find(function(x){ return String(x.id) === String(agentId); }) || { name:'Agent #'+agentId };
+  var amt = prompt('Record a surplus payment to '+a.name+'.\n\nOwed now: '+_gmMoney(balance)+'\n\nAmount paid (enter less if only part was paid):', Number(balance).toFixed(2));
+  if(amt == null) return; var paid = Math.round((parseFloat(String(amt).replace(/[^0-9.]/g,''))||0)*100)/100;
+  if(!(paid > 0)){ alert('Enter the amount that was paid.'); return; }
+  var note = ''; if(paid < balance){ note = prompt('Only '+_gmMoney(paid)+' of '+_gmMoney(balance)+' was paid. What happened to the other '+_gmMoney(balance - paid)+'? (it stays owed and carries forward)', '') || ''; }
+  else { note = prompt('Note (optional, e.g. payroll direct deposit 10/9):', 'Payroll direct deposit') || ''; }
+  var wk = _gmAddDays(_gmPayWeekStart(_ctToday()), -7);
+  var row = { agent_id:Number(agentId), agent_name:a.name, week_start:wk, week_end:_gmAddDays(wk,6), owed:balance, paid:paid, note:note, paid_by:(DB.current&&DB.current.name)||'' };
+  var r = await supaClient.from('gm_agent_payouts').insert(row);
+  if(r && r.error){ alert('Not saved: '+r.error.message); return; }
+  if(paid >= balance - 0.004){ try{ await supaClient.from('gm_sales').update({ agent_payback_status:'paid' }).eq('agent_id', Number(agentId)).eq('status','paid').eq('payer','customer').eq('agent_payback_status','unpaid'); }catch(e){} }
+  try{ showToast('Recorded '+_gmMoney(paid)+' paid to '+a.name+(paid < balance ? ' \u2014 '+_gmMoney(balance-paid)+' still owed' : '')); }catch(e){}
+  await gmPayoutsLoad(); try{ gmSalesLoad(); }catch(e){}
+}
+// agent-side numbers: today / this pay week / this month, canceled, chargebacks, phones held
+function gmAgentPeriodsHtml(rows){
+  rows = rows || []; var t = _ctToday(), wk = _gmPayWeekStart(t), mo = t.slice(0,7);
+  var inP = function(s, p){ var day = _gmSaleDay(s); if(!day) return false; return p === 'day' ? day === t : (p === 'week' ? _gmPayWeekStart(day) === wk : day.slice(0,7) === mo); };
+  var stat = function(p){ var L = rows.filter(function(s){ return inP(s, p); }), paid = L.filter(function(s){ return s.status === 'paid'; });
+    return { orders:paid.length, money: paid.reduce(function(x,s){ return x + (Number(s.amount_paid != null ? s.amount_paid : s.amount_charged)||0); }, 0), surplus: paid.reduce(function(x,s){ return x + _gmSurplusOf(s); }, 0),
+      canceled: L.filter(function(s){ return s.status === 'canceled' || s.status === 'replaced'; }).length, chargebacks: L.filter(function(s){ return s.status === 'refunded' || s.status === 'chargeback' || s.chargeback_at; }).length }; };
+  var held = 0; try{ var me = DB.current; if(me && !GMPAY.token) held = wmamUniqPool().filter(function(d){ return String(_wmamHolderOf(d)) === String(me.id) && wmamDevState(d) === 'available'; }).length; }catch(e){}
+  var col = function(label, S){ return '<div style="flex:1 1 150px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:.68rem;font-weight:800;letter-spacing:1px;color:#6b7280">'+label+'</div><div style="font-size:1.25rem;font-weight:900;color:#003594">'+S.orders+' order'+(S.orders===1?'':'s')+'</div><div style="font-size:.82rem;color:#374151">'+_gmMoney(S.money)+' collected \u00b7 <b style="color:#7c3aed">'+_gmMoney(S.surplus)+' surplus</b></div>'+((S.canceled||S.chargebacks)?'<div style="font-size:.76rem;color:#b91c1c">'+(S.canceled?S.canceled+' canceled ':'')+(S.chargebacks?'\u00b7 '+S.chargebacks+' chargeback'+(S.chargebacks===1?'':'s'):'')+'</div>':'')+'</div>'; };
+  return '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">' + col('TODAY', stat('day')) + col('THIS PAY WEEK', stat('week')) + col('THIS MONTH', stat('month'))
+    + (GMPAY.token ? '' : '<div style="flex:1 1 150px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:.68rem;font-weight:800;letter-spacing:1px;color:#6b7280">PHONES I HOLD</div><div style="font-size:1.25rem;font-weight:900;color:#003594">'+held+'</div><div style="font-size:.78rem;color:#6b7280">available to sell</div></div>') + '</div>';
+}
+if(typeof window!=='undefined'){ Object.assign(window, { gmPayoutsLoad:gmPayoutsLoad, gmPayoutRecord:gmPayoutRecord, gmAgentLedger:gmAgentLedger, gmPayoutsHtml:gmPayoutsHtml, gmAgentPeriodsHtml:gmAgentPeriodsHtml, GMPAYOUTS:GMPAYOUTS }); }
+
 function gmSalesRender(){
   var box = document.getElementById('gmSalesBox'); if(!box) return;
   var all = GMSALES.rows, paid = all.filter(function(s){ return s.status==='paid'; });
@@ -14581,8 +14661,9 @@ function gmSalesRender(){
     + '</div>';
   var _unpaidCanceled = all.filter(function(s){ return (s.status==='canceled' || s.status==='replaced') && !s.paid_at; });
   if(_unpaidCanceled.length) h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:10px 12px;margin-bottom:12px"><span style="color:#9a3412;font-weight:700">'+_unpaidCanceled.length+' canceled order'+(_unpaidCanceled.length===1?'':'s')+' never took a payment</span><button onclick="gmSalesRemoveCanceled()" style="padding:8px 14px;border:none;border-radius:8px;background:#b91c1c;color:#fff;font-weight:800;cursor:pointer">Remove them</button></div>';
-  var tabs = [['all','All'],['paid','Paid'],['waiting','Waiting'],['payback','Agent paybacks due']];
+  var tabs = [['all','All'],['paid','Paid'],['waiting','Waiting'],['payback','Agent paybacks due'],['payouts','Surplus payouts']];
   h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">' + tabs.map(function(t){ var on = GMSALES.filter===t[0]; return '<button onclick="gmSalesSetFilter(\''+t[0]+'\')" style="padding:8px 14px;border-radius:999px;border:1px solid #003594;background:'+(on?'#003594':'#fff')+';color:'+(on?'#fff':'#003594')+';font-weight:700;cursor:pointer">'+t[1]+'</button>'; }).join('') + '</div>';
+  if(GMSALES.filter === 'payouts'){ if(Date.now() - GMPAYOUTS.loadedAt > 30000){ gmPayoutsLoad().then(function(){ gmSalesRender(); }); } box.innerHTML = h + gmPayoutsHtml(); return; }
   var rows = all.filter(function(s){
     if(GMSALES.filter==='paid') return s.status==='paid';
     if(GMSALES.filter==='waiting') return s.status==='link_created';
@@ -15130,7 +15211,7 @@ function panelGmPrices(){
   if(!canAccess(DB.current,'gm-sales')) return '<div style="padding:40px;text-align:center;color:#888">This screen is for the office.</div>';
   setTimeout(async function(){
     await gmPayLoadPricing();
-    if(isOwner(DB.current)) { gmPriceRender(); return; }
+    if(isOwner(DB.current) || wmamHasFullOffice(DB.current) || (typeof isInventory === 'function' && isInventory(DB.current))) { gmPriceRender(); return; }
     var box = document.getElementById('gmPriceBox'); if(!box) return;
     var P = GMPAY.pricing || GM_SALE_PRICING_DEFAULT;
     box.innerHTML = '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;overflow-x:auto"><table style="border-collapse:collapse;font-size:.9rem;min-width:420px"><tr style="text-align:left"><th style="padding:6px 10px">Phone</th><th style="padding:6px 10px">Full price</th><th style="padding:6px 10px">With a data plan</th></tr>'
@@ -15568,8 +15649,9 @@ function _gmAgentSummaryHtml(rows){
   var cur = stat(weeks[wk] || []);
   var allPaid = rows.filter(function(s){ return s.status === 'paid'; });
   var owedAll = allPaid.filter(function(s){ return s.agent_payback_status !== 'paid'; }).reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0);
+  try{ if(GMPAYOUTS.rows && GMPAYOUTS.rows.length && rows.length){ var _L = gmAgentLedger(rows[0].agent_id, rows, GMPAYOUTS.rows); owedAll = Math.max(0, _L.balance); } }catch(e){}
   var card = function(k,v,c,sub){ return '<div style="flex:1 1 140px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:.66rem;font-weight:800;letter-spacing:1px;color:#6b7280;text-transform:uppercase">'+k+'</div><div style="font-size:1.4rem;font-weight:900;color:'+(c||'#003594')+'">'+v+'</div>'+(sub?'<div style="font-size:.72rem;color:#6b7280">'+sub+'</div>':'')+'</div>'; };
-  var h = '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin:4px 0 4px">MY PAY LINK SALES</div>'
+  var h = '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin:4px 0 4px">MY PAY LINK SALES</div>' + gmAgentPeriodsHtml(rows)
     + '<div style="font-size:.82rem;color:#374151;margin-bottom:8px">This pay week: <b>'+_gmShort(wk)+' \u2013 '+_gmShort(wkEnd)+'</b> \u00b7 surplus paid <b>Friday '+(new Date(payDay+'T12:00:00').getMonth()+1)+'/'+new Date(payDay+'T12:00:00').getDate()+'</b> by direct deposit</div>'
     + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">'
     + card('Paid sales this week', cur.paid) + card('Surplus this week', money(cur.surplus), cur.surplus>0?'#7c3aed':'#6b7280', 'paid Friday')
@@ -15628,9 +15710,11 @@ function wmamGMDates(d){
   var received = (d.dateHolderId != null && String(d.dateHolderId) === hid && d.receivedAt) ? String(d.receivedAt).slice(0,10)
                : (d.dateHolderId != null && String(d.dateHolderId) !== hid) ? _ctToday()
                : (_gmIso(d.receivedAt) || _gmIso(d.assignedDate) || up);
-  var base = agentLevel ? received : up;
-  var days = role === 'Field Agent' ? 14 : (role === 'Team Leader' ? 21 : 30);
-  var source = role === 'Field Agent' ? 'Agents: 14 days from receiving it' : (role === 'Team Leader' ? 'Team Leaders: 21 days from receiving it' : 'Managers / markets: 30 days from upload'), fixed = null;
+  // v2026.10.02: EVERY holder (agent, team leader, manager) gets 21 days from the day THEY received it
+  var base = holder ? received : up;
+  var _mgr = holder && /^(Market Manager|Campaign Manager|IBO)$/.test(role);
+  var days = holder ? (_mgr ? 30 : 21) : 30;   // managers 30 days (hard cutoff), team leaders + agents 21
+  var source = holder ? (_mgr ? 'Managers: 30 days from receiving it' : '21 days from receiving it') : 'Not given to anyone yet: 30 days from upload', fixed = null;
   var mr = d.market && GM_DATE_RULES.markets && GM_DATE_RULES.markets[d.market];
   if(mr){ if(mr.date) fixed = _gmIso(mr.date); else if(mr.days) days = +mr.days; source = 'Custom for market ' + d.market; }
   var ar = holder && GM_DATE_RULES.agents && GM_DATE_RULES.agents[holder.id];
@@ -16420,6 +16504,9 @@ function ahubProfRender(id){
     + (typeof hasImpersonationAccess === 'function' && hasImpersonationAccess(DB.current) ? btn('\uD83D\uDC41 View as', "document.getElementById('ahubProf').remove();startImpersonation("+a.id+")") : '')
     + (a.active === false ? btn('Reactivate agent', 'ahubSetActive('+a.id+',true)', '#16a34a', '#fff') : btn('Deactivate agent', 'ahubSetActive('+a.id+',false)', '#fff', '#b91c1c'))
     + '</div>';
+  var _canInv = isOwner(DB.current) || (typeof isInventory === 'function' && isInventory(DB.current));
+  h += '<label style="display:flex;gap:10px;align-items:flex-start;border:1px solid '+(a.canTransferWithoutApproval?'#86efac':'#e5e7eb')+';background:'+(a.canTransferWithoutApproval?'#ecfdf5':'#f8fafc')+';border-radius:12px;padding:10px 12px;margin-bottom:12px;'+(_canInv?'cursor:pointer':'opacity:.7')+'"><input type="checkbox" '+(a.canTransferWithoutApproval?'checked':'')+(_canInv?'':' disabled')+' onchange="ahubToggleBypass('+a.id+', this.checked)" style="margin-top:3px"><span><b>Can transfer inventory without Inventory Dept approval</b><br><span style="font-size:.8rem;color:#6b7280">Off: every transfer they send waits for the Inventory Dept. On: it goes straight to the receiver to e-sign. Phones with less than 21 days left at the company ALWAYS wait for the Inventory Dept.'+(_canInv?'':' (Only the Inventory Dept or the owner can change this.)')+'</span></span></label>';
+  if(isOwner(DB.current)) h += '<label style="display:flex;gap:10px;align-items:flex-start;border:1px solid '+(a.fullOfficeAccess?'#93c5fd':'#e5e7eb')+';background:'+(a.fullOfficeAccess?'#eff6ff':'#f8fafc')+';border-radius:12px;padding:10px 12px;margin-bottom:12px;cursor:pointer"><input type="checkbox" '+(a.fullOfficeAccess?'checked':'')+' onchange="ahubToggleFullOffice('+a.id+', this.checked)" style="margin-top:3px"><span><b>Full office access</b><br><span style="font-size:.8rem;color:#6b7280">Everything in the back office except the Owner Control panel (owner only).</span></span></label>';
   h += '<div style="font-weight:900;color:#003594;margin:6px 0">CAMPAIGNS</div>';
   h += cs.length ? cs.map(function(c){ var s = wmamAgentCampStatus(a, c), code = wmamCodeFor(a, c) || '';
       return '<div style="border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;margin-bottom:8px">'
@@ -16435,6 +16522,30 @@ function ahubProfRender(id){
   if(avail.length) h += '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px"><select id="ahubAddC" style="padding:8px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px"><option value="">Add a campaign\u2026</option>'+avail.map(function(c){ return '<option>'+esc(c)+'</option>'; }).join('')+'</select>'+btn('+ Add', 'ahubAddCampaign('+a.id+')')+'</div>';
   box.innerHTML = h;
 }
+
+
+// v2026.10.02: Makenzie Gibson and K-Anna Williams get full office access (set once by the owner's browser)
+var _wmamFullOfficeSet = false;
+function wmamEnsureFullOfficeFor(){
+  if(_wmamFullOfficeSet || !DB.current || !isOwner(DB.current) || !Array.isArray(DB.agents) || !DB.agents.length) return; _wmamFullOfficeSet = true;
+  (DB.agents||[]).forEach(function(a){ if(a && a.active !== false && /^(makenzie gibson|k-?anna williams)$/i.test(String(a.name||'').trim()) && a.fullOfficeAccess !== true){ a.fullOfficeAccess = true; try{ saveAgentToSupabase(a); }catch(e){} console.log('[access] full office access ON for '+a.name); } });
+}
+function ahubToggleFullOffice(id, on){
+  if(!isOwner(DB.current)){ alert('Only the owner can change full office access.'); ahubProfRender(id); return; }
+  var a = (DB.agents||[]).find(function(x){ return x && String(x.id) === String(id); }); if(!a) return;
+  a.fullOfficeAccess = !!on; _ahubSave(a); try{ showToast(a.name + (on ? ' now has full office access' : ' no longer has full office access')); }catch(e){} ahubProfRender(id);
+}
+if(typeof window!=='undefined'){ window.wmamEnsureFullOfficeFor = wmamEnsureFullOfficeFor; window.ahubToggleFullOffice = ahubToggleFullOffice; window.wmamHasFullOffice = wmamHasFullOffice; }
+
+function ahubToggleBypass(id, on){
+  if(!(isOwner(DB.current) || (typeof isInventory === 'function' && isInventory(DB.current)))){ alert('Only the Inventory Dept or the owner can change this.'); ahubProfRender(id); return; }
+  var a = (DB.agents||[]).find(function(x){ return x && String(x.id) === String(id); }); if(!a) return;
+  a.canTransferWithoutApproval = !!on; _ahubSave(a);
+  try{ showToast(a.name + (on ? ' can now transfer without approval' : ' now needs Inventory Dept approval to transfer')); }catch(e){}
+  ahubProfRender(id);
+}
+if(typeof window!=='undefined') window.ahubToggleBypass = ahubToggleBypass;
+
 function _ahubSave(a){ try{ saveAgentToSupabase(a); }catch(e){} try{ saveToStorage(); }catch(e){} try{ if(DB.current && DB.current.id === a.id) wmamSyncCurrent(); }catch(e){} }
 function ahubSaveCode(id, c){
   var a = (DB.agents||[]).find(function(x){ return x && String(x.id) === String(id); }); if(!a) return;
@@ -16505,9 +16616,13 @@ function ahubAssignPackage(agentId, pkgId){
 }
 if(typeof window!=='undefined'){ Object.assign(window, { panelAgentsHub:panelAgentsHub, ahubRender:ahubRender, ahubOpen:ahubOpen, ahubProfRender:ahubProfRender, ahubSaveCode:ahubSaveCode, ahubOverride:ahubOverride, ahubAddCampaign:ahubAddCampaign, ahubSetActive:ahubSetActive, ahubSendContracts:ahubSendContracts, wmamAgentCampStatus:wmamAgentCampStatus, wmamCampaignsOf:wmamCampaignsOf, wmamLoadAgreements:wmamLoadAgreements, WMAM_AGREE_SET:WMAM_AGREE_SET, AHUB:AHUB }); }
 
+var WMAM_OWNER_ONLY_AREAS = { 'owner-control':1, 'owner':1 };
+function wmamHasFullOffice(u){ return !!(u && u.active !== false && u.fullOfficeAccess === true); }
 function canAccess(u, area){
+  try{ var _fu = (arguments[0] && typeof arguments[0] === 'object' && arguments[0].role !== undefined) ? arguments[0] : DB.current; var _fid = (typeof arguments[1] === 'string') ? arguments[1] : (typeof arguments[0] === 'string' ? arguments[0] : ''); if(wmamHasFullOffice(_fu) && _fid && !WMAM_OWNER_ONLY_AREAS[_fid]) return true; }catch(e){}
   if(!u) return false;
-  if(isOwner(u)) return true;  // Owner always has full access — permanent, never override
+  if(isOwner(u)) return true;  // Owner always has full access
+  if(wmamHasFullOffice(u) && !WMAM_OWNER_ONLY_AREAS[area]) return true;   // v2026.10.02: full office access (everything but the Owner Control panel) — permanent, never override
 
   var role = u.role||'';
   // Admin is DEPRECATED as a privilege. It is kept as a legacy label only.
@@ -23257,7 +23372,7 @@ async function syncPullFreshAgent(agentId){
       dartScanLog:   (function(){ try{ return _unpackDartScanLog(a); }catch(e){ return []; } })(),
       directMmMarkets: (function(){ try{ return _unpackDirectMmMarkets(a); }catch(e){ return []; } })(),
       iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
-      campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(), campaignActive: (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return (m.campaignActive && typeof m.campaignActive === 'object') ? m.campaignActive : {}; }catch(e){ return {}; } })(),
+      campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(), campaignActive: (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return (m.campaignActive && typeof m.campaignActive === 'object') ? m.campaignActive : {}; }catch(e){ return {}; } })(), fullOfficeAccess: (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.fullOfficeAccess === true; }catch(e){ return false; } })(),
       createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
       // Calvin 2026-06-04: office-override bypass flag
       bypassOnboardingGate:    a.bypass_onboarding_gate === true,
@@ -23326,7 +23441,7 @@ async function syncPullFreshAllAgents(){
       dartScanLog:   (function(){ try{ return _unpackDartScanLog(a); }catch(e){ return []; } })(),
       directMmMarkets: (function(){ try{ return _unpackDirectMmMarkets(a); }catch(e){ return []; } })(),
         iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
-        campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(), campaignActive: (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return (m.campaignActive && typeof m.campaignActive === 'object') ? m.campaignActive : {}; }catch(e){ return {}; } })(),
+        campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(), campaignActive: (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return (m.campaignActive && typeof m.campaignActive === 'object') ? m.campaignActive : {}; }catch(e){ return {}; } })(), fullOfficeAccess: (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.fullOfficeAccess === true; }catch(e){ return false; } })(),
         createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
         bypassOnboardingGate:    a.bypass_onboarding_gate === true,
         bypassOnboardingGateBy:  a.bypass_onboarding_gate_by || null,
@@ -23920,7 +24035,7 @@ function wmamBackfillExpiryDates(){
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log(' EXPIRY BACKFILL — fixing TL/Field Agent device expiries');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  var ROLE_CAPS = { 'Team Leader': 14, 'Field Agent': 14, 'Sales Rep': 14 };
+  var ROLE_CAPS = { 'Team Leader': 21, 'Field Agent': 21, 'Sales Rep': 21, 'Market Manager': 30, 'Campaign Manager': 30, 'IBO': 30 };   // v2026.10.02: 21 days for everyone
   var changed = 0;
   var pools = [];
   if(typeof GM_INVENTORY !== 'undefined' && Array.isArray(GM_INVENTORY)) pools.push({name:'GM_INVENTORY', pool:GM_INVENTORY});
@@ -25053,7 +25168,7 @@ async function loadFromSupabase(){
       dartScanLog:   (function(){ try{ return _unpackDartScanLog(a); }catch(e){ return []; } })(),
       directMmMarkets: (function(){ try{ return _unpackDirectMmMarkets(a); }catch(e){ return []; } })(),
           iboId:         (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
-          campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(), campaignActive: (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return (m.campaignActive && typeof m.campaignActive === 'object') ? m.campaignActive : {}; }catch(e){ return {}; } })(),
+          campaigns:     (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(), campaignActive: (function(){ try{ var m = _unpackAgentReportsTo(a.reports_to).meta; return (m.campaignActive && typeof m.campaignActive === 'object') ? m.campaignActive : {}; }catch(e){ return {}; } })(), fullOfficeAccess: (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.fullOfficeAccess === true; }catch(e){ return false; } })(),
           createdAt:     (function(){ try{ return _unpackAgentReportsTo(a.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
           // Calvin 2026-06-04: office-override bypass flag
           bypassOnboardingGate:    a.bypass_onboarding_gate === true,
@@ -25973,6 +26088,7 @@ function _buildAgentRow(agent){
   else delete meta.campaigns;
   if(agent.campaignActive && typeof agent.campaignActive === 'object' && Object.keys(agent.campaignActive).length) meta.campaignActive = agent.campaignActive;
   else delete meta.campaignActive;
+  if(agent.fullOfficeAccess === true) meta.fullOfficeAccess = true; else delete meta.fullOfficeAccess;
   if(agent.createdAt) meta.createdAt = agent.createdAt;
   if(agent.createdById) meta.createdById = agent.createdById;
   if(agent.createdByName) meta.createdByName = agent.createdByName;
@@ -26267,7 +26383,7 @@ async function saveAgentToSupabase(agent){
 // v2026.10.01: keep the logged-in (or "viewing as") person in sync with the latest
 // copy of their record. Sales uploads replace the copy in DB.agents; without this,
 // Monthly / Weekly Production on their dashboard stayed at the old numbers.
-var _WMAM_SYNC_KEYS = ['monthlySales','sales','agentCodes','programs','program','campaigns','campaignActive','role','team','active',
+var _WMAM_SYNC_KEYS = ['monthlySales','sales','agentCodes','programs','program','campaigns','campaignActive','fullOfficeAccess','role','team','active',
   'marketManagerId','teamLeaderId','campaignManagerId','reportsTo','depts','iboMarkets','directMmMarkets','canDistributeInventory','canTransferWithoutApproval','canUseDartScanner'];
 function wmamSyncCurrent(){
   try{
@@ -26331,6 +26447,7 @@ function _mergeServerAgentIntoLocal(serverRow){
     iboId:       (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.iboId || null; }catch(e){ return null; } })(),
     campaigns:   (function(){ try{ var m = _unpackAgentReportsTo(serverRow.reports_to).meta; return Array.isArray(m.campaigns) ? m.campaigns : []; }catch(e){ return []; } })(),
     campaignActive: (function(){ try{ var m = _unpackAgentReportsTo(serverRow.reports_to).meta; return (m.campaignActive && typeof m.campaignActive === 'object') ? m.campaignActive : {}; }catch(e){ return {}; } })(),
+    fullOfficeAccess: (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.fullOfficeAccess === true; }catch(e){ return false; } })(),
     createdAt:   (function(){ try{ return _unpackAgentReportsTo(serverRow.reports_to).meta.createdAt || null; }catch(e){ return null; } })(),
     // Calvin 2026-06-04: hydrate the office-override bypass flag from
     // the server. Default to false if column missing (older schema).
@@ -43516,6 +43633,7 @@ function gotoPanel(id, params){
       ? renderInventoryConflictBanner() : '';
     try{ if(typeof wmamSyncCurrent==='function') wmamSyncCurrent(); }catch(e){}
     try{ if(typeof wmamDeriveTeamsFromMarkets==='function') wmamDeriveTeamsFromMarkets(); }catch(e){}
+    try{ if(typeof wmamEnsureFullOfficeFor==='function') wmamEnsureFullOfficeFor(); }catch(e){}
     document.getElementById('boBody').innerHTML = _invBanner + (typeof wmamTabBarFor==='function' ? wmamTabBarFor(id) : '') + (map[id]||panelBO)()
       + ((typeof awSimBannerHtml==='function') ? awSimBannerHtml() : '')
       + ((!map[id] || id==='bo' || id==='home' || id==='dashboard' || id==='owner' || id==='sold-reports' || id==='inv-dashboard') && typeof wmamReportNamesAlertHtml==='function' ? wmamReportNamesAlertHtml() : '')
@@ -52499,6 +52617,12 @@ function invDeptApprove(transferId, campaign){
   if(!isOwner(u) && !isInventory(u)){
     alert('Only Inventory Department members or the Owner can approve this transfer.');
     return false;
+  }
+  if(Array.isArray(req.shortDatedImeis) && req.shortDatedImeis.length){
+    var _ext = prompt(req.shortDatedImeis.length+' phone(s) in this transfer have less than 21 days left at the company.\n\nSet the date '+req.toName+' must activate them by (YYYY-MM-DD). After that date they are charged full cost:', _gmAddDays(_ctToday(), 7));
+    var _ed = _gmIso(_ext); if(!_ed){ alert('An extension date is required for short-dated phones. Nothing was approved.'); return false; }
+    req.extensionDate = _ed; req.extensionBy = u.name;
+    try{ var _pl = cfg.inventory(); req.shortDatedImeis.forEach(function(im){ var d = _pl.find(function(x){ return x && x.imei === im; }); if(d){ d.chargeOverride = _ed; d.extensionBy = u.name; d.extensionAt = new Date().toISOString(); } }); }catch(e){}
   }
   req.status = 'pending-agent-signature';
   req.invDeptApprovedBy = u.id;
@@ -70006,9 +70130,13 @@ function invInitiateTransfer(campaign){
   // Calvin 2026-08-11: EVERY manager->agent transfer must be reviewed by the Inventory
   // Dept. The canTransferWithoutApproval / preApproved bypasses are NO LONGER honored
   // here — that's what let Brandon's transfer go straight to Karma without Makenzie.
-  var senderBypass = (u.canTransferWithoutApproval === true); // retained for reference; not used to skip approval
-  var needsInvDeptApproval = senderIsManager
-                          && recipientIsAgent;
+  // v2026.10.02 (Calvin): the profile checkbox "can transfer without approval" (set by Makenzie) is honored again.
+  // Without it, EVERY transfer waits for Makenzie. Phones with less than 21 days left at the company ALWAYS
+  // wait for Makenzie (she sets their extension date), no matter who sends them.
+  var senderBypass = (u.canTransferWithoutApproval === true);
+  var _poolNow = cfg.inventory(), _soon = _gmAddDays(_ctToday(), 21);
+  var shortDated = imeis.filter(function(im){ var d = _poolNow.find(function(x){ return x && x.imei === im; }); if(!d) return false; var cd = null; try{ cd = (typeof wmamGMDates === 'function' && (d.campaign === 'Gen Mobile' || campaign === 'Gen Mobile')) ? wmamGMDates(d).companyExpiry : null; }catch(e){} cd = cd || _gmIso(d.vendorDueDate) || _gmIso(d.companyExpiry) || _gmIso(d.expiryDate); return !!(cd && cd < _soon); });
+  var needsInvDeptApproval = (shortDated.length > 0 && !(isOwner(u) || isInventory(u))) || !(preApproved || senderBypass);
 
   var pool = cfg.inventory();
 
@@ -70020,8 +70148,7 @@ function invInitiateTransfer(campaign){
   // — wrong UX, since the whole point of the bypass is "no review needed."
   var initialStatus;
   if(needsInvDeptApproval)               initialStatus = 'pending-inv-dept-approval';
-  else if(preApproved || senderBypass)   initialStatus = 'pending-agent-signature';
-  else                                    initialStatus = 'pending-approval';
+  else                                    initialStatus = 'pending-agent-signature';   // the receiver must ALWAYS e-sign the invoice
 
   var req = {
     id:         cfg.id+'t-'+Date.now(),
@@ -70035,6 +70162,7 @@ function invInitiateTransfer(campaign){
     imeis:      imeis,
     reason:     reason,
     status:     initialStatus,
+    shortDatedImeis: shortDated,   // v2026.10.02: < 21 days left at the company -> Makenzie sets an extension date
     createdAt:  new Date().toISOString(),
     approvedBy: null, approvedAt: null,
     // Calvin 2026-05-14: Inv Dept approval trail
@@ -70168,6 +70296,8 @@ function invShowAcceptModal(campaign, req){
       model:   (dev.model || rd.model || ''),
       sku:     (dev.sku || rd.sku || ''),
       devType: (dev.devType || rd.devType || dev.type || 'device'),
+      sim:     dev.sim || dev.iccid || dev.simNumber || '',
+      activateBy: (function(){ var co = null; try{ co = (typeof wmamGMDates === 'function' && campaign === 'Gen Mobile') ? wmamGMDates(dev).companyExpiry : null; }catch(e){} co = co || _gmIso(dev.vendorDueDate) || _gmIso(dev.companyExpiry) || _gmIso(dev.expiryDate); var ext = _gmIso(dev.chargeOverride); var _rd = /^(Market Manager|Campaign Manager|IBO)$/.test(req.toRole||'') ? 30 : 21; return ext || _gmMinDate(_gmAddDays(_ctToday(), _rd), co); })(),
       cost:    resolved.cost,
       source:  resolved.source,
       warning: resolved.warning
@@ -70275,10 +70405,10 @@ function invShowAcceptModal(campaign, req){
   // Line items
   html += '<div style="border:1px solid var(--sand);border-radius:8px;overflow:hidden;margin-bottom:18px">';
   html += '<div style="background:var(--cream);padding:8px 14px;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;color:var(--brown);font-weight:700;display:grid;grid-template-columns:1.6fr 1fr 80px 90px;gap:10px">';
-  html += '<div>Model / IMEI</div><div>SKU</div><div style="text-align:center">Tier</div><div style="text-align:right">Amount</div>';
+  html += '<div>Model / IMEI / SIM</div><div>Activate by</div><div style="text-align:center">Tier</div><div style="text-align:right">Full cost</div>';
   html += '</div>';
   html += '<div style="max-height:240px;overflow-y:auto">';
-  lineItems.slice(0,30).forEach(function(li){
+  lineItems.forEach(function(li){   // v2026.10.02: EVERY phone on the invoice
     var tierBg = (li.devType === 'upsell') ? '#15803d' : (li.devType === 'sim' ? '#7c3aed' : '#0c4cb8');
     var tierLabel = (li.devType||'device').toUpperCase();
     var costColor = li.warning ? '#CC0000' : 'var(--brown)';
@@ -70286,18 +70416,18 @@ function invShowAcceptModal(campaign, req){
     html += '<div style="padding:9px 14px;border-top:1px solid var(--sand);font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--brown);display:grid;grid-template-columns:1.6fr 1fr 80px 90px;gap:10px;align-items:center;'+rowStyle+'">';
     html += '<div>';
     html += '<div style="font-weight:700;font-size:.84rem;color:var(--brown)">'+(li.model||'Device')+'</div>';
-    html += '<div style="font-family:monospace;font-size:.7rem;color:var(--muted);margin-top:2px">'+li.imei+'</div>';
+    html += '<div style="font-family:monospace;font-size:.7rem;color:var(--muted);margin-top:2px">IMEI '+li.imei+'</div>';
+    if(li.sim) html += '<div style="font-family:monospace;font-size:.7rem;color:var(--muted)">SIM '+li.sim+'</div>';
     html += '</div>';
-    html += '<div style="font-family:monospace;font-size:.68rem;color:var(--muted);word-break:break-all">'+(li.sku||'—')+'</div>';
+    html += '<div style="font-size:.78rem;font-weight:700;color:'+(li.activateBy && li.activateBy <= _gmAddDays(_ctToday(),7) ? '#b91c1c' : 'var(--brown)')+'">'+(li.activateBy||'')+'</div>';
     html += '<div style="text-align:center"><span style="background:'+tierBg+';color:white;padding:2px 7px;border-radius:3px;font-size:.6rem;letter-spacing:1.5px;font-weight:700">'+tierLabel+'</span></div>';
     html += '<div style="text-align:right"><div style="font-family:Bebas Neue,sans-serif;font-size:.98rem;letter-spacing:1px;color:'+costColor+'">$'+li.cost.toFixed(2)+'</div>';
     if(li.warning) html += '<div style="font-size:.62rem;color:#CC0000;margin-top:2px">'+li.warning+'</div>';
     html += '</div>';
     html += '</div>';
   });
-  if(lineItems.length > 30){
-    html += '<div style="padding:8px 14px;border-top:1px solid var(--sand);text-align:center;color:var(--muted);font-size:.74rem">…and '+(lineItems.length-30)+' more</div>';
-  }
+  html += '<div style="padding:8px 14px;border-top:1px solid var(--sand);text-align:right;color:var(--muted);font-size:.78rem">'+lineItems.length+' device'+(lineItems.length===1?'':'s')+' \u00b7 full cost, no discounts</div>';
+  if(Array.isArray(req.shortDatedImeis) && req.shortDatedImeis.length) html += '<div style="padding:10px 14px;background:#fef2f2;border-top:2px solid #fca5a5;color:#991b1b;font-size:.84rem;font-weight:700">\u26A0 '+req.shortDatedImeis.length+' device'+(req.shortDatedImeis.length===1?' has':'s have')+' less than 21 days left at the company. '+(req.extensionDate ? 'Extension set by '+(req.extensionBy||'the Inventory Dept')+': activate by <u>'+req.extensionDate+'</u> or '+(req.shortDatedImeis.length===1?'it is':'they are')+' charged full cost.' : 'The Inventory Dept sets the activate-by date.')+'</div>';
   html += '</div>';
   // Total row
   html += '<div style="padding:12px 14px;background:rgba(0,53,148,.05);border-top:2px solid rgba(0,53,148,.2);display:flex;justify-content:space-between;align-items:center">';
@@ -70635,6 +70765,8 @@ function invDeviceInvoiceCost(d){
   if(isAgedOut && owned && purchaseCost > 0){
     return {cost: purchaseCost, source: 'agedOutPurchase', warning: null};
   }
+  // Gen Mobile uploads store each phone's arrival cost as deviceCost (full cost, no discounts)
+  if(d.deviceCost != null && d.deviceCost !== '' && Number(d.deviceCost) > 0){ return {cost: Number(d.deviceCost), source:'deviceCost', warning:null}; }
   // Standard: use devCost
   if(typeof d.devCost === 'number' && d.devCost > 0){
     return {cost: d.devCost, source: 'devCost', warning: null};
@@ -70716,14 +70848,9 @@ function resolveTransferExpiry(senderExpiryDate, recipientRole, todayMs, vendorD
 
   // ── Role cap (only for TL/FA — managers inherit AS-IS) ──
   // Calvin 2026-07-07: max hold time by role — Manager 30d, TL 20d, Agent 14d.
-  var ROLE_CAPS = {
-    'Campaign Manager': 30,
-    'IBO':              30,
-    'Market Manager':   30,
-    'Team Leader':      20,
-    'Field Agent':      14
-  };
-  var roleCap = ROLE_CAPS.hasOwnProperty(recipientRole) ? ROLE_CAPS[recipientRole] : 14;
+  // v2026.10.02: everyone who receives inventory gets 21 days max (any company, any role)
+  var ROLE_CAPS = { 'Campaign Manager': 30, 'IBO': 30, 'Market Manager': 30, 'Team Leader': 21, 'Field Agent': 21 };   // managers 30 (hard cutoff), everyone else 21
+  var roleCap = ROLE_CAPS.hasOwnProperty(recipientRole) ? ROLE_CAPS[recipientRole] : 21;
   // Manager status is by ROLE (they skip the reclaim gap/block), not by cap.
   var recipientIsManager = (['Campaign Manager','IBO','Market Manager'].indexOf(recipientRole) >= 0);
 
@@ -70860,6 +70987,7 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
     dev.assignedTo     = req.toId;
     dev.assignedToName = req.toName;
     dev.holderId       = req.toId;
+    dev.receivedAt     = _ctToday(); dev.dateHolderId = String(req.toId);   // v2026.10.02: their 21-day clock starts the day they sign
     dev.holderName     = req.toName;
     dev.assignedAt     = now.toISOString();
     dev.assignedDate   = now.toISOString().slice(0,10);
@@ -78853,6 +78981,15 @@ function _wmamFixMarketIds(srv, local, base){
   if(typeof MARKET_NEXT_ID !== 'undefined'){ try{ MARKET_NEXT_ID = Math.max(MARKET_NEXT_ID, next); }catch(e){} }
 }
 
+
+// a market removed ON PURPOSE is recorded, so the database knows not to bring it back
+async function wmamRecordMarketDeleted(id){
+  try{ var r = await supaClient.from('app_settings').select('value').eq('key','markets_deleted').maybeSingle(); var arr = []; try{ arr = JSON.parse(r.data.value) || []; }catch(e){ arr = []; }
+    if(arr.map(String).indexOf(String(id)) < 0) arr.push(Number(id));
+    await supaClient.from('app_settings').upsert({ key:'markets_deleted', value:JSON.stringify(arr), updated_at:new Date().toISOString() }, { onConflict:'key' }); }catch(e){ console.warn('[markets] record delete', e); }
+}
+if(typeof window!=='undefined') window.wmamRecordMarketDeleted = wmamRecordMarketDeleted;
+
 var _wmamMkSaving = null;
 async function wmamSaveMarketsNow(why){
   // a save already running? wait for it, then save again so THIS change is included
@@ -78946,7 +79083,7 @@ function marketDelete(id, _moved){
     if(!confirm('Permanently delete market "'+m.name+'"?\n\nThis cannot be undone. Existing applications referencing this market will keep their reference but the market won\'t appear in the dropdown anymore. To preserve history, consider DEACTIVATING instead.')) return;
     var idx = MARKETS.findIndex(function(x){ return x.id === id; });
     if(idx >= 0) MARKETS.splice(idx, 1);
-    wmamMarketsChanged(); wmamSaveMarketsNow('delete');
+    wmamMarketsChanged(); wmamRecordMarketDeleted(id).then(function(){ wmamSaveMarketsNow('delete'); });
     saveInventory();
     console.log('[marketDelete] removed market #'+id);
     marketEditCancel();
