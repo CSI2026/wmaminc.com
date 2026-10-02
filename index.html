@@ -3789,7 +3789,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.02.0300';
+var BUILD_VERSION = '2026.10.02.0500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13889,6 +13889,8 @@ function gmFindDevice(pricing, model){ var n=gmNorm(model); if(!n) return null;
 function gmR2(x){ return Math.round(Number(x)*100)/100; }
 function gmComputeSale(pricing, input){
   var dev=gmFindDevice(pricing, input.model); if(!dev) return {error:'Unknown phone model. Pick the model from the list.'};
+  // v2026.10.02: a phone keeps the cost it arrived at (from its inventory upload). The plan credit comes from the price sheet.
+  var own = Number(input.ownCost); if(own > 0){ var _cr = Math.max(0, (+dev.full||0) - (+dev.credited||0)); dev = Object.assign({}, dev, { full: own, credited: Math.max(0, Math.round((own - _cr)*100)/100) }); }
   var plan=null; if(input.planId){ plan=(pricing.plans||[]).find(function(p){ return p.id===input.planId; }); if(!plan) return {error:'Unknown data plan.'}; }
   var payer = input.payer==='customer' ? 'customer' : 'agent';
   var deviceCost = gmR2(plan ? dev.credited : dev.full);
@@ -13998,7 +14000,7 @@ async function gmAutoLinkPriceNames(){
 function gmPriceNamesModal(list){
   list = list || window._gmUnmatchedNames || []; if(!list.length) return;
   var P = GMPAY.pricing || GM_SALE_PRICING_DEFAULT, esc = _gmPayEsc;
-  var opts = '<option value="">Pick the matching phone\u2026</option>' + (P.devices||[]).map(function(d,i){ return '<option value="'+i+'">'+esc(d.model)+' \u2014 $'+Number(d.full).toFixed(2)+'</option>'; }).join('');
+  var opts = '<option value="">Pick the matching phone\u2026</option>' + (P.devices||[]).map(function(d){ return '<option value="'+esc(d.model)+'">'+esc(d.model)+' \u2014 $'+Number(d.full).toFixed(2)+'</option>'; }).join('');
   var ov = document.createElement('div'); ov.id = 'gmNamesOv';
   ov.style.cssText = 'position:fixed;inset:0;z-index:100700;background:rgba(0,0,0,.6);overflow-y:auto;padding:16px';
   ov.innerHTML = '<div style="max-width:720px;margin:0 auto;background:#fff;border-radius:14px;padding:18px;font-family:Arial,sans-serif">'
@@ -14008,11 +14010,19 @@ function gmPriceNamesModal(list){
     + '<div id="gmNmMsg" style="font-weight:700;margin:6px 0"></div><div style="display:flex;gap:8px;justify-content:flex-end"><button onclick="document.getElementById(\'gmNamesOv\').remove()" style="padding:10px 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;font-weight:700;cursor:pointer">Later</button><button id="gmNmSave" style="padding:10px 16px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Save</button></div></div>';
   document.body.appendChild(ov);
   document.getElementById('gmNmSave').onclick = async function(){
-    var P2 = await gmLoadPricingFresh(), n = 0;
-    list.forEach(function(x,i){ var v = document.getElementById('gmNm'+i).value; if(v === '') return; var d = P2.devices[+v]; if(!d) return; d.aliases = (d.aliases||[]).filter(function(a){ return a !== x.model; }).concat([x.model]); n++; });
+    var P2 = await gmLoadPricingFresh(), n = 0, picks = [];
+    list.forEach(function(x,i){ var v = document.getElementById('gmNm'+i).value; if(v === '') return; picks.push({ name:x.model, phone:v });
+      var d = (P2.devices||[]).find(function(dd){ return dd.model === v; }); if(!d) return;
+      (P2.devices||[]).forEach(function(dd){ if(dd.aliases) dd.aliases = dd.aliases.filter(function(a){ return a !== x.model; }); });   // a name belongs to ONE phone
+      d.aliases = (d.aliases||[]).concat([x.model]); n++; });
     var msg = document.getElementById('gmNmMsg');
     if(!n){ msg.style.color = '#b91c1c'; msg.textContent = 'Pick a phone for at least one name.'; return; }
     try{ await gmSavePricing(P2, 'linked phone names'); }catch(e){ msg.style.color = '#b91c1c'; msg.textContent = 'Not saved: '+e.message; return; }
+    // read it back from the database: every match must be there
+    var P3 = await gmLoadPricingFresh();
+    var missing = picks.filter(function(pk){ var d = (P3.devices||[]).find(function(dd){ return dd.model === pk.phone; }); return !(d && (d.aliases||[]).indexOf(pk.name) >= 0); });
+    if(missing.length){ msg.style.color = '#b91c1c'; msg.textContent = 'Not confirmed in the database: '+missing.map(function(x){ return x.name; }).join(', ')+'. Try Save again.'; return; }
+    GMPAY.pricing = P3;
     window._gmUnmatchedNames = (window._gmUnmatchedNames||[]).filter(function(x){ return !gmFindDevice(P2, x.model); });
     ov.remove(); try{ showToast('Saved \u2014 '+n+' phone name'+(n===1?'':'s')+' can now be sold on the Pay Link'); }catch(e){}
     try{ if(typeof renderCurrentPanel === 'function') renderCurrentPanel(); }catch(e){}
@@ -14223,16 +14233,17 @@ async function gmPayLookup(digits){
   var me = DB.current || {};
   var dev = null;
   try{ dev = (typeof GM_INVENTORY!=='undefined' ? GM_INVENTORY : []).find(function(x){ return x && String(x.imei||'').replace(/\D/g,'') === digits; }) || null; }catch(e){}
-  var rec = dev ? { model: dev.model||'', assigned_to: dev.assignedTo, status: dev.status, deleted: !!(dev.deletedAt||dev.deleted_at) } : null;
+  var rec = dev ? { model: dev.model||'', assigned_to: dev.assignedTo, status: dev.status, deleted: !!(dev.deletedAt||dev.deleted_at), cost: (dev.deviceCost != null && dev.deviceCost !== '') ? +dev.deviceCost : null } : null;
   if(GMPAY.token){ rec = null; try{ var pr = await supaClient.rpc('wmam_paylink_imei', { p_token: GMPAY.token, p_imei: digits }); var pd0 = pr && pr.data; if(pd0 && pd0.found) rec = { model: pd0.model||'', status: pd0.status, deleted: !!pd0.deleted }; }catch(e){} }
   else if(!rec){
     try{
-      var r = await supaClient.from('gm_inventory').select('model,assigned_to,status,deleted_at').eq('imei', digits).limit(1);
-      if(r && Array.isArray(r.data) && r.data.length){ var x = r.data[0]; rec = { model: x.model||'', assigned_to: x.assigned_to, status: x.status, deleted: !!x.deleted_at }; }
+      var r = await supaClient.from('gm_inventory').select('model,assigned_to,status,deleted_at,raw').eq('imei', digits).limit(1);
+      if(r && Array.isArray(r.data) && r.data.length){ var x = r.data[0]; var _rw = x.raw || {}; rec = { model: x.model||'', assigned_to: x.assigned_to, status: x.status, deleted: !!x.deleted_at, cost: (_rw.deviceCost != null && _rw.deviceCost !== '') ? +_rw.deviceCost : null }; }
     }catch(e){}
   }
   if(GMPAY.lookupFor !== digits) return;           // they kept typing
   GMPAY.invModel = rec ? rec.model : '';
+  GMPAY.ownCost = (rec && rec.cost > 0) ? rec.cost : null;
   var pd = rec ? gmFindDevice(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, rec.model) : null;
   GMPAY.model = '';
   // Any Gen Mobile phone in OUR inventory can be sold by a coded agent (not sold, not removed)
@@ -14263,7 +14274,7 @@ function gmPayTotalMsg(){
 }
 if(typeof window!=='undefined'){ window.gmPaySetTotal = gmPaySetTotal; window.gmPayTotalMsg = gmPayTotalMsg; }
 function _gmPayCalc(){
-  return gmComputeSale(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, { model: GMPAY.model, planId: GMPAY.planId || null, payer: GMPAY.payer, customerPhonePrice: GMPAY.custPrice });
+  return gmComputeSale(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, { model: GMPAY.model, ownCost: GMPAY.ownCost || null, planId: GMPAY.planId || null, payer: GMPAY.payer, customerPhonePrice: GMPAY.custPrice });
 }
 function gmPaySummary(){
   var el = document.getElementById('gmPaySummary'); if(!el) return;
@@ -14615,12 +14626,126 @@ async function gmSalesMarkAgentPaid(id){
   if(r && r.error){ alert('Could not save: '+r.error.message); return; }
   s.agent_payback_status='paid'; s.agent_paid_by=who; gmSalesRender();
 }
+
+// ══════════════════════════════════════════════════════════════════════
+//  UPLOAD NEW GEN MOBILE PRICE SHEET — Calvin 2026-10-02 v0500
+//  Lifeline Payments → Price Lists (and Gen Mobile upload): upload the monthly
+//  sheet (PDF, Excel or CSV) → review old → new for every phone → confirm.
+//  The new prices go live for the Pay Link, personal links and the payment
+//  server. Matched phone names ("also called") are kept. Phones not on the new
+//  sheet are kept (flagged). Every sheet is recorded with its month.
+//  IMPORTANT: this NEVER changes the cost of phones already in inventory —
+//  each phone keeps the cost it arrived at (see gmComputeSale ownCost).
+// ══════════════════════════════════════════════════════════════════════
+var WMAM_PS = null;
+function wmamPriceSheetOpen(){
+  if(!(isOwner(DB.current) || canAccess(DB.current,'gm-sales') || canAccess(DB.current,'inventory'))){ alert('Only the office can upload price sheets.'); return; }
+  WMAM_PS = { step:'pick', month:_ctToday().slice(0,7), rows:null, file:'' };
+  var ov = document.createElement('div'); ov.id = 'wmamPsOv';
+  ov.style.cssText = 'position:fixed;inset:0;z-index:100800;background:rgba(0,0,0,.6);overflow-y:auto;padding:16px';
+  ov.innerHTML = '<div id="wmamPsBox" style="max-width:860px;margin:20px auto;background:#fff;border-radius:14px;padding:18px;font-family:Arial,sans-serif"></div>';
+  document.body.appendChild(ov); wmamPsRender();
+}
+function wmamPsClose(){ var o = document.getElementById('wmamPsOv'); if(o) o.remove(); WMAM_PS = null; }
+function wmamPsRender(){
+  var box = document.getElementById('wmamPsBox'); if(!box || !WMAM_PS) return; var esc = _escapeHtml, S = WMAM_PS;
+  var head = '<div style="display:flex;justify-content:space-between;align-items:center"><div style="font-weight:900;color:#003594;font-size:1.2rem">\uD83D\uDCE4 Upload new Gen Mobile price sheet</div><button onclick="wmamPsClose()" style="border:none;background:#f3f4f6;border-radius:50%;width:34px;height:34px;cursor:pointer">\u2715</button></div>';
+  if(S.step === 'pick'){
+    box.innerHTML = head + '<div style="font-size:.9rem;color:#374151;margin:8px 0 12px">Upload the sheet Gen Mobile sent (PDF, Excel or CSV). You\u2019ll see every price change before anything goes live. <b>Phones already in inventory keep the cost they arrived at.</b></div>'
+      + '<label class="f-label">Sheet month</label><input id="wmamPsMonth" type="month" value="'+S.month+'" class="f-input" style="max-width:220px">'
+      + '<label class="f-label" style="margin-top:12px">Price sheet file</label><input id="wmamPsFile" type="file" accept=".pdf,.xlsx,.xls,.csv" onchange="wmamPsRead(this.files[0])" class="f-input">'
+      + '<div id="wmamPsMsg" style="margin-top:10px;font-weight:700"></div>';
+    return;
+  }
+  if(S.step === 'review'){
+    var R = S.review;
+    var row = function(x, kind){ var col = kind==='up' ? '#b91c1c' : (kind==='down' ? '#166534' : '#374151');
+      return '<tr style="border-top:1px solid #eef0f4"><td style="padding:6px 8px">'+esc(x.model)+(x.sheetName && x.sheetName!==x.model?'<div style="font-size:.72rem;color:#6b7280">sheet: '+esc(x.sheetName)+'</div>':'')+'</td>'
+        + '<td style="padding:6px 8px">'+(x.oldFull!=null?_gmMoney(x.oldFull):'\u2014')+' \u2192 <b style="color:'+col+'">'+_gmMoney(x.newFull)+'</b></td>'
+        + '<td style="padding:6px 8px">'+(x.oldCred!=null?_gmMoney(x.oldCred):'\u2014')+' \u2192 <b>'+_gmMoney(x.newCred)+'</b></td></tr>'; };
+    box.innerHTML = head + '<div style="font-size:.9rem;color:#374151;margin:6px 0 10px">Sheet <b>'+esc(S.file)+'</b> for <b>'+esc(S.month)+'</b>: '+R.changed.length+' price change'+(R.changed.length===1?'':'s')+' \u00b7 '+R.added.length+' new phone'+(R.added.length===1?'':'s')+' \u00b7 '+R.same.length+' unchanged \u00b7 '+R.missing.length+' not on this sheet</div>'
+      + '<div style="overflow-x:auto;border:1px solid #e5e7eb;border-radius:10px"><table style="width:100%;border-collapse:collapse;font-size:.88rem;min-width:520px"><tr style="background:#003594;color:#fff;text-align:left"><th style="padding:7px 8px">Phone</th><th style="padding:7px 8px">Full price</th><th style="padding:7px 8px">With plan (after credit)</th></tr>'
+      + (R.changed.length ? '<tr><td colspan="3" style="padding:6px 8px;background:#fff7ed;font-weight:800;color:#9a3412">PRICE CHANGES</td></tr>' + R.changed.map(function(x){ return row(x, x.newFull > x.oldFull ? 'up' : 'down'); }).join('') : '')
+      + (R.added.length ? '<tr><td colspan="3" style="padding:6px 8px;background:#ecfdf5;font-weight:800;color:#166534">NEW PHONES (added to the price list)</td></tr>' + R.added.map(function(x){ return row(x,''); }).join('') : '')
+      + (R.same.length ? '<tr><td colspan="3" style="padding:6px 8px;background:#f8fafc;font-weight:800;color:#6b7280">UNCHANGED</td></tr>' + R.same.map(function(x){ return row(x,''); }).join('') : '')
+      + '</table></div>'
+      + (R.missing.length ? '<div style="font-size:.84rem;color:#6b7280;margin-top:8px">Not on this sheet (kept on the price list so phones already in stock can still be sold): '+R.missing.map(esc).join(', ')+'</div>' : '')
+      + '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:10px 12px;margin-top:10px;font-size:.86rem;color:#1e3a8a">Phones <b>already in inventory keep the cost they arrived at</b>. The new prices apply to phones that arrive with the new prices (and to any phone with no recorded cost).</div>'
+      + '<div id="wmamPsMsg" style="margin-top:10px;font-weight:700"></div>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button onclick="WMAM_PS.step=\'pick\';wmamPsRender()" style="padding:10px 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;font-weight:700;cursor:pointer">Back</button><button id="wmamPsGo" onclick="wmamPsCommit()" style="padding:10px 18px;border:none;border-radius:8px;background:#16a34a;color:#fff;font-weight:900;cursor:pointer">Make these prices live</button></div>';
+    return;
+  }
+  if(S.step === 'done'){
+    box.innerHTML = head + '<div style="text-align:center;padding:20px"><div style="font-size:2rem">\u2705</div><div style="font-weight:900;color:#166534;font-size:1.15rem">New prices are live ('+esc(S.month)+')</div><div style="color:#374151;margin-top:6px">'+S.doneMsg+'</div><button onclick="wmamPsClose();try{gotoPanel(\'gm-prices\')}catch(e){}" style="margin-top:14px;padding:10px 18px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Done</button></div>';
+  }
+}
+function _wmamPsFromTable(rows){
+  if(!rows || !rows.length) return [];
+  var hdrIdx = rows.findIndex(function(r){ var t = (r||[]).join(' ').toLowerCase(); return /(model|device|phone|handset)/.test(t) && /(price|cost|msrp)/.test(t); });
+  if(hdrIdx < 0) return [];
+  var H = rows[hdrIdx].map(function(x){ return String(x||'').toLowerCase().trim(); });
+  var col = function(re, not){ return H.findIndex(function(h){ return re.test(h) && !(not && not.test(h)); }); };
+  var cM = col(/model|device|phone|handset/, /price|cost/), cP = col(/price|cost|msrp/, /credit|tribal|non/), cN = col(/non.?ca|non.?california/), cC = col(/tribal|(^|\s)ca(\s|$)/, /non/);
+  var num = function(v){ var n = parseFloat(String(v==null?'':v).replace(/[^0-9.]/g,'')); return isNaN(n) ? null : n; };
+  return rows.slice(hdrIdx+1).map(function(r){ var m = String((r||[])[cM]||'').trim(); var p = num((r||[])[cP]); if(!m || p == null) return null; return { model:m, price:p, nonCACredit: cN>=0 ? num(r[cN]) : null, caTribalCredit: cC>=0 ? num(r[cC]) : null }; }).filter(Boolean);
+}
+async function wmamPsRead(file){
+  var msg = document.getElementById('wmamPsMsg'); if(!file) return;
+  WMAM_PS.month = (document.getElementById('wmamPsMonth')||{}).value || WMAM_PS.month; WMAM_PS.file = file.name;
+  msg.style.color = '#003594'; msg.textContent = 'Reading the sheet\u2026';
+  var rows = [];
+  try{
+    if(/\.pdf$/i.test(file.name)){ var text = await gmPdfExtractText(file); rows = (gmPdfParseRows(text).rows||[]).map(function(r){ return { model:r.model, price:r.price, nonCACredit:r.nonCACredit, caTribalCredit:r.caTribalCredit }; }); }
+    else if(/\.csv$/i.test(file.name) || typeof XLSX === 'undefined'){ var txt = (typeof file.text === 'function') ? await file.text() : await new Promise(function(res, rej){ var fr = new FileReader(); fr.onload = function(){ res(String(fr.result||'')); }; fr.onerror = rej; fr.readAsText(file); }); var tbl = txt.split(/\r?\n/).filter(function(l){ return l.trim(); }).map(function(l){ var out = [], cur = '', q = false; for(var i=0;i<l.length;i++){ var ch = l[i]; if(ch === '"'){ q = !q; } else if(ch === ',' && !q){ out.push(cur); cur = ''; } else cur += ch; } out.push(cur); return out.map(function(x){ return x.trim(); }); }); rows = _wmamPsFromTable(tbl); }
+    else { var buf = await file.arrayBuffer(); var wb = XLSX.read(buf, { type:'array' }); wb.SheetNames.forEach(function(n){ if(rows.length) return; rows = _wmamPsFromTable(XLSX.utils.sheet_to_json(wb.Sheets[n], { header:1, raw:false })); }); }
+  }catch(e){ msg.style.color = '#b91c1c'; msg.textContent = 'Could not read that file: '+(e.message||e); return; }
+  if(!rows.length){ msg.style.color = '#b91c1c'; msg.textContent = 'No phones and prices were found in that file. Make sure it\u2019s the Gen Mobile price sheet (it needs a phone/model column and a price column).'; return; }
+  WMAM_PS.rows = rows; WMAM_PS.review = await wmamPsBuildReview(rows); WMAM_PS.step = 'review'; wmamPsRender();
+}
+async function wmamPsBuildReview(rows){
+  var P = await gmLoadPricingFresh(); WMAM_PS.base = P;
+  var R = { changed:[], added:[], same:[], missing:[] }, hit = {};
+  rows.forEach(function(r){
+    var d = gmFindDevice(P, r.model) || (gmPriceMatchCandidates(P, r.model).length === 1 ? gmPriceMatchCandidates(P, r.model)[0] : null);
+    var credit = (r.nonCACredit != null) ? r.nonCACredit : (d ? Math.max(0, (+d.full||0) - (+d.credited||0)) : 0);
+    var newFull = Math.round(r.price*100)/100, newCred = Math.max(0, Math.round((r.price - credit)*100)/100);
+    var x = { model: d ? d.model : r.model, sheetName: r.model, oldFull: d ? +d.full : null, oldCred: d ? +d.credited : null, newFull:newFull, newCred:newCred, isNew: !d };
+    if(d) hit[d.model] = 1;
+    if(!d) R.added.push(x); else if(x.oldFull !== newFull || x.oldCred !== newCred) R.changed.push(x); else R.same.push(x);
+  });
+  R.missing = (P.devices||[]).filter(function(d){ return !hit[d.model]; }).map(function(d){ return d.model; });
+  return R;
+}
+async function wmamPsCommit(){
+  var S = WMAM_PS, msg = document.getElementById('wmamPsMsg'), btn = document.getElementById('wmamPsGo'); if(!S) return;
+  if(btn){ btn.disabled = true; btn.textContent = 'Saving\u2026'; }
+  try{
+    var P = await gmLoadPricingFresh(), R = S.review;
+    R.changed.concat(R.same).forEach(function(x){ var d = (P.devices||[]).find(function(dd){ return dd.model === x.model; }); if(d){ d.full = x.newFull; d.credited = x.newCred; delete d.notOnLatestSheet; } });
+    R.added.forEach(function(x){ if(!(P.devices||[]).some(function(dd){ return dd.model === x.model; })) (P.devices = P.devices || []).push({ model:x.model, full:x.newFull, credited:x.newCred, addedFromSheet:S.month }); });
+    (P.devices||[]).forEach(function(d){ if(R.missing.indexOf(d.model) >= 0) d.notOnLatestSheet = S.month; });
+    P.sheetMonth = S.month; P.sheetFile = S.file; P.version = S.month;
+    await gmSavePricing(P, 'price sheet '+S.month);
+    var back = await gmLoadPricingFresh();
+    var bad = R.changed.concat(R.added).filter(function(x){ var d = (back.devices||[]).find(function(dd){ return dd.model === x.model; }); return !(d && +d.full === x.newFull && +d.credited === x.newCred); });
+    if(bad.length) throw new Error('not confirmed for: '+bad.map(function(x){ return x.model; }).join(', '));
+    GMPAY.pricing = back;
+    try{ var hist = []; var hr = await supaClient.from('app_settings').select('value').eq('key','gm_price_sheets').maybeSingle(); try{ hist = JSON.parse(hr.data.value) || []; }catch(e){ hist = []; }
+      hist.unshift({ id: Date.now(), month:S.month, file:S.file, uploadedAt:new Date().toISOString(), by:(DB.current&&DB.current.name)||'', changed:R.changed.length, added:R.added.length, same:R.same.length });
+      await saveAppSettingToSupabase('gm_price_sheets', hist.slice(0, 36)); }catch(e){}
+    S.doneMsg = R.changed.length+' price change'+(R.changed.length===1?'':'s')+' and '+R.added.length+' new phone'+(R.added.length===1?'':'s')+' saved and confirmed. Phones already in inventory keep the cost they arrived at.';
+    S.step = 'done'; wmamPsRender();
+    try{ gmPriceNamesCheck(false); }catch(e){}
+  }catch(e){ if(btn){ btn.disabled = false; btn.textContent = 'Make these prices live'; } msg.style.color = '#b91c1c'; msg.textContent = 'Not saved: '+(e.message||e)+'. Nothing changed \u2014 try again.'; }
+}
+if(typeof window!=='undefined'){ Object.assign(window, { wmamPriceSheetOpen:wmamPriceSheetOpen, wmamPsClose:wmamPsClose, wmamPsRead:wmamPsRead, wmamPsCommit:wmamPsCommit, wmamPsRender:wmamPsRender, _wmamPsFromTable:_wmamPsFromTable, wmamPsBuildReview:wmamPsBuildReview }); }
+
 function gmPriceRender(){
   var box = document.getElementById('gmPriceBox'); if(!box) return;
   var P = GMPAY.pricing || GM_SALE_PRICING_DEFAULT;
   var num = 'width:90px;padding:6px 8px;border:1px solid #ccc;border-radius:6px;font-size:14px';
   var h = '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px">'
-    + '<div style="font-weight:800;color:#003594;letter-spacing:1px">PRICE LIST (OWNER ONLY)</div>'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div style="font-weight:800;color:#003594;letter-spacing:1px">PRICE LIST'+(P.sheetMonth?' \u00b7 sheet '+_gmPayEsc(P.sheetMonth):'')+'</div><button onclick="wmamPriceSheetOpen()" style="padding:9px 14px;border:none;border-radius:8px;background:#16a34a;color:#fff;font-weight:800;cursor:pointer">\uD83D\uDCE4 Upload new price sheet</button></div>'
     + '<div style="font-size:.8rem;color:#666;margin:4px 0 10px">When Gen Mobile sends a new sheet, update the numbers here and save. \u201CWith plan\u201D = price after the 0 Non-CA credit.</div>'
     + '<div style="overflow-x:auto"><table style="border-collapse:collapse;font-size:.85rem"><tr style="text-align:left"><th style="padding:6px">Phone</th><th style="padding:6px">Full price</th><th style="padding:6px">With plan</th><th style="padding:6px">Other names in inventory (comma separated)</th></tr>'
     + P.devices.map(function(d,i){ return '<tr><td style="padding:4px 6px">'+_gmPayEsc(d.model)+'</td><td style="padding:4px 6px"><input id="gmPrF'+i+'" inputmode="decimal" value="'+d.full+'" style="'+num+'"></td><td style="padding:4px 6px"><input id="gmPrC'+i+'" inputmode="decimal" value="'+d.credited+'" style="'+num+'"></td><td style="padding:4px 6px"><input id="gmPrA'+i+'" value="'+_gmPayEsc((d.aliases||[]).join(', '))+'" placeholder="e.g. Moto G Play 2024" style="width:260px;padding:6px 8px;border:1px solid #ccc;border-radius:6px;font-size:14px"></td></tr>'; }).join('')
@@ -14647,10 +14772,16 @@ async function gmPriceUnmatched(){
   }catch(e){}
 }
 async function gmPriceSave(){
+  var _latest = null; try{ _latest = await gmLoadPricingFresh(); }catch(e){}
   var P = JSON.parse(JSON.stringify(GMPAY.pricing || GM_SALE_PRICING_DEFAULT)), bad = false;
   var val = function(id){ var v = parseFloat(String(document.getElementById(id).value).replace(/[^0-9.]/g,'')); if(!(v>=0)) bad = true; return Math.round(v*100)/100; };
   P.devices.forEach(function(d,i){ d.full = val('gmPrF'+i); d.credited = val('gmPrC'+i);
     var al = String((document.getElementById('gmPrA'+i)||{}).value||'').split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+    var was = (_latest && (_latest.devices||[]).find(function(x){ return x.model === d.model; }) || {}).aliases || [];
+    var shown = String((document.getElementById('gmPrA'+i)||{}).defaultValue||'').split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+    // keep names saved since this page was opened; drop only names you deleted from the box
+    var keep = was.filter(function(a){ return shown.indexOf(a) < 0; });
+    al = al.concat(keep).filter(function(a,j,arr){ return arr.indexOf(a) === j; });
     if(al.length) d.aliases = al; else delete d.aliases; });
   P.plans.forEach(function(p,i){ p.price = val('gmPrP'+i); });
   var msg = document.getElementById('gmPriceMsg');
@@ -15526,7 +15657,7 @@ function wmamApplyGMDates(d){
   d.uploadedAt = r.uploadedAt; d.uploadDate = r.uploadedAt; d.companyExpiry = r.companyExpiry; d.chargeDate = r.chargeDate; d.needsManualDate = !!r.needsManual;
   d.receivedAt = r.receivedAt; d.dateHolderId = r.holderKey || null;
   d.expiryDate = r.chargeDate; d.mmExpiresAt = r.chargeDate; d.tlExpiresAt = r.chargeDate; d.agentExpiresAt = r.chargeDate;
-  var c = wmamGMCost(d); if(c != null && (d.deviceCost == null || d.deviceCost === '')) d.deviceCost = c;
+  var c = wmamGMCost(d); if(c != null && (d.deviceCost == null || d.deviceCost === '')){ d.deviceCost = c; d.deviceCostSource = d.deviceCostSource || 'price-list at arrival'; }   // set ONCE; never changed by later price sheets
   return d;
 }
 function wmamDaysUntil(ymd){ if(!ymd) return null; var t = new Date(String(ymd).slice(0,10)+'T12:00:00'), n = new Date(_ctToday()+'T12:00:00'); return isNaN(t) ? null : Math.round((t-n)/86400000); }
@@ -62780,6 +62911,7 @@ function panelGMUpload(){
   h += '📌 Two upload types: <strong>Inventory</strong> (Shipments CSV — new devices received) and <strong>Activations</strong> (Devices CSV — sold devices). System auto-deduplicates by IMEI. Market names are extracted automatically from "Team Name" column.';
   h += '</div>';
 
+  h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;background:#ecfdf5;border:1px solid #86efac;border-radius:10px;padding:12px 16px;margin-bottom:20px"><div><b style="color:#166534">New monthly price sheet from Gen Mobile?</b><div style="font-size:.84rem;color:#166534">Upload it here. Phones already in inventory keep the cost they arrived at.</div></div><button onclick="wmamPriceSheetOpen()" style="padding:10px 16px;border:none;border-radius:8px;background:#16a34a;color:#fff;font-weight:800;cursor:pointer">\uD83D\uDCE4 Upload new price sheet</button></div>';
   h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">';
 
   // Inventory Upload Card
@@ -63655,7 +63787,7 @@ function panelGMPricelist(){
   h += '<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap;align-items:center">';
   h += '<button onclick="gmPricelistShowAddForm()" class="btn-fire" style="padding:10px 24px;background:#059669;border-color:#059669">+ Add Device</button>';
   // Calvin 2026-06-03: PDF upload — drops in monthly Gen Mobile pricelist PDF
-  h += '<button onclick="gmPdfShowUploadModal()" style="padding:10px 24px;background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer;font-weight:700">📤 Upload Price Sheet (PDF)</button>';
+  h += '<button onclick="wmamPriceSheetOpen()" style="padding:10px 24px;background:#dc2626;color:white;border:none;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer;font-weight:700">📤 Upload Price Sheet (PDF)</button>';
   h += '<button onclick="gmPricelistShowImportSheet()" style="padding:10px 18px;background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.3);color:#7c3aed;font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:6px;cursor:pointer">📋 View Source Sheet</button>';
   h += '<div style="flex:1"></div>';
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--muted)">'+Object.keys(byModel).filter(function(k){return byModel[k].current && !byModel[k].current.isTombstone;}).length+' active models · '+GM_PRICELIST.length+' total rows (incl. history)</div>';
