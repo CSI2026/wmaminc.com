@@ -3803,7 +3803,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.05.0200';
+var BUILD_VERSION = '2026.10.05.0300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -16780,12 +16780,12 @@ function ahubSendContracts(ids){
   document.getElementById('ahubSendGo').onclick = function(){
     var mode = (document.querySelector('input[name=ahubSendMode]:checked')||{}).value, pkgId = (document.getElementById('ahubSendPkg')||{}).value;
     if(mode === 'pick' && !pkgId){ document.getElementById('ahubSendMsg').textContent = 'Choose a document package.'; return; }
-    var oa = window.alert, oc = window.confirm, notes = [], sent = 0; window.alert = function(m){ notes.push(String(m)); }; window.confirm = function(){ return true; };
+    var oa = window.alert, oc = window.confirm, notes = [], sent = 0; window.alert = function(m){ notes.push(String(m)); }; window.confirm = function(){ return true; }; window._wmamManualSend = true;
     try{ people.forEach(function(a){ try{
       if(mode === 'pick'){ ahubAssignPackage(a.id, pkgId); }
       else sendOnboardingPacketAllForAgent(a.id);
       sent++; }catch(e){ notes.push(a.name+': '+e.message); } }); }
-    finally{ window.alert = oa; window.confirm = oc; }
+    finally{ window.alert = oa; window.confirm = oc; setTimeout(function(){ window._wmamManualSend = false; }, 3000); }
     ov.remove(); AHUB.sel = {};
     try{ showToast('Contracts sent to '+sent+' '+(sent===1?'person':'people')); }catch(e){}
     ahubRender(); var pb = document.getElementById('ahubProfBox'); if(pb && people.length === 1) ahubProfRender(people[0].id);
@@ -27655,6 +27655,117 @@ async function _logNotification(row){
 if(typeof window !== 'undefined'){
   window.notifyByEmail = notifyByEmail;
 }
+
+// ══════════════════════════════════════════════════════════════════════
+//  NOTIFICATION RULES — Calvin 2026-10-05 v0300
+//  1. No notifications or emails about agents who are removed / deactivated.
+//  2. Unsigned-document reminders: NO daily emails. The office gets ONE email a
+//     week (a digest). Agents and the office get a daily reminder on the
+//     dashboard bell only.
+//  3. A notification you cleared does not come back for 2 days — it only
+//     returns if the same thing still isn't taken care of after 2 days.
+//  4. The same email to the same person is not sent twice within 7 days.
+// ══════════════════════════════════════════════════════════════════════
+var WMAM_DOC_TOPIC = /onboarding|assigned_doc|document|contract|unsigned|packet|sign\b|signature|background check|bg authorization|reminder/i;
+function _wmamIsDocTopic(o){ o = o || {}; return WMAM_DOC_TOPIC.test(String(o.eventType||'')) || WMAM_DOC_TOPIC.test(String(o.title||'')) || WMAM_DOC_TOPIC.test(String(o.body||'')); }
+function _wmamAgentById(id){ return (DB.agents||[]).find(function(a){ return a && String(a.id) === String(id); }) || null; }
+function _wmamIsGone(a){ return !!(a && (a.active === false || a.removed === true || a.deleted === true || a.status === 'removed' || a.status === 'inactive')); }
+function _wmamIsOfficeAgent(a){ return !!(a && (isOwner(a) || a.role === 'admin' || (typeof isOfficeRole === 'function' && isOfficeRole(a)))); }
+function _wmamSeen(store){ try{ return JSON.parse(localStorage.getItem(store) || '{}') || {}; }catch(e){ return {}; } }
+function _wmamSeenSave(store, m){ try{ var keys = Object.keys(m); if(keys.length > 800){ keys.sort(function(a,b){ return String(m[a]).localeCompare(String(m[b])); }).slice(0, keys.length - 800).forEach(function(k){ delete m[k]; }); } localStorage.setItem(store, JSON.stringify(m)); }catch(e){} }
+var _wmamPushRaw = pushNotification;
+pushNotification = function(opts){
+  opts = opts || {};
+  try{
+    // 1) drop recipients who are removed / deactivated; skip entirely if it's about one of them
+    var subj = opts.agentId || (opts.data && (opts.data.agentId || opts.data.agent_id)) || null;
+    if(subj != null && _wmamIsGone(_wmamAgentById(subj))) return null;
+    if(Array.isArray(opts.toIds) && opts.toIds.length){
+      var keep = opts.toIds.filter(function(id){ return !_wmamIsGone(_wmamAgentById(id)); });
+      var hadAgent = opts.toIds.some(function(id){ var a = _wmamAgentById(id); return a && !_wmamIsOfficeAgent(a); });
+      var keepsAgent = keep.some(function(id){ var a = _wmamAgentById(id); return a && !_wmamIsOfficeAgent(a); });
+      if(hadAgent && !keepsAgent && !(opts.toRoles||[]).length) return null;   // it was for an agent who is gone
+      opts = Object.assign({}, opts, { toIds: keep });
+    }
+    var doc = _wmamIsDocTopic(opts);
+    // 2) document reminders never email (the office gets the weekly digest instead)
+    if(doc) opts = Object.assign({}, opts, { skipEmail: true });
+    // 3) same notification within 2 days (even if cleared) -> don't create it again
+    var sig = String(opts.title||'') + '|' + String(opts.body||'') + '|' + (opts.toIds||[]).slice().sort().join(',') + '|' + (opts.toRoles||[]).slice().sort().join(',');
+    var now = Date.now(), seen = _wmamSeen('wmam_notif_seen');
+    var recent = (typeof WMAM_NOTIFICATIONS !== 'undefined' ? WMAM_NOTIFICATIONS : []).some(function(n){ return n && (n.title + '|' + n.body) === (String(opts.title||'') + '|' + String(opts.body||'')) && (now - new Date(n.ts).getTime()) < 48*3600*1000; });
+    if(!window._wmamManualSend && (recent || (seen[sig] && now - seen[sig] < 48*3600*1000))) return null;   // a deliberate send/resend by the office always goes
+    seen[sig] = now; _wmamSeenSave('wmam_notif_seen', seen);
+  }catch(e){ console.warn('[notif rules]', e); }
+  return _wmamPushRaw(opts);
+};
+window.pushNotification = pushNotification;
+var _wmamEmailRaw = notifyByEmail;
+notifyByEmail = async function(opts){
+  opts = opts || {};
+  try{
+    var to = opts.toAgent || {};
+    var a = to.id != null ? _wmamAgentById(to.id) : null;
+    if(a && _wmamIsGone(a)) return { skipped:'agent removed or deactivated' };
+    var ev = String(opts.eventType || '');
+    // daily document reminder emails are replaced by the weekly office digest + the dashboard
+    if(/reminder|assigned_doc_waiting|docs?_pending|nudge|applicant\.followup/i.test(ev) && !opts._weeklyDigest) return { skipped:'document reminders are weekly digest only' };
+    // never the same email to the same person twice within 7 days (one-time events like a new packet still send)
+    var key = ev + '|' + String(to.email || to.id || '') + '|' + String((opts.payload && (opts.payload.title || opts.payload.campaignName || opts.payload.packageName)) || '');
+    var m = _wmamSeen('wmam_email_seen'), now = Date.now();
+    if(!window._wmamManualSend && m[key] && now - m[key] < 7*24*3600*1000) return { skipped:'already emailed this week' };
+    m[key] = now; _wmamSeenSave('wmam_email_seen', m);
+  }catch(e){ console.warn('[email rules]', e); }
+  return _wmamEmailRaw(opts);
+};
+window.notifyByEmail = notifyByEmail;
+// the old hourly reminder scanner (emailed agents from every open browser) is retired
+scanForOnboardingReminders = function(){ return 0; };
+window.scanForOnboardingReminders = scanForOnboardingReminders;
+
+// who still has unsigned documents (active agents only)
+function wmamUnsignedDocAgents(){
+  var out = [];
+  (DB.agents||[]).forEach(function(a){
+    if(!a || _wmamIsGone(a) || isOwner(a)) return;
+    var pkt = (typeof AGENT_ONBOARDING_STATUS !== 'undefined' && AGENT_ONBOARDING_STATUS[a.id]) || {};
+    var camps = Object.keys(pkt).filter(function(c){ return pkt[c] && pkt[c].packetSentAt && !pkt[c].allComplete; });
+    var asg = (typeof ONBOARD_ASSIGNMENTS !== 'undefined' ? ONBOARD_ASSIGNMENTS : []).filter(function(x){ return x && x.agentId === a.id && x.status === 'pending'; }).length;
+    if(camps.length || asg) out.push({ id:a.id, name:a.name, campaigns:camps, extra:asg });
+  });
+  return out.sort(function(x,y){ return String(x.name).localeCompare(String(y.name)); });
+}
+// daily dashboard reminder for the office (bell only, once a day)
+function wmamOfficeDailyDocReminder(){
+  var me = DB.current; if(!me || !_wmamIsOfficeAgent(me)) return;
+  var day = _ctToday(), k = 'wmam_docs_daily_' + me.id;
+  try{ if(localStorage.getItem(k) === day) return; }catch(e){}
+  var L = wmamUnsignedDocAgents(); if(!L.length) return;
+  try{ localStorage.setItem(k, day); }catch(e){}
+  _wmamPushRaw({ toIds:[me.id], toRoles:[], icon:'\uD83D\uDCCB', title:'Unsigned documents \u2014 ' + L.length + ' agent' + (L.length===1?'':'s'), body: L.slice(0,6).map(function(x){ return x.name; }).join(', ') + (L.length > 6 ? '\u2026' : '') + ' still need to sign. Open Agents to resend or follow up.', panel:'agents', priority:'normal', skipEmail:true });
+}
+// ONE email a week to the office (claimed in the database so only one browser sends it)
+async function wmamWeeklyDocDigest(){
+  var me = DB.current; if(!me || !_wmamIsOfficeAgent(me)) return;
+  try{
+    var r = await supaClient.from('app_settings').select('value').eq('key','docs_digest_last').maybeSingle();
+    var last = r && r.data && r.data.value ? String(r.data.value).replace(/"/g,'') : '';
+    if(last && (Date.now() - new Date(last + 'T12:00:00Z').getTime()) < 6.5*24*3600*1000) return;
+    var day = _ctToday();
+    var up = await supaClient.from('app_settings').upsert({ key:'docs_digest_last', value:JSON.stringify(day), updated_at:new Date().toISOString() }, { onConflict:'key' });
+    if(up && up.error) return;
+    var L = wmamUnsignedDocAgents(); if(!L.length) return;
+    var body = L.map(function(x){ return '\u2022 ' + x.name + (x.campaigns.length ? ' \u2014 ' + x.campaigns.join(', ') : '') + (x.extra ? ' (+' + x.extra + ' other document' + (x.extra===1?'':'s') + ')' : ''); }).join('\n');
+    var office = (DB.agents||[]).filter(function(a){ return a && !_wmamIsGone(a) && a.email && (isOwner(a) || a.fullOfficeAccess === true); });
+    office.forEach(function(a){ _wmamEmailRaw({ toAgent:{ id:a.id, name:a.name, email:a.email }, eventType:'in_app_notification', _weeklyDigest:true, payload:{ title:'Weekly: ' + L.length + ' agent' + (L.length===1?'':'s') + ' with unsigned documents', body: body + '\n\nOpen People \u2192 Agents & Teams \u2192 Agents to resend contracts or follow up.' } }).catch(function(){}); });
+  }catch(e){ console.warn('[weekly digest]', e); }
+}
+if(typeof window!=='undefined'){
+  Object.assign(window, { wmamUnsignedDocAgents:wmamUnsignedDocAgents, wmamOfficeDailyDocReminder:wmamOfficeDailyDocReminder, wmamWeeklyDocDigest:wmamWeeklyDocDigest });
+  setTimeout(function(){ try{ wmamOfficeDailyDocReminder(); wmamWeeklyDocDigest(); }catch(e){} }, 15000);
+  setInterval(function(){ try{ wmamOfficeDailyDocReminder(); wmamWeeklyDocDigest(); }catch(e){} }, 3*3600*1000);
+}
+
 
 // ════════════════════════════════════════════════════════════════════════
 //  wmamTestEmail() — F12 console helper for diagnosing email setup.
@@ -62859,7 +62970,7 @@ function submitBankingInfo(agentId,campaignName){
 // ── Daily reminder ──
 function checkAgentDocReminders(){
   var u=DB.current;
-  if(!u||!isSalesRole(u)) return;
+  if(!u||!isSalesRole(u)||u.active===false) return;   // v2026.10.05: daily dashboard reminder only, never for deactivated agents
   var pkt=AGENT_ONBOARDING_STATUS[u.id]||{};
   var pending=Object.keys(pkt).filter(function(c){return pkt[c].packetSentAt&&!pkt[c].allComplete;});
   if(!pending.length) return;
@@ -62867,7 +62978,7 @@ function checkAgentDocReminders(){
   var key='wmam_docremind_'+u.id;
   try{if(localStorage.getItem(key)===today) return; localStorage.setItem(key,today);}catch(e){}
   setTimeout(function(){
-    pushNotification({toIds:[u.id],toRoles:[],icon:'⚠️',title:'Action Required — Onboarding Documents Pending',body:'You have unsigned onboarding documents. Complete them to activate your portal access.',panel:'my-documents',priority:'high'});
+    (typeof _wmamPushRaw === 'function' ? _wmamPushRaw : pushNotification)({skipEmail:true, priority:'normal', toIds:[u.id],toRoles:[],icon:'⚠️',title:'Action Required — Onboarding Documents Pending',body:'You have unsigned onboarding documents. Complete them to activate your portal access.',panel:'my-documents',priority:'normal'});
   },3000);
 }
 
