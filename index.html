@@ -3803,7 +3803,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.05.0300';
+var BUILD_VERSION = '2026.10.05.0400';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14525,6 +14525,88 @@ async function gmPayLoadMine(){
 // ── Office: every sale + paybacks + price list ─────────────────────────
 var GMSALES = { rows:[], filter:'all', loading:false };
 // v2026.09.29: "Paid Device Sales" = every phone sold through the payment link (PAID).
+
+// ══════════════════════════════════════════════════════════════════════
+//  GEN MOBILE "NO USAGE" PHONES — Calvin 2026-10-05 v0400
+//  Comm. Elig. yes OR no -> the phone always comes out of inventory as sold.
+//   • YES (usage)  -> the agent earns the commission.
+//   • NO (no usage)-> no commission, AND the enrolling agent owes the FULL device
+//     cost (added to their payroll debt). The phone is flagged and the agent,
+//     their upline and the office inventory team are notified (bell).
+//   • A later report showing YES -> the debt is removed automatically + notice.
+// ══════════════════════════════════════════════════════════════════════
+function _wmamUplineIds(a){
+  var ids = {};
+  if(!a) return [];
+  [a.teamLeaderId, a.marketManagerId, a.campaignManagerId, a.iboId].forEach(function(v){ if(v != null && v !== '') ids[v] = 1; });
+  try{ var rt = a.reportsTo && a.reportsTo['Gen Mobile']; if(rt != null) ids[rt] = 1; }catch(e){}
+  return Object.keys(ids).map(Number).filter(function(v){ return !isNaN(v) && v !== a.id; });
+}
+function _wmamGMFullCost(d, act){
+  var c = Number(d && d.deviceCost) || Number(act && act.devCost) || Number(d && d.devCost) || 0;
+  if(!c){ try{ var dv = gmFindDevice(GMPAY.pricing || GM_SALE_PRICING_DEFAULT, (d && d.model) || (act && act.model)); if(dv) c = Number(dv.full) || 0; }catch(e){} }
+  return Math.round(c * 100) / 100;
+}
+function wmamNoUsageCheck(act){
+  try{
+    var imei = String(act && act.imei || '').replace(/\D/g,''); if(!imei) return;
+    var d = (GM_INVENTORY||[]).find(function(x){ return x && String(x.imei).replace(/\D/g,'') === imei; }); if(!d) return;
+    var agent = act.agentId != null ? (DB.agents||[]).find(function(a){ return a && String(a.id) === String(act.agentId); }) : null;
+    var day = (typeof _gmIso === 'function' && _gmIso(act.activationDate)) || act.activationDate || _ctToday();
+    if(!act.commEligible){
+      if(d.noUsageDebt && !d.noUsageDebt.reversed) return;           // already recorded
+      var cost = _wmamGMFullCost(d, act);
+      d.noUsage = true;
+      if(!agent){ d.noUsageNeedsAgent = true; return; }               // report name not matched yet -> office matches it (Match names)
+      if(cost > 0 && typeof payrollAddDebt === 'function') payrollAddDebt(agent.id, Math.round(cost*100), 'Gen Mobile phone sold with NO usage (not commission-eligible) \u2014 '+(d.model||'phone')+' IMEI '+imei+' \u2014 full device cost', '');
+      d.noUsageDebt = { agentId:agent.id, agentName:agent.name, cents:Math.round(cost*100), at:new Date().toISOString(), date:day };
+      delete d.noUsageNeedsAgent;
+      pushNotification({ toIds:[agent.id].concat(_wmamUplineIds(agent)), toRoles:['Inventory'], icon:'\u26A0\uFE0F', priority:'normal', skipEmail:true, agentId:agent.id,
+        title:'No usage on a sold phone \u2014 '+agent.name+' owes '+_gmMoney(cost),
+        body:(d.model||'Phone')+' IMEI '+imei+' (sold '+day+') shows NO usage on the Gen Mobile report, so there is no commission and the full device cost ('+_gmMoney(cost)+') is added to '+agent.name+'\u2019s balance. If the customer starts using it, the next report removes the charge automatically.',
+        panel:'gm-paid' });
+    } else if(d.noUsageDebt && !d.noUsageDebt.reversed){
+      var nd = d.noUsageDebt;
+      if(typeof payrollClearDebt === 'function') payrollClearDebt(nd.agentId, nd.cents, 'Usage now showing on Gen Mobile report \u2014 IMEI '+imei+' \u2014 charge removed', '');
+      nd.reversed = new Date().toISOString(); d.noUsage = false;
+      var ag2 = (DB.agents||[]).find(function(a){ return a && String(a.id) === String(nd.agentId); });
+      pushNotification({ toIds:[nd.agentId].concat(_wmamUplineIds(ag2)), toRoles:['Inventory'], icon:'\u2705', priority:'normal', skipEmail:true, agentId:nd.agentId,
+        title:'Usage now showing \u2014 charge removed for '+(nd.agentName||'agent'),
+        body:(d.model||'Phone')+' IMEI '+imei+' now shows usage and is commission-eligible. The '+_gmMoney(nd.cents/100)+' device charge was removed.', panel:'gm-paid' });
+    }
+  }catch(e){ console.warn('[no-usage]', e); }
+}
+// what the sold report says about a Pay Link sale's phone
+function _gmSaleReportBadge(imei){
+  var d = (GM_INVENTORY||[]).find(function(x){ return x && String(x.imei).replace(/\D/g,'') === imei; });
+  var onReport = !!(d && (d.status === 'activated' || d.activatedAt) && (d.activatedBy || d.reportAgentName || d.activatedById || d._phantomFromActivation));
+  if(!onReport) return '<div style="font-size:.72rem;color:#92400e;font-weight:700">Waiting for sold report</div>';
+  if(d.commEligible === false){
+    var owe = d.noUsageDebt && !d.noUsageDebt.reversed ? ' \u2014 '+_escapeHtml(d.noUsageDebt.agentName||'agent')+' owes '+_gmMoney(d.noUsageDebt.cents/100) : (d.noUsageNeedsAgent ? ' \u2014 match the report name to charge the agent' : '');
+    return '<div style="font-size:.72rem;color:#b91c1c;font-weight:800">\u26A0 On sold report \u00b7 Commission: NO (no usage)'+owe+'</div>';
+  }
+  return '<div style="font-size:.72rem;color:#166534;font-weight:700">\u2714 On sold report \u00b7 Commission: YES</div>';
+}
+if(typeof window!=='undefined'){ Object.assign(window, { wmamNoUsageCheck:wmamNoUsageCheck, _gmSaleReportBadge:_gmSaleReportBadge }); }
+
+
+// apply the rule to phones already on uploaded reports (activations from Oct 1, 2026 on) — once, office browser only
+var WMAM_NOUSAGE_FROM = '2026-10-01', _wmamNoUsageScanned = false;
+function wmamNoUsageBackfill(){
+  var me = DB.current; if(_wmamNoUsageScanned || !me || !(isOwner(me) || (typeof isInventory === 'function' && isInventory(me)) || me.fullOfficeAccess === true)) return 0;
+  if(!Array.isArray(GM_INVENTORY) || !GM_INVENTORY.length || !(DB.agents||[]).length) return 0;
+  _wmamNoUsageScanned = true; var n = 0;
+  GM_INVENTORY.forEach(function(d){
+    if(!d || d.deletedAt || d.commEligible !== false || (d.noUsageDebt && !d.noUsageDebt.reversed)) return;
+    var day = (typeof _gmIso === 'function' && _gmIso(d.activatedAt)) || '';
+    if(!day || day < WMAM_NOUSAGE_FROM) return;
+    wmamNoUsageCheck({ imei:d.imei, agentId:d.activatedById || null, commEligible:false, activationDate:d.activatedAt, devCost:d.devCost, model:d.model }); n++;
+  });
+  if(n){ try{ saveInventory(); }catch(e){} console.log('[no-usage] applied to '+n+' phone(s) already on reports'); }
+  return n;
+}
+if(typeof window!=='undefined'){ window.wmamNoUsageBackfill = wmamNoUsageBackfill; setTimeout(function(){ try{ wmamNoUsageBackfill(); }catch(e){} }, 20000); }
+
 function panelGmPaid(){
   GMSALES.filter = 'paid'; GMSALES._title = 'PAID DEVICE SALES';
   var h = panelGmSales();
@@ -14834,7 +14916,7 @@ function gmSalesRender(){
       + '<td style="padding:8px 10px">'+_gmMoney(s.owed_gen_mobile)+'</td>'
       + '<td style="padding:8px 10px">'+(Number(s.owed_agent)>0?_gmMoney(s.owed_agent):'\u2014')+'</td>'
       + '<td style="padding:8px 10px">'+_gmStatusChip(s.status)
-        + (s.status==='paid' ? (_wmamFindSaleByImei(String(s.imei||'').replace(/\D/g,'')) ? '<div style="font-size:.72rem;color:#166534;font-weight:700">\u2714 On sold report (counted)</div>' : '<div style="font-size:.72rem;color:#92400e;font-weight:700">Waiting for sold report</div>') : '')
+        + (s.status==='paid' ? _gmSaleReportBadge(String(s.imei||'').replace(/\D/g,'')) : '')
         + (s.customer_signature ? '<div><button onclick="gmViewSignature('+s.id+')" style="margin-top:4px;padding:3px 8px;border:1px solid #003594;border-radius:5px;background:#fff;color:#003594;font-size:.72rem;font-weight:700;cursor:pointer">View signature</button></div>' : (s.payer==='customer' && s.status==='link_created' ? '<div style="font-size:.72rem;color:#92400e">not signed yet</div>' : ''))
         + (s.status==='link_created' ? '<div><button onclick="gmPayCancel('+s.id+')" style="margin-top:4px;padding:3px 8px;border:1px solid #CC0000;border-radius:5px;background:#fff;color:#CC0000;font-size:.72rem;font-weight:700;cursor:pointer">Cancel order</button></div>' : '')
         + (s.status==='canceled' && s.canceled_by ? '<div style="font-size:.72rem;color:#666">by '+_gmPayEsc(s.canceled_by)+'</div>' : '')+'</td>'
@@ -21064,6 +21146,15 @@ function processGMActivationCSV(csvText){
     if(!imei) return;
 
     if(alreadyActivated[imei]){
+      // v2026.10.05: a phone already on an earlier report that NOW shows usage (no -> yes): commission earned, charge removed
+      var _prev = alreadyActivated[imei];
+      if(_prev && _prev.commEligible === false && commElig){
+        _prev.commEligible = true; _prev.eligibleSince = new Date().toISOString();
+        var _dv = (GM_INVENTORY||[]).find(function(x){ return x && x.imei === imei; }); if(_dv) _dv.commEligible = true;
+        try{ wmamNoUsageCheck({ imei:imei, agentId:_prev.agentId, commEligible:true, activationDate:_prev.activationDate, model:model }); }catch(e){}
+        if(_prev.agentId){ try{ recordSale({ agentId:_prev.agentId, campaign:'Gen Mobile', program:'Lifeline', date:((typeof _gmIso==='function' && _gmIso(_prev.activationDate)) || _prev.activationDate), tribal:!!_prev.tribal, imei:imei, source:'gm-usage-now-showing', deferSave:true }); }catch(e){} }
+        try{ setTimeout(function(){ saveInventory(); saveToStorage(); }, 0); }catch(e){}
+      }
       duplicates.push({imei:imei, agentUser:agentUser, actDate:actDate});
       return;
     }
@@ -21212,6 +21303,7 @@ function applyGMActivations(activations, uploadBatchId){
     // Add to activations list
     act.uploadBatchId = uploadBatchId;
     GM_ACTIVATIONS.push(act);
+    try{ wmamNoUsageCheck(act); }catch(e){}   // v2026.10.05: no usage -> agent owes full device cost + flagged
     // ── Calvin 2026-05-18: COMPLETE counter update ──
     // Scoreboard / leaderboard / dashboard read FOUR fields. Previously
     // only sales + agent.sales were bumped, so weekly scoreboard always
