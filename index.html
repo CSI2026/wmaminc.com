@@ -26,8 +26,10 @@
   function realLen(){ try{ return lenDesc.get.call(LS); }catch(e){ return 0; } }
 
   // Stays on the device (tiny, needed before login or per-device by design)
+  // v2026.10.05: browser backup snapshots stay on this device only (the real data lives in the database tables)
+  var BACKUP_KEYS = /^wmam_(backup_.*|auto_backups|agents_backup)$/;
   function isDeviceKey(k){
-    return /^(__|sb-)/.test(k) || k === 'wmam_session_id' || /^wmam_lang/.test(k) || /^wmam_force_reload/.test(k);
+    return /^(__|sb-)/.test(k) || k === 'wmam_session_id' || /^wmam_lang/.test(k) || /^wmam_force_reload/.test(k) || BACKUP_KEYS.test(k);
   }
   function isCloudKey(k){ return typeof k === 'string' && /^_?wmam_/.test(k) && !isDeviceKey(k); }
   // Never stored anywhere as a blob: these already live in their own Supabase tables
@@ -79,10 +81,19 @@
   // ---- 2. Load this person's data from the cloud --------------------
   if(sess && sess.access_token && sess.user && sess.user.id){
     state.uid = sess.user.id; state.token = sess.access_token;
-    var g = syncXhr('GET', '/rest/v1/wmam_store?select=key,value&limit=5000', null, sess.access_token);
-    if(g.status !== 200){ g = syncXhr('GET', '/rest/v1/wmam_store?select=key,value&limit=5000', null, sess.access_token); }   // v2026.10.01: one quick retry before going read-only
-    if(g.status === 200){
-      try{ JSON.parse(g.text).forEach(function(row){ if(row && row.key != null){ cache[row.key] = row.value; sent[row.key] = row.value; } }); }catch(e){}
+    // v2026.10.05: load in small pages, skipping backup snapshots, so a large saved copy can't time out
+    var PAGE = 20, off = 0, okAll = true, g = { status:0 }, loaded = {};
+    for(var _pg = 0; _pg < 200; _pg++){
+      var q = '/rest/v1/wmam_store?select=key,value&key=not.like.wmam_backup_*&key=not.in.(wmam_auto_backups,wmam_agents_backup)&order=key.asc&limit=' + PAGE + '&offset=' + off;
+      g = syncXhr('GET', q, null, sess.access_token);
+      if(g.status !== 200){ g = syncXhr('GET', q, null, sess.access_token); }   // one quick retry per page
+      if(g.status !== 200){ okAll = false; break; }
+      var rowsP = []; try{ rowsP = JSON.parse(g.text) || []; }catch(e){ rowsP = []; }
+      rowsP.forEach(function(row){ if(row && row.key != null){ loaded[row.key] = row.value; } });
+      if(rowsP.length < PAGE) break; off += PAGE;
+    }
+    if(okAll){
+      Object.keys(loaded).forEach(function(k){ cache[k] = loaded[k]; sent[k] = loaded[k]; });
       state.mode = 'cloud';
     } else {
       state.mode = 'readonly';                                          // could not load -> never save over the cloud
@@ -136,6 +147,7 @@
       cache[k] = v; delete dels[k]; dirty[k] = true; schedule();
       return;
     }
+    if(this === LS && BACKUP_KEYS.test(String(k))){ try{ return rSet.apply(this, arguments); }catch(e){ return; } }   // a full device just skips the backup
     return rSet.apply(this, arguments);
   };
   P.removeItem = function(k){
@@ -1430,7 +1442,7 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
     <button onclick="showPage('careers')" id="nav-careers">Careers</button>
     <button onclick="showPage('team')" id="nav-team">Our Team</button>
     <button onclick="showPage('contact')" id="nav-contact">Contact</button>
-    <button id="wmamLangBtnPublic" data-no-i18n onclick="wmamToggleLang()" class="nav-lang" style="background:none;border:1px solid rgba(255,255,255,.35);color:inherit;font-weight:700;letter-spacing:1px;padding:6px 12px;border-radius:100px;cursor:pointer">\U0001F310 ES</button>
+    <button id="wmamLangBtnPublic" data-no-i18n onclick="wmamToggleLang()" class="nav-lang" style="background:none;border:1px solid rgba(255,255,255,.35);color:inherit;font-weight:700;letter-spacing:1px;padding:6px 12px;border-radius:100px;cursor:pointer">&#127760; ES</button>
     <button onclick="showPage('login')" class="nav-cta">Agent Portal</button>
   </div>
   <div class="nav-burger" id="burgerBtn" onclick="toggleNav()">
@@ -1809,7 +1821,7 @@ body.modal-app-open .reveal { animation:none !important; transition:none !import
 <!-- ═══════════════════════════════════
      BACK OFFICE
 ════════════════════════════════════ -->
-<button id="wmamLangFloat" data-no-i18n onclick="wmamToggleLang()" style="position:fixed;right:16px;bottom:16px;z-index:9999;background:#003594;color:#fff;border:none;font-family:system-ui,sans-serif;font-weight:700;letter-spacing:1px;font-size:.8rem;padding:12px 18px;border-radius:100px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.3)">\U0001F310 Espa\u00f1ol</button>
+<button id="wmamLangFloat" data-no-i18n onclick="wmamToggleLang()" style="position:fixed;right:16px;bottom:16px;z-index:9999;background:#003594;color:#fff;border:none;font-family:system-ui,sans-serif;font-weight:700;letter-spacing:1px;font-size:.8rem;padding:12px 18px;border-radius:100px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.3)">&#127760; Espa&ntilde;ol</button>
 <div id="backoffice">
   <div style="position:sticky;top:0;z-index:900;background:#fff;border-bottom:3px solid var(--blue);box-shadow:0 2px 8px rgba(0,0,0,.06)">
   <!-- BO TOP NAV ROW 1: Logo + User + Logout -->
@@ -3791,7 +3803,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.02.1400';
+var BUILD_VERSION = '2026.10.05.0200';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
