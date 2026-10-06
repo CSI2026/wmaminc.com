@@ -3803,7 +3803,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.06.0800';
+var BUILD_VERSION = '2026.10.06.0820';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -17389,6 +17389,78 @@ async function wmaiSetAccess(id, on){
 }
 setTimeout(function(){ try{ if(DB.current) wmaiLoadAccess(); }catch(e){} }, 6000);
 if(typeof window!=='undefined'){ Object.assign(window, { WMAI:WMAI, wmaiSay:wmaiSay, wmaiLoadAccess:wmaiLoadAccess, wmaiToggle:wmaiToggle, wmaiRender:wmaiRender, wmaiAsk:wmaiAsk, wmaiApprove:wmaiApprove, wmaiMic:wmaiMic, wmaiSetAccess:wmaiSetAccess }); }
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  MARKETS — FIND THEM IN THE DATA + RECOVER ONES STUCK ON A DEVICE
+//  Calvin 2026-10-06 v0900
+//  1) The dashboard lists every market found in the data: uploaded inventory
+//     (all campaigns), people's profiles, the old Teams list and sales reports,
+//     matched to real markets through upload-name links. Names that aren't set
+//     up yet still show (devices, people, sales) with a "Set up" button.
+//  2) If a market was added on this device but never reached the server
+//     (connection drop), it is re-sent automatically the next time the site is
+//     opened here — unless it was deliberately removed.
+// ══════════════════════════════════════════════════════════════════════
+var _WMAM_LOCAL_MARKETS_AT_START = null;
+try{ _WMAM_LOCAL_MARKETS_AT_START = localStorage.getItem('wmam_markets'); }catch(e){}
+function _wmamCanonMarket(raw){ var r = String(raw||'').trim(); if(!r) return ''; try{ var n = wmamMarketNameFor(r); if(n) return n; }catch(e){} return r; }
+function wmamDiscoveredMarkets(){
+  var have = {}; (MARKETS||[]).forEach(function(m){ if(m && m.name) have[String(m.name).toLowerCase()] = 1; });
+  var found = {};
+  var add = function(raw, kind){ var c = _wmamCanonMarket(raw); if(!c || /^\(no market\)$/i.test(c) || /^market-\d+$/.test(c)) return; var k = c.toLowerCase(); if(have[k]) return; found[k] = found[k] || { name:c, from:{} }; found[k].from[kind] = 1; };
+  try{ (typeof wmamUnsetMarketNames === 'function' ? wmamUnsetMarketNames() : []).forEach(function(x){ add(x.name, 'inventory'); }); }catch(e){}
+  [GM_INVENTORY, TC_INVENTORY, AW_INVENTORY, EX_INVENTORY, INVENTORY_DEVICES].forEach(function(p){ (p||[]).forEach(function(d){ if(d && !d.deletedAt && d.status !== 'deleted' && d.market) add(d.market, 'inventory'); }); });
+  (DB.agents||[]).forEach(function(a){ if(a && a.active !== false && !a.deletedAt && a.team) add(a.team, 'people'); });
+  try{ (typeof LIFELINE_TEAMS !== 'undefined' ? LIFELINE_TEAMS : []).forEach(function(t){ if(t && t.active !== false && t.name) add(t.name, 'teams'); }); }catch(e){}
+  try{ (typeof GM_ACTIVATIONS !== 'undefined' ? GM_ACTIVATIONS : []).forEach(function(x){ if(x && x.market) add(x.market, 'sales'); }); }catch(e){}
+  return Object.keys(found).map(function(k){ return found[k]; }).sort(function(a,b){ return a.name.localeCompare(b.name); });
+}
+async function wmamRecoverDeviceMarkets(){
+  var u = DB.current; if(!u || !_WMAM_LOCAL_MARKETS_AT_START) return 0;
+  if(!(isOwner(u) || u.fullOfficeAccess === true || (typeof isOfficeRole === 'function' && isOfficeRole(u)) || (typeof isInventory === 'function' && isInventory(u)))) return 0;
+  var mine = []; try{ mine = JSON.parse(_WMAM_LOCAL_MARKETS_AT_START) || []; }catch(e){ return 0; }
+  if(!Array.isArray(mine) || !mine.length) return 0;
+  var srv = [], del = [];
+  try{ var r = await supaClient.from('app_settings').select('value').eq('key','markets').maybeSingle(); srv = JSON.parse((r && r.data && r.data.value) || '[]') || []; }catch(e){ return 0; }
+  try{ var r2 = await supaClient.from('app_settings').select('value').eq('key','markets_deleted').maybeSingle(); del = (JSON.parse((r2 && r2.data && r2.data.value) || '[]') || []).map(String); }catch(e){}
+  var ids = {}, names = {}; srv.forEach(function(m){ if(!m) return; ids[String(m.id)] = 1; names[String(m.name||'').toLowerCase()] = 1; });
+  var missing = mine.filter(function(m){ return m && m.name && !ids[String(m.id)] && !names[String(m.name).toLowerCase()] && del.indexOf(String(m.id)) < 0 && m.deletedAt == null; });
+  if(!missing.length){ _WMAM_LOCAL_MARKETS_AT_START = null; return 0; }
+  missing.forEach(function(m){ if(!(MARKETS||[]).some(function(x){ return x && (String(x.id) === String(m.id) || String(x.name).toLowerCase() === String(m.name).toLowerCase()); })) MARKETS.push(m); });
+  try{ if(typeof wmamSaveMarketsNow === 'function') await wmamSaveMarketsNow('recovered '+missing.length+' market(s) saved only on this device'); }catch(e){}
+  try{ wmamMarketsChanged(); }catch(e){}
+  try{ pushNotification({ toIds:[], toRoles:['Owner'], icon:'\uD83D\uDDFA', priority:'normal', skipEmail:true, title:missing.length+' market(s) recovered from '+u.name+'\u2019s device', body:'These were added but never reached the server: '+missing.map(function(m){ return m.name; }).join(', ')+'. They are now saved for everyone.', panel:'markets-admin' }); }catch(e){}
+  _WMAM_LOCAL_MARKETS_AT_START = null; return missing.length;
+}
+setTimeout(function(){ try{ wmamRecoverDeviceMarkets(); }catch(e){} }, 9000);
+if(typeof window!=='undefined'){ Object.assign(window, { wmamDiscoveredMarkets:wmamDiscoveredMarkets, wmamRecoverDeviceMarkets:wmamRecoverDeviceMarkets }); }
+// one tiny check when the dashboard opens (no background polling): asks only "when did markets
+// last change?"; downloads the list only if it changed, then redraws the dashboard once.
+var _WMAM_DASH_MK = { at:null, last:0, busy:false };
+async function wmamDashMarketCheck(){
+  if(_WMAM_DASH_MK.busy || Date.now() - _WMAM_DASH_MK.last < 60000 || !supaClient) return;
+  _WMAM_DASH_MK.busy = true; _WMAM_DASH_MK.last = Date.now();
+  try{
+    var t = await supaClient.from('app_settings').select('updated_at').eq('key','markets').maybeSingle();
+    var at = t && t.data && t.data.updated_at;
+    if(at && _WMAM_DASH_MK.at && at === _WMAM_DASH_MK.at){ _WMAM_DASH_MK.busy = false; return; }
+    var r = await supaClient.from('app_settings').select('value').eq('key','markets').maybeSingle();
+    var raw = r && r.data && r.data.value, changed = false;
+    if(raw && (typeof _wmamSetSnap === 'undefined' || _wmamSetSnap['markets'] !== raw) && !((typeof _wmamMkSaving !== 'undefined') && _wmamMkSaving)){
+      var rem = JSON.parse(raw);
+      if(Array.isArray(rem)){ var before = JSON.stringify(MARKETS.map(function(m){ return m && [m.id, m.name, m.active, m.status]; }));
+        var seen = {}; MARKETS.length = 0; rem.forEach(function(m){ var k = m && m.id != null ? String(m.id) : ('n:'+(m && m.name)); if(seen[k]) return; seen[k] = 1; MARKETS.push(m); });
+        try{ if(typeof _wmamSetSnap !== 'undefined') _wmamSetSnap['markets'] = raw; localStorage.setItem('wmam_markets', JSON.stringify(MARKETS)); }catch(e){}
+        try{ wmamMarketsChanged(); }catch(e){}
+        changed = before !== JSON.stringify(MARKETS.map(function(m){ return m && [m.id, m.name, m.active, m.status]; })); }
+    }
+    _WMAM_DASH_MK.at = at || _WMAM_DASH_MK.at;
+    if(changed && window._currentPanelId === 'owner'){ var a = document.activeElement; if(!(a && /INPUT|TEXTAREA|SELECT/.test(a.tagName))){ var y = window.scrollY; gotoPanel('owner'); setTimeout(function(){ window.scrollTo(0, y); }, 30); } }
+  }catch(e){}
+  _WMAM_DASH_MK.busy = false;
+}
+if(typeof window!=='undefined') window.wmamDashMarketCheck = wmamDashMarketCheck;
 
 function panelAgentsHub(){
   var u = DB.current;
@@ -47712,7 +47784,7 @@ function _ownerDash3(u){
     var stats=[
       {v:wk,l:'Sales this week',p:'biz-snapshot'},{v:sales.length,l:'Active agents',p:'agents'},{v:devOut,l:'Devices with agents',p:'biz-snapshot'},
       {v:(mvp?(mvp.a.name.split(' ')[0]):'\u2014'),l:(mvp?('Top: '+mvp.n+' this wk'):'Top performer')},{v:total,l:'All-time enrollments',p:'lb'},
-      {v:mkts,l:'Active markets',p:'markets-admin'},{v:mgrs,l:'Managers',p:'agents'},{v:invAvail,l:'Not assigned (warehouse)',p:'biz-snapshot'}
+      {v:(mkts + (function(){ try{ return wmamDiscoveredMarkets().length; }catch(e){ return 0; } })()),l:'Active markets',p:'markets-admin'},{v:mgrs,l:'Managers',p:'agents'},{v:invAvail,l:'Not assigned (warehouse)',p:'biz-snapshot'}
     ];
     H+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:10px;margin-bottom:22px">';
     stats.forEach(function(s){
@@ -47759,11 +47831,20 @@ function _ownerDash3(u){
     H+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:11px"><span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:3px;text-transform:uppercase;color:'+Cl+'">\uD83D\uDDFA Active markets</span><button onclick="gotoPanel(\'markets-admin\')" style="background:none;border:1px solid '+_rgbaFromHex(Cl,.4)+';color:'+Cl+';font-family:Barlow Condensed,sans-serif;font-size:.55rem;letter-spacing:1px;text-transform:uppercase;padding:4px 12px;border-radius:999px;cursor:pointer">Manage markets</button></div>';
     H+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:22px">';
     if(!_mk.length){ H+='<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:rgba(255,255,255,.4)">No active markets yet.</div>'; }
+    var _disc=[]; try{ _disc=wmamDiscoveredMarkets(); }catch(e){}
+    try{ setTimeout(wmamDashMarketCheck, 300); }catch(e){}
     _mk.forEach(function(m){
       var nm=m.name||'Market', ppl=0; try{ ppl=(typeof wmamMarketPeopleIds==='function')?wmamMarketPeopleIds(m).length:0; }catch(e){}
       var dv=_invR.filter(function(r){ return r.market===nm; }).length, sw=_salR.filter(function(r){ return r.market===nm; }).reduce(function(t,r){ return t+r.week; },0);
       H+='<div onclick="BIZ.kind=\'inv\';BIZ.camp=null;BIZ.market=null;gotoPanel(\'biz-snapshot\')" style="cursor:pointer;background:rgba(255,255,255,.03);border:1px solid '+_rgbaFromHex(C,.3)+';border-left:3px solid '+Cl+';border-radius:0 10px 10px 0;padding:12px 14px"><div style="color:#fff;font-family:Barlow Condensed,sans-serif;font-size:.95rem;font-weight:700">'+_escapeHtml(nm)+'</div>'
         +'<div style="display:flex;justify-content:space-between;margin-top:6px;color:rgba(255,255,255,.75);font-family:Barlow Condensed,sans-serif;font-size:.78rem"><span>'+ppl+' '+(ppl===1?'person':'people')+'</span><span>'+dv+' devices</span><span style="color:#fff;font-weight:800">'+sw+' sales/wk</span></div></div>';
+    });
+    _disc.forEach(function(x){
+      var nm=x.name, ppl=(DB.agents||[]).filter(function(a){ return a && a.active!==false && a.team && _wmamCanonMarket(a.team)===nm; }).length;
+      var dv=_invR.filter(function(r){ return r.market===nm; }).length, sw=_salR.filter(function(r){ return r.market===nm; }).reduce(function(t,r){ return t+r.week; },0);
+      H+='<div style="background:rgba(249,115,22,.08);border:1px solid rgba(249,115,22,.55);border-left:3px solid #f97316;border-radius:0 10px 10px 0;padding:12px 14px"><div style="color:#fff;font-family:Barlow Condensed,sans-serif;font-size:.95rem;font-weight:700">'+_escapeHtml(nm)+'</div><div style="color:#fdba74;font-size:.66rem;letter-spacing:1px;text-transform:uppercase;margin-top:2px">Found in your data \u2014 not set up yet</div>'
+        +'<div style="display:flex;justify-content:space-between;margin-top:6px;color:rgba(255,255,255,.75);font-family:Barlow Condensed,sans-serif;font-size:.78rem"><span>'+ppl+' '+(ppl===1?'person':'people')+'</span><span>'+dv+' devices</span><span style="color:#fff;font-weight:800">'+sw+' sales/wk</span></div>'
+        +'<button onclick="event.stopPropagation();gotoPanel(\'markets-admin\')" style="margin-top:8px;padding:5px 10px;border:1px solid #f97316;border-radius:8px;background:transparent;color:#fdba74;font-weight:800;cursor:pointer;font-size:.74rem">Set up / attach on Markets \u203A</button></div>';
     });
     H+='</div>';
 
