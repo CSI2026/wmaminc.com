@@ -3803,7 +3803,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.07.0300';
+var BUILD_VERSION = '2026.10.07.0400';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -50099,6 +50099,7 @@ function ppCommitStaged(){
     var parsed  = det.parsed;
     if(!parsed) return;
     var match = ppMatchRowsToAgents(parsed, carrier);
+    if(carrier === 'TruConnect'){ try{ var _tcSync = wmamTCInvoiceSyncSales(match); console.log('[TC invoice -> sales]', _tcSync); det.salesSync = _tcSync; }catch(e){ console.warn('[TC invoice -> sales]', e); } }
     // Run the commission engine — produces the actual per-agent pay
     // (ceiling-respected, multi-TL safe, override-routed correctly).
     // The output replaces the old "grossCents = carrier × deals" approach,
@@ -70206,7 +70207,9 @@ function processTCActivationUpload(htmlText, batchId){
     var agentName   = (cells[15] || '').trim();
     var planType    = (cells[16] || '').trim();
 
-    if(!imei || !orderNumber){ return; } // skip junk rows
+    // v2026.10.07: SIM sales often have NO IMEI — keep them (an order number is enough); only skip true junk rows
+    var _isSimRow = /^\s*sim\b/i.test(cells[16] || '');
+    if(!orderNumber || (!imei && !_isSimRow && !(cells[15]||'').trim())){ return; }
 
     var dedupKey = imei + '|' + orderNumber;
     if(existingKeys[dedupKey]){
@@ -70289,6 +70292,45 @@ function processTCActivationUpload(htmlText, batchId){
 // Commit the parsed activation upload to scoreboard + leaderboard + Path B.
 // Only Approved sales credit the agent (mirrors GM behavior).
 // Canceled and Pending are recorded but don't bump counts.
+
+// ══════════════════════════════════════════════════════════════════════
+//  TRUCONNECT SIM SALES + INVOICE = SOURCE OF TRUTH — Calvin 2026-10-07 v0400
+//  • Sold report: "SIM" = SIM card sale; "Handset" = phone/tablet. A handset whose
+//    IMEI isn't in our TruConnect inventory is counted as a SIM sale (our TC
+//    inventory file doesn't carry SIM cards).
+//  • TruConnect's invoice (the pay file) is the real record: every activation on it
+//    that the sold report missed is credited to the agent's sales (company, agent,
+//    upline, team, rankings) and counted as a SIM sale. Never counted twice.
+// ══════════════════════════════════════════════════════════════════════
+function _tcIsoDate(s){
+  s = String(s||'').trim(); if(!s) return _ctToday();
+  if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
+  try{ var p = _tcParseDate(s); if(p) return p; }catch(e){}
+  try{ var n = ppNormalizeDate(s); if(n) return String(n).slice(0,10); }catch(e){}
+  return _ctToday();
+}
+function wmamTCInvoiceSyncSales(match){
+  if(typeof TC_ACTIVATIONS === 'undefined' || !Array.isArray(TC_ACTIVATIONS)) window.TC_ACTIVATIONS = [];
+  var out = { credited:0, alreadyOnReport:0, sim:0, linked:0 };
+  (match && match.matched || []).forEach(function(m){
+    var agent = m.agent; if(!agent) return;
+    (m.row && m.row.details || []).forEach(function(d){
+      var order = String(d.orderNum||'').trim(); if(!order) return;
+      var act = TC_ACTIVATIONS.find(function(a){ return a && String(a.orderNumber||'').trim() === order; });
+      if(act && act.agentId && String(act.status||'').toLowerCase() === 'approved'){ out.alreadyOnReport++; return; }   // already credited from the sold report
+      var date = _tcIsoDate(d.date);
+      var r = recordSale({ agentId:agent.id, campaign:'TruConnect', program:'Lifeline', date:date, tribal:!!d.tribal,
+                           imei:(act && act.imei) || ('TC-ORDER '+order), source:'tc-invoice', deferSave:true });
+      if(act){ act.agentId = agent.id; act.agentName = act.agentName || agent.name; act.status = 'approved'; act.paidOnInvoice = true; out.linked++; }
+      else { TC_ACTIVATIONS.push({ orderNumber:order, agentId:agent.id, agentName:agent.name, saleDate:date, tribal:!!d.tribal, status:'approved', isSim:true, simReason:'on TruConnect invoice, not on the sold report', fromInvoice:true, imei:null }); out.sim++; }
+      if(r) out.credited++;
+    });
+  });
+  try{ saveToStorage(); }catch(e){}
+  return out;
+}
+if(typeof window!=='undefined') window.wmamTCInvoiceSyncSales = wmamTCInvoiceSyncSales;
+
 async function applyTCActivations(parseResult){
   if(!parseResult || !parseResult.ok) return {ok:false, error:'invalid-parse-result'};
   if(typeof TC_ACTIVATIONS === 'undefined' || !Array.isArray(TC_ACTIVATIONS)){
@@ -70332,6 +70374,9 @@ async function applyTCActivations(parseResult){
             console.warn('[applyTCActivations] Path B failed for '+dev.imei+':', e);
           });
         }
+      } else {
+        act.isSim = true; act.simReason = 'handset IMEI not in our TruConnect inventory';   // v2026.10.07: counted as a SIM card sale
+        simSalesRecorded++;
       }
     } else if(act.isSim){
       simSalesRecorded++;
@@ -70342,7 +70387,7 @@ async function applyTCActivations(parseResult){
       // Calvin 2026-06-27: unified sales writer (campaign=TruConnect). Returns
       // the entry only when the agent was matched, preserving credited count.
       var _tcEntry = recordSale({ agentId:act.agentId, campaign:'TruConnect', program:'Lifeline',
-                   date:act.saleDate, tribal:!!act.tribal, imei:act.imei,
+                   date:act.saleDate, tribal:!!act.tribal, imei:(act.imei || ('TC-ORDER '+act.orderNumber)),
                    source:'tc-activation-upload', deferSave:true });
       if(_tcEntry) creditedSales++;
     }
