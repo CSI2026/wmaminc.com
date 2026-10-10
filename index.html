@@ -3803,7 +3803,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.08.0100';
+var BUILD_VERSION = '2026.10.08.0300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -8194,6 +8194,8 @@ function payrollBuildWeeklyRollup(periodEnd){
       a.chargebackCents += lineCb;
     });
   });
+  // v2026.10.08: Tribal Manager overrides (tiers) for this week
+  try{ wmamTribalOverrideLines(periodEnd).forEach(function(o){ var aid = o.agentId; if(!result.agents[aid]){ var _ag = (DB.agents||[]).find(function(x){ return x && x.id === aid; }); result.agents[aid] = { agentId:aid, agentName:(_ag && _ag.name) || ('Agent #'+aid), lines:[], grossCents:0, chargebackCents:0, carryoverAppliedCents:0, netCents:0 }; } var a = result.agents[aid]; a.lines.push({ carrier:o.label, weekId:null, grossCents:o.cents, chargebackCents:0, kind:'override' }); a.grossCents += o.cents; }); }catch(e){ console.warn('[tribal overrides]', e); }
   // Second pass — apply carryover debt as a negative line per agent
   Object.keys(result.agents).forEach(function(aid){
     var a = result.agents[aid];
@@ -15453,6 +15455,7 @@ function _wmamTabAllowed(u, id){
   if(id==='inv-transfer-center') return _xtcIsInv(u) || _xtcIsMgr(u);
   if(id==='surplus-payouts') return canAccess(u,'gm-sales');
   if(id==='tool-center') return !!u;
+  if(id==='hours-ops' || id==='mgr-overrides') return !!u && (isOwner(u) || u.fullOfficeAccess === true);
   if(id==='comp-builder') return !!u && (isOwner(u) || u.fullOfficeAccess === true);
   if(id==='biz-snapshot') return !!u && (isOwner(u) || u.fullOfficeAccess === true || (typeof isInventory === 'function' && isInventory(u)));
   if(id==='time-clock') return !!u && (_tcIsOffice(u) || u.hourlyPay === true);
@@ -15520,7 +15523,7 @@ var WMAM_NAV = [
     { title:'Documents', icon:'\uD83D\uDCC4', bg:'#d9f3ea', tabs:[['campaign-docs','Campaign Documents'],['onboard-packages','Onboarding Packages']] } ]},
   { key:'payroll', label:'\uD83D\uDCB0 Payroll', cards:[
     { title:'Pay Link Surplus', icon:'\uD83D\uDCB5', bg:'#dcfce7', tabs:[['surplus-payouts','Surplus Payouts (pay agents)']] },
-    { title:'Hourly Campaigns', icon:'\u23F1', bg:'#e0f2fe', tabs:[['hours-admin','Hours & Approvals']] },
+    { title:'Hourly Campaigns', icon:'\u23F1', bg:'#e0f2fe', tabs:[['hours-admin','Hours (Photo Clock)'],['hours-ops','Hours of Operation'],['mgr-overrides','Manager Overrides']] },
     { title:'Comp Plan Builder', icon:'\uD83E\uDDEE', bg:'#ede9fe', tabs:[['comp-builder','Comp Plan Builder'],['comp-plans','Compensation Plans (current)']] },
     { title:'Payroll', icon:'\uD83D\uDCB0', bg:'#dbe6ff', tabs:[['payroll','Agent Earnings'],['payroll-upload','Upload Pay File'],['payroll-loans','Loans & Recurring'],['direct-deposits-admin','Direct Deposits'],['my-payroll','My Payroll']] },
     { title:'Business Finances', icon:'\uD83D\uDCCA', bg:'#e9e2ff', tabs:[['operating-costs','Operating Costs'],['payroll-owner','Owner P&L']] } ]},
@@ -16918,6 +16921,449 @@ async function hadmFix(id){
 if(typeof window!=='undefined'){ Object.assign(window, { panelToolCenter:panelToolCenter, tcRender:tcRender, tcLoad:tcLoad, tcSave:tcSave, tcAddCampaign:tcAddCampaign, tcAddSection:tcAddSection, tcEditSection:tcEditSection, tcDelSection:tcDelSection, tcEditItem:tcEditItem, tcDelItem:tcDelItem, tcCanEdit:tcCanEdit, TCUI:TCUI,
   panelTimeClock:panelTimeClock, tclkIn:tclkIn, tclkOut:tclkOut, tclkRender:tclkRender, panelHoursAdmin:panelHoursAdmin, hadmApprove:hadmApprove, hadmFix:hadmFix, wmamHourlyRate:wmamHourlyRate, _tclkWeekStart:_tclkWeekStart }); }
 
+// ══════════════════════════════════════════════════════════════════════
+//  PHOTO TIME CLOCK + HOURS OF OPERATION + TRIBAL MANAGER OVERRIDES
+//  Calvin 2026-10-08 v0200 (approved mockups ①–⑦)
+//  • Clock in AND out need 2 live photos: front selfie + setup (back camera).
+//  • Only inside the campaign's hours of operation (set per campaign).
+//  • 40 hours per pay week (Thu–Wed) is a HARD limit — no exceptions.
+//  • Auto clock-out when the campaign closes or the 40th hour is reached.
+//  • Server enforces hours + 40 too (WMAM_Photo_Clock.sql).
+// ══════════════════════════════════════════════════════════════════════
+var CHOURS = { rows:[], at:0 };
+var WMAM_TZS = [['America/Chicago','Central'],['America/New_York','Eastern'],['America/Denver','Mountain'],['America/Phoenix','Arizona'],['America/Los_Angeles','Pacific']];
+var WMAM_DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+async function chLoad(force){
+  if(!force && Date.now() - CHOURS.at < 60000) return CHOURS.rows;
+  try{ var r = await supaClient.from('campaign_hours').select('*'); if(r && Array.isArray(r.data)){ CHOURS.rows = r.data; CHOURS.at = Date.now(); } }catch(e){}
+  return CHOURS.rows;
+}
+function _chFor(camp){ var c = String(camp||'').toLowerCase(); return (CHOURS.rows||[]).find(function(x){ return String(x.campaign||'').toLowerCase() === c; }) || null; }
+function _chLocal(ms, tz){ var d = new Date(ms); var p = {}; new Intl.DateTimeFormat('en-US', { timeZone:tz||'America/Chicago', weekday:'short', hour:'numeric', minute:'numeric', hour12:false }).formatToParts(d).forEach(function(x){ p[x.type] = x.value; }); var h = parseInt(p.hour,10) % 24; return { dow:WMAM_DAYS.indexOf(p.weekday), min:h*60 + parseInt(p.minute,10) }; }
+function _chFmt(m){ var h = Math.floor(m/60), mm = m%60, ap = h >= 12 ? 'PM' : 'AM', h12 = h % 12 || 12; return h12 + ':' + String(mm).padStart(2,'0') + ' ' + ap; }
+function chStatus(camp, nowMs){
+  var ch = _chFor(camp); nowMs = nowMs || Date.now();
+  if(!ch) return { set:false, open:false, text:'No hours of operation set for '+camp+' yet \u2014 clock-in is closed. Ask the office.' };
+  var L = _chLocal(nowMs, ch.tz), days = ch.days || [];
+  var hoursTxt = _chFmt(ch.open_min)+' \u2013 '+_chFmt(ch.close_min)+' ('+days.map(function(d){ return WMAM_DAYS[d]; }).join(', ')+')';
+  var open = days.indexOf(L.dow) >= 0 && L.min >= ch.open_min && L.min < ch.close_min;
+  return { set:true, open:open, hoursTxt:hoursTxt, today:_chFmt(ch.open_min)+' \u2013 '+_chFmt(ch.close_min), closeAt: open ? nowMs + (ch.close_min - L.min) * 60000 : null, ch:ch };
+}
+// when a shift must end: campaign close that day, or the moment the week reaches 40 h
+function _tclkShiftEnd(p, otherHours){
+  var inMs = new Date(p.clock_in).getTime(), ch = _chFor(p.campaign), ends = [];
+  if(ch){ var L = _chLocal(inMs, ch.tz); ends.push({ at: inMs + Math.max(0, ch.close_min - L.min) * 60000, why:'closed' }); }
+  ends.push({ at: inMs + Math.max(0, 40 - (otherHours||0)) * 3600000, why:'40h' });
+  return ends.sort(function(a,b){ return a.at - b.at; })[0];
+}
+// ---------- camera: 2 live photos ----------
+var PCAM = { stream:null, shots:{}, mode:'in', step:'selfie' };
+function _pcamStop(){ try{ if(PCAM.stream) PCAM.stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} PCAM.stream = null; }
+async function pcamOpen(mode){
+  PCAM.mode = mode; PCAM.shots = {}; PCAM.step = 'selfie';
+  var ov = document.getElementById('pcamOv'); if(ov) ov.remove();
+  ov = document.createElement('div'); ov.id = 'pcamOv'; ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:99999;display:flex;align-items:center;justify-content:center;padding:10px';
+  document.body.appendChild(ov); pcamRender(); await pcamStart();
+}
+async function pcamStart(){
+  _pcamStop(); var msg = document.getElementById('pcamMsg');
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ if(msg) msg.textContent = 'This browser can\u2019t open the camera. Use Chrome or Safari on your phone.'; return; }
+  try{ PCAM.stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode: PCAM.step === 'selfie' ? 'user' : { ideal:'environment' }, width:{ ideal:1280 } }, audio:false }); }
+  catch(e){ if(msg) msg.textContent = 'Camera blocked \u2014 allow camera access for wmaminc.com and try again.'; return; }
+  var v = document.getElementById('pcamVid'); if(v){ v.srcObject = PCAM.stream; try{ await v.play(); }catch(e){} }
+}
+function pcamRender(){
+  var ov = document.getElementById('pcamOv'); if(!ov) return;
+  var label = PCAM.step === 'selfie' ? 'Step 1 \u00b7 Selfie (front camera) \u2014 center your face' : 'Step 2 \u00b7 Your setup (back camera) \u2014 show your table, signage & location';
+  ov.innerHTML = '<div style="background:#fff;border-radius:16px;max-width:520px;width:100%;padding:14px">'
+    + '<div style="font-weight:900;color:#003594;font-size:1.1rem">\uD83D\uDCF8 Clock '+(PCAM.mode === 'in' ? 'in' : 'out')+' \u2014 2 live photos</div>'
+    + '<div style="font-size:.85rem;color:#374151;margin:4px 0 8px">'+label+'</div>'
+    + '<div style="position:relative;background:#111827;border-radius:12px;overflow:hidden;aspect-ratio:4/3"><video id="pcamVid" playsinline muted style="width:100%;height:100%;object-fit:cover;'+(PCAM.step==='selfie'?'transform:scaleX(-1);':'')+'"></video><span style="position:absolute;top:8px;left:10px;color:#f87171;font-weight:800;font-size:.75rem">\u25CF LIVE</span></div>'
+    + '<div style="display:flex;gap:8px;margin-top:8px"><div style="flex:1;font-size:.8rem;color:'+(PCAM.shots.selfie?'#166534':'#6b7280')+';font-weight:800">'+(PCAM.shots.selfie?'\u2714':'\u25CB')+' Selfie</div><div style="flex:1;font-size:.8rem;color:'+(PCAM.shots.setup?'#166534':'#6b7280')+';font-weight:800">'+(PCAM.shots.setup?'\u2714':'\u25CB')+' Setup</div></div>'
+    + '<div id="pcamMsg" style="color:#b91c1c;font-weight:700;font-size:.85rem;margin-top:6px"></div>'
+    + '<div style="display:flex;gap:8px;margin-top:10px"><button onclick="pcamCancel()" style="padding:12px 14px;border:1px solid #cbd5e1;border-radius:10px;background:#fff;font-weight:700;cursor:pointer">Cancel</button><button id="pcamShot" onclick="pcamShoot()" style="flex:1;padding:12px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:900;font-size:1rem;cursor:pointer">\uD83D\uDCF7 Take '+(PCAM.step==='selfie'?'selfie':'setup photo')+'</button></div></div>';
+  var v = document.getElementById('pcamVid'); if(v && PCAM.stream){ v.srcObject = PCAM.stream; try{ v.play(); }catch(e){} }
+}
+function pcamCancel(){ _pcamStop(); var ov = document.getElementById('pcamOv'); if(ov) ov.remove(); }
+function _pcamGrab(){
+  var v = document.getElementById('pcamVid'); if(!v || !v.videoWidth) return null;
+  var s = Math.min(1, 720 / Math.max(v.videoWidth, v.videoHeight)), cv = document.createElement('canvas');
+  cv.width = Math.round(v.videoWidth * s); cv.height = Math.round(v.videoHeight * s); cv.getContext('2d').drawImage(v, 0, 0, cv.width, cv.height);
+  return new Promise(function(res){ cv.toBlob(function(b){ res(b); }, 'image/jpeg', 0.72); });
+}
+async function pcamShoot(){
+  var b = await _pcamGrab(); var msg = document.getElementById('pcamMsg');
+  if(!b){ if(msg) msg.textContent = 'The camera isn\u2019t ready yet \u2014 wait a second and try again.'; return; }
+  PCAM.shots[PCAM.step] = b;
+  if(PCAM.step === 'selfie'){ PCAM.step = 'setup'; pcamRender(); await pcamStart(); return; }
+  _pcamStop(); var btn = document.getElementById('pcamShot'); if(btn){ btn.disabled = true; btn.textContent = 'Saving\u2026'; }
+  try{ await tclkFinish(PCAM.mode, PCAM.shots); pcamCancel(); }
+  catch(e){ if(msg) msg.textContent = e.message || 'Could not save'; if(btn){ btn.disabled = false; btn.textContent = 'Try again'; } }
+}
+async function _pcamUpload(kind, blob){
+  var u = DB.current, day = new Date().toISOString().slice(0,10);
+  var path = u.id + '/' + day + '/' + Date.now() + '-' + kind + '.jpg';
+  var r = await supaClient.storage.from('timeclock').upload(path, blob, { contentType:'image/jpeg', upsert:false });
+  if(r && r.error) throw new Error('Photo didn\u2019t upload: ' + r.error.message);
+  return path;
+}
+// ---------- clock in / out ----------
+async function tclkIn(){
+  var camp = (document.getElementById('tclkCamp')||{}).value, msg = document.getElementById('tclkMsg');
+  await chLoad(true); var st = chStatus(camp);
+  if(!st.open){ if(msg) msg.textContent = st.set ? 'Clock-in is closed. '+camp+' hours: '+st.hoursTxt+'.' : st.text; return; }
+  if(_tclkHours(TCLK.week) >= 40){ if(msg) msg.textContent = 'You\u2019ve reached 40 hours this pay week. No exceptions.'; return; }
+  TCLK.pending = { campaign:camp, market:((document.getElementById('tclkMkt')||{}).value||'').trim() || null, tribal:!!(document.getElementById('tclkTribal')||{}).checked };
+  pcamOpen('in');
+}
+async function tclkOut(note, atIso, autoWhy){
+  if(!TCLK.open) return;
+  if(autoWhy){   // automatic clock-out: no photos (they may not be at the phone)
+    var r0 = await supaClient.from('time_punches').update({ clock_out: atIso || new Date().toISOString(), out_note: note || null, auto_out: autoWhy }).eq('id', TCLK.open.id);
+    if(r0 && r0.error){ console.warn('[auto clock-out]', r0.error.message); return; }
+    try{ showToast(note || 'Clocked out automatically'); }catch(e){} tclkRender(); return;
+  }
+  pcamOpen('out');
+}
+async function tclkFinish(mode, shots){
+  var u = DB.current;
+  var selfie = await _pcamUpload(mode + '-selfie', shots.selfie), setup = await _pcamUpload(mode + '-setup', shots.setup);
+  if(mode === 'in'){
+    var p = TCLK.pending || {}; var row = { agent_id:u.id, agent_name:u.name, campaign:p.campaign, market:p.market, tribal:!!p.tribal, in_selfie:selfie, in_setup:setup };
+    var r = await supaClient.from('time_punches').insert(row);
+    if(r && r.error) throw new Error(r.error.message);
+    try{ showToast('Clocked in'); }catch(e){}
+  } else {
+    var r2 = await supaClient.from('time_punches').update({ clock_out:new Date().toISOString(), out_selfie:selfie, out_setup:setup }).eq('id', TCLK.open.id);
+    if(r2 && r2.error) throw new Error(r2.error.message);
+    try{ showToast('Clocked out'); }catch(e){}
+  }
+  tclkRender();
+}
+async function tclkRender(){
+  var box = document.getElementById('tclkBox'); if(!box) return; var u = DB.current, esc = _escapeHtml; if(!u) return;
+  var camps = _tclkMyCamps(u);
+  if(!camps.length){ box.innerHTML = '<div style="padding:20px;color:#888">The Photo Time Clock is turned on per agent by the office. Ask the office if you should have it.</div>'; return; }
+  await Promise.all([tclkLoad(u.id), chLoad()]);
+  // a shift left open past closing / past 40 h is closed at that exact moment
+  if(TCLK.open){ var oth = _tclkHours(TCLK.week.filter(function(p){ return p.id !== TCLK.open.id; })), end = _tclkShiftEnd(TCLK.open, oth);
+    if(end && end.at <= Date.now()){ await tclkOut(end.why === '40h' ? 'Clocked out automatically at 40 hours' : 'Clocked out automatically \u2014 campaign closed', new Date(end.at).toISOString(), end.why); return; } }
+  var hrs = _tclkHours(TCLK.week), rate = wmamHourlyRate(u), left = Math.max(0, 40 - hrs), pct = Math.min(100, hrs / 40 * 100);
+  var h = wmamConsentCardHtml(u) + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.7rem;font-weight:800;color:#003594;letter-spacing:1px">\uD83D\uDCF8 PHOTO TIME CLOCK</div><div style="font-size:.86rem;color:#374151;margin-bottom:12px">Clock in and out with a live selfie and a photo of your setup. Only during your campaign\u2019s hours \u00b7 40 hours per pay week (Thu\u2013Wed) maximum.</div>';
+  if(TCLK.open){
+    var mins = Math.floor((Date.now() - new Date(TCLK.open.clock_in).getTime()) / 60000), stO = chStatus(TCLK.open.campaign);
+    h += '<div style="background:#ecfdf5;border:2px solid #16a34a;border-radius:14px;padding:16px;text-align:center"><div style="font-weight:900;color:#166534;font-size:1.2rem">\u25CF CLOCKED IN</div><div style="color:#374151;margin-top:4px">'+esc(TCLK.open.campaign||'')+' \u00b7 since '+new Date(TCLK.open.clock_in).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' })+' \u00b7 '+Math.floor(mins/60)+'h '+(mins%60)+'m</div>'
+      + (stO.set ? '<div style="font-size:.82rem;color:#6b7280;margin-top:4px">Campaign closes at '+_chFmt(stO.ch.close_min)+' \u2014 you\u2019ll be clocked out automatically then.</div>' : '')
+      + '<button onclick="tclkOut()" style="margin-top:12px;width:100%;padding:16px;border:none;border-radius:12px;background:#b91c1c;color:#fff;font-size:1.15rem;font-weight:900;cursor:pointer">\uD83D\uDCF8 Clock out (2 photos)</button></div>';
+  } else {
+    var mk = (typeof wmamMarketNameFor === 'function') ? wmamMarketNameFor(u.team) : (u.team||''), st = chStatus(camps[0]);
+    var blocked = hrs >= 40 ? '\u26D4 40-hour limit reached this pay week. You can clock in again Thursday. No exceptions.' : (!st.open ? '\u26D4 ' + (st.set ? 'Clock-in closed. '+camps[0]+' hours: '+st.hoursTxt+'.' : st.text) : '');
+    h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:16px">'
+      + '<label class="f-label">Campaign</label><select id="tclkCamp" class="f-input" onchange="tclkRender()">'+camps.map(function(c){ return '<option'+(c===(document.getElementById('tclkCamp')||{}).value?' selected':'')+'>'+esc(c)+'</option>'; }).join('')+'</select>'
+      + '<div style="font-size:.85rem;margin-top:6px">Hours today: <b>'+(st.set ? st.today : 'not set')+'</b> \u00b7 now <b>'+new Date().toLocaleTimeString([], { hour:'numeric', minute:'2-digit' })+'</b> '+(st.open ? '<span style="color:#16a34a;font-weight:800">\u00b7 open</span>' : '<span style="color:#b91c1c;font-weight:800">\u00b7 closed</span>')+'</div>'
+      + '<label class="f-label" style="margin-top:10px">Market / location</label><input id="tclkMkt" class="f-input" value="'+_escapeAttr(mk||'')+'">'
+      + '<label style="display:flex;gap:8px;align-items:center;margin-top:10px;font-weight:700"><input type="checkbox" id="tclkTribal"> Working Tribal lands this shift</label>'
+      + (blocked ? '<div style="color:#b91c1c;font-weight:800;margin-top:12px">'+esc(blocked)+'</div><button disabled style="margin-top:10px;width:100%;padding:16px;border:none;border-radius:12px;background:#94a3b8;color:#fff;font-size:1.15rem;font-weight:900">\u25B6 Clock in</button>'
+                 : '<button onclick="tclkIn()" style="margin-top:12px;width:100%;padding:16px;border:none;border-radius:12px;background:#16a34a;color:#fff;font-size:1.15rem;font-weight:900;cursor:pointer">\uD83D\uDCF8 Clock in (2 photos)</button>')
+      + '<div id="tclkMsg" style="color:#b91c1c;font-weight:700;margin-top:8px"></div></div>';
+  }
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">'
+    + '<div style="flex:1 1 150px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:.7rem;font-weight:800;color:#6b7280;letter-spacing:1px">THIS PAY WEEK (THU\u2013WED)</div><div style="font-size:1.5rem;font-weight:900">'+hrs.toFixed(2)+' h <span style="font-size:.85rem;color:#6b7280">of 40</span></div><div style="height:10px;border-radius:99px;background:#e5e7eb;overflow:hidden;margin-top:4px"><div style="height:100%;width:'+pct+'%;background:'+(pct>=100?'#dc2626':pct>=90?'#f59e0b':'#16a34a')+'"></div></div><div style="font-size:.75rem;color:#6b7280;margin-top:2px">'+left.toFixed(2)+' h left</div></div>'
+    + '<div style="flex:1 1 150px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:.7rem;font-weight:800;color:#6b7280;letter-spacing:1px">PAY SO FAR</div><div style="font-size:1.5rem;font-weight:900">'+_gmMoney(hrs*rate)+'</div><div style="font-size:.75rem;color:#6b7280">'+_gmMoney(rate)+'/hour</div></div></div>';
+  h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;margin-top:12px"><div style="font-weight:900;margin-bottom:6px">This week\u2019s shifts</div>' + (TCLK.week.length ? TCLK.week.map(function(p){ var hh = _tclkHours([p]); return '<div style="display:flex;justify-content:space-between;gap:8px;font-size:.86rem;padding:5px 0;border-top:1px solid #f1f5f9"><span>'+new Date(p.clock_in).toLocaleDateString([], { weekday:'short', month:'numeric', day:'numeric' })+' \u00b7 '+new Date(p.clock_in).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' })+' \u2013 '+(p.clock_out ? new Date(p.clock_out).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' }) : 'now')+(p.auto_out ? ' <span style="background:#fef3c7;color:#92400e;border-radius:6px;padding:1px 6px;font-size:.72rem;font-weight:800">auto \u00b7 '+(p.auto_out==='40h'?'40 h':'closed')+'</span>' : '')+'</span><b>'+hh.toFixed(2)+' h</b></div>'; }).join('') : '<div style="color:#888;font-size:.86rem">No shifts yet this week.</div>') + '</div>';
+  box.innerHTML = h;
+  clearInterval(TCLK.tick);
+  if(TCLK.open) TCLK.tick = setInterval(function(){ if(!document.getElementById('tclkBox')){ clearInterval(TCLK.tick); return; } var oth2 = _tclkHours(TCLK.week.filter(function(p){ return p.id !== TCLK.open.id; })), e2 = _tclkShiftEnd(TCLK.open, oth2); if(e2 && e2.at <= Date.now()){ clearInterval(TCLK.tick); tclkOut(e2.why === '40h' ? 'Clocked out automatically at 40 hours' : 'Clocked out automatically \u2014 campaign closed', new Date(e2.at).toISOString(), e2.why); } }, 30000);
+}
+// ---------- office: weekly hours log with photos ----------
+var HADM = { urls:{} };
+async function _hadmSign(paths){
+  paths = paths.filter(function(p){ return p && !HADM.urls[p]; }); if(!paths.length) return;
+  try{ var r = await supaClient.storage.from('timeclock').createSignedUrls(paths, 3600); ((r && r.data) || []).forEach(function(x){ if(x && x.signedUrl) HADM.urls[x.path] = x.signedUrl; }); }catch(e){}
+}
+function _hadmThumb(path, label){
+  if(!path) return '<span style="display:inline-block;width:44px;height:44px;border-radius:8px;background:#e5e7eb;color:#6b7280;font-size:.6rem;text-align:center;line-height:44px;margin-right:3px">none</span>';
+  var u = HADM.urls[path];
+  return u ? '<a href="'+u+'" target="_blank" rel="noopener" title="'+label+'"><img src="'+u+'" alt="'+label+'" style="width:44px;height:44px;object-fit:cover;border-radius:8px;margin-right:3px;vertical-align:middle"></a>'
+           : '<span style="display:inline-block;width:44px;height:44px;border-radius:8px;background:#334155;color:#cbd5e1;font-size:.6rem;text-align:center;line-height:44px;margin-right:3px">'+label+'</span>';
+}
+async function hadmRender(){
+  var box = document.getElementById('hadmBox'); if(!box) return; var esc = _escapeHtml, ws = _tclkWeekStart();
+  var since = new Date(Date.now() - 9*864e5).toISOString(), rows = [];
+  try{ var r = await supaClient.from('time_punches').select('*').gte('clock_in', since).order('clock_in', { ascending:false }); rows = (r && r.data) || []; }catch(e){}
+  await chLoad();
+  // close any shift left open past closing / 40 h at that exact moment
+  for(var i = 0; i < rows.length; i++){ var p = rows[i]; if(p.clock_out) continue;
+    var oth = _tclkHours(rows.filter(function(q){ return q.agent_id === p.agent_id && q.id !== p.id && _tclkWeekStart(q.clock_in) === _tclkWeekStart(p.clock_in); })), end = _tclkShiftEnd(p, oth);
+    if(end && end.at <= Date.now()){ var at = new Date(end.at).toISOString(); try{ await supaClient.from('time_punches').update({ clock_out:at, auto_out:end.why, out_note:'Clocked out automatically' }).eq('id', p.id); p.clock_out = at; p.auto_out = end.why; }catch(e){} } }
+  try{ wmamPurgeOldClockPhotos(); }catch(e){}
+  var open = rows.filter(function(p){ return !p.clock_out; }), week = rows.filter(function(p){ return _tclkWeekStart(p.clock_in) === ws; });
+  await _hadmSign([].concat.apply([], week.map(function(p){ return [p.in_selfie, p.in_setup, p.out_selfie, p.out_setup]; })));
+  var by = {}; week.forEach(function(p){ (by[p.agent_id] = by[p.agent_id] || { name:p.agent_name, rows:[] }).rows.push(p); });
+  var totH = 0, totPay = 0;
+  var h = '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.7rem;font-weight:800;color:#003594;letter-spacing:1px">\u23F1 HOURS \u2014 PHOTO TIME CLOCK</div><div style="font-size:.86rem;color:#374151;margin-bottom:12px">Pay week starting Thursday '+ws+' \u00b7 40 hours is a hard limit \u00b7 tap a photo to open, download or save it to the agent\u2019s profile \u00b7 photos are kept 7 days</div>';
+  h += '<div style="background:#ecfdf5;border:1px solid #86efac;border-radius:12px;padding:10px 12px;margin-bottom:12px"><b>On the clock now ('+open.length+')</b>' + (open.length ? open.map(function(p){ return '<div style="font-size:.88rem;padding:3px 0">'+esc(p.agent_name||'')+' \u2014 '+esc(p.campaign||'')+' since '+new Date(p.clock_in).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' })+'</div>'; }).join('') : '<div style="font-size:.86rem;color:#6b7280">Nobody right now.</div>') + '</div>';
+  h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.86rem;min-width:860px"><tr style="background:#003594;text-align:left">'+['Agent','Day','Clock in','In photos','Clock out','Out photos','Hours','Week total',''].map(function(x){ return '<th style="padding:8px;color:#fff!important">'+x+'</th>'; }).join('')+'</tr>';
+  Object.keys(by).forEach(function(id){ var g = by[id], hh = _tclkHours(g.rows), ag = (DB.agents||[]).find(function(x){ return x && String(x.id) === String(id); }), rt = wmamHourlyRate(ag), pct = Math.min(100, hh/40*100); totH += hh; totPay += hh*rt;
+    g.rows.forEach(function(p, k){ var ph = _tclkHours([p]);
+      h += '<tr style="border-top:1px solid #eef0f4"><td style="padding:8px">'+(k===0?'<b>'+esc(g.name||'')+'</b><div style="font-size:.72rem;color:#6b7280">'+esc(p.campaign||'')+' \u00b7 '+_gmMoney(rt)+'/h</div>':'')+'</td>'
+        + '<td style="padding:8px">'+new Date(p.clock_in).toLocaleDateString([], { weekday:'short', month:'numeric', day:'numeric' })+'</td>'
+        + '<td style="padding:8px">'+new Date(p.clock_in).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' })+'</td>'
+        + '<td style="padding:8px;white-space:nowrap">'+_hadmThumb(p.in_selfie,'selfie',p)+_hadmThumb(p.in_setup,'setup',p)+'</td>'
+        + '<td style="padding:8px">'+(p.clock_out ? new Date(p.clock_out).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' }) : '<i>on the clock</i>')+(p.auto_out ? ' <span style="background:'+(p.auto_out==='40h'?'#fee2e2;color:#991b1b':'#fef3c7;color:#92400e')+';border-radius:99px;padding:2px 7px;font-size:.7rem;font-weight:800">auto \u00b7 '+(p.auto_out==='40h'?'40 h':'closed')+'</span>' : '')+'</td>'
+        + '<td style="padding:8px;white-space:nowrap">'+(p.clock_out ? _hadmThumb(p.out_selfie,'selfie',p)+_hadmThumb(p.out_setup,'setup',p) : '')+'</td>'
+        + '<td style="padding:8px"><b>'+ph.toFixed(2)+'</b></td>'
+        + '<td style="padding:8px">'+(k===0?'<div style="height:10px;width:120px;border-radius:99px;background:#e5e7eb;overflow:hidden;display:inline-block;vertical-align:middle"><div style="height:100%;width:'+pct+'%;background:'+(pct>=100?'#dc2626':pct>=90?'#f59e0b':'#16a34a')+'"></div></div> <b>'+hh.toFixed(1)+' h</b>':'')+'</td>'
+        + '<td style="padding:8px"><button onclick="hadmFix('+p.id+')" style="padding:4px 9px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;cursor:pointer">Fix</button></td></tr>'; }); });
+  if(!Object.keys(by).length) h += '<tr><td colspan="9" style="padding:12px;color:#888">No shifts this week yet.</td></tr>';
+  h += '</table></div><div style="display:flex;gap:18px;margin-top:10px;font-size:.92rem;flex-wrap:wrap"><div>Total hours: <b>'+totH.toFixed(2)+'</b></div><div>Pay (rate \u00d7 hours): <b>'+_gmMoney(totPay)+'</b></div><button onclick="hadmExport()" style="padding:6px 12px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Export week</button></div>';
+  HADM.week = week; box.innerHTML = h;
+}
+function hadmExport(){
+  var rows = [['Agent','Campaign','Clock in','Clock out','Hours','Auto clock-out','Rate','Pay']];
+  (HADM.week||[]).forEach(function(p){ var ag = (DB.agents||[]).find(function(x){ return x && x.id === p.agent_id; }), hh = _tclkHours([p]), rt = wmamHourlyRate(ag); rows.push([p.agent_name, p.campaign, p.clock_in, p.clock_out||'', hh.toFixed(2), p.auto_out||'', rt, (hh*rt).toFixed(2)]); });
+  var csv = rows.map(function(r){ return r.map(function(c){ return '"'+String(c==null?'':c).replace(/"/g,'""')+'"'; }).join(','); }).join('\n');
+  var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type:'text/csv' })); a.download = 'hours-week-'+_tclkWeekStart()+'.csv'; a.click();
+}
+// ---------- owner / office: hours of operation per campaign ----------
+function panelHoursOps(){ setTimeout(hopsRender, 0); return '<div style="max-width:1100px;margin:0 auto;padding:12px"><div id="hopsBox"><div style="padding:30px;text-align:center;color:#888">Loading\u2026</div></div></div>'; }
+async function hopsRender(){
+  var box = document.getElementById('hopsBox'); if(!box) return; var esc = _escapeHtml; await chLoad(true);
+  var names = []; (WMAM_CAMPAIGNS||[]).forEach(function(c){ if(c && c.active !== false && names.indexOf(c.name) < 0) names.push(c.name); }); (CHOURS.rows||[]).forEach(function(r){ if(names.indexOf(r.campaign) < 0) names.push(r.campaign); });
+  var toT = function(m){ return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0'); };
+  var h = '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.7rem;font-weight:800;color:#003594;letter-spacing:1px">\uD83D\uDD52 HOURS OF OPERATION</div><div style="font-size:.86rem;color:#374151;margin-bottom:12px">Each campaign\u2019s days and hours. Nobody can clock in outside them, and anyone still on the clock at closing is clocked out automatically. A campaign with no hours set stays closed.</div>';
+  h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.88rem;min-width:860px"><tr style="background:#003594;text-align:left">'+['Campaign','Days','Opens','Closes','Time zone',''].map(function(x){ return '<th style="padding:8px;color:#fff!important">'+x+'</th>'; }).join('')+'</tr>';
+  names.forEach(function(n, i){ var r = _chFor(n);
+    h += '<tr style="border-top:1px solid #eef0f4"><td style="padding:8px">'+wmamCampaignLogoHtml(n, 18)+'<b>'+esc(n)+'</b>'+(r?'':'<div style="font-size:.72rem;color:#b91c1c">not set \u2014 clock-in closed</div>')+'</td>'
+      + '<td style="padding:8px">'+WMAM_DAYS.map(function(d, di){ var on = r ? (r.days||[]).indexOf(di) >= 0 : (di >= 1 && di <= 5); return '<label style="margin-right:6px;white-space:nowrap"><input type="checkbox" class="hops-d-'+i+'" value="'+di+'"'+(on?' checked':'')+'> '+d+'</label>'; }).join('')+'</td>'
+      + '<td style="padding:8px"><input type="time" id="hops-o-'+i+'" class="f-input" style="width:150px" value="'+toT(r ? r.open_min : 540)+'"></td>'
+      + '<td style="padding:8px"><input type="time" id="hops-c-'+i+'" class="f-input" style="width:150px" value="'+toT(r ? r.close_min : 1140)+'"></td>'
+      + '<td style="padding:8px"><select id="hops-z-'+i+'" class="f-input" style="width:auto">'+WMAM_TZS.map(function(z){ return '<option value="'+z[0]+'"'+((r ? r.tz : 'America/Chicago') === z[0] ? ' selected' : '')+'>'+z[1]+'</option>'; }).join('')+'</select></td>'
+      + '<td style="padding:8px;white-space:nowrap"><button data-n="'+_escapeAttr(n)+'" onclick="hopsSave('+i+', this.dataset.n)" style="padding:7px 12px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Save</button>'+(r?' <button data-n="'+_escapeAttr(n)+'" onclick="hopsClear(this.dataset.n)" style="padding:7px 10px;border:1px solid #fca5a5;border-radius:8px;background:#fff;color:#b91c1c;cursor:pointer">Close</button>':'')+'</td></tr>'; });
+  box.innerHTML = h + '</table></div>';
+}
+async function hopsSave(i, name){
+  var u = DB.current; if(!(isOwner(u) || u.fullOfficeAccess === true)){ alert('Only the owner or full-office staff can set hours.'); return; }
+  var days = [].slice.call(document.querySelectorAll('.hops-d-'+i)).filter(function(x){ return x.checked; }).map(function(x){ return +x.value; });
+  var tm = function(id){ var v = (document.getElementById(id)||{}).value || '00:00', p = v.split(':'); return (+p[0])*60 + (+p[1]); };
+  var o = tm('hops-o-'+i), c = tm('hops-c-'+i); if(!days.length){ alert('Pick at least one day.'); return; } if(c <= o){ alert('Closing time must be after opening time.'); return; }
+  var r = await supaClient.from('campaign_hours').upsert({ campaign:name, days:days, open_min:o, close_min:c, tz:(document.getElementById('hops-z-'+i)||{}).value || 'America/Chicago', updated_by:u.name, updated_at:new Date().toISOString() }, { onConflict:'campaign' });
+  if(r && r.error){ alert('Not saved: '+r.error.message); return; } try{ showToast(name+' hours saved'); }catch(e){} hopsRender();
+}
+async function hopsClear(name){ if(!confirm('Remove '+name+'\u2019s hours? Clock-in will be closed for that campaign.')) return; var r = await supaClient.from('campaign_hours').delete().eq('campaign', name); if(r && r.error){ alert('Not saved: '+r.error.message); return; } hopsRender(); }
+// ---------- owner / office: Tribal Manager overrides (tiers) ----------
+var TOVR = { rules:[], paid:{} , loaded:false };
+async function tovrLoad(){
+  try{ var r = await supaClient.from('app_settings').select('key,value').in('key', ['tribal_overrides','tribal_override_paid']);
+    ((r && r.data) || []).forEach(function(x){ try{ var v = JSON.parse(x.value); if(x.key === 'tribal_overrides') TOVR.rules = v || []; else TOVR.paid = v || {}; }catch(e){} }); TOVR.loaded = true; }catch(e){}
+  return TOVR;
+}
+async function tovrSaveKey(key, val){ var r = await supaClient.from('app_settings').upsert({ key:key, value:JSON.stringify(val), updated_at:new Date().toISOString() }, { onConflict:'key' }); return !(r && r.error); }
+function _tovrWeek(endYmd){ var e = new Date(endYmd+'T12:00:00'), s = new Date(e); s.setDate(e.getDate()-6); return { start:s.toISOString().slice(0,10), end:e.toISOString().slice(0,10) }; }
+function _tovrCurrentWeekEnd(){ var s = new Date(_tclkWeekStart()+'T12:00:00'); s.setDate(s.getDate()+6); return s.toISOString().slice(0,10); }
+function tovrCount(rule, wk){
+  var agents = (DB.agents||[]).filter(function(a){ return a && a.active !== false && !a.deletedAt && (!rule.market || ((typeof wmamMarketNameFor === 'function' ? wmamMarketNameFor(a.team) : a.team) === rule.market)); });
+  var camp = String(rule.campaign||'').toLowerCase(), n = 0;
+  agents.forEach(function(a){ (a.monthlySales||[]).forEach(function(b){ if(String(b.campaign||'').toLowerCase() !== camp) return; (b.entries||[]).forEach(function(e){ var d = String(e.date||'').slice(0,10); if(d >= wk.start && d <= wk.end && (!rule.tribalOnly || e.tribal)) n += (e.count||1); }); }); });
+  return { count:n, agents:agents.length };
+}
+function tovrTier(rule, count){ var t = (rule.tiers||[]).slice().filter(function(x){ return x.from > 0; }).sort(function(a,b){ return a.from - b.from; }), hit = null, next = null; t.forEach(function(x, i){ if(count >= x.from){ hit = { idx:i+1, tier:x }; } else if(!next){ next = { idx:i+1, tier:x }; } }); return { hit:hit, next:next, amount: hit ? hit.tier.amount : 0 }; }
+// payroll: override lines for a week; a week's amount is recorded once, later drops go to payroll debt
+function wmamTribalOverrideLines(periodEnd){
+  var out = []; if(!TOVR.loaded) return out; var wk = _tovrWeek(periodEnd), changed = false;
+  (TOVR.rules||[]).forEach(function(rule){ if(!rule.active || !rule.managerId) return;
+    var c = tovrCount(rule, wk), t = tovrTier(rule, c.count), key = rule.id + '|' + periodEnd, rec = TOVR.paid[key];
+    if(!rec){ if(t.amount > 0){ rec = TOVR.paid[key] = { amount:t.amount, count:c.count, tier:t.hit.idx, at:new Date().toISOString() }; changed = true; } }
+    else if(t.amount < rec.amount){ var diff = Math.round((rec.amount - t.amount) * 100); try{ payrollAddDebt(rule.managerId, diff, 'Tribal Manager override adjusted \u2014 week ending '+periodEnd+' dropped to '+c.count+' enrollments after chargebacks', periodEnd); }catch(e){} rec.adjustedTo = t.amount; rec.adjustedCount = c.count; rec.amountAfter = t.amount; changed = true; }
+    if(rec && rec.amount > 0) out.push({ agentId:rule.managerId, cents:Math.round(rec.amount*100), label:'Tribal Manager override \u2014 Tier '+rec.tier+' ('+rec.count+' enrollments, '+rule.campaign+')' });
+  });
+  if(changed) tovrSaveKey('tribal_override_paid', TOVR.paid);
+  return out;
+}
+function panelMgrOverrides(){ setTimeout(function(){ tovrLoad().then(tovrRender); }, 0); return '<div style="max-width:1150px;margin:0 auto;padding:12px"><div id="tovrBox"><div style="padding:30px;text-align:center;color:#888">Loading\u2026</div></div></div>'; }
+function tovrRender(){
+  var box = document.getElementById('tovrBox'); if(!box) return; var esc = _escapeHtml, edit = isOwner(DB.current) || DB.current.fullOfficeAccess === true;
+  var wkEnd = _tovrCurrentWeekEnd(), wk = _tovrWeek(wkEnd), mkts = []; try{ mkts = marketActiveList().map(function(m){ return m.name; }); }catch(e){}
+  var people = (DB.agents||[]).filter(function(a){ return a && a.active !== false && !a.deletedAt; }).sort(function(a,b){ return String(a.name).localeCompare(String(b.name)); });
+  var camps = (WMAM_CAMPAIGNS||[]).filter(function(c){ return c && c.active !== false; }).map(function(c){ return c.name; });
+  var h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><div style="font-family:Barlow Condensed,sans-serif;font-size:1.7rem;font-weight:800;color:#003594;letter-spacing:1px">\uD83C\uDFC6 TRIBAL MANAGER OVERRIDES</div><div style="font-size:.86rem;color:#374151">You fill in the tiers. Weekly (Thu\u2013Wed). Counts only enrollments confirmed on uploaded sales reports. Pays the highest tier reached.</div></div>'+(edit?'<button onclick="tovrAdd()" style="padding:9px 14px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">+ New rule</button>':'')+'</div>';
+  (TOVR.rules||[]).forEach(function(r, ri){
+    var c = tovrCount(r, wk), t = tovrTier(r, c.count), mgr = (DB.agents||[]).find(function(a){ return a && String(a.id) === String(r.managerId); });
+    h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-top:12px"><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">'
+      + '<div><div class="f-label">Campaign</div><select class="f-input" style="width:auto" onchange="tovrSet('+ri+',\'campaign\',this.value)"'+(edit?'':' disabled')+'>'+camps.map(function(x){ return '<option'+(x===r.campaign?' selected':'')+'>'+esc(x)+'</option>'; }).join('')+'</select></div>'
+      + '<div><div class="f-label">Tribal Manager</div><select class="f-input" style="width:auto" onchange="tovrSet('+ri+',\'managerId\',+this.value)"'+(edit?'':' disabled')+'><option value="">\u2014 pick \u2014</option>'+people.map(function(a){ return '<option value="'+a.id+'"'+(String(a.id)===String(r.managerId)?' selected':'')+'>'+esc(a.name)+'</option>'; }).join('')+'</select></div>'
+      + '<div><div class="f-label">Agents who count</div><select class="f-input" style="width:auto" onchange="tovrSet('+ri+',\'market\',this.value)"'+(edit?'':' disabled')+'>'+mkts.map(function(m){ return '<option'+(m===r.market?' selected':'')+'>'+esc(m)+'</option>'; }).join('')+'</select></div>'
+      + '<label style="font-size:.85rem;font-weight:700;padding-bottom:8px"><input type="checkbox"'+(r.tribalOnly?' checked':'')+(edit?'':' disabled')+' onchange="tovrSet('+ri+',\'tribalOnly\',this.checked)"> Tribal enrollments only</label>'
+      + '<div style="padding-bottom:8px"><span style="padding:3px 9px;border-radius:99px;font-size:.75rem;font-weight:800;background:'+(r.active?'#dcfce7;color:#166534':'#f1f5f9;color:#475569')+'">'+(r.active?'ACTIVE':'OFF')+'</span></div></div>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:.88rem;margin-top:10px"><tr style="background:#003594;text-align:left">'+['Tier','Team enrollments in the week','Manager gets (that week)',''].map(function(x){ return '<th style="padding:7px;color:#fff!important">'+x+'</th>'; }).join('')+'</tr>'
+      + (r.tiers||[]).map(function(x, ti){ return '<tr style="border-top:1px solid #eef0f4"><td style="padding:7px"><b>'+(ti+1)+'</b></td><td style="padding:7px">From <input type="number" min="1" class="f-input" style="width:90px;display:inline-block" value="'+x.from+'"'+(edit?'':' disabled')+' onchange="tovrTierSet('+ri+','+ti+',\'from\',this.value)"> enrollments</td><td style="padding:7px">$ <input type="number" min="0" step="0.01" class="f-input" style="width:110px;display:inline-block" value="'+x.amount+'"'+(edit?'':' disabled')+' onchange="tovrTierSet('+ri+','+ti+',\'amount\',this.value)"></td><td style="padding:7px">'+(edit?'<a href="javascript:void(0)" onclick="tovrTierDel('+ri+','+ti+')" style="color:#b91c1c">remove</a>':'')+'</td></tr>'; }).join('')
+      + '</table>'
+      + (edit ? '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><button onclick="tovrTierAdd('+ri+')" style="padding:7px 12px;border:2px dashed #003594;border-radius:8px;background:#fff;color:#003594;font-weight:800;cursor:pointer">+ Add tier</button><button onclick="tovrSet('+ri+',\'active\','+(!r.active)+')" style="padding:7px 12px;border:none;border-radius:8px;background:'+(r.active?'#475569':'#16a34a')+';color:#fff;font-weight:800;cursor:pointer">'+(r.active?'Turn off':'Turn on')+'</button><button onclick="tovrDel('+ri+')" style="padding:7px 12px;border:1px solid #fca5a5;border-radius:8px;background:#fff;color:#b91c1c;cursor:pointer">Remove rule</button></div>' : '')
+      + '<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;background:#f8fafc;border-radius:10px;padding:10px 12px;font-size:.9rem"><div>\uD83E\uDDEE Test: <input type="number" min="0" id="tovrT'+ri+'" class="f-input" style="width:90px;display:inline-block" placeholder="enrollments" oninput="tovrTest('+ri+')"> <span id="tovrTR'+ri+'" style="font-weight:800"></span></div>'
+      + '<div>This week so far ('+wk.start+' \u2192 '+wk.end+'): <b>'+c.count+'</b> confirmed from '+c.agents+' agent(s) \u2192 '+(t.hit ? '<b>Tier '+t.hit.idx+'</b> = <b style="color:#16a34a">'+_gmMoney(t.amount)+'</b>' : '<b>below Tier 1</b> = $0.00')+(t.next ? ' \u00b7 <span style="color:#6b7280">'+(t.next.tier.from - c.count)+' to Tier '+t.next.idx+'</span>' : '')+'</div></div></div>';
+  });
+  if(!(TOVR.rules||[]).length) h += '<div style="color:#888;padding:20px">No override rules yet.'+(edit?' Click <b>+ New rule</b>.':'')+'</div>';
+  box.innerHTML = h;
+}
+function tovrTest(ri){ var r = TOVR.rules[ri], n = +((document.getElementById('tovrT'+ri)||{}).value || 0), t = tovrTier(r, n), out = document.getElementById('tovrTR'+ri); if(out) out.innerHTML = t.hit ? n+' reached Tier '+t.hit.idx+' \u2192 <span style="color:#16a34a">'+_gmMoney(t.amount)+'</span>'+(t.next ? ' \u00b7 '+(t.next.tier.from - n)+' more to Tier '+t.next.idx+' ('+_gmMoney(t.next.tier.amount)+')' : '') : 'below Tier 1 \u2192 $0.00'; }
+async function _tovrCommit(why){ if(!(isOwner(DB.current) || DB.current.fullOfficeAccess === true)){ alert('Only the owner or full-office staff can change override rules.'); return; } if(await tovrSaveKey('tribal_overrides', TOVR.rules)){ try{ showToast('Override rules saved'); }catch(e){} } else alert('Not saved \u2014 check the connection.'); tovrRender(); }
+function tovrAdd(){ var c = ((WMAM_CAMPAIGNS||[]).find(function(x){ return /entouch/i.test(x.name); }) || (WMAM_CAMPAIGNS||[])[0] || {}).name || ''; var m = ''; try{ m = marketActiveList()[0].name; }catch(e){} TOVR.rules.push({ id:'tovr-'+Date.now(), campaign:c, managerId:null, market:m, tribalOnly:false, active:false, tiers:[{ from:25, amount:0 }], createdBy:DB.current.name, at:new Date().toISOString() }); _tovrCommit('add'); }
+function tovrSet(ri, k, v){ TOVR.rules[ri][k] = v; _tovrCommit(k); }
+function tovrTierSet(ri, ti, k, v){ TOVR.rules[ri].tiers[ti][k] = k === 'from' ? Math.max(1, parseInt(v,10) || 1) : Math.max(0, parseFloat(v) || 0); _tovrCommit('tier'); }
+function tovrTierAdd(ri){ var t = TOVR.rules[ri].tiers, last = t[t.length-1]; t.push({ from:(last ? last.from + 25 : 25), amount:0 }); _tovrCommit('tier+'); }
+function tovrTierDel(ri, ti){ TOVR.rules[ri].tiers.splice(ti,1); _tovrCommit('tier-'); }
+function tovrDel(ri){ if(!confirm('Remove this override rule?')) return; TOVR.rules.splice(ri,1); _tovrCommit('del'); }
+setTimeout(function(){ try{ if(DB.current) tovrLoad(); }catch(e){} }, 8000);
+// ══════════════════════════════════════════════════════════════════════
+//  v2026.10.08.0300 — weekend hours · 7-day photos · save to agent folder · ad consent
+// ══════════════════════════════════════════════════════════════════════
+// hours for a given weekday: Saturday / Sunday can have their own hours
+function _chDay(ch, dow){
+  if(!ch || (ch.days||[]).indexOf(dow) < 0) return null;
+  if(dow === 6 && ch.sat_open_min != null) return { open:ch.sat_open_min, close:ch.sat_close_min };
+  if(dow === 0 && ch.sun_open_min != null) return { open:ch.sun_open_min, close:ch.sun_close_min };
+  return { open:ch.open_min, close:ch.close_min };
+}
+function _chSummary(ch){
+  var wk = [1,2,3,4,5].filter(function(d){ return (ch.days||[]).indexOf(d) >= 0; });
+  var part = function(lbl, h){ return lbl+' '+(h ? _chFmt(h.open)+'\u2013'+_chFmt(h.close) : 'closed'); };
+  return (wk.length ? (wk.length === 5 ? 'Mon\u2013Fri' : wk.map(function(d){ return WMAM_DAYS[d]; }).join(', '))+' '+_chFmt(ch.open_min)+'\u2013'+_chFmt(ch.close_min) : 'Weekdays closed')+' \u00b7 '+part('Sat', _chDay(ch,6))+' \u00b7 '+part('Sun', _chDay(ch,0));
+}
+function chStatus(camp, nowMs){
+  var ch = _chFor(camp); nowMs = nowMs || Date.now();
+  if(!ch) return { set:false, open:false, text:'No hours of operation set for '+camp+' yet \u2014 clock-in is closed. Ask the office.' };
+  var L = _chLocal(nowMs, ch.tz), d = _chDay(ch, L.dow);
+  var open = !!d && L.min >= d.open && L.min < d.close;
+  return { set:true, open:open, hoursTxt:_chSummary(ch), today: d ? _chFmt(d.open)+' \u2013 '+_chFmt(d.close) : 'closed today', closeAt: open ? nowMs + (d.close - L.min) * 60000 : null, ch:ch, day:d };
+}
+function _tclkShiftEnd(p, otherHours){
+  var inMs = new Date(p.clock_in).getTime(), ch = _chFor(p.campaign), ends = [];
+  if(ch){ var L = _chLocal(inMs, ch.tz), d = _chDay(ch, L.dow); ends.push({ at: inMs + Math.max(0, (d ? d.close : L.min) - L.min) * 60000, why:'closed' }); }
+  ends.push({ at: inMs + Math.max(0, 40 - (otherHours||0)) * 3600000, why:'40h' });
+  return ends.sort(function(a,b){ return a.at - b.at; })[0];
+}
+// Hours of Operation editor: weekdays + Saturday + Sunday (closed / same as weekdays / custom)
+async function hopsRender(){
+  var box = document.getElementById('hopsBox'); if(!box) return; var esc = _escapeHtml; await chLoad(true);
+  var names = []; (WMAM_CAMPAIGNS||[]).forEach(function(c){ if(c && c.active !== false && names.indexOf(c.name) < 0) names.push(c.name); }); (CHOURS.rows||[]).forEach(function(r){ if(names.indexOf(r.campaign) < 0) names.push(r.campaign); });
+  var toT = function(m){ return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0'); };
+  var tIn = function(id, m){ return '<input type="time" id="'+id+'" class="f-input" style="width:150px;display:inline-block" value="'+toT(m)+'">'; };
+  var wkend = function(i, key, r, dow){
+    var mode = !r ? 'closed' : ((r.days||[]).indexOf(dow) < 0 ? 'closed' : (r[key+'_open_min'] != null ? 'custom' : 'same'));
+    return '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap"><b style="width:34px">'+(dow===6?'Sat':'Sun')+'</b><select id="hops-'+key+'m-'+i+'" class="f-input" style="width:auto" onchange="document.getElementById(\'hops-'+key+'t-'+i+'\').style.display=this.value===\'custom\'?\'inline-flex\':\'none\'">'
+      + [['closed','Closed'],['same','Same as weekdays'],['custom','Custom hours']].map(function(o){ return '<option value="'+o[0]+'"'+(o[0]===mode?' selected':'')+'>'+o[1]+'</option>'; }).join('')+'</select>'
+      + '<span id="hops-'+key+'t-'+i+'" style="display:'+(mode==='custom'?'inline-flex':'none')+';gap:6px;align-items:center">'+tIn('hops-'+key+'o-'+i, r && r[key+'_open_min'] != null ? r[key+'_open_min'] : 600)+' to '+tIn('hops-'+key+'c-'+i, r && r[key+'_close_min'] != null ? r[key+'_close_min'] : 960)+'</span></div>';
+  };
+  var h = '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.7rem;font-weight:800;color:#003594;letter-spacing:1px">\uD83D\uDD52 HOURS OF OPERATION</div><div style="font-size:.86rem;color:#374151;margin-bottom:12px">Each campaign\u2019s weekday hours, plus its own Saturday and Sunday hours. Nobody can clock in outside them; anyone still on the clock at closing is clocked out automatically. A campaign with no hours set stays closed.</div>';
+  names.forEach(function(n, i){ var r = _chFor(n);
+    h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><div>'+wmamCampaignLogoHtml(n, 18)+'<b style="font-size:1rem">'+esc(n)+'</b> '+(r ? '<span style="font-size:.8rem;color:#166534;font-weight:700">\u00b7 '+esc(_chSummary(r))+'</span>' : '<span style="font-size:.8rem;color:#b91c1c;font-weight:700">\u00b7 not set \u2014 clock-in closed</span>')+'</div>'
+      + '<div style="display:flex;gap:6px;align-items:center"><select id="hops-z-'+i+'" class="f-input" style="width:auto">'+WMAM_TZS.map(function(z){ return '<option value="'+z[0]+'"'+((r ? r.tz : 'America/Chicago') === z[0] ? ' selected' : '')+'>'+z[1]+'</option>'; }).join('')+'</select><button data-n="'+_escapeAttr(n)+'" onclick="hopsSave('+i+', this.dataset.n)" style="padding:8px 14px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Save</button>'+(r?'<button data-n="'+_escapeAttr(n)+'" onclick="hopsClear(this.dataset.n)" style="padding:8px 10px;border:1px solid #fca5a5;border-radius:8px;background:#fff;color:#b91c1c;cursor:pointer">Close</button>':'')+'</div></div>'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-top:10px">'
+      + '<div style="background:#f8fafc;border-radius:10px;padding:10px"><div style="font-weight:800;margin-bottom:6px">Weekdays</div><div style="margin-bottom:6px">'+[1,2,3,4,5].map(function(di){ var on = r ? (r.days||[]).indexOf(di) >= 0 : true; return '<label style="margin-right:8px;white-space:nowrap"><input type="checkbox" class="hops-d-'+i+'" value="'+di+'"'+(on?' checked':'')+'> '+WMAM_DAYS[di]+'</label>'; }).join('')+'</div>'+tIn('hops-o-'+i, r ? r.open_min : 540)+' to '+tIn('hops-c-'+i, r ? r.close_min : 1140)+'</div>'
+      + '<div style="background:#f8fafc;border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:8px"><div style="font-weight:800">Weekend</div>'+wkend(i,'sat',r,6)+wkend(i,'sun',r,0)+'</div>'
+      + '</div></div>'; });
+  box.innerHTML = h;
+}
+async function hopsSave(i, name){
+  var u = DB.current; if(!(isOwner(u) || u.fullOfficeAccess === true)){ alert('Only the owner or full-office staff can set hours.'); return; }
+  var tm = function(id){ var v = (document.getElementById(id)||{}).value || '00:00', p = v.split(':'); return (+p[0])*60 + (+p[1]); };
+  var days = [].slice.call(document.querySelectorAll('.hops-d-'+i)).filter(function(x){ return x.checked; }).map(function(x){ return +x.value; });
+  var o = tm('hops-o-'+i), c = tm('hops-c-'+i); if(days.length && c <= o){ alert('Weekday closing time must be after opening time.'); return; }
+  var row = { campaign:name, open_min:o, close_min:c, tz:(document.getElementById('hops-z-'+i)||{}).value || 'America/Chicago', sat_open_min:null, sat_close_min:null, sun_open_min:null, sun_close_min:null, updated_by:u.name, updated_at:new Date().toISOString() };
+  var bad = '';
+  [['sat',6],['sun',0]].forEach(function(x){ var m = (document.getElementById('hops-'+x[0]+'m-'+i)||{}).value || 'closed'; if(m === 'closed') return; days.push(x[1]);
+    if(m === 'custom'){ var so = tm('hops-'+x[0]+'o-'+i), sc = tm('hops-'+x[0]+'c-'+i); if(sc <= so) bad = (x[1]===6?'Saturday':'Sunday')+' closing time must be after opening time.'; row[x[0]+'_open_min'] = so; row[x[0]+'_close_min'] = sc; } });
+  if(bad){ alert(bad); return; } if(!days.length){ alert('Pick at least one day.'); return; }
+  row.days = days.sort();
+  var r = await supaClient.from('campaign_hours').upsert(row, { onConflict:'campaign' });
+  if(r && r.error){ alert('Not saved: '+r.error.message); return; } try{ showToast(name+' hours saved'); }catch(e){} hopsRender();
+}
+// ---------- photos: 7 days, view, download + save to the agent's profile folder ----------
+var WMAM_PHOTO_DAYS = 7;
+function wmamMediaConsent(agent){ var c = agent && agent.mediaConsent; return c && typeof c === 'object' ? c : null; }
+function _wmamSafeName(s){ return String(s||'agent').trim().replace(/[^A-Za-z0-9]+/g,'-').replace(/^-|-$/g,''); }
+async function _wmamBlobFrom(src){ if(/^data:/.test(src)){ var r = await fetch(src); return await r.blob(); } var r2 = await fetch(src); if(!r2.ok) throw new Error('Could not load the photo'); return await r2.blob(); }
+// open a photo large with Download / Save buttons
+function wmamPhotoOpen(src, meta){
+  meta = meta || {}; var esc = _escapeHtml, ag = (DB.agents||[]).find(function(a){ return a && String(a.id) === String(meta.agentId); }), c = wmamMediaConsent(ag);
+  var left = meta.takenAt ? Math.max(0, WMAM_PHOTO_DAYS - Math.floor((Date.now() - new Date(meta.takenAt).getTime()) / 864e5)) : null;
+  window.__wmamPhoto = { src:src, meta:meta };
+  var ov = document.getElementById('wmamPhotoOv'); if(ov) ov.remove();
+  ov = document.createElement('div'); ov.id = 'wmamPhotoOv'; ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:99999;display:flex;align-items:center;justify-content:center;padding:10px';
+  ov.innerHTML = '<div style="background:#fff;border-radius:16px;max-width:760px;width:100%;max-height:94vh;overflow:auto;padding:14px">'
+    + '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><div style="min-width:0;flex:1"><b>'+esc(meta.agentName||'')+'</b> \u2014 '+esc(meta.kind||'photo')+'<div style="font-size:.78rem;color:#6b7280">'+(meta.takenAt ? new Date(meta.takenAt).toLocaleString() : '')+(left != null ? ' \u00b7 available '+left+' more day'+(left===1?'':'s')+', then removed' : '')+'</div></div><button onclick="document.getElementById(\'wmamPhotoOv\').remove()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;flex-shrink:0">\u2715</button></div>'
+    + '<img src="'+src+'" style="width:100%;max-height:60vh;object-fit:contain;background:#000;border-radius:10px;margin-top:8px">'
+    + '<div style="font-size:.8rem;margin-top:8px">Advertising consent: '+(c ? (c.agreed ? '<b style="color:#166534">\u2714 agreed '+new Date(c.at).toLocaleDateString()+'</b>' : '<b style="color:#b91c1c">\u2716 declined '+new Date(c.at).toLocaleDateString()+'</b>') : '<b style="color:#92400e">not answered yet</b>')+'</div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button onclick="wmamPhotoSave(\'compliance\')" style="flex:1;padding:12px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:900;cursor:pointer">\u2B07 Save \u2014 Compliance</button>'
+    + '<button onclick="wmamPhotoSave(\'social\')"'+(c && c.agreed ? '' : ' disabled title="This agent has not agreed to advertising use"')+' style="flex:1;padding:12px;border:none;border-radius:10px;background:'+(c && c.agreed ? '#7c3aed' : '#cbd5e1')+';color:#fff;font-weight:900;cursor:'+(c && c.agreed ? 'pointer' : 'not-allowed')+'">\u2B07 Save \u2014 Social media'+(c && c.agreed ? '' : ' (needs consent)')+'</button></div>'
+    + '<div style="font-size:.76rem;color:#6b7280;margin-top:6px">Saving downloads the photo and keeps a permanent copy in '+esc(meta.agentName||'the agent')+'\u2019s profile folder (\uD83D\uDCC1 Photos & files).</div><div id="wmamPhotoMsg" style="font-weight:800;margin-top:6px"></div></div>';
+  document.body.appendChild(ov);
+}
+async function wmamPhotoSave(purpose){
+  var P = window.__wmamPhoto; if(!P) return; var meta = P.meta, msg = document.getElementById('wmamPhotoMsg'), u = DB.current;
+  if(!(isOwner(u) || u.fullOfficeAccess === true || (typeof _tcIsOffice === 'function' && _tcIsOffice(u)))){ alert('Only the office can save photos to a profile.'); return; }
+  var ag = (DB.agents||[]).find(function(a){ return a && String(a.id) === String(meta.agentId); }), c = wmamMediaConsent(ag);
+  if(purpose === 'social' && !(c && c.agreed)){ alert((meta.agentName||'This agent')+' has not agreed to advertising use. You can still save it for compliance.'); return; }
+  try{
+    if(msg){ msg.style.color = '#374151'; msg.textContent = 'Saving\u2026'; }
+    var blob = await _wmamBlobFrom(P.src), day = (meta.takenAt ? new Date(meta.takenAt) : new Date()).toISOString().slice(0,10);
+    var fname = _wmamSafeName(meta.agentName)+'_'+day+'_'+_wmamSafeName(meta.kind||'photo')+(purpose === 'social' ? '_social' : '_compliance')+'.jpg';
+    var path = meta.agentId + '/photos/' + Date.now() + '_' + fname;
+    var up = await supaClient.storage.from('agent-files').upload(path, blob, { contentType: blob.type || 'image/jpeg', upsert:false });
+    if(up && up.error) throw new Error(up.error.message);
+    var ins = await supaClient.from('agent_files').insert({ agent_id:meta.agentId, agent_name:meta.agentName, path:path, file_name:fname, purpose:purpose, source:meta.source||'', photo_kind:meta.kind||'', taken_at:meta.takenAt||null, saved_by:u.name });
+    if(ins && ins.error) throw new Error(ins.error.message);
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fname; document.body.appendChild(a); a.click(); setTimeout(function(){ a.remove(); }, 500);
+    if(msg){ msg.style.color = '#166534'; msg.textContent = '\u2714 Downloaded and saved to '+(meta.agentName||'the agent')+'\u2019s profile folder as '+fname; }
+  }catch(e){ if(msg){ msg.style.color = '#b91c1c'; msg.textContent = 'Not saved: '+(e.message||e); } }
+}
+// remove time clock photos older than 7 days (office visit; the shift record stays)
+async function wmamPurgeOldClockPhotos(){
+  var u = DB.current; if(!(isOwner(u) || u.fullOfficeAccess === true || (typeof _tcIsOffice === 'function' && _tcIsOffice(u)))) return 0;
+  var cutoff = new Date(Date.now() - WMAM_PHOTO_DAYS*864e5).toISOString(), n = 0;
+  try{
+    var r = await supaClient.from('time_punches').select('id,in_selfie,in_setup,out_selfie,out_setup,clock_in').lt('clock_in', cutoff).or('in_selfie.not.is.null,in_setup.not.is.null,out_selfie.not.is.null,out_setup.not.is.null').limit(200);
+    var rows = (r && r.data) || []; if(!rows.length) return 0;
+    var paths = []; rows.forEach(function(p){ [p.in_selfie,p.in_setup,p.out_selfie,p.out_setup].forEach(function(x){ if(x) paths.push(x); }); });
+    if(paths.length) await supaClient.storage.from('timeclock').remove(paths);
+    for(var i = 0; i < rows.length; i++){ await supaClient.from('time_punches').update({ in_selfie:null, in_setup:null, out_selfie:null, out_setup:null }).eq('id', rows[i].id); n++; }
+  }catch(e){ console.warn('[photo purge]', e); }
+  return n;
+}
+// thumbnails in the hours log open the viewer (only for 7 days)
+function _hadmThumb(path, label, p){
+  var fresh = p && (Date.now() - new Date(p.clock_in).getTime()) < WMAM_PHOTO_DAYS*864e5;
+  if(!path || !fresh) return '<span style="display:inline-block;width:44px;height:44px;border-radius:8px;background:#e5e7eb;color:#6b7280;font-size:.6rem;text-align:center;line-height:44px;margin-right:3px">'+(path && !fresh ? 'removed' : 'none')+'</span>';
+  var u = HADM.urls[path], kind = (label === 'selfie' ? 'selfie' : 'setup'), isOut = p && (path === p.out_selfie || path === p.out_setup);
+  var meta = JSON.stringify({ agentId:p.agent_id, agentName:p.agent_name, kind:(isOut?'clock-out ':'clock-in ')+kind, takenAt:(isOut ? p.clock_out : p.clock_in), source:'timeclock' }).replace(/"/g,'&quot;');
+  return u ? '<a href="javascript:void(0)" onclick="wmamPhotoOpen(\''+u+'\','+meta+')" title="Open \u00b7 download \u00b7 save"><img src="'+u+'" alt="'+label+'" style="width:44px;height:44px;object-fit:cover;border-radius:8px;margin-right:3px;vertical-align:middle;border:2px solid #c7d2fe"></a>'
+           : '<span style="display:inline-block;width:44px;height:44px;border-radius:8px;background:#334155;color:#cbd5e1;font-size:.6rem;text-align:center;line-height:44px;margin-right:3px">'+label+'</span>';
+}
+// one-time advertising consent question (agents)
+function wmamConsentCardHtml(u){
+  if(!u || wmamMediaConsent(u)) return '';
+  return '<div id="wmamConsentCard" style="background:#f5f3ff;border:2px solid #a78bfa;border-radius:14px;padding:14px;margin-bottom:12px"><div style="font-weight:900;color:#5b21b6">\uD83D\uDCE3 Photo use for advertising</div>'
+    + '<div style="font-size:.88rem;color:#374151;margin:6px 0 10px">WMAMinc keeps your time clock and audit photos for compliance. May WMAMinc also use your photos on social media and in advertising? You can change your answer with the office anytime.</div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap"><button onclick="wmamSetConsent(true)" style="flex:1;padding:11px;border:none;border-radius:10px;background:#7c3aed;color:#fff;font-weight:900;cursor:pointer">\u2714 I agree</button><button onclick="wmamSetConsent(false)" style="flex:1;padding:11px;border:1px solid #cbd5e1;border-radius:10px;background:#fff;font-weight:800;cursor:pointer">No, compliance only</button></div></div>';
+}
+function wmamSetConsent(agreed){
+  var u = DB.current; if(!u) return; u.mediaConsent = { agreed:!!agreed, at:new Date().toISOString(), by:u.name };
+  var a = (DB.agents||[]).find(function(x){ return x && x.id === u.id; }); if(a && a !== u) a.mediaConsent = u.mediaConsent;
+  try{ _ahubSave(a || u); }catch(e){ try{ saveToStorage(); }catch(e2){} }
+  var card = document.getElementById('wmamConsentCard'); if(card) card.outerHTML = '<div style="background:#ecfdf5;border:1px solid #86efac;border-radius:12px;padding:10px 12px;margin-bottom:12px;font-weight:800;color:#166534">Thanks \u2014 saved: '+(agreed ? 'you agreed to advertising use.' : 'compliance use only.')+'</div>';
+}
+// profile: 📁 Photos & files (office) + consent status
+async function wmamAgentFilesHtml(agentId){
+  var rows = []; try{ var r = await supaClient.from('agent_files').select('*').eq('agent_id', agentId).order('saved_at', { ascending:false }).limit(60); rows = (r && r.data) || []; }catch(e){}
+  var urls = {}; if(rows.length){ try{ var s = await supaClient.storage.from('agent-files').createSignedUrls(rows.map(function(x){ return x.path; }), 3600); ((s && s.data) || []).forEach(function(x){ if(x && x.signedUrl) urls[x.path] = x.signedUrl; }); }catch(e){} }
+  var esc = _escapeHtml;
+  return rows.length ? rows.map(function(x){ var u = urls[x.path]; return '<div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-top:1px solid #f1f5f9">'+(u?'<a href="'+u+'" target="_blank" rel="noopener"><img src="'+u+'" style="width:48px;height:48px;object-fit:cover;border-radius:8px"></a>':'')+'<div style="flex:1;min-width:0"><div style="font-weight:800;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(x.file_name||'')+'</div><div style="font-size:.74rem;color:#6b7280">'+esc(x.photo_kind||'')+' \u00b7 saved '+new Date(x.saved_at).toLocaleDateString()+' by '+esc(x.saved_by||'')+'</div></div><span style="font-size:.7rem;font-weight:800;border-radius:99px;padding:2px 8px;background:'+(x.purpose==='social'?'#ede9fe;color:#5b21b6':'#dbeafe;color:#1e3a8a')+'">'+(x.purpose==='social'?'Social media':'Compliance')+'</span>'+(u?'<a href="'+u+'" download="'+_escapeAttr(x.file_name||'photo.jpg')+'" style="font-size:.8rem;font-weight:800;color:#003594">\u2B07</a>':'')+'</div>'; }).join('') : '<div style="font-size:.85rem;color:#6b7280">No saved photos yet. Save one from the Time Clock log or a daily audit.</div>';
+}
+async function wmamAgentFilesFill(agentId){ var el = document.getElementById('ahubFiles_'+agentId); if(!el) return; el.innerHTML = await wmamAgentFilesHtml(agentId); }
+if(typeof window!=='undefined'){ Object.assign(window, { _chDay:_chDay, chStatus:chStatus, _tclkShiftEnd:_tclkShiftEnd, hopsRender:hopsRender, hopsSave:hopsSave, wmamPhotoOpen:wmamPhotoOpen, wmamPhotoSave:wmamPhotoSave, wmamPurgeOldClockPhotos:wmamPurgeOldClockPhotos, wmamSetConsent:wmamSetConsent, wmamConsentCardHtml:wmamConsentCardHtml, wmamAgentFilesFill:wmamAgentFilesFill, wmamMediaConsent:wmamMediaConsent }); }
+if(typeof window!=='undefined'){ Object.assign(window, { chLoad:chLoad, chStatus:chStatus, _tclkShiftEnd:_tclkShiftEnd, pcamOpen:pcamOpen, pcamShoot:pcamShoot, pcamCancel:pcamCancel, tclkIn:tclkIn, tclkOut:tclkOut, tclkFinish:tclkFinish, tclkRender:tclkRender, hadmRender:hadmRender, hadmExport:hadmExport,
+  panelHoursOps:panelHoursOps, hopsRender:hopsRender, hopsSave:hopsSave, hopsClear:hopsClear, panelMgrOverrides:panelMgrOverrides, tovrRender:tovrRender, tovrLoad:tovrLoad, tovrCount:tovrCount, tovrTier:tovrTier, tovrTest:tovrTest, tovrAdd:tovrAdd, tovrSet:tovrSet, tovrTierSet:tovrTierSet, tovrTierAdd:tovrTierAdd, tovrTierDel:tovrTierDel, tovrDel:tovrDel, wmamTribalOverrideLines:wmamTribalOverrideLines, TOVR:TOVR, CHOURS:CHOURS }); }
+
 
 // ══════════════════════════════════════════════════════════════════════
 //  BUSINESS SNAPSHOT — Calvin 2026-10-06 v0600
@@ -17605,7 +18051,8 @@ function ahubProfRender(id){
     + '</div>';
   var _canInv = isOwner(DB.current) || (typeof isInventory === 'function' && isInventory(DB.current));
   h += '<label style="display:flex;gap:10px;align-items:flex-start;border:1px solid '+(a.canTransferWithoutApproval?'#86efac':'#e5e7eb')+';background:'+(a.canTransferWithoutApproval?'#ecfdf5':'#f8fafc')+';border-radius:12px;padding:10px 12px;margin-bottom:12px;'+(_canInv?'cursor:pointer':'opacity:.7')+'"><input type="checkbox" '+(a.canTransferWithoutApproval?'checked':'')+(_canInv?'':' disabled')+' onchange="ahubToggleBypass('+a.id+', this.checked)" style="margin-top:3px"><span><b>Can transfer inventory without Inventory Dept approval</b><br><span style="font-size:.8rem;color:#6b7280">Off: every transfer they send waits for the Inventory Dept. On: it goes straight to the receiver to e-sign. Phones with less than 21 days left at the company ALWAYS wait for the Inventory Dept.'+(_canInv?'':' (Only the Inventory Dept or the owner can change this.)')+'</span></span></label>';
-  if(_tcIsOffice(DB.current)) h += '<div style="border:1px solid '+(a.hourlyPay?'#fcd34d':'#e5e7eb')+';background:'+(a.hourlyPay?'#fffbeb':'#f8fafc')+';border-radius:12px;padding:10px 12px;margin-bottom:12px"><label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer"><input type="checkbox" '+(a.hourlyPay?'checked':'')+' onchange="ahubSetHourly('+a.id+', this.checked)" style="margin-top:3px"><span><b>Hourly pay (time clock)</b><br><span style="font-size:.8rem;color:#6b7280">For agents who must clock hours (e.g. Tribal). Turns on the Time Clock and the 40-hour limit.</span></span></label>'+(a.hourlyPay?'<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><span style="font-weight:700">Rate $</span><input id="ahubRate" class="f-input" style="max-width:110px" inputmode="decimal" value="'+wmamHourlyRate(a)+'"><span>per hour</span><button onclick="ahubSaveRate('+a.id+')" style="padding:8px 12px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Save rate</button></div>':'')+'</div>';
+  if(_tcIsOffice(DB.current)) h += '<div style="border:1px solid '+(a.hourlyPay?'#fcd34d':'#e5e7eb')+';background:'+(a.hourlyPay?'#fffbeb':'#f8fafc')+';border-radius:12px;padding:10px 12px;margin-bottom:12px"><label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer"><input type="checkbox" '+(a.hourlyPay?'checked':'')+' onchange="ahubSetHourly('+a.id+', this.checked)" style="margin-top:3px"><span><b>\uD83D\uDCF8 Photo Time Clock (hourly pay)</b><br><span style="font-size:.8rem;color:#6b7280">Clock in / out with a live selfie + setup photo. Only during the campaign\u2019s hours of operation; 40 hours per week maximum (no exceptions).</span></span></label>'+(a.hourlyPay?'<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><span style="font-weight:700">Rate $</span><input id="ahubRate" class="f-input" style="max-width:110px" inputmode="decimal" value="'+wmamHourlyRate(a)+'"><span>per hour</span><button onclick="ahubSaveRate('+a.id+')" style="padding:8px 12px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Save rate</button></div>':'')+'</div>';
+  if(typeof _tcIsOffice === 'function' && _tcIsOffice(DB.current)){ var _mc = wmamMediaConsent(a); h += '<div style="border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:10px 12px;margin-bottom:12px"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><b>\uD83D\uDCC1 Photos & files</b><span style="font-size:.78rem;font-weight:800;color:'+(_mc ? (_mc.agreed ? '#166534' : '#b91c1c') : '#92400e')+'">Advertising consent: '+(_mc ? (_mc.agreed ? '\u2714 agreed '+new Date(_mc.at).toLocaleDateString() : '\u2716 declined '+new Date(_mc.at).toLocaleDateString()) : 'not answered yet')+'</span></div><div id="ahubFiles_'+a.id+'" style="margin-top:6px;font-size:.85rem;color:#6b7280">Loading\u2026</div></div>'; setTimeout(function(){ wmamAgentFilesFill(a.id); }, 0); }
   if(isOwner(DB.current)){ var _ai = (WMAI.ids||[]).indexOf(String(a.id)) >= 0; h += '<label style="display:flex;gap:10px;align-items:flex-start;border:1px solid '+(_ai?'#a5b4fc':'#e5e7eb')+';background:'+(_ai?'#eef2ff':'#f8fafc')+';border-radius:12px;padding:10px 12px;margin-bottom:12px;cursor:pointer"><input type="checkbox" '+(_ai?'checked':'')+' onchange="wmaiSetAccess('+a.id+', this.checked)" style="margin-top:3px"><span><b>WMAMinc Assistant (AI) access</b><br><span style="font-size:.8rem;color:#6b7280">Can use the AI assistant to learn the job and draft pay changes for approval.</span></span></label>'; }
   if(isOwner(DB.current)) h += '<label style="display:flex;gap:10px;align-items:flex-start;border:1px solid '+(a.canEditToolCenter?'#86efac':'#e5e7eb')+';background:'+(a.canEditToolCenter?'#ecfdf5':'#f8fafc')+';border-radius:12px;padding:10px 12px;margin-bottom:12px;cursor:pointer"><input type="checkbox" '+(a.canEditToolCenter?'checked':'')+' onchange="ahubToggleFlag('+a.id+',\'canEditToolCenter\', this.checked)" style="margin-top:3px"><span><b>Can edit the Tool Center</b><br><span style="font-size:.8rem;color:#6b7280">Add, change or remove links, phone numbers, guides and forms for any program.</span></span></label>';
   if(isOwner(DB.current)) h += '<label style="display:flex;gap:10px;align-items:flex-start;border:1px solid '+(a.fullOfficeAccess?'#93c5fd':'#e5e7eb')+';background:'+(a.fullOfficeAccess?'#eff6ff':'#f8fafc')+';border-radius:12px;padding:10px 12px;margin-bottom:12px;cursor:pointer"><input type="checkbox" '+(a.fullOfficeAccess?'checked':'')+' onchange="ahubToggleFullOffice('+a.id+', this.checked)" style="margin-top:3px"><span><b>Full office access</b><br><span style="font-size:.8rem;color:#6b7280">Everything in the back office except the Owner Control panel (owner only).</span></span></label>';
@@ -33236,7 +33683,7 @@ function panelDailyAudit(){
   var audits = JSON.parse(localStorage.getItem('wmam_audits')||'[]');
   var todayAudit = audits.find(function(a){ return a.agentId===u.id && a.date===today; });
 
-  var h = '<div style="max-width:640px;margin:0 auto">';
+  var h = '<div style="max-width:640px;margin:0 auto">' + (typeof wmamConsentCardHtml === 'function' ? wmamConsentCardHtml(u) : '');
 
   // Header banner
   h += '<div style="background:linear-gradient(135deg,var(--blue),#002268);border-radius:10px;padding:24px 28px;margin-bottom:20px;color:white">'
@@ -33858,10 +34305,14 @@ function viewAuditDetail(agentId, dateStr, submittedTs){
   gotoPanel('audit-detail');
 }
 
+function wmamAuditPhoto(which){ var r = window.__auditRec; if(!r) return; var src = which === 'selfie' ? r.selfie : r.station; if(!src) return;
+  wmamPhotoOpen(src, { agentId:r.agentId, agentName:r.agentName, kind:(which === 'selfie' ? 'audit selfie' : 'audit station'), takenAt:(r.submittedTs ? new Date(r.submittedTs).toISOString() : (r.date ? r.date+'T12:00:00' : null)), source:'daily-audit' }); }
+if(typeof window!=='undefined') window.wmamAuditPhoto = wmamAuditPhoto;
 function panelAuditDetail(){
   var u = DB.current;
   var key = window._auditViewKey || {};
   var rec = _findAuditRecord(key.agentId, key.date, key.submittedTs);
+  window.__auditRec = rec;
   var h = '';
   h += panelHeader('📸 Daily Audit Detail');
 
@@ -33953,13 +34404,13 @@ function panelAuditDetail(){
     if(rec.selfie){
       h += '<div>'
         +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">ID Badge Selfie</div>'
-        +'<img src="'+rec.selfie+'" style="width:100%;border-radius:8px;border:1px solid var(--border);max-height:480px;object-fit:contain;background:#000">'
+        +'<img src="'+rec.selfie+'" onclick="wmamAuditPhoto(\'selfie\')" style="cursor:zoom-in;width:100%;border-radius:8px;border:1px solid var(--border);max-height:480px;object-fit:contain;background:#000">'+'<button onclick="wmamAuditPhoto(\'selfie\')" style="margin-top:6px;width:100%;padding:9px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">\uD83D\uDD0D Open \u00b7 \u2B07 download \u00b7 save to profile</button>'
         +'</div>';
     }
     if(rec.station){
       h += '<div>'
         +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Location / Station Photo</div>'
-        +'<img src="'+rec.station+'" style="width:100%;border-radius:8px;border:1px solid var(--border);max-height:480px;object-fit:contain;background:#000">'
+        +'<img src="'+rec.station+'" onclick="wmamAuditPhoto(\'station\')" style="cursor:zoom-in;width:100%;border-radius:8px;border:1px solid var(--border);max-height:480px;object-fit:contain;background:#000">'+'<button onclick="wmamAuditPhoto(\'station\')" style="margin-top:6px;width:100%;padding:9px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">\uD83D\uDD0D Open \u00b7 \u2B07 download \u00b7 save to profile</button>'
         +'</div>';
     }
     h += '</div></div>';
@@ -44785,7 +45236,7 @@ function gotoPanel(id, params){
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
     'gm-pricelist':'GM Pricelist',
-    'gm-pay-link':'Lifeline Payment Links','sim-orders':'SIM Orders','tool-center':'Tool Center','comp-builder':'Comp Plan Builder','biz-snapshot':'Business Snapshot','time-clock':'Time Clock','hours-admin':'Hours & Approvals','inv-transfer-center':'Transfer Center','surplus-payouts':'Surplus Payouts','gm-sales':'Lifeline Sales & Paybacks','gm-paid':'Paid Device Sales','gm-prices':'Lifeline Price Lists','agent-cleanup':'Agent Cleanup','gm-dates':'Dates & Charges','inv-sign':'Sign & Invoices','inv-teams':'Inventory by Manager','inv-explorer':'Inventory Overview & Search',
+    'gm-pay-link':'Lifeline Payment Links','sim-orders':'SIM Orders','tool-center':'Tool Center','hours-ops':'Hours of Operation','mgr-overrides':'Manager Overrides','comp-builder':'Comp Plan Builder','biz-snapshot':'Business Snapshot','time-clock':'Time Clock','hours-admin':'Hours & Approvals','inv-transfer-center':'Transfer Center','surplus-payouts':'Surplus Payouts','gm-sales':'Lifeline Sales & Paybacks','gm-paid':'Paid Device Sales','gm-prices':'Lifeline Price Lists','agent-cleanup':'Agent Cleanup','gm-dates':'Dates & Charges','inv-sign':'Sign & Invoices','inv-teams':'Inventory by Manager','inv-explorer':'Inventory Overview & Search',
     'inv-hub':'Inventory Hub',
     'aw-inventory':'Assurance Wireless Inventory','aw-upload':'Assurance Upload','aw-transfers':'Assurance Transfers',
     'aw-payfile':'Assurance Pay-File',
@@ -44823,7 +45274,7 @@ function gotoPanel(id, params){
     'inv-export':panelInvExport,'inv-my-inventory':panelMyInventory,
     'inv-distribute':panelDistribute,
     'inv-hub':panelInvHub,
-    'gm-pay-link':panelGmPayLink,'sim-orders':panelSimOrders,'tool-center':panelToolCenter,'comp-builder':panelCompBuilder,'biz-snapshot':panelBizSnapshot,'time-clock':panelTimeClock,'hours-admin':panelHoursAdmin,'inv-transfer-center':panelInvTransferCenter,'surplus-payouts':panelSurplusPayouts,'gm-sales':panelGmSales,'gm-paid':panelGmPaid,'gm-prices':panelGmPrices,'agent-cleanup':panelAgentCleanup,'gm-dates':panelGmDates,'inv-sign':panelInvSign,'inv-teams':panelInvTeams,'inv-explorer':function(){ return panelInvExplorer(window._invxParams||null); },
+    'gm-pay-link':panelGmPayLink,'sim-orders':panelSimOrders,'tool-center':panelToolCenter,'hours-ops':panelHoursOps,'mgr-overrides':panelMgrOverrides,'comp-builder':panelCompBuilder,'biz-snapshot':panelBizSnapshot,'time-clock':panelTimeClock,'hours-admin':panelHoursAdmin,'inv-transfer-center':panelInvTransferCenter,'surplus-payouts':panelSurplusPayouts,'gm-sales':panelGmSales,'gm-paid':panelGmPaid,'gm-prices':panelGmPrices,'agent-cleanup':panelAgentCleanup,'gm-dates':panelGmDates,'inv-sign':panelInvSign,'inv-teams':panelInvTeams,'inv-explorer':function(){ return panelInvExplorer(window._invxParams||null); },
     'dart-scanner':panelDartScanner,
     'dart-inventory':panelDartInventory,
     // Calvin 2026-06-11 v2930: new DART-style carrier panels.
