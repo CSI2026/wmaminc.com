@@ -3796,7 +3796,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.10.0900';
+var BUILD_VERSION = '2026.10.11.0100';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -8046,6 +8046,14 @@ function payrollApproveWeek(weekId){
   });
   if(typeof savePayrollWeeks === 'function') savePayrollWeeks();
   if(typeof saveToStorage === 'function') saveToStorage();
+  // v2026.10.11 (Calvin): finalize automatically once the LAST campaign file for this pay period is approved
+  try{
+    var _pe = w.periodEnd, _left = PAYROLL_WEEKS.filter(function(x){ return x && x.periodEnd === _pe && x.status !== 'approved' && x.status !== 'rejected'; }).length;
+    if(_left === 0 && typeof OBLIGATION_COMMITS !== 'undefined' && !OBLIGATION_COMMITS[_pe] && typeof payrollCommitObligations === 'function'){
+      w.autoFinalized = true;
+      if(payrollCommitObligations(_pe)){ try{ showToast('Week ending '+_pe+' finalized automatically \u2014 surplus, disputes and expired phones recorded'); }catch(e){} }
+    } else if(_left > 0){ try{ showToast(_left+' more campaign file'+(_left===1?'':'s')+' to approve for this week \u2014 it finalizes automatically after the last one'); }catch(e){} }
+  }catch(e){ console.warn('[auto-finalize]', e); }
   return true;
 }
 
@@ -14499,21 +14507,14 @@ function _gmStatusChip(s){
   var m = map[s] || ['#6b7280', String(s||'').toUpperCase()];
   return '<span style="display:inline-block;background:'+m[0]+';color:#fff;border-radius:999px;padding:2px 9px;font-size:.7rem;font-weight:800;letter-spacing:.5px">'+m[1]+'</span>';
 }
-async function gmPayLoadMine(){
-  try{ if(!GMPAY.token && DB.current && Date.now() - GMPAYOUTS.loadedAt > 60000) await gmPayoutsLoad(DB.current.id); }catch(e){}   // this agent's recorded surplus payments
-  var el = document.getElementById('gmPayMine'); if(!el || (!DB.current && !GMPAY.token)) return;
-  try{
-    var r = GMPAY.token ? await (async function(){ var x = await wmamInvoke('gm-pay-link', { body: { payToken: GMPAY.token, action:'list' } }); return { data: x && x.data && x.data.sales }; })()
-                        : await supaClient.from('gm_sales').select('*').eq('agent_id', DB.current.id).order('created_at',{ascending:false}).limit(500);
-    var allRows = (r && r.data) || [];
-    var rows = allRows.slice(0, 20);
-    if(!allRows.length){ el.innerHTML = _gmAgentSummaryHtml([]) + '<div style="color:#888;font-size:.88rem">No Pay Link sales yet.</div>'; return; }
-    el.innerHTML = _gmAgentSummaryHtml(allRows) + '<div style="font-weight:800;color:#003594;margin-bottom:8px;letter-spacing:1px">MY RECENT GEN MOBILE SALES</div>'
-      + rows.map(function(s){
+
+// v2026.10.11 (Calvin, A+B): agent Pay Link — This Week (one big number) · Disputes · Past Weeks (PAID receipts)
+var _gmSaleCard = function(s){
           return '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin-bottom:8px;font-size:.9rem">'
             + '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><b>'+_gmPayEsc(s.model)+' \u00b7 '+_gmMoney(s.amount_charged)+'</b>'+_gmStatusChip(s.status)+'</div>'
             + '<div style="color:#666;font-size:.8rem;margin-top:3px">IMEI '+_gmPayEsc(s.imei)+' \u00b7 '+_gmPayEsc(s.plan_name)+' \u00b7 '+(s.payer==='customer'?'customer paid':'you paid')+' \u00b7 '+new Date(s.created_at).toLocaleString()+'</div>'
-            + (Number(s.owed_agent)>0 ? '<div style="margin-top:4px;font-weight:700;color:'+(s.agent_payback_status==='paid'?'#166534':'#92400e')+'">Your payback: '+_gmMoney(s.owed_agent)+' \u2014 '+(s.agent_payback_status==='paid'?'paid to you':'owed to you')+'</div>' : '')
+            + ((s.dispute_state && s.dispute_state !== 'WON') ? '<div style="margin-top:4px;font-weight:800;color:#991b1b">\u26A0 Disputed by the customer \u2014 no surplus; charged back on your next payroll</div>' : '')
+            + (Number(s.owed_agent)>0 && !(s.dispute_state && s.dispute_state !== 'WON') ? '<div style="margin-top:4px;font-weight:700;color:'+(s.agent_payback_status==='paid'?'#166534':'#92400e')+'">Your payback: '+_gmMoney(s.owed_agent)+' \u2014 '+(s.agent_payback_status==='paid'?'paid to you':'owed to you')+'</div>' : '')
             + (s.status==='link_created' && s.square_link_url ? (function(){ var u = _gmShareUrl(s), ph = String(s.customer_phone||'').replace(/[^0-9+]/g,'');
                 var msg = encodeURIComponent('WMAMinc - your Gen Mobile phone payment ('+_gmMoney(s.amount_charged)+'): '+u+'  ALL SALES FINAL.');
                 return '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">'
@@ -14522,8 +14523,58 @@ async function gmPayLoadMine(){
                   + '<button onclick="gmPayCopyText(\''+_gmPayEsc(u)+'\')" style="padding:7px 10px;border-radius:6px;background:#fff;color:#003594;border:1px solid #003594;font-weight:700;font-size:.8rem;cursor:pointer">Copy</button>'
                   + '<button onclick="gmPayCancel('+s.id+')" style="padding:7px 10px;border-radius:6px;background:#fff;color:#CC0000;border:1px solid #CC0000;font-weight:700;font-size:.8rem;cursor:pointer">Cancel order</button></div>'
                   + (s.payer==='customer' ? '<div style="font-size:.75rem;margin-top:4px;color:'+(s.customer_signed_at?'#166534':'#92400e')+'">'+(s.customer_signed_at?'\u2714 Customer signed':'Waiting for customer to sign')+'</div>' : ''); })() : '')
-            + '</div>';
-        }).join('');
+            + '</div>';};
+function _gmDisp(s){ var st = String(s && s.dispute_state || ''); return !!st && st !== 'WON'; }
+function gmAgentPLTab(t){ GMPAY.mineTab = t; var el = document.getElementById('gmPayMine'); if(el) el.innerHTML = gmAgentPLHtml(GMPAY.mineRows || []); }
+function gmAgentPLHtml(rows){
+  var money = _gmMoney, esc = _gmPayEsc, tab = GMPAY.mineTab || 'week', today = _ctToday(), wk = _gmPayWeekStart(today), wkEnd = _gmAddDays(wk, 6), payDay = _gmAddDays(wk, 8);
+  var fri = function(ymd){ var d = new Date(ymd+'T12:00:00'); return 'Friday '+(d.getMonth()+1)+'/'+d.getDate(); };
+  var inWeek = function(s, k){ var day = _gmSaleDay(s); return day && _gmPayWeekStart(day) === k; };
+  var earned = function(s){ return s.status === 'paid' && s.payer === 'customer' && !_gmDisp(s) ? (Number(s.owed_agent)||0) : 0; };
+  var disputes = rows.filter(_gmDisp);
+  var tabBtn = function(id, label){ var on = tab === id; return '<button onclick="gmAgentPLTab(\''+id+'\')" style="flex:1;padding:9px 0;border:none;border-radius:9px;font-weight:'+(on?'900':'700')+';font-size:.86rem;cursor:pointer;background:'+(on?'#fff':'transparent')+';color:'+(on?'#0b1b3f':'#6b7280')+';'+(on?'box-shadow:0 1px 3px rgba(0,0,0,.12)':'')+'">'+label+'</button>'; };
+  var h = '<div style="font-weight:900;font-size:1.1rem;color:#0b1b3f;margin:4px 0 8px">My Pay Link</div>'
+    + '<div style="display:flex;gap:4px;background:#e5e7eb;border-radius:12px;padding:4px;margin-bottom:12px">'+tabBtn('week','This Week')+tabBtn('disp','Disputes'+(disputes.length ? ' <span style="background:#fee2e2;color:#991b1b;border-radius:99px;padding:1px 7px;font-size:.72rem">'+disputes.length+'</span>' : ''))+tabBtn('past','Past Weeks')+'</div>';
+  if(tab === 'week'){
+    var mine = rows.filter(function(s){ return !_gmDisp(s) && (inWeek(s, wk) || (s.status === 'link_created' && _gmPayWeekStart(String(s.created_at||'').slice(0,10)) === wk)); });
+    var paidN = mine.filter(function(s){ return s.status === 'paid' && !_gmDisp(s); }).length, waitN = mine.filter(function(s){ return s.status === 'link_created'; }).length;
+    var sur = mine.reduce(function(t,s){ return t + earned(s); }, 0), paidOut = mine.filter(function(s){ return earned(s) > 0 && s.agent_payback_status === 'paid'; }).reduce(function(t,s){ return t + earned(s); }, 0);
+    var older = rows.filter(function(s){ return !inWeek(s, wk) && earned(s) > 0 && s.agent_payback_status !== 'paid'; }).reduce(function(t,s){ return t + earned(s); }, 0);
+    h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;text-align:center;margin-bottom:12px">'
+      + '<div style="font-size:.72rem;font-weight:800;letter-spacing:1px;color:#6b7280">YOUR SURPLUS THIS WEEK</div>'
+      + '<div style="font-size:2.5rem;font-weight:900;color:#7c3aed;line-height:1.15">'+money(sur)+'</div>'
+      + '<div style="font-size:.88rem">'+(sur > 0 && paidOut >= sur - 0.001 ? '<b style="color:#166534">\u2714 Paid</b> with your payroll' : (sur > 0 ? 'Paid <b>'+fri(payDay)+'</b> with your payroll' : 'Surplus from paid customer sales shows here'))+'</div>'
+      + '<div style="font-size:.76rem;color:#6b7280;margin-top:4px">'+_gmShort(wk)+' \u2013 '+_gmShort(wkEnd)+' \u00b7 '+paidN+' paid sale'+(paidN===1?'':'s')+(waitN ? ' \u00b7 '+waitN+' waiting for payment' : '')+'</div>'
+      + (older > 0 ? '<div style="margin-top:8px;font-size:.8rem;color:#7c3aed;font-weight:700">+ '+money(older)+' from earlier weeks, also on your next payroll</div>' : '') + '</div>';
+    h += '<div style="font-weight:800;margin:4px 0 8px">This week\u2019s sales</div>' + (mine.length ? mine.map(_gmSaleCard).join('') : '<div style="color:#888;font-size:.88rem;margin-bottom:10px">No sales yet this week.</div>');
+  } else if(tab === 'disp'){
+    h += '<div style="font-size:.84rem;color:#374151;margin-bottom:10px">All sales are final. When a customer disputes a card payment, that sale earns <b>no surplus</b> and is <b>charged back on your next payroll</b>. If we win the dispute, it\u2019s returned to you automatically.</div>'
+      + (disputes.length ? disputes.map(_gmSaleCard).join('') : '<div style="background:#ecfdf5;border:1px solid #86efac;border-radius:12px;padding:12px;color:#166534;font-weight:700">No disputes. \uD83D\uDC4D</div>');
+  } else {
+    var weeks = {}; rows.forEach(function(s){ var day = _gmSaleDay(s); if(!day) return; var k = _gmPayWeekStart(day); if(k >= wk) return; (weeks[k] = weeks[k] || []).push(s); });
+    var keys = Object.keys(weeks).sort().reverse().slice(0, 12);
+    h += keys.length ? keys.map(function(k){ var list = weeks[k], sales = list.filter(function(s){ return earned(s) > 0; }), tot = sales.reduce(function(t,s){ return t + earned(s); }, 0), paid = sales.filter(function(s){ return s.agent_payback_status === 'paid'; }).reduce(function(t,s){ return t + earned(s); }, 0), pd = _gmAddDays(k, 8);
+        var head = tot <= 0 ? '<div style="background:#f1f5f9;padding:10px 12px;display:flex;justify-content:space-between"><b style="color:#6b7280">No surplus</b><span style="font-size:.76rem;color:#6b7280">'+_gmShort(k)+' \u2013 '+_gmShort(_gmAddDays(k,6))+'</span></div>'
+          : (paid >= tot - 0.001 ? '<div style="background:#dcfce7;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px"><b style="color:#166534;font-size:1rem">\u2714 PAID '+money(tot)+'</b><span style="font-size:.76rem;color:#166534;font-weight:700">'+fri(pd)+' \u00b7 direct deposit</span></div>'
+             : '<div style="background:#fef3c7;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px"><b style="color:#92400e;font-size:1rem">OWED '+money(tot - paid)+'</b><span style="font-size:.76rem;color:#92400e;font-weight:700">on your next payroll</span></div>');
+        var body = sales.length ? '<div style="padding:8px 12px 10px;font-size:.84rem"><div style="font-size:.74rem;color:#6b7280;margin-bottom:4px">Week '+_gmShort(k)+' \u2013 '+_gmShort(_gmAddDays(k,6))+'</div>'+sales.map(function(s){ var d = new Date((s.paid_at||s.created_at)); return '<div style="display:flex;justify-content:space-between;padding:2px 0"><span>'+esc(s.model||'Phone')+' \u00b7 '+(d.getMonth()+1)+'/'+d.getDate()+'</span><b>'+money(earned(s))+'</b></div>'; }).join('')+'</div>' : '';
+        return '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;margin-bottom:10px">'+head+body+'</div>'; }).join('')
+      : '<div style="color:#888;font-size:.88rem">No past weeks yet.</div>';
+  }
+  return h + '<div style="font-size:.74rem;color:#666;margin:6px 0 12px">Surplus = on paid customer sales, the amount charged above the company cost. Sales Thursday\u2013Wednesday are paid the next Friday with your payroll.</div>';
+}
+if(typeof window!=='undefined'){ window.gmAgentPLHtml = gmAgentPLHtml; window.gmAgentPLTab = gmAgentPLTab; }
+async function gmPayLoadMine(){
+  try{ if(!GMPAY.token && DB.current && Date.now() - GMPAYOUTS.loadedAt > 60000) await gmPayoutsLoad(DB.current.id); }catch(e){}   // this agent's recorded surplus payments
+  var el = document.getElementById('gmPayMine'); if(!el || (!DB.current && !GMPAY.token)) return;
+  try{
+    var r = GMPAY.token ? await (async function(){ var x = await wmamInvoke('gm-pay-link', { body: { payToken: GMPAY.token, action:'list' } }); return { data: x && x.data && x.data.sales }; })()
+                        : await supaClient.from('gm_sales').select('*').eq('agent_id', DB.current.id).order('created_at',{ascending:false}).limit(500);
+    var allRows = (r && r.data) || [];
+    var rows = allRows.slice(0, 20);
+    if(!allRows.length){ GMPAY.mineRows = []; el.innerHTML = gmAgentPLHtml([]); return; }
+    GMPAY.mineRows = allRows; el.innerHTML = gmAgentPLHtml(allRows);
+
   }catch(e){}
 }
 // ── Office: every sale + paybacks + price list ─────────────────────────
@@ -14740,7 +14791,7 @@ async function gmPayoutRecord(agentId, balance){
 function gmAgentPeriodsHtml(rows){
   rows = rows || []; var t = _ctToday(), wk = _gmPayWeekStart(t), mo = t.slice(0,7);
   var inP = function(s, p){ var day = _gmSaleDay(s); if(!day) return false; return p === 'day' ? day === t : (p === 'week' ? _gmPayWeekStart(day) === wk : day.slice(0,7) === mo); };
-  var stat = function(p){ var L = rows.filter(function(s){ return inP(s, p); }), paid = L.filter(function(s){ return s.status === 'paid'; });
+  var stat = function(p){ var L = rows.filter(function(s){ return inP(s, p); }), paid = L.filter(function(s){ return s.status === 'paid' && !(s.dispute_state && s.dispute_state !== 'WON'); });   // v2026.10.11: disputed sales don't count
     return { orders:paid.length, money: paid.reduce(function(x,s){ return x + (Number(s.amount_paid != null ? s.amount_paid : s.amount_charged)||0); }, 0), surplus: paid.reduce(function(x,s){ return x + _gmSurplusOf(s); }, 0),
       canceled: L.filter(function(s){ return s.status === 'canceled' || s.status === 'replaced'; }).length, chargebacks: L.filter(function(s){ return s.status === 'refunded' || s.status === 'chargeback' || s.chargeback_at; }).length }; };
   var held = 0; try{ var me = DB.current; if(me && !GMPAY.token) held = wmamUniqPool().filter(function(d){ return String(_wmamHolderOf(d)) === String(me.id) && wmamDevState(d) === 'available'; }).length; }catch(e){}
@@ -15932,15 +15983,17 @@ function _gmAgentSummaryHtml(rows){
   var esc = _escapeHtml, money = _gmMoney;
   var weeks = {};
   rows.forEach(function(s){ var day = _gmSaleDay(s); if(!day) return; var k = _gmPayWeekStart(day); (weeks[k] = weeks[k] || []).push(s); });
-  var stat = function(list){ var paid = list.filter(function(s){ return s.status === 'paid'; });
+  var _disp = function(s){ var st = String(s && s.dispute_state || ''); return !!st && st !== 'WON'; };   // v2026.10.11: disputed sales earn no surplus (same as payroll)
+  var stat = function(list){ var paid = list.filter(function(s){ return s.status === 'paid' && !_disp(s); });
     return { paid: paid.length, surplus: paid.reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0),
       paidOut: paid.filter(function(s){ return s.agent_payback_status === 'paid'; }).reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0),
       waiting: list.filter(function(s){ return s.status === 'link_created'; }).length,
       canceled: list.filter(function(s){ return s.status === 'canceled' || s.status === 'replaced' || s.status === 'refunded'; }).length }; };
   var cur = stat(weeks[wk] || []);
-  var allPaid = rows.filter(function(s){ return s.status === 'paid'; });
+  var allPaid = rows.filter(function(s){ return s.status === 'paid' && !_disp(s); });
   var owedAll = allPaid.filter(function(s){ return s.agent_payback_status !== 'paid'; }).reduce(function(t,s){ return t + (Number(s.owed_agent)||0); }, 0);
-  try{ if(GMPAYOUTS.rows && GMPAYOUTS.rows.length && rows.length){ var _L = gmAgentLedger(rows[0].agent_id, rows, GMPAYOUTS.rows); owedAll = Math.max(0, _L.balance); } }catch(e){}
+  try{ if(GMPAYOUTS.rows && GMPAYOUTS.rows.length && rows.length){ var _L = gmAgentLedger(rows[0].agent_id, rows.filter(function(s){ return !_disp(s); }), GMPAYOUTS.rows); owedAll = Math.max(0, _L.balance); } }catch(e){}
+  var _nDisp = rows.filter(_disp).length;
   var card = function(k,v,c,sub){ return '<div style="flex:1 1 140px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:.66rem;font-weight:800;letter-spacing:1px;color:#6b7280;text-transform:uppercase">'+k+'</div><div style="font-size:1.4rem;font-weight:900;color:'+(c||'#003594')+'">'+v+'</div>'+(sub?'<div style="font-size:.72rem;color:#6b7280">'+sub+'</div>':'')+'</div>'; };
   var _myPays = (!GMPAY.token && GMPAYOUTS && Array.isArray(GMPAYOUTS.rows) && rows.length) ? GMPAYOUTS.rows.filter(function(p){ return String(p.agent_id) === String(rows[0].agent_id); }) : [];
   var h = '<div style="font-weight:800;color:#003594;letter-spacing:1px;margin:4px 0 4px">MY PAY LINK SALES</div>' + gmAgentPeriodsHtml(rows)
@@ -15949,7 +16002,8 @@ function _gmAgentSummaryHtml(rows){
     + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">'
     + card('Paid sales this week', cur.paid) + card('Surplus this week', money(cur.surplus), cur.surplus>0?'#7c3aed':'#6b7280', 'paid Friday')
     + card('Waiting for payment', cur.waiting, cur.waiting?'#b45309':'#6b7280') + card('Canceled this week', cur.canceled, cur.canceled?'#b91c1c':'#6b7280')
-    + card('Total still owed to you', money(owedAll), owedAll>0?'#7c3aed':'#6b7280', 'all weeks, not paid out yet') + '</div>';
+    + card('Total still owed to you', money(owedAll), owedAll>0?'#7c3aed':'#6b7280', 'all weeks, not paid out yet') + '</div>'
+    + (_nDisp ? '<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:10px;padding:8px 12px;margin-bottom:8px;font-size:.84rem;color:#991b1b"><b>'+_nDisp+' sale'+(_nDisp===1?'':'s')+' disputed by the customer.</b> All sales are final: a disputed sale earns no surplus and is charged back on your next payroll (returned if the dispute is won).</div>' : '');
   var keys = Object.keys(weeks).sort().reverse().slice(0, 8);
   if(keys.length){
     h += '<div style="overflow-x:auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;margin-bottom:6px"><table style="width:100%;border-collapse:collapse;font-size:.84rem;min-width:520px"><tr style="text-align:left;background:#003594">'
@@ -51583,7 +51637,7 @@ function payHomeRender(){
   h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0">'
     + step(weeks.length > 0, !weeks.length, '1. Pay files uploaded', weeks.length ? weeks.map(function(w){ return esc(w.carrier); }).join(' \u00b7 ') : 'none yet', '<div style="margin-top:6px"><button onclick="gotoPanel(\'payroll-upload\')" style="padding:5px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;cursor:pointer;font-size:.78rem">\u2B06 Upload</button></div>')
     + step(weeks.length && approved.length === weeks.length, weeks.length && approved.length < weeks.length, '2. Reviewed', approved.length+' of '+weeks.length+' campaign'+(weeks.length===1?'':'s')+' approved', '<div style="margin-top:6px"><button onclick="gotoPanel(\'payroll-process\')" style="padding:5px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;cursor:pointer;font-size:.78rem">Review</button></div>')
-    + step(!!committed, approved.length && !committed, '3. Finalize & pay', committed ? 'finalized '+String(committed.at||'').slice(0,10)+(committed.by?' by '+esc(committed.by):'') : 'records deductions, surplus & disputes',
+    + step(!!committed, approved.length && !committed, '3. Finalize & pay', committed ? 'finalized '+String(committed.at||committed.committedAt||'').slice(0,10)+(committed.by?' by '+esc(committed.by):'') : 'finalizes automatically when the last campaign is approved',
         committed ? '' : '<div style="margin-top:6px"><button '+(approved.length?'':'disabled ')+'onclick="if(confirm(\'Finalize this week? Loans, fees, expired phones, Pay Link surplus and disputes will be recorded. This runs ONCE per week.\')){ if(payrollCommitObligations(\''+pe+'\')){ alert(\'\\u2713 Week finalized.\'); gotoPanel(\'payroll-home\',{periodEnd:\''+pe+'\'}); } }" style="padding:6px 12px;border:none;border-radius:8px;background:'+(approved.length?'#16a34a':'#94a3b8')+';color:#fff;font-weight:800;cursor:pointer">\u2705 Finalize week</button></div>')
     + '</div>';
   h += Object.keys(rollup.agents).length ? wmamPayBreakdownHtml(rollup, { weekLabel:'Period ending '+_gmShort(pe) }) : '<div class="bo-card" style="padding:24px;text-align:center;color:#6b7280">No approved pay for this period yet.</div>';
