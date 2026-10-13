@@ -3790,7 +3790,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.12.0800';
+var BUILD_VERSION = '2026.10.12.0900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15568,6 +15568,7 @@ function _wmamTabAllowed(u, id){
   if(id==='inv-audit') return !!u;
   if(id==='ai-settings') return !!u && isOwner(u);
   if(id==='notices') return !!u && _ntcCanEdit(u);
+  if(id==='email-center') return !!u && _emcCan(u);
   if(id==='missed-paylink') return !!u && (isOwner(u) || u.fullOfficeAccess === true || (typeof isInventory === 'function' && isInventory(u)));
   if(id==='hours-ops' || id==='mgr-overrides') return !!u && (isOwner(u) || u.fullOfficeAccess === true);
   if(id==='comp-builder' || id==='comp-plans') return !!u && (isOwner(u) || u.fullOfficeAccess === true);
@@ -15650,7 +15651,7 @@ var WMAM_NAV = [
     { title:'Reports & Tools', icon:'\uD83E\uDDFE', bg:'#d6f5f1', group:'tools' } ]},
   { key:'comms', label:'\uD83D\uDCAC Communication', cards:[
     { title:'Meetings & Calls', icon:'\uD83D\uDCDE', bg:'#dbe6ff', tabs:[['meetings','Meetings & Video'],['book-call','Book a Call'],['my-bookings','My Calls'],['my-calendar','My Calendar'],['call-schedule-admin','Call Schedule']] },
-    { title:'Messages', icon:'\uD83D\uDCE2', bg:'#fde7c7', tabs:[['notices','Notices & Reminders'],['announce','Announcements'],['community-hub','Channels & Chats'],['mass-email','Mass Email'],['mass-sms','Mass SMS']] } ]},
+    { title:'Messages', icon:'\uD83D\uDCE2', bg:'#fde7c7', tabs:[['email-center','Email Center'],['notices','Notices & Reminders'],['announce','Announcements'],['community-hub','Channels & Chats'],['mass-email','Mass Email'],['mass-sms','Mass SMS']] } ]},
   { key:'points', label:'\uD83C\uDFC6 Points', cards:[
     { title:'My Points', icon:'\uD83C\uDFC6', bg:'#fff2c7', tabs:[['my-points','My Points'],['store','Store'],['my-redemptions','My Redemptions'],['my-orders','My Orders'],['team-points','Team Points']] },
     { title:'Points Admin', icon:'\uD83D\uDCE6', bg:'#e9e2ff', tabs:[['owner-points','Points Dashboard'],['fulfillment','Fulfillment Queue']] } ]},
@@ -15671,7 +15672,7 @@ function _wmamIdAllowed(id){
   if(id==='gm-pay-link') return !!(DB.current && DB.current.active !== false);
   if(id==='payroll-home' || id==='payroll-rollup' || id==='payroll-process' || id==='payroll-salaries' || id==='payroll-disputes') return wmamIsPayrollStaff(DB.current);
   // v2026.10.10: pages added after the original menu list use their own access rules (they were being hidden)
-  if(/^(surplus-payouts|hours-admin|hours-ops|mgr-overrides|comp-builder|comp-plans|time-clock|tool-center|my-invoices|missed-paylink|biz-snapshot|inv-audit|ai-settings|notices)$/.test(id)) return _wmamTabAllowed(DB.current, id);
+  if(/^(surplus-payouts|hours-admin|hours-ops|mgr-overrides|comp-builder|comp-plans|time-clock|tool-center|my-invoices|missed-paylink|biz-snapshot|inv-audit|ai-settings|notices|email-center)$/.test(id)) return _wmamTabAllowed(DB.current, id);
   if(id==='agent-cleanup') return canEditAgentProfiles(DB.current);
   if(id==='markets-admin' || id==='agents' || id==='agent-master') return canAccess(DB.current, id);   // v2026.09.30: office staff
   if(_wmamAllowed[id]) return true;
@@ -18883,6 +18884,132 @@ async function aiGapsHtml(){ var L = []; try{ var r = await supaClient.from('app
   return '<div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:16px;background:#fff"><b style="color:#003594">\u2753 Questions the assistants couldn\u2019t answer</b><div style="font-size:.8rem;color:#6b7280;margin:2px 0 8px">Only you see this. Each one is something to add to the assistants.</div>'
     + (L.length ? L.map(function(x){ return '<div style="font-size:.84rem;padding:5px 0;border-top:1px solid #f1f5f9">'+esc(x.q)+' <span style="color:#6b7280">\u2014 '+esc(x.who)+', '+esc(String(x.at).slice(0,10))+'</span></div>'; }).join('') : '<div style="color:#6b7280;font-size:.84rem">None yet.</div>') + '</div>'; }
 window.aiGapsHtml = aiGapsHtml;
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  EMAIL CENTER (v2026.10.12, Part 1) — Gmail-style inbox inside the back office.
+//  Each person connects THEIR OWN mailboxes (IONOS, Gmail, masked @wmaminc.com
+//  addresses forwarded into Gmail). Only they see their mail (database rule).
+//  Replies send from the address the email came to.
+// ══════════════════════════════════════════════════════════════════════
+var EMC = { accounts:[], msgs:[], acct:'all', folder:'INBOX', q:'', open:null, compose:null, loading:false };
+function _emcCan(u){ return !!(u && (isOwner(u) || _wmamActIsOffice(u))); }
+function _emcEsc(s){ return _escapeHtml(s); }
+async function emcLoad(){
+  EMC.loading = true;
+  try{ var a = await supaClient.from('email_accounts').select('id,address,provider,aliases,last_sync_at,status,error').order('created_at', { ascending:true }); EMC.accounts = (a && a.data) || [];
+    var m = await supaClient.from('email_messages').select('id,account_id,folder,uid,message_id,in_reply_to,refs,thread_key,from_name,from_addr,to_addrs,cc_addrs,delivered_to,subject,sent_at,snippet,attachments,seen,flagged').order('sent_at', { ascending:false }).limit(1500); EMC.msgs = (m && m.data) || [];
+  }catch(e){} EMC.loading = false; emcRender();
+}
+function panelEmailCenter(){ if(!_emcCan(DB.current)) return '<div style="padding:40px;text-align:center;color:#888">The Email Center is for the office.</div>'; setTimeout(emcLoad, 0); return '<div id="emcBox" style="max-width:1400px;margin:0 auto;padding:10px"><div style="padding:30px;color:#888">Loading your email\u2026</div></div>'; }
+function _emcAcctOf(m){ return EMC.accounts.find(function(a){ return a.id === m.account_id; }) || {}; }
+function _emcInView(m){ if(m.folder !== EMC.folder) return false; if(EMC.acct === 'all') return true; if(EMC.acct.indexOf('alias:') === 0) return String(m.delivered_to||'').toLowerCase() === EMC.acct.slice(6); return m.account_id === EMC.acct; }
+function _emcThreads(){
+  var q = EMC.q.trim().toLowerCase(), T = {};
+  EMC.msgs.forEach(function(m){ if(!_emcInView(m)) return; if(q && [m.from_name, m.from_addr, m.subject, m.snippet, m.to_addrs].join(' ').toLowerCase().indexOf(q) < 0) return;
+    var k = m.account_id + '|' + (m.thread_key || m.message_id || ('u'+m.id)); var t = T[k] = T[k] || { key:k, msgs:[], unread:0 }; t.msgs.push(m); if(!m.seen) t.unread++; });
+  return Object.keys(T).map(function(k){ var t = T[k]; t.msgs.sort(function(a,b){ return String(a.sent_at).localeCompare(String(b.sent_at)); }); t.last = t.msgs[t.msgs.length-1]; return t; }).sort(function(a,b){ return String(b.last.sent_at).localeCompare(String(a.last.sent_at)); });
+}
+function _emcWhen(iso){ if(!iso) return ''; var d = new Date(iso), n = new Date(); if(d.toDateString() === n.toDateString()) return d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' }); var y = new Date(n); y.setDate(n.getDate()-1); if(d.toDateString() === y.toDateString()) return 'Yesterday'; return d.toLocaleDateString([], { month:'short', day:'numeric' }); }
+function _emcTag(m){ var a = _emcAcctOf(m), addr = m.delivered_to || a.address || '', col = m.delivered_to ? '#7c3aed' : '#003594'; return addr ? '<span style="display:inline-block;font-size:10px;font-weight:800;border-radius:99px;padding:1px 7px;margin-left:6px;color:#fff;background:'+col+'">'+_emcEsc(addr.split('@')[0])+'@</span>' : ''; }
+function emcRender(){
+  var box = document.getElementById('emcBox'); if(!box) return; var esc = _emcEsc;
+  if(!EMC.accounts.length){ box.innerHTML = '<div style="max-width:620px;margin:20px auto;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:24px;text-align:center"><div style="font-size:2rem">\u2709\uFE0F</div><div style="font-weight:900;font-size:1.3rem;color:#003594;margin:6px 0">Connect your email</div><div style="color:#374151;margin-bottom:14px">Bring your work email into the back office. Only you will see it.</div><button onclick="emcConnectOpen()" style="padding:12px 18px;border:none;border-radius:12px;background:#003594;color:#fff;font-weight:900;cursor:pointer">+ Connect an email address</button></div>' + (EMC.compose && EMC.compose.connect ? _emcConnectHtml() : ''); return; }
+  var unreadFor = function(fn){ return EMC.msgs.filter(function(m){ return m.folder === 'INBOX' && !m.seen && fn(m); }).length; };
+  var item = function(id, label, n, sub){ var on = EMC.acct === id; return '<div onclick="EMC.acct=\''+id+'\';EMC.open=null;emcRender()" style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-radius:10px;font-size:'+(sub?'.8rem':'.88rem')+';margin:0 0 2px '+(sub?'12px':'0')+';cursor:pointer;'+(on?'background:#dbe6ff;font-weight:800;color:#003594':'')+'"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+label+'</span>'+(n?'<span style="font-size:11px;font-weight:800;background:#003594;color:#fff;border-radius:99px;padding:1px 8px">'+n+'</span>':'')+'</div>'; };
+  var side = '<button onclick="emcComposeNew()" style="display:block;width:100%;background:#003594;color:#fff;font-weight:800;border:none;border-radius:12px;padding:12px;margin-bottom:12px;cursor:pointer">\u270F\uFE0F New email</button>'
+    + '<div style="font-size:11px;font-weight:800;letter-spacing:1px;color:#6b7280;margin:8px 4px 6px">MY ACCOUNTS</div>' + item('all', '\uD83D\uDCE5 All my inboxes', unreadFor(function(){ return true; }))
+    + EMC.accounts.map(function(a){ return item(a.id, esc(a.address)+(a.status === 'error' ? ' \u26A0\uFE0F' : ''), unreadFor(function(m){ return m.account_id === a.id; })) + (a.aliases||[]).map(function(al){ return item('alias:'+String(al).toLowerCase(), '\u21B3 '+esc(al), unreadFor(function(m){ return String(m.delivered_to||'').toLowerCase() === String(al).toLowerCase(); }), true); }).join(''); }).join('')
+    + '<div style="font-size:11px;font-weight:800;letter-spacing:1px;color:#6b7280;margin:12px 4px 6px">FOLDERS</div>'
+    + [['INBOX','\uD83D\uDCE5 Inbox'],['Sent','\uD83D\uDCE4 Sent'],['Drafts','\uD83D\uDCDD Drafts'],['Trash','\uD83D\uDDD1 Trash'],['Spam','\u26A0\uFE0F Spam']].map(function(f){ var on = EMC.folder === f[0]; return '<div onclick="EMC.folder=\''+f[0]+'\';EMC.open=null;emcRender()" style="padding:8px 10px;border-radius:10px;font-size:.88rem;cursor:pointer;'+(on?'background:#dbe6ff;font-weight:800;color:#003594':'')+'">'+f[1]+'</div>'; }).join('')
+    + '<div style="font-size:11px;font-weight:800;letter-spacing:1px;color:#6b7280;margin:12px 4px 6px">CONNECT</div><div onclick="emcConnectOpen()" style="padding:8px 10px;color:#003594;font-weight:800;cursor:pointer;font-size:.88rem">\uFF0B Add another address</div>';
+  var threads = _emcThreads();
+  var list = '<div style="padding:10px"><input id="emcQ" type="search" value="'+esc(EMC.q)+'" oninput="EMC.q=this.value;clearTimeout(window._emcQT);window._emcQT=setTimeout(function(){ emcRender(); var i=document.getElementById(\'emcQ\'); if(i){ i.focus(); var n=i.value.length; i.setSelectionRange(n,n); } },200)" placeholder="\uD83D\uDD0D Search mail \u2014 name, subject, words\u2026" style="width:100%;padding:10px 12px;border:2px solid #cbd5e1;border-radius:10px;font-size:.9rem"></div>'
+    + (threads.length ? threads.slice(0, 300).map(function(t){ var m = t.last, sel = EMC.open === t.key, who = EMC.folder === 'Sent' ? ('To: '+(m.to_addrs||'')) : (m.from_name || m.from_addr || '');
+        return '<div onclick="emcOpen(\''+t.key.replace(/'/g,"\\'")+'\')" style="padding:11px 14px;border-top:1px solid #f1f5f9;font-size:.82rem;cursor:pointer;'+(sel?'background:#eef4ff;border-left:4px solid #003594;':'')+'"><div style="display:flex;justify-content:space-between;gap:8px;font-size:.88rem;'+(t.unread?'font-weight:900':'')+'"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(who)+(t.msgs.length>1?' ('+t.msgs.length+')':'')+'</span><span style="white-space:nowrap">'+_emcWhen(m.sent_at)+'</span></div><div style="font-weight:'+(t.unread?'800':'600')+';margin-top:2px">'+esc(m.subject||'(no subject)')+_emcTag(m)+'</div><div style="color:#6b7280;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(m.snippet||'')+'</div></div>'; }).join('')
+      : '<div style="padding:30px;text-align:center;color:#6b7280">'+(EMC.loading ? 'Loading\u2026' : (EMC.q ? 'No emails match.' : 'Nothing here.'))+'</div>');
+  var acctErr = EMC.accounts.filter(function(a){ return a.status === 'error'; });
+  box.innerHTML = '<div style="background:#fff;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.06);overflow:hidden">'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:12px 18px;border-bottom:3px solid #003594"><div style="font-family:Barlow Condensed,sans-serif;font-weight:900;letter-spacing:2px;color:#003594;font-size:1.3rem">\u2709\uFE0F EMAIL CENTER</div><div style="font-size:.8rem;color:#6b7280">Only you see your inbox \u00b7 '+(EMC.accounts[0] && EMC.accounts[0].last_sync_at ? 'updated '+_emcWhen(EMC.accounts.map(function(a){ return a.last_sync_at || ''; }).sort().pop()) : 'syncing')+' <button onclick="emcSync()" id="emcSyncBtn" style="margin-left:6px;border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:4px 10px;cursor:pointer">\u27F3 Refresh</button></div></div>'
+    + (acctErr.length ? '<div style="background:#fee2e2;color:#991b1b;padding:8px 16px;font-size:.82rem;font-weight:700">\u26A0\uFE0F '+acctErr.map(function(a){ return esc(a.address)+': '+esc(a.error||'sign-in problem'); }).join(' \u00b7 ')+' \u2014 <a href="#" onclick="emcConnectOpen(\''+esc(acctErr[0].address)+'\');return false">reconnect</a></div>' : '')
+    + '<div style="display:grid;grid-template-columns:230px minmax(280px,420px) 1fr;min-height:680px"><div style="background:#f8fafc;border-right:1px solid #e5e7eb;padding:12px">'+side+'</div><div style="border-right:1px solid #e5e7eb;max-height:760px;overflow:auto">'+list+'</div><div id="emcRead" style="padding:16px 20px;max-height:760px;overflow:auto">'+_emcReadHtml()+'</div></div></div>'
+    + (EMC.compose && EMC.compose.connect ? _emcConnectHtml() : '');
+  _emcFillFrames();
+}
+function _emcThreadByKey(k){ return _emcThreads().find(function(t){ return t.key === k; }) || null; }
+function _emcReadHtml(){
+  var esc = _emcEsc;
+  if(EMC.compose && !EMC.compose.connect && !EMC.compose.reply) return _emcComposeHtml();
+  var t = EMC.open ? _emcThreadByKey(EMC.open) : null; if(!t) return '<div style="color:#9ca3af;text-align:center;margin-top:120px">Select an email to read it.</div>';
+  var a = _emcAcctOf(t.last);
+  return '<div style="font-size:1.25rem;font-weight:900">'+esc(t.last.subject||'(no subject)')+'</div><div style="font-size:.76rem;color:#6b7280;margin:4px 0 12px">to '+esc(t.last.delivered_to || a.address || '')+' \u00b7 '+t.msgs.length+' message'+(t.msgs.length===1?'':'s')+'</div>'
+    + t.msgs.map(function(m){ var mine = (m.from_addr === String(a.address||'').toLowerCase()) || (a.aliases||[]).map(function(x){ return String(x).toLowerCase(); }).indexOf(m.from_addr) >= 0, ini = (m.from_name || m.from_addr || '?').split(/\s+/).map(function(w){ return w[0]; }).join('').slice(0,2).toUpperCase();
+      return '<div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:8px;font-size:.8rem;color:#6b7280;margin-bottom:6px"><span><span style="width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:11px;margin-right:6px;vertical-align:middle;background:'+(mine?'#003594':'#0e7490')+'">'+esc(ini)+'</span><b style="color:#0b1b3f">'+(mine?'You':esc(m.from_name||m.from_addr))+'</b> &lt;'+esc(m.from_addr)+'&gt;</span><span>'+(m.sent_at ? new Date(m.sent_at).toLocaleString() : '')+'</span></div>'
+        + '<div class="emcBody" data-mid="'+m.id+'" style="font-size:.9rem;color:#1f2937">Loading\u2026</div>'
+        + ((m.attachments||[]).length ? '<div style="margin-top:6px">'+m.attachments.map(function(x){ return '<span style="display:inline-block;border:1px solid #cbd5e1;border-radius:8px;padding:4px 9px;font-size:.76rem;margin:4px 6px 0 0">\uD83D\uDCCE '+esc(x.name)+(x.size ? ' \u00b7 '+Math.max(1, Math.round(x.size/1024))+' KB' : '')+'</span>'; }).join('')+'</div>' : '') + '</div>'; }).join('')
+    + (EMC.compose && EMC.compose.reply ? _emcComposeHtml() : '<div style="display:flex;gap:8px;margin-top:6px"><button onclick="emcReply(\'reply\')" style="padding:9px 14px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:800;cursor:pointer">\u21A9 Reply</button><button onclick="emcReply(\'all\')" style="padding:9px 14px;border:1px solid #003594;border-radius:10px;background:#fff;color:#003594;font-weight:800;cursor:pointer">\u21A9 Reply all</button><button onclick="emcReply(\'fwd\')" style="padding:9px 14px;border:1px solid #003594;border-radius:10px;background:#fff;color:#003594;font-weight:800;cursor:pointer">\u21AA Forward</button></div>');
+}
+async function _emcFillFrames(){
+  var els = [].slice.call(document.querySelectorAll('.emcBody')); if(!els.length) return; var ids = els.map(function(e){ return +e.getAttribute('data-mid'); });
+  var r = null; try{ r = await supaClient.from('email_messages').select('id,body_text,body_html').in('id', ids); }catch(e){} var by = {}; ((r && r.data) || []).forEach(function(x){ by[x.id] = x; });
+  els.forEach(function(el){ var b = by[+el.getAttribute('data-mid')] || {}; if(b.body_html){ var f = document.createElement('iframe'); f.setAttribute('sandbox', 'allow-same-origin allow-popups allow-popups-to-escape-sandbox'); f.style.cssText = 'width:100%;border:0;min-height:80px'; f.srcdoc = '<base target="_blank"><style>body{font-family:Arial,sans-serif;font-size:14px;margin:0;color:#1f2937;word-wrap:break-word}img{max-width:100%}</style>' + b.body_html; f.onload = function(){ try{ f.style.height = Math.min(3000, f.contentDocument.documentElement.scrollHeight + 8) + 'px'; }catch(e){ f.style.height = '420px'; } }; el.innerHTML = ''; el.appendChild(f); }
+    else { el.style.whiteSpace = 'pre-wrap'; el.textContent = b.body_text || ''; } });
+}
+function emcOpen(k){ EMC.open = k; EMC.compose = null; emcRender(); var t = _emcThreadByKey(k); if(t) t.msgs.filter(function(m){ return !m.seen; }).forEach(function(m){ m.seen = true; try{ wmamInvoke('email-center', { body:{ action:'mark_read', message_id:m.id } }); }catch(e){} }); setTimeout(emcRender, 50); }
+function _emcMyAddresses(){ var out = []; EMC.accounts.forEach(function(a){ out.push({ account_id:a.id, address:a.address, gmail:a.provider === 'gmail', alias:false }); (a.aliases||[]).forEach(function(al){ out.push({ account_id:a.id, address:String(al).toLowerCase(), gmail:a.provider === 'gmail', alias:true }); }); }); return out; }
+function emcReply(kind){
+  var t = _emcThreadByKey(EMC.open); if(!t) return; var m = t.last, a = _emcAcctOf(m), from = (m.delivered_to && (a.aliases||[]).map(function(x){ return String(x).toLowerCase(); }).indexOf(String(m.delivered_to).toLowerCase()) >= 0) ? String(m.delivered_to).toLowerCase() : a.address;
+  var last = t.msgs.filter(function(x){ return x.from_addr !== String(a.address).toLowerCase() && x.from_addr !== from; }).pop() || m;
+  var all = [last.from_addr].concat(String(last.to_addrs||'').split(','), String(last.cc_addrs||'').split(',')).map(function(s){ return (String(s).match(/[^\s<>,]+@[^\s<>,]+/) || [''])[0].toLowerCase(); }).filter(function(x){ return x && x !== from && x !== String(a.address).toLowerCase(); });
+  EMC.compose = { reply:true, account_id:a.id, from:from, to: kind === 'fwd' ? '' : (kind === 'all' ? all.filter(function(x,i){ return all.indexOf(x) === i; }).join(', ') : last.from_addr), subject:(kind === 'fwd' ? 'Fwd: ' : 'Re: ') + String(m.subject||'').replace(/^((re|fwd?):\s*)+/i,''), text: kind === 'fwd' ? '\n\n---------- Forwarded message ----------\nFrom: '+(m.from_name||'')+' <'+m.from_addr+'>\nSubject: '+(m.subject||'')+'\n\n'+(m.snippet||'') : '', in_reply_to: kind === 'fwd' ? '' : (m.message_id||''), refs: kind === 'fwd' ? '' : (m.refs||'') };
+  emcRender();
+}
+function emcComposeNew(){ var mine = _emcMyAddresses(); if(!mine.length){ emcConnectOpen(); return; } EMC.open = null; EMC.compose = { reply:false, account_id:mine[0].account_id, from:mine[0].address, to:'', subject:'', text:'' }; emcRender(); }
+function _emcComposeHtml(){
+  var c = EMC.compose, esc = _emcEsc, mine = _emcMyAddresses(), sel = mine.find(function(x){ return x.address === c.from; }) || mine[0] || {};
+  return '<div style="border:2px solid #003594;border-radius:12px;padding:12px 14px;margin-top:6px">'
+    + '<div style="display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid #f1f5f9;font-size:.84rem"><b style="width:60px;color:#6b7280">From</b><select id="emcFrom" onchange="var o=this.options[this.selectedIndex];EMC.compose.from=o.value;EMC.compose.account_id=o.getAttribute(\'data-acc\');emcRender()" style="flex:1;padding:6px;border:1px solid #cbd5e1;border-radius:8px">'+mine.map(function(x){ return '<option value="'+esc(x.address)+'" data-acc="'+x.account_id+'"'+(x.address === c.from ? ' selected' : '')+'>'+esc(x.address)+(x.alias ? ' (masked)' : '')+'</option>'; }).join('')+'</select></div>'
+    + (c.reply ? '<div style="font-size:.74rem;color:#6b7280;padding:2px 0 4px 68px">Picked automatically \u2014 the address this email came to</div>' : '')
+    + (sel.alias && sel.gmail ? '<div style="font-size:.76rem;background:#fff7ed;border:1px solid #fdba74;color:#9a3412;border-radius:8px;padding:6px 8px;margin:4px 0">Sending as a masked address goes through Gmail. It must be added once in Gmail \u2192 Settings \u2192 Accounts \u2192 <b>Send mail as</b>, or Gmail will send it from your Gmail address instead.</div>' : '')
+    + '<div style="display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid #f1f5f9;font-size:.84rem"><b style="width:60px;color:#6b7280">To</b><input id="emcTo" value="'+esc(c.to||'')+'" placeholder="name@example.com" style="flex:1;padding:6px;border:1px solid #cbd5e1;border-radius:8px"></div>'
+    + '<div style="display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid #f1f5f9;font-size:.84rem"><b style="width:60px;color:#6b7280">Cc</b><input id="emcCc" value="'+esc(c.cc||'')+'" style="flex:1;padding:6px;border:1px solid #cbd5e1;border-radius:8px"></div>'
+    + '<div style="display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid #f1f5f9;font-size:.84rem"><b style="width:60px;color:#6b7280">Subject</b><input id="emcSubj" value="'+esc(c.subject||'')+'" style="flex:1;padding:6px;border:1px solid #cbd5e1;border-radius:8px"></div>'
+    + '<textarea id="emcText" rows="8" style="width:100%;margin-top:8px;padding:8px;border:1px solid #cbd5e1;border-radius:8px;font-size:.9rem" placeholder="Write your message\u2026">'+esc(c.text||'')+'</textarea>'
+    + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button id="emcSendBtn" onclick="emcSend()" style="padding:9px 18px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:900;cursor:pointer">Send</button><button onclick="EMC.compose=null;emcRender()" style="border:none;background:none;color:#6b7280;cursor:pointer">Discard</button><span id="emcSendMsg" style="font-size:.78rem;color:#6b7280"></span></div></div>';
+}
+async function emcSend(){
+  var c = EMC.compose; c.to = (document.getElementById('emcTo')||{}).value || ''; c.cc = (document.getElementById('emcCc')||{}).value || ''; c.subject = (document.getElementById('emcSubj')||{}).value || ''; c.text = (document.getElementById('emcText')||{}).value || '';
+  var msg = document.getElementById('emcSendMsg'), btn = document.getElementById('emcSendBtn');
+  if(!/@/.test(c.to)){ if(msg) msg.textContent = 'Add who it\u2019s to.'; return; }
+  if(btn){ btn.disabled = true; btn.textContent = 'Sending\u2026'; }
+  try{ var r = await wmamInvoke('email-center', { body:{ action:'send', account_id:c.account_id, from:c.from, to:c.to, cc:c.cc, subject:c.subject, text:c.text, in_reply_to:c.in_reply_to||'', refs:c.refs||'' } }); var d = (r && r.data) || {};
+    if(r.error || !d.ok) throw new Error((r.error && r.error.message) || d.error || 'not sent');
+    EMC.compose = null; try{ showToast('Sent from '+c.from); }catch(e){} emcRender(); setTimeout(emcSync, 1500);
+  }catch(e){ if(btn){ btn.disabled = false; btn.textContent = 'Send'; } if(msg){ msg.style.color = '#b91c1c'; msg.textContent = 'Not sent: '+(e.message||e); } }
+}
+async function emcSync(){ var b = document.getElementById('emcSyncBtn'); if(b){ b.disabled = true; b.textContent = 'Syncing\u2026'; } try{ await wmamInvoke('email-center', { body:{ action:'sync' } }); }catch(e){} await emcLoad(); }
+function emcConnectOpen(addr){ EMC.compose = { connect:true, address:addr||'', provider: /@gmail\.com$/i.test(addr||'') ? 'gmail' : 'ionos' }; emcRender(); }
+function _emcConnectHtml(){
+  var c = EMC.compose, esc = _emcEsc, pv = function(id, label){ var on = c.provider === id; return '<button onclick="EMC.compose.provider=\''+id+'\';EMC.compose.address=(document.getElementById(\'emcCA\')||{}).value||\'\';emcRender()" style="flex:1;padding:10px;border-radius:10px;border:2px solid #003594;background:'+(on?'#003594':'#fff')+';color:'+(on?'#fff':'#003594')+';font-weight:800;cursor:pointer">'+label+'</button>'; };
+  return '<div style="position:fixed;inset:0;background:rgba(11,27,63,.6);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px"><div style="background:#fff;border-radius:16px;padding:18px;max-width:460px;width:100%">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:1.1rem;color:#003594">Connect an email address</b><button onclick="EMC.compose=null;emcRender()" style="border:none;background:none;font-size:1.3rem;cursor:pointer">\u2715</button></div>'
+    + '<div style="display:flex;gap:8px;margin:12px 0">'+pv('ionos','IONOS (@wmaminc.com)')+pv('gmail','Gmail')+'</div>'
+    + '<div class="f-label">Email address</div><input id="emcCA" class="f-input" value="'+esc(c.address||'')+'" placeholder="'+(c.provider === 'gmail' ? 'you@gmail.com' : 'you@wmaminc.com')+'" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px">'
+    + '<div class="f-label" style="margin-top:8px">'+(c.provider === 'gmail' ? 'Gmail App Password (16 letters)' : 'Password (the one you use at mail.ionos.com)')+'</div><input id="emcCP" type="password" class="f-input" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px" autocomplete="new-password">'
+    + (c.provider === 'gmail' ? '<div style="font-size:.76rem;color:#374151;background:#f8fafc;border-radius:8px;padding:8px;margin-top:8px">Gmail needs an <b>App Password</b>, not your normal password: Google Account \u2192 Security \u2192 turn on <b>2-Step Verification</b> \u2192 search \u201cApp passwords\u201d \u2192 create one named \u201cWMAMinc\u201d \u2192 paste the 16 letters here.</div>' : '')
+    + '<div style="font-size:.74rem;color:#6b7280;margin-top:8px">\uD83D\uDD12 Your password is stored encrypted and only used to get your mail. Only you will see this inbox.</div>'
+    + '<button id="emcCBtn" onclick="emcConnect()" style="width:100%;margin-top:12px;padding:12px;border:none;border-radius:12px;background:#003594;color:#fff;font-weight:900;cursor:pointer">Connect</button><div id="emcCMsg" style="font-size:.82rem;margin-top:8px"></div></div></div>';
+}
+async function emcConnect(){
+  var addr = ((document.getElementById('emcCA')||{}).value||'').trim(), pw = (document.getElementById('emcCP')||{}).value || '', msg = document.getElementById('emcCMsg'), btn = document.getElementById('emcCBtn');
+  if(!addr || !pw){ msg.style.color = '#b91c1c'; msg.textContent = 'Enter the email address and password.'; return; }
+  btn.disabled = true; btn.textContent = 'Connecting\u2026 (first sync can take a minute)';
+  try{ var r = await wmamInvoke('email-center', { body:{ action:'connect', provider:EMC.compose.provider, address:addr, password:pw } }); var d = (r && r.data) || {};
+    if(r.error || !d.ok) throw new Error((r.error && r.error.message) || d.error || 'could not connect');
+    EMC.compose = null; try{ showToast('Connected '+d.connected+' \u2014 '+(d.synced||0)+' emails loaded'); }catch(e){} await emcLoad();
+  }catch(e){ btn.disabled = false; btn.textContent = 'Connect'; msg.style.color = '#b91c1c'; msg.textContent = e.message || String(e); }
+}
+if(typeof window!=='undefined'){ Object.assign(window, { EMC:EMC, panelEmailCenter:panelEmailCenter, emcLoad:emcLoad, emcRender:emcRender, emcOpen:emcOpen, emcReply:emcReply, emcComposeNew:emcComposeNew, emcSend:emcSend, emcSync:emcSync, emcConnectOpen:emcConnectOpen, emcConnect:emcConnect, _emcThreads:_emcThreads }); }
 
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
@@ -46368,7 +46495,7 @@ function gotoPanel(id, params){
     'inv-transfer':'Transfer Devices','inv-requests':'Pending Requests',
     'gm-inventory':'Gen Mobile Inventory','gm-upload':'GM Upload','gm-transfers':'GM Transfers','gm-agent-inv':'My GM Inventory',
     'gm-pricelist':'GM Pricelist',
-    'gm-pay-link':'Lifeline Payment Links','sim-orders':'SIM Orders','tool-center':'Tool Center','notices':'Notices & Reminders','ai-settings':'AI Employees','inv-transfers':'Transfers','payroll-home':'This Week\u2019s Payroll','payroll-salaries':'Office Salaries','payroll-disputes':'Customer Disputes','missed-paylink':'Missed Pay Link','my-invoices':'My Invoices','hours-ops':'Hours of Operation','mgr-overrides':'Manager Overrides','comp-builder':'Comp Plan Builder','biz-snapshot':'Business Snapshot','time-clock':'Time Clock','hours-admin':'Hours & Approvals','inv-transfer-center':'Transfer Center','surplus-payouts':'Surplus Payouts','gm-sales':'Lifeline Sales & Paybacks','gm-paid':'Paid Device Sales','gm-prices':'Lifeline Price Lists','agent-cleanup':'Agent Cleanup','gm-dates':'Dates & Charges','inv-sign':'Sign & Invoices','inv-teams':'Inventory by Manager','inv-explorer':'Inventory Overview & Search',
+    'gm-pay-link':'Lifeline Payment Links','sim-orders':'SIM Orders','tool-center':'Tool Center','notices':'Notices & Reminders','email-center':'Email Center','ai-settings':'AI Employees','inv-transfers':'Transfers','payroll-home':'This Week\u2019s Payroll','payroll-salaries':'Office Salaries','payroll-disputes':'Customer Disputes','missed-paylink':'Missed Pay Link','my-invoices':'My Invoices','hours-ops':'Hours of Operation','mgr-overrides':'Manager Overrides','comp-builder':'Comp Plan Builder','biz-snapshot':'Business Snapshot','time-clock':'Time Clock','hours-admin':'Hours & Approvals','inv-transfer-center':'Transfer Center','surplus-payouts':'Surplus Payouts','gm-sales':'Lifeline Sales & Paybacks','gm-paid':'Paid Device Sales','gm-prices':'Lifeline Price Lists','agent-cleanup':'Agent Cleanup','gm-dates':'Dates & Charges','inv-sign':'Sign & Invoices','inv-teams':'Inventory by Manager','inv-explorer':'Inventory Overview & Search',
     'inv-hub':'Inventory Hub',
     'aw-inventory':'Assurance Wireless Inventory','aw-upload':'Assurance Upload','aw-transfers':'Assurance Transfers',
     'aw-payfile':'Assurance Pay-File',
@@ -46406,7 +46533,7 @@ function gotoPanel(id, params){
     'inv-export':panelInvExport,'inv-my-inventory':panelMyInventory,
     'inv-distribute':panelDistribute,
     'inv-hub':panelInvHub,
-    'gm-pay-link':panelGmPayLink,'sim-orders':panelSimOrders,'tool-center':panelToolCenter,'notices':panelNotices,'ai-settings':panelAISettings,'inv-transfers':panelInvTransfers,'payroll-home':panelPayrollHome,'payroll-salaries':panelPayrollSalaries,'payroll-disputes':panelPayrollDisputes,'missed-paylink':panelMissedPayLink,'my-invoices':panelMyInvoices,'hours-ops':panelHoursOps,'mgr-overrides':panelMgrOverrides,'comp-builder':panelCompBuilder,'biz-snapshot':panelBizSnapshot,'time-clock':panelTimeClock,'hours-admin':panelHoursAdmin,'inv-transfer-center':panelInvTransferCenter,'surplus-payouts':panelSurplusPayouts,'gm-sales':panelGmSales,'gm-paid':panelGmPaid,'gm-prices':panelGmPrices,'agent-cleanup':panelAgentCleanup,'gm-dates':panelGmDates,'inv-sign':panelInvSign,'inv-teams':panelInvTeams,'inv-explorer':function(){ return panelInvExplorer(window._invxParams||null); },
+    'gm-pay-link':panelGmPayLink,'sim-orders':panelSimOrders,'tool-center':panelToolCenter,'notices':panelNotices,'email-center':panelEmailCenter,'ai-settings':panelAISettings,'inv-transfers':panelInvTransfers,'payroll-home':panelPayrollHome,'payroll-salaries':panelPayrollSalaries,'payroll-disputes':panelPayrollDisputes,'missed-paylink':panelMissedPayLink,'my-invoices':panelMyInvoices,'hours-ops':panelHoursOps,'mgr-overrides':panelMgrOverrides,'comp-builder':panelCompBuilder,'biz-snapshot':panelBizSnapshot,'time-clock':panelTimeClock,'hours-admin':panelHoursAdmin,'inv-transfer-center':panelInvTransferCenter,'surplus-payouts':panelSurplusPayouts,'gm-sales':panelGmSales,'gm-paid':panelGmPaid,'gm-prices':panelGmPrices,'agent-cleanup':panelAgentCleanup,'gm-dates':panelGmDates,'inv-sign':panelInvSign,'inv-teams':panelInvTeams,'inv-explorer':function(){ return panelInvExplorer(window._invxParams||null); },
     'dart-scanner':panelDartScanner,
     'dart-inventory':panelDartInventory,
     // Calvin 2026-06-11 v2930: new DART-style carrier panels.
