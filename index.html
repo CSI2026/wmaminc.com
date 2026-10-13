@@ -3795,7 +3795,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.13.0500';
+var BUILD_VERSION = '2026.10.13.0700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15054,6 +15054,7 @@ function gmSalesRender(){
         + (s.status==='paid' ? _gmSaleReportBadge(String(s.imei||'').replace(/\D/g,'')) : '')
         + (s.customer_signature ? '<div><button onclick="gmViewSignature('+s.id+')" style="margin-top:4px;padding:3px 8px;border:1px solid #003594;border-radius:5px;background:#fff;color:#003594;font-size:.72rem;font-weight:700;cursor:pointer">View signature</button></div>' : (s.payer==='customer' && s.status==='link_created' ? '<div style="font-size:.72rem;color:#92400e">not signed yet</div>' : ''))
         + (s.status==='link_created' ? '<div><button onclick="gmPayCancel('+s.id+')" style="margin-top:4px;padding:3px 8px;border:1px solid #CC0000;border-radius:5px;background:#fff;color:#CC0000;font-size:.72rem;font-weight:700;cursor:pointer">Cancel order</button></div>' : '')
+        + ((s.status==='paid' || s.status==='link_created') && !/^(sim|byod)$/i.test(String(s.order_type||'')) && typeof _gmSwapIsOffice==='function' && _gmSwapIsOffice() ? '<div><button onclick="gmSwapOpen('+s.id+')" style="margin-top:4px;padding:3px 8px;border:1px solid #003594;border-radius:5px;background:#fff;color:#003594;font-size:.72rem;font-weight:700;cursor:pointer">\uD83D\uDD04 Swap IMEI</button></div>' : '')
         + (s.status==='canceled' && s.canceled_by ? '<div style="font-size:.72rem;color:#666">by '+_gmPayEsc(s.canceled_by)+'</div>' : '')+'</td>'
       + '<td style="padding:8px 10px">'+pay+'</td></tr>';
   });
@@ -19758,6 +19759,170 @@ gmPayCreate = async function(){
   GMPAY.busy = false; gmPayRender();
 };
 if(typeof window !== 'undefined'){ Object.assign(window, { gmPaySetKind:gmPaySetKind, gmByodSet:gmByodSet, gmPayCreate:gmPayCreate }); }
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  ACTIVATION RECORDS — review & correct Gen Mobile activations after upload  v2026.10.13
+//  Office (owner, Inventory Dept, full office access). Every change needs a reason and is logged.
+//  Changing commission eligibility updates BOTH the activation record and the phone record,
+//  adds/removes the no-usage charge through the same rule the uploads use, and refreshes Pay Link.
+// ══════════════════════════════════════════════════════════════════════
+var ACTX = { q:'', edits:null, check:null, msg:'' };
+function _actxIsOffice(u){ u = u || DB.current; return !!(u && (isOwner(u) || (typeof isInventory === 'function' && isInventory(u)) || u.fullOfficeAccess === true)); }
+function _actxN(v){ return String(v || '').replace(/\D/g, ''); }
+function _actxFind(imei){
+  var n = _actxN(imei); if(n.length < 10) return null;
+  var acts = (GM_ACTIVATIONS || []).filter(function(a){ return a && _actxN(a.imei) === n; });
+  var act = acts.sort(function(a, b){ return String(b.uploadedAt || '').localeCompare(String(a.uploadedAt || '')); })[0] || null;
+  var dev = (GM_INVENTORY || []).find(function(d){ return d && _actxN(d.imei) === n; }) || null;
+  if(!act && !dev) return null;
+  return { imei:n, act:act, dev:dev };
+}
+function _actxComm(r){ // what each record says
+  var a = r.act ? r.act.commEligible !== false : null, d = r.dev ? (r.dev.commEligible === false ? false : (r.dev.commEligible === true ? true : null)) : null;
+  return { act:a, dev:d, agree:(a === null || d === null || a === d) };
+}
+async function _actxLoadEdits(){ if(ACTX.edits) return ACTX.edits; ACTX.edits = [];
+  try{ var r = await supaClient.from('app_settings').select('value').eq('key', 'gm_activation_edits').maybeSingle(); if(r && r.data && r.data.value) ACTX.edits = JSON.parse(r.data.value) || []; }catch(e){}
+  try{ if(!ACTX.edits.length){ var l = localStorage.getItem('wmam_gm_activation_edits'); if(l) ACTX.edits = JSON.parse(l) || []; } }catch(e){}
+  return ACTX.edits; }
+async function _actxLog(entry){ await _actxLoadEdits(); ACTX.edits.unshift(entry); ACTX.edits = ACTX.edits.slice(0, 3000);
+  try{ localStorage.setItem('wmam_gm_activation_edits', JSON.stringify(ACTX.edits)); }catch(e){}
+  try{ await supaClient.from('app_settings').upsert({ key:'gm_activation_edits', value:JSON.stringify(ACTX.edits), updated_at:new Date().toISOString() }, { onConflict:'key' }); }catch(e){} }
+// the one place a correction is applied (editor, report check and the assistant all use it)
+async function wmamActSetCommEligible(imei, eligible, reason, source){
+  var u = DB.current; if(!_actxIsOffice(u)) return { ok:false, error:'Only the office can correct activation records.' };
+  reason = String(reason || '').trim(); if(reason.length < 3) return { ok:false, error:'Enter a reason for the change.' };
+  var r = _actxFind(imei); if(!r) return { ok:false, error:'IMEI ' + _actxN(imei) + ' is not on any uploaded report or in Gen Mobile inventory.' };
+  eligible = !!eligible;
+  var before = _actxComm(r), debtBefore = r.dev && r.dev.noUsageDebt && !r.dev.noUsageDebt.reversed ? r.dev.noUsageDebt.cents : 0;
+  var agentId = (r.act && r.act.agentId) || (r.dev && r.dev.activatedById) || null;
+  var actDate = (r.act && r.act.activationDate) || (r.dev && r.dev.activatedAt) || '';
+  if(r.act){ r.act.commEligible = eligible; if(eligible) r.act.eligibleSince = r.act.eligibleSince || new Date().toISOString(); r.act.correctedAt = new Date().toISOString(); r.act.correctedBy = u.name; }
+  if(r.dev){ r.dev.commEligible = eligible; if(eligible){ r.dev.noUsage = false; delete r.dev.noUsageNeedsAgent; } }
+  // same rule the uploads use: NO -> full device cost charged; YES -> charge removed + notices
+  try{ wmamNoUsageCheck({ imei:r.imei, agentId:agentId, commEligible:eligible, activationDate:actDate, devCost:(r.act && r.act.devCost) || (r.dev && r.dev.devCost), model:(r.act && r.act.model) || (r.dev && r.dev.model) }); }catch(e){}
+  if(eligible && agentId){ try{ recordSale({ agentId:agentId, campaign:'Gen Mobile', program:'Lifeline', date:((typeof _gmIso === 'function' && _gmIso(actDate)) || actDate), tribal:!!((r.act && r.act.tribal) || (r.dev && r.dev.tribal)), imei:r.imei, source:'gm-activation-correction', deferSave:true }); }catch(e){} }
+  try{ saveInventory(); }catch(e){} try{ saveToStorage(); }catch(e){}
+  var debtAfter = r.dev && r.dev.noUsageDebt && !r.dev.noUsageDebt.reversed ? r.dev.noUsageDebt.cents : 0;
+  await _actxLog({ at:new Date().toISOString(), by:u.name, byId:u.id, imei:r.imei, field:'Commission eligible', from:(before.act === false || before.dev === false) ? 'NO' : 'YES', to:eligible ? 'YES' : 'NO', reason:reason, source:source || 'editor',
+    agent:(r.act && r.act.agentName) || (r.dev && r.dev.activatedByName) || '', chargeBefore:debtBefore, chargeAfter:debtAfter });
+  try{ wmamLogActivity && wmamLogActivity('actCorrectCommission', { label:'Corrected commission eligibility', args:[r.imei, eligible ? 'YES' : 'NO'] }); }catch(e){}
+  return { ok:true, imei:r.imei, eligible:eligible, chargeBefore:debtBefore / 100, chargeAfter:debtAfter / 100 };
+}
+// ---- screen ----
+function panelActivationRecords(){
+  if(!_actxIsOffice()) return '<div style="padding:24px">Only the office can open this page.</div>';
+  setTimeout(function(){ _actxLoadEdits().then(function(){ actxRender(); }); }, 0);
+  return '<div style="padding:4px 0"><div style="font-size:1.35rem;font-weight:900;color:#003594">Activation Records</div>'
+    + '<div style="font-size:.86rem;color:#4b5563;margin:4px 0 14px">Look up any phone on an uploaded Gen Mobile report and correct it. Commission changes update Pay Link, the no-usage charge and payroll automatically. Every change is logged with who, when and why.</div>'
+    + '<div id="actxBox"></div></div>';
+}
+function actxRender(){
+  var box = document.getElementById('actxBox'); if(!box) return; var esc = _escapeHtml, q = ACTX.q, r = q ? _actxFind(q) : null, h = '';
+  var card = 'background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-bottom:14px';
+  h += '<div style="' + card + '"><div style="font-weight:900;color:#003594;margin-bottom:8px">🔍 Find a phone</div><div style="display:flex;gap:8px;flex-wrap:wrap">'
+    + '<input id="actxQ" inputmode="numeric" placeholder="Scan or type the IMEI" value="' + esc(q) + '" onkeydown="if(event.key===\'Enter\'){ACTX.q=this.value;ACTX.msg=\'\';actxRender();}" style="flex:1 1 260px;padding:10px;border:1px solid #cbd5e1;border-radius:10px;font-family:monospace">'
+    + '<button onclick="ACTX.q=document.getElementById(\'actxQ\').value;ACTX.msg=\'\';actxRender()" style="padding:10px 18px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:900;cursor:pointer">Look up</button></div>';
+  if(q && !r) h += '<div style="margin-top:10px;color:#b91c1c;font-weight:700">IMEI ' + esc(_actxN(q)) + ' is not on any uploaded report or in Gen Mobile inventory.</div>';
+  if(r){
+    var c = _actxComm(r), a = r.act || {}, d = r.dev || {}, debt = d.noUsageDebt && !d.noUsageDebt.reversed ? d.noUsageDebt : null, cur = (c.act === false || c.dev === false) ? false : true;
+    var row = function(k, v){ return '<tr><td style="padding:6px 0;color:#6b7280;width:42%;border-bottom:1px solid #f3f4f6">' + k + '</td><td style="padding:6px 0;font-weight:700;border-bottom:1px solid #f3f4f6">' + v + '</td></tr>'; };
+    var yn = function(v){ return v === null ? '<span style="color:#9ca3af">—</span>' : (v ? '<span style="color:#166534">YES</span>' : '<span style="color:#b91c1c">NO (no usage)</span>'); };
+    h += '<div style="margin-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px">'
+      + '<div><div style="font-weight:900;margin-bottom:4px">' + esc(a.model || d.model || 'Phone') + ' · IMEI ' + esc(r.imei) + '</div><table style="width:100%;border-collapse:collapse;font-size:.86rem">'
+      + row('Sold by (report)', esc(a.agentName || d.activatedByName || a.agentUsername || d.reportAgentName || 'not matched')) + row('Activation date', esc(a.activationDate || d.activatedAt || '—'))
+      + row('Plan', esc(a.planName || d.planName || '—')) + row('Tribal', (a.tribal || d.tribal) ? 'Yes' : 'No') + row('Uploaded', esc(String(a.uploadedAt || '').slice(0, 10) || '—')) + row('Device cost', a.devCost || d.devCost ? _gmMoney(a.devCost || d.devCost) : '—')
+      + '</table></div><div><table style="width:100%;border-collapse:collapse;font-size:.86rem">'
+      + row('Commission — report record', yn(c.act)) + row('Commission — phone record (Pay Link reads this)', yn(c.dev))
+      + row('No-usage charge', debt ? '<span style="color:#b91c1c">' + esc(debt.agentName || '') + ' owes ' + _gmMoney(debt.cents / 100) + '</span>' : '<span style="color:#166534">None</span>')
+      + row('Pay Link shows', (typeof _gmSaleReportBadge === 'function' ? _gmSaleReportBadge(r.imei) : '—')) + '</table>'
+      + (!c.agree ? '<div style="margin-top:8px;background:#fff7ed;border:1px solid #fdba74;color:#9a3412;border-radius:8px;padding:8px;font-size:.82rem;font-weight:700">⚠ The two records disagree. Pick the correct answer below to fix both.</div>' : '') + '</div></div>'
+      + '<div style="margin-top:14px;border-top:1px solid #e5e7eb;padding-top:12px"><div style="font-weight:900;margin-bottom:6px">Correct commission eligibility</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><select id="actxSet" style="padding:9px;border:1px solid #cbd5e1;border-radius:10px"><option value="yes"' + (cur ? ' selected' : '') + '>YES — commission-eligible (usage)</option><option value="no"' + (!cur ? ' selected' : '') + '>NO — no usage (agent owes device cost)</option></select>'
+      + '<input id="actxWhy" placeholder="Reason (required) — e.g. Gen Mobile report 10/12 shows Comm. Elig. yes" style="flex:1 1 300px;padding:9px;border:1px solid #cbd5e1;border-radius:10px">'
+      + '<button onclick="actxSave()" style="padding:9px 16px;border:none;border-radius:10px;background:#16a34a;color:#fff;font-weight:900;cursor:pointer">Save correction</button></div>'
+      + (ACTX.msg ? '<div style="margin-top:8px;font-weight:700;color:' + (/^✔/.test(ACTX.msg) ? '#166534' : '#b91c1c') + '">' + esc(ACTX.msg) + '</div>' : '') + '</div>';
+    var hist = (ACTX.edits || []).filter(function(e){ return e.imei === r.imei; });
+    if(hist.length) h += '<div style="margin-top:12px;font-size:.8rem;color:#4b5563"><b>History</b>' + hist.map(function(e){ return '<div>• ' + esc(new Date(e.at).toLocaleString()) + ' — ' + esc(e.by) + ': ' + esc(e.field) + ' ' + esc(e.from) + ' → ' + esc(e.to) + ' (' + esc(e.reason) + ')</div>'; }).join('') + '</div>';
+  }
+  h += '</div>';
+  // check a report file
+  h += '<div style="' + card + '"><div style="font-weight:900;color:#003594">📄 Check against a Gen Mobile report</div><div style="font-size:.82rem;color:#4b5563;margin:2px 0 8px">Choose the original (or a newer) sales report. Every phone where the report’s <b>Comm. Elig.</b> differs from what’s recorded is listed so you can fix them. Nothing changes until you click Fix.</div>'
+    + '<input type="file" accept=".csv,text/csv" onchange="actxCheckFile(this.files[0])">';
+  if(ACTX.check){ var k = ACTX.check;
+    h += '<div style="margin-top:10px;font-size:.86rem"><b>' + esc(k.file) + '</b>: ' + k.total + ' phones checked · <b style="color:' + (k.diffs.length ? '#b91c1c' : '#166534') + '">' + k.diffs.length + ' need' + (k.diffs.length === 1 ? 's' : '') + ' correcting</b>' + (k.notFound ? ' · ' + k.notFound + ' not on any upload yet' : '') + '</div>';
+    if(k.diffs.length) h += '<table style="width:100%;border-collapse:collapse;font-size:.82rem;margin-top:8px"><tr style="background:#f1f5f9;text-align:left"><th style="padding:6px">IMEI</th><th style="padding:6px">Agent</th><th style="padding:6px">Report says</th><th style="padding:6px">Recorded</th><th></th></tr>'
+      + k.diffs.map(function(x, i){ return '<tr style="border-top:1px solid #eef0f4"><td style="padding:6px;font-family:monospace">' + esc(x.imei) + '</td><td style="padding:6px">' + esc(x.agent) + '</td><td style="padding:6px;font-weight:800;color:' + (x.file ? '#166534' : '#b91c1c') + '">' + (x.file ? 'YES' : 'NO') + '</td><td style="padding:6px">' + esc(x.recorded) + '</td><td style="padding:6px">' + (x.done ? '<span style="color:#166534;font-weight:800">✔ Fixed</span>' : '<button onclick="actxFixOne(' + i + ')" style="padding:5px 10px;border:1px solid #16a34a;border-radius:8px;background:#fff;color:#166534;font-weight:800;cursor:pointer">Fix</button>') + '</td></tr>'; }).join('')
+      + '</table><button onclick="actxFixAll()" style="margin-top:8px;padding:8px 14px;border:none;border-radius:10px;background:#16a34a;color:#fff;font-weight:900;cursor:pointer">Fix all to match the report</button>';
+  }
+  h += '</div>';
+  // recent corrections
+  var recent = (ACTX.edits || []).slice(0, 15);
+  h += '<div style="' + card + '"><div style="font-weight:900;color:#003594;margin-bottom:6px">🗒 Recent corrections</div>' + (recent.length ? recent.map(function(e){ return '<div style="font-size:.82rem;padding:3px 0;border-top:1px solid #f3f4f6">' + esc(new Date(e.at).toLocaleString()) + ' · <b>' + esc(e.by) + '</b> · IMEI ' + esc(e.imei) + (e.agent ? ' (' + esc(e.agent) + ')' : '') + ' · ' + esc(e.from) + ' → ' + esc(e.to) + ' · ' + esc(e.reason) + '</div>'; }).join('') : '<div style="font-size:.84rem;color:#6b7280">No corrections yet.</div>') + '</div>';
+  box.innerHTML = h;
+}
+async function actxSave(){ var r = await wmamActSetCommEligible(ACTX.q, (document.getElementById('actxSet') || {}).value === 'yes', (document.getElementById('actxWhy') || {}).value, 'editor');
+  ACTX.msg = r.ok ? '✔ Saved. Commission is now ' + (r.eligible ? 'YES' : 'NO') + (r.chargeBefore && !r.chargeAfter ? ' — the ' + _gmMoney(r.chargeBefore) + ' charge was removed.' : (!r.chargeBefore && r.chargeAfter ? ' — a ' + _gmMoney(r.chargeAfter) + ' device charge was added.' : '.')) : r.error; actxRender(); }
+function actxCheckFile(f){ if(!f) return; var rd = new FileReader(); rd.onload = function(){
+  var rows = []; try{ rows = parseGMInventoryCSV(String(rd.result)); }catch(e){ alert('Could not read that file.'); return; }
+  var diffs = [], total = 0, notFound = 0;
+  rows.forEach(function(row){ var imei = _actxN(row['IMEI']); if(imei.length < 10) return;
+    var key = ['Comm. Elig.','Comm Elig','Comm. Elig','Commission Eligible','Comm. Eligible','Comm Eligible'].find(function(k){ return Object.prototype.hasOwnProperty.call(row, k); }); if(!key) return;
+    var v = String(row[key] || '').trim().toLowerCase(), file = (v === 'yes' || v === 'y'); total++;
+    var r = _actxFind(imei); if(!r){ notFound++; return; } var c = _actxComm(r);
+    if(c.act === (!file) || c.dev === (!file) || (c.act === null && c.dev === null)) { if(c.act === file && c.dev === file) return; diffs.push({ imei:imei, file:file, agent:(r.act && r.act.agentName) || (r.dev && r.dev.activatedByName) || row['Street Agent (Short)'] || '', recorded:'report record ' + (c.act === null ? '—' : (c.act ? 'YES' : 'NO')) + ' · phone record ' + (c.dev === null ? '—' : (c.dev ? 'YES' : 'NO')) }); }
+  });
+  ACTX.check = { file:f.name, total:total, diffs:diffs, notFound:notFound }; actxRender(); }; rd.readAsText(f); }
+async function actxFixOne(i){ var x = ACTX.check && ACTX.check.diffs[i]; if(!x || x.done) return; var r = await wmamActSetCommEligible(x.imei, x.file, 'Matched to report file ' + ACTX.check.file, 'report-check'); if(r.ok) x.done = true; else alert(r.error); actxRender(); }
+async function actxFixAll(){ var k = ACTX.check; if(!k) return; var n = k.diffs.filter(function(x){ return !x.done; }).length; if(!n || !confirm('Correct ' + n + ' phone(s) to match ' + k.file + '?')) return; for(var i = 0; i < k.diffs.length; i++){ if(!k.diffs[i].done) await actxFixOne(i); } }
+// menu + access (office only)
+try{ WMAM_TAB_GROUPS.tools.tabs.splice(1, 0, ['activation-records', 'Activation Records']); }catch(e){}
+var _canAccessActx = canAccess; canAccess = function(u, id){ if(id === 'activation-records') return _actxIsOffice(u); return _canAccessActx.apply(this, arguments); }; window.canAccess = canAccess;
+var _tabAllowedActx = _wmamTabAllowed; _wmamTabAllowed = function(u, id){ if(id === 'activation-records') return _actxIsOffice(u); return _tabAllowedActx.apply(this, arguments); }; window._wmamTabAllowed = _wmamTabAllowed;
+if(typeof window !== 'undefined'){ Object.assign(window, { ACTX:ACTX, panelActivationRecords:panelActivationRecords, actxRender:actxRender, actxSave:actxSave, actxCheckFile:actxCheckFile, actxFixOne:actxFixOne, actxFixAll:actxFixAll, wmamActSetCommEligible:wmamActSetCommEligible, _actxFind:_actxFind }); }
+
+
+// v2026.10.13 — IMEI SWAP (office only, never agents): move a Pay Link order to the phone the agent swapped in
+function _gmSwapIsOffice(){ return typeof _actxIsOffice === 'function' ? _actxIsOffice(DB.current) : isOwner(DB.current); }
+function gmSwapOpen(saleId){
+  if(!_gmSwapIsOffice()){ alert('Only the office can swap an IMEI.'); return; }
+  var s = (GMSALES.rows || []).find(function(x){ return x && x.id === saleId; }); if(!s) return;
+  var esc = _escapeHtml, ov = document.createElement('div'); ov.id = 'gmSwapOv';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(11,27,63,.6);z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px';
+  ov.innerHTML = '<div style="background:#fff;border-radius:16px;padding:20px;width:min(480px,100%);font-size:.9rem"><div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:1.1rem;color:#003594">🔄 Swap IMEI — Order GM-' + s.id + '</b><button onclick="document.getElementById(\'gmSwapOv\').remove()" style="border:none;background:none;font-size:1.3rem;cursor:pointer">✕</button></div>'
+    + '<div style="margin:10px 0;background:#f8fafc;border-radius:10px;padding:10px">' + esc(s.agent_name || '') + ' · ' + (s.status === 'paid' ? '<b style="color:#166534">PAID</b>' : '<b style="color:#92400e">Unpaid link</b>') + '<br>Current phone: <b>' + esc(s.model || '') + '</b> · IMEI <span style="font-family:monospace">' + esc(s.imei || '') + '</span><br>Plan: ' + esc(s.plan_name || '') + '</div>'
+    + '<label style="font-weight:800;font-size:.78rem;letter-spacing:1px;color:#6b7280">NEW IMEI (the phone the agent swapped in)</label><input id="gmSwapImei" inputmode="numeric" placeholder="Scan or type the new IMEI" style="width:100%;margin:4px 0 10px;padding:10px;border:1px solid #cbd5e1;border-radius:10px;font-family:monospace">'
+    + '<label style="font-weight:800;font-size:.78rem;letter-spacing:1px;color:#6b7280">REASON (required)</label><input id="gmSwapWhy" placeholder="e.g. Customer’s phone was defective — agent swapped it" style="width:100%;margin:4px 0 10px;padding:10px;border:1px solid #cbd5e1;border-radius:10px">'
+    + '<div style="font-size:.8rem;color:#4b5563;line-height:1.45">' + (s.status === 'paid' ? 'The order moves to the new phone. If the new phone costs more, the <b>difference is charged to ' + esc(s.agent_name || 'the agent') + ' through payroll</b>.' : 'The old payment link is switched off and a new link is created at the new phone’s price.') + ' The original phone goes back to ' + esc(s.agent_name || 'the agent') + ' as unsold.</div>'
+    + '<div id="gmSwapMsg" style="margin-top:8px;font-weight:700"></div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button onclick="document.getElementById(\'gmSwapOv\').remove()" style="padding:9px 14px;border:1px solid #cbd5e1;border-radius:10px;background:#fff;cursor:pointer">Cancel</button><button id="gmSwapBtn" onclick="gmSwapDo(' + s.id + ')" style="padding:9px 16px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:900;cursor:pointer">Swap IMEI</button></div></div>';
+  document.body.appendChild(ov); setTimeout(function(){ try{ document.getElementById('gmSwapImei').focus(); }catch(e){} }, 50);
+}
+async function gmSwapDo(saleId){
+  var s = (GMSALES.rows || []).find(function(x){ return x && x.id === saleId; }) || {}, msg = document.getElementById('gmSwapMsg'), btn = document.getElementById('gmSwapBtn');
+  var imei = String((document.getElementById('gmSwapImei') || {}).value || '').replace(/\D/g, ''), why = String((document.getElementById('gmSwapWhy') || {}).value || '').trim();
+  if(imei.length < 14){ msg.style.color = '#b91c1c'; msg.textContent = 'Enter the full new IMEI (15 digits).'; return; }
+  if(why.length < 3){ msg.style.color = '#b91c1c'; msg.textContent = 'Enter a reason for the swap.'; return; }
+  btn.disabled = true; btn.textContent = 'Swapping…';
+  var d = null, err = '';
+  try{ var r = await wmamInvoke('gm-pay-link', { body:{ action:'imei_swap', saleId:saleId, newImei:imei, reason:why } }); d = r && r.data;
+    if(r && r.error){ try{ var j = r.error.context && typeof r.error.context.json === 'function' ? await r.error.context.json() : null; err = (j && j.error) || String(r.error.message || r.error); }catch(e){ err = String(r.error.message || r.error); } }
+    else if(!d || !d.ok) err = (d && d.error) || 'The swap did not go through.';
+  }catch(e){ err = 'Could not reach the server. Check your connection and try again.'; }
+  if(err){ btn.disabled = false; btn.textContent = 'Swap IMEI'; msg.style.color = '#b91c1c'; msg.textContent = err; return; }
+  var notes = [];
+  // the difference on a paid order is charged to the agent through payroll
+  if(d.chargeAgent > 0 && s.agent_id && typeof payrollAddDebt === 'function'){ try{ payrollAddDebt(s.agent_id, Math.round(d.chargeAgent * 100), 'Pay Link IMEI swap on order GM-' + saleId + ': ' + d.oldModel + ' → ' + d.newModel + ' (new phone costs ' + _gmMoney(d.chargeAgent) + ' more)', ''); notes.push(_gmMoney(d.chargeAgent) + ' difference charged to ' + (s.agent_name || 'the agent') + ' through payroll'); }catch(e){ notes.push('⚠ Could not add the ' + _gmMoney(d.chargeAgent) + ' payroll charge — add it in Payroll → Deductions'); } }
+  // the original phone goes back to the agent as unsold (a sold report always wins)
+  try{ var old = (GM_INVENTORY || []).find(function(x){ return x && String(x.imei).replace(/\D/g, '') === String(d.oldImei).replace(/\D/g, ''); });
+    if(old && (old.status === 'activated' || old.activatedAt)) notes.push('⚠ A sold report already shows the original phone (' + d.oldImei + ') as activated — check it in Activation Records');
+    else if(old && s.agent_id){ old.status = 'assigned'; old.assignedTo = s.agent_id; old.holderId = s.agent_id; old.holderName = s.agent_name || old.holderName; old.assignedToName = s.agent_name || old.assignedToName; delete old.soldAt; notes.push('Original phone ' + d.oldImei + ' is back with ' + (s.agent_name || 'the agent') + ' as unsold'); try{ saveInventory(); }catch(e){} }
+  }catch(e){}
+  try{ wmamLogActivity && wmamLogActivity('gmImeiSwap', { label:'Swapped a Pay Link IMEI', args:['GM-' + saleId, d.oldImei, d.newImei] }); }catch(e){}
+  msg.style.color = '#166534'; msg.innerHTML = '✔ Swapped: ' + _escapeHtml(d.oldImei) + ' → ' + _escapeHtml(d.newImei) + ' (' + _escapeHtml(d.newModel) + ')' + (notes.length ? '<div style="font-weight:600;font-size:.82rem;margin-top:4px">' + notes.map(_escapeHtml).join('<br>') + '</div>' : '');
+  btn.textContent = 'Done'; setTimeout(function(){ try{ gmSalesLoad(); }catch(e){} }, 400);
+}
+if(typeof window !== 'undefined'){ Object.assign(window, { gmSwapOpen:gmSwapOpen, gmSwapDo:gmSwapDo }); }
 
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
@@ -24483,9 +24648,10 @@ function processGMActivationCSV(csvText){
     if(alreadyActivated[imei] && !_stuck){
       // v2026.10.05: a phone already on an earlier report that NOW shows usage (no -> yes): commission earned, charge removed
       var _prev = alreadyActivated[imei];
-      if(_prev && _prev.commEligible === false && commElig){
+      var _dv0 = (GM_INVENTORY||[]).find(function(x){ return x && x.imei === imei; });   // v2026.10.13: the phone record and the report record can disagree — fix whichever says NO
+      if(_prev && commElig && (_prev.commEligible === false || (_dv0 && _dv0.commEligible === false))){
         _prev.commEligible = true; _prev.eligibleSince = new Date().toISOString();
-        var _dv = (GM_INVENTORY||[]).find(function(x){ return x && x.imei === imei; }); if(_dv) _dv.commEligible = true;
+        var _dv = _dv0; if(_dv){ _dv.commEligible = true; _dv.noUsage = false; }
         try{ wmamNoUsageCheck({ imei:imei, agentId:_prev.agentId, commEligible:true, activationDate:_prev.activationDate, model:model }); }catch(e){}
         if(_prev.agentId){ try{ recordSale({ agentId:_prev.agentId, campaign:'Gen Mobile', program:'Lifeline', date:((typeof _gmIso==='function' && _gmIso(_prev.activationDate)) || _prev.activationDate), tribal:!!_prev.tribal, imei:imei, source:'gm-usage-now-showing', deferSave:true }); }catch(e){} }
         try{ setTimeout(function(){ saveInventory(); saveToStorage(); }, 0); }catch(e){}
@@ -47372,6 +47538,7 @@ function gotoPanel(id, params){
     'my-profile':panelMyProfile,
     'imei-search':panelImeiSearch,
     'sold-reports':panelSoldReports,
+    'activation-records':function(){ return panelActivationRecords(); },
     'my-points':panelMyPoints,
     'team-points':panelTeamPoints,
     'owner-points':panelOwnerPoints,
