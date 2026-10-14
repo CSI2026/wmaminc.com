@@ -3795,7 +3795,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.14.2330';
+var BUILD_VERSION = '2026.10.15.0200';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15577,6 +15577,7 @@ function _wmamTabAllowed(u, id){
   if(id==='payroll-home' || id==='payroll-rollup' || id==='payroll-process' || id==='payroll-salaries' || id==='payroll-disputes') return wmamIsPayrollStaff(u);
   if(id==='surplus-payouts') return canAccess(u,'gm-sales') || wmamIsPayrollStaff(u);
   if(id==='old-invoices') return _oiCan(u);
+  if(id==='markets-audit' || id==='market-cleanup') return !!u && canManageMarkets(u);
   if(id==='tool-center') return !!u;
   if(id==='my-invoices') return !!u;
   if(id==='inv-audit') return !!u;
@@ -15647,7 +15648,7 @@ if(typeof window!=='undefined'){ Object.assign(window, { wmamTabBarFor:wmamTabBa
 // ══════════════════════════════════════════════════════════════════════
 var WMAM_NAV = [
   { key:'people', label:'\uD83D\uDC65 People', badge:true, cards:[
-    { title:'Agents & Teams', icon:'\uD83D\uDC64', bg:'#dbe6ff', tabs:[['hr-dashboard','HR Dashboard'],['agents','Agents'],['markets-admin','Markets']] },
+    { title:'Agents & Teams', icon:'\uD83D\uDC64', bg:'#dbe6ff', tabs:[['hr-dashboard','HR Dashboard'],['agents','Agents'],['markets-admin','Markets'],['market-cleanup','Market Cleanup']] },
     { title:'Hiring & Onboarding', icon:'\uD83D\uDCDD', bg:'#fde7c7', badge:true, tabs:[['applications','Applications'],['bg-check-queue','Background Checks']] },
     { title:'Documents', icon:'\uD83D\uDCC4', bg:'#d9f3ea', tabs:[['campaign-docs','Campaign Documents'],['onboard-packages','Onboarding Packages']] } ]},
   { key:'payroll', label:'\uD83D\uDCB0 Payroll', cards:[
@@ -15688,6 +15689,8 @@ function _wmamIdAllowed(id){
   // v2026.10.10: pages added after the original menu list use their own access rules (they were being hidden)
   if(/^(surplus-payouts|hours-admin|hours-ops|mgr-overrides|comp-builder|comp-plans|time-clock|tool-center|my-invoices|missed-paylink|biz-snapshot|inv-audit|ai-settings|notices|email-center)$/.test(id)) return _wmamTabAllowed(DB.current, id);
   if(id==='agent-cleanup') return canEditAgentProfiles(DB.current);
+  if(id==='markets-audit' || id==='market-cleanup') return !!DB.current && canManageMarkets(DB.current);
+  if(id==='old-invoices') return _oiCan(DB.current);
   if(id==='markets-admin' || id==='agents' || id==='agent-master') return canAccess(DB.current, id);   // v2026.09.30: office staff
   if(_wmamAllowed[id]) return true;
   // inventory / payments screens keep their own access rules
@@ -21549,6 +21552,329 @@ function ppDebtRemove(aid){
 }
 if(typeof window !== 'undefined'){ Object.assign(window, { ppDebtShow:ppDebtShow, ppDebtRemove:ppDebtRemove }); }
 
+
+// ══════════════════════════════════════════════════════════════════════
+//  MARKET AUDIT — Calvin 2026-10-14 (v2026.10.15.0100)  People → Agents & Teams → Market Audit
+//  One WMAMinc market can be called something different on each campaign's reports
+//  ("Lafayette B" on Gen Mobile, "Team Lafayette BC" on TruConnect). This page audits EVERY market:
+//   1. Duplicates  — markets that are the same place. Pick the one to keep + its WMAMinc name → Merge.
+//   2. Every market — people, unsold phones, sold phones, sales, managers, and each campaign's name for it.
+//   3. Names in uploads/profiles that are not attached to any market yet.
+//   4. Paused / empty markets → remove.
+//  NOTHING IS LOST: phones are never edited (each upload keeps the name the carrier used); the old
+//  market name is kept as an "also called" name on the market it merged into, so every phone, sale and
+//  person still counts there. Each merge is checked (counts before = counts after) and saved with a
+//  full copy of the old market so it can be put back.
+// ══════════════════════════════════════════════════════════════════════
+var MKA = { keep:{}, name:{}, msg:'', busy:false, open:{} };
+var _MKA_POOLS = function(){ return [[GM_INVENTORY,'Gen Mobile'],[TC_INVENTORY,'TruConnect'],[AW_INVENTORY,'Assurance Wireless'],[EX_INVENTORY,'Excess Telecom'],[INVENTORY_DEVICES,'DART']]; };
+function _mkaSold(d){ return d && (d.status === 'sold' || d.status === 'activated' || !!d.soldAt); }
+function _mkaGone(d){ return !d || d.deletedAt || d.status === 'deleted'; }
+function _mkaKeysOf(m){ var ks = {}; ks[_wmamRawKey(m.name)] = 1; (m.aliases || []).forEach(function(a){ var k = _wmamRawKey(a && (a.name || a)); if(k) ks[k] = 1; }); return ks; }
+// every count for one market, computed from the raw data (not from the alias map) so before/after can be compared
+function _mkaStats(m){
+  var ks = _mkaKeysOf(m), st = { people:{}, inactive:{}, unsold:0, sold:0, byCamp:{}, names:{}, sales:0, devU:{}, devS:{} };
+  _MKA_POOLS().forEach(function(p){ (p[0] || []).forEach(function(d){ if(_mkaGone(d) || !d.market) return; var k = _wmamRawKey(d.market); if(!ks[k] && !(String(d.market) === 'market-' + m.id)) return;
+    var c = d.campaign || p[1]; var b = st.byCamp[c] = st.byCamp[c] || { unsold:0, sold:0 }, dk = p[1] + '|' + (d.id || '') + '|' + (d.imei || d.sim || ''); if(_mkaSold(d)){ st.sold++; b.sold++; st.devS[dk] = 1; } else { st.unsold++; b.unsold++; st.devU[dk] = 1; }
+    var nk = c + '|' + String(d.market).trim(); st.names[nk] = (st.names[nk] || 0) + 1; }); });
+  var addP = function(id){ if(id == null) return; var a = (DB.agents || []).find(function(x){ return x && String(x.id) === String(id); }); if(!a || a.deletedAt) return; if(a.active === false) st.inactive[a.id] = 1; else st.people[a.id] = 1; };
+  Object.keys(m.programs || {}).forEach(function(k){ var x = m.programs[k]; if(!x) return; [x.cmId, x.mmId, x.iboId].forEach(addP); (x.tlIds || []).concat(x.faIds || []).forEach(addP); });
+  (DB.agents || []).forEach(function(a){ if(a && !a.deletedAt && a.team && (ks[_wmamRawKey(a.team)] || String(a.team) === 'market-' + m.id)) addP(a.id); });
+  Object.keys(st.people).forEach(function(id){ var a = (DB.agents || []).find(function(x){ return x && String(x.id) === String(id); }); try{ st.sales += agentSalesCount(a, { period:'month' }) || 0; }catch(e){} });
+  st.peopleN = Object.keys(st.people).length; st.inactiveN = Object.keys(st.inactive).length; return st;
+}
+function _mkaName(id){ var a = (DB.agents || []).find(function(x){ return x && String(x.id) === String(id); }); return a ? a.name : ''; }
+function _mkaManagers(m){ var out = []; Object.keys(m.programs || {}).forEach(function(k){ var x = m.programs[k]; if(!x || !/^lifeline/.test(k)) return; var lab = k === 'lifeline' ? 'Lifeline' : k.split('|')[1];
+  var bits = []; if(x.cmId != null) bits.push('CM ' + _mkaName(x.cmId)); if(x.iboId != null) bits.push('IBO ' + _mkaName(x.iboId)); if(x.mmId != null) bits.push('MM ' + _mkaName(x.mmId)); if((x.tlIds || []).length) bits.push('TL ' + x.tlIds.map(_mkaName).filter(Boolean).join(', '));
+  if(bits.length) out.push(lab + ': ' + bits.join(' · ')); }); return out; }
+// duplicate groups: same name key, or a name that is another market's "also called" name
+function mkaDuplicateGroups(){
+  var L = (MARKETS || []).filter(Boolean), parent = {}, find = function(x){ while(parent[x] !== x){ parent[x] = parent[parent[x]]; x = parent[x]; } return x; }, union = function(a, b){ parent[find(a)] = find(b); };
+  L.forEach(function(m){ parent[m.id] = m.id; });
+  var byKey = {}; L.forEach(function(m){ Object.keys(_mkaKeysOf(m)).forEach(function(k){ (byKey[k] = byKey[k] || []).push(m.id); }); });
+  Object.keys(byKey).forEach(function(k){ var ids = byKey[k]; for(var i = 1; i < ids.length; i++) union(ids[0], ids[i]); });
+  var g = {}; L.forEach(function(m){ var r = find(m.id); (g[r] = g[r] || []).push(m); });
+  return Object.keys(g).map(function(r){ return g[r]; }).filter(function(x){ return x.length > 1; });
+}
+// names used on phones/profiles that no market claims yet (sold phones included, so sales history is not lost)
+function mkaUnattached(){
+  var claimed = {}; (MARKETS || []).forEach(function(m){ if(m){ Object.keys(_mkaKeysOf(m)).forEach(function(k){ claimed[k] = 1; }); claimed['market' + m.id] = 1; } });
+  var out = {};
+  _MKA_POOLS().forEach(function(p){ (p[0] || []).forEach(function(d){ if(_mkaGone(d) || !d.market) return; var k = _wmamRawKey(d.market); if(!k || claimed[k]) return; var o = out[k] = out[k] || { name:String(d.market).trim(), camps:{}, unsold:0, sold:0, people:0 }; var c = d.campaign || p[1]; o.camps[c] = 1; if(_mkaSold(d)) o.sold++; else o.unsold++; }); });
+  (DB.agents || []).forEach(function(a){ if(!a || a.deletedAt || !a.team) return; var k = _wmamRawKey(a.team); if(!k || claimed[k]) return; var o = out[k] = out[k] || { name:String(a.team).trim(), camps:{}, unsold:0, sold:0, people:0 }; o.people++; });
+  return Object.keys(out).map(function(k){ return out[k]; }).sort(function(a, b){ return (b.unsold + b.sold + b.people) - (a.unsold + a.sold + a.people); });
+}
+async function _mkaLog(entry){ try{ var r = await supaClient.from('app_settings').select('value').eq('key', 'markets_audit_log').maybeSingle(); var arr = []; try{ arr = JSON.parse(r.data.value) || []; }catch(e){ arr = []; }
+  arr.push(Object.assign({ at:new Date().toISOString(), by:(DB.current && DB.current.name) || '' }, entry)); await supaClient.from('app_settings').upsert({ key:'markets_audit_log', value:JSON.stringify(arr.slice(-300)), updated_at:new Date().toISOString() }, { onConflict:'key' }); }catch(e){ console.warn('[market audit] log', e); } }
+function _mkaAddAlias(m, name, campaign, extra){ var k = _wmamRawKey(name); if(!k || k === _wmamRawKey(m.name)) return; m.aliases = (m.aliases || []).filter(function(a){ return _wmamRawKey(a && (a.name || a)) !== k; }); m.aliases.push(Object.assign({ name:String(name).trim(), campaign:campaign || _wmamCampaignOfName(name) || '', addedAt:new Date().toISOString(), addedBy:(DB.current && DB.current.name) || '' }, extra || {})); }
+// MERGE: dupIds go into keepId; keepId gets finalName. Phones are not edited; old names become "also called".
+async function mkaMerge(keepId, dupIds, finalName, opt){
+  var u = DB.current; if(!canManageMarkets(u)) return { ok:false, error:'Only the owner or office can change markets.' };
+  var keep = marketGetById(keepId); if(!keep) return { ok:false, error:'Market not found.' };
+  var dups = (dupIds || []).map(marketGetById).filter(function(m){ return m && m.id !== keep.id; });
+  finalName = String(finalName || keep.name).trim(); if(!finalName) return { ok:false, error:'Enter the WMAMinc name.' };
+  var clash = (MARKETS || []).find(function(m){ return m && m.id !== keep.id && dups.indexOf(m) < 0 && Object.keys(_mkaKeysOf(m)).indexOf(_wmamRawKey(finalName)) >= 0; });
+  if(clash) return { ok:false, error:'“' + finalName + '” is already used by the market “' + clash.name + '”. Pick another name or merge that one too.' };
+  var before = [keep].concat(dups).map(_mkaStats), uni = function(f){ var o = {}; before.forEach(function(s){ Object.keys(s[f]).forEach(function(k){ o[k] = 1; }); }); return o; }, bU = uni('devU'), bS = uni('devS');
+  var ppl = {}; before.forEach(function(s){ Object.keys(s.people).forEach(function(k){ ppl[k] = 1; }); });
+  var backup = JSON.parse(JSON.stringify([keep].concat(dups))), oldNames = [keep.name].concat(dups.map(function(d){ return d.name; }));
+  ensureMarketSections(keep);
+  dups.forEach(function(m){
+    _mkaAddAlias(keep, m.name, '', { mergedFrom:m.id }); (m.aliases || []).forEach(function(a){ _mkaAddAlias(keep, a && (a.name || a), a && a.campaign, { mergedFrom:m.id }); });
+    Object.keys(m.programs || {}).forEach(function(k){ var a = m.programs[k]; if(!a) return; var b = keep.programs[k] = keep.programs[k] || _emptyProgramSection();
+      ['cmId', 'mmId', 'iboId'].forEach(function(f){ if(b[f] == null && a[f] != null) b[f] = a[f]; });
+      b.tlIds = (b.tlIds || []).concat((a.tlIds || []).filter(function(v){ return (b.tlIds || []).map(String).indexOf(String(v)) < 0; }));
+      b.faIds = (b.faIds || []).concat((a.faIds || []).filter(function(v){ return (b.faIds || []).map(String).indexOf(String(v)) < 0; }));
+      if(a.campaigns){ b.campaigns = (b.campaigns || []).concat(a.campaigns.filter(function(c){ return (b.campaigns || []).indexOf(c) < 0; })); }
+      if(a.active) b.active = true; });
+    ['street', 'city', 'state', 'zip', 'notes'].forEach(function(f){ if(!keep[f] && m[f]) keep[f] = m[f]; });
+  });
+  if(finalName !== keep.name){ var _oldNm = keep.name; keep.name = finalName; _mkaAddAlias(keep, _oldNm, '', { renamedFrom:true }); }
+  keep.active = true; keep.updatedAt = new Date().toISOString();
+  // people whose profile market was any of the old names now read the WMAMinc name
+  var oldKeys = {}; oldNames.forEach(function(n){ oldKeys[_wmamRawKey(n)] = 1; }); dups.forEach(function(m){ oldKeys['market' + m.id] = 1; });
+  var saveP = [], oldTeam = [];
+  (DB.agents || []).forEach(function(a){ if(!a || !a.team) return; var k = /^market-\d+$/.test(String(a.team)) ? String(a.team).replace('-', '') : _wmamRawKey(a.team); if(oldKeys[k] && a.team !== keep.name){ oldTeam.push([a, a.team]); a.team = keep.name; saveP.push(a); } });
+  // remove the duplicates (recorded as removed so the database never brings them back)
+  dups.forEach(function(m){ var i = MARKETS.indexOf(m); if(i >= 0) MARKETS.splice(i, 1); });
+  _wmamAliasMap = null;   // check first; nothing is saved or synced until the check passes
+  var after = _mkaStats(keep);
+  var lost = [];
+  Object.keys(bU).forEach(function(k){ if(!after.devU[k]) lost.push('an unsold phone (' + k.split('|').pop() + ') would not count here'); });
+  Object.keys(bS).forEach(function(k){ if(!after.devS[k]) lost.push('a sold phone (' + k.split('|').pop() + ') would not count here'); });
+  Object.keys(ppl).forEach(function(id){ if(!after.people[id]) lost.push((_mkaName(id) || ('#' + id)) + ' is no longer in the market'); });
+  if(lost.length){ // put everything back exactly as it was
+    MARKETS.splice(MARKETS.indexOf(keep), 1); backup.forEach(function(b){ MARKETS.push(b); }); MARKETS.sort(function(a, b){ return a.id - b.id; });
+    oldTeam.forEach(function(x){ x[0].team = x[1]; }); _wmamAliasMap = null; _wmamTeamsSig = ''; try{ wmamDeriveTeamsFromMarkets(); }catch(e){}
+    return { ok:false, error:'Stopped — the check did not match, so nothing was changed: ' + lost.join('; ') };
+  }
+  if(opt && opt.noSave) return { ok:true, keep:keep, after:after, saveP:saveP, removedIds:dups.map(function(d){ return d.id; }) };   // the caller checks everything and saves once
+  wmamMarketsChanged();
+  for(var i = 0; i < dups.length; i++){ try{ await wmamRecordMarketDeleted(dups[i].id); }catch(e){} }
+  saveP.forEach(function(a){ try{ saveAgentToSupabase(a); }catch(e){} });
+  var ok = await wmamSaveMarketsNow('audit-merge');
+  await _mkaLog({ kind:'merge', keptId:keep.id, finalName:finalName, merged:dups.map(function(d){ return { id:d.id, name:d.name }; }), check:{ unsold:after.unsold, sold:after.sold, people:after.peopleN }, backup:backup });
+  return { ok:ok, keep:keep, after:after, saved:ok, moved:saveP.length };
+}
+async function mkaRename(id, name){ var m = marketGetById(id); name = String(name || '').trim(); if(!m || !name || name === m.name) return; var r = await mkaMerge(id, [], name); if(!r.ok) alert(r.error || 'Not saved.'); gotoPanel('markets-audit'); }
+async function mkaAddCampaignName(id){
+  var m = marketGetById(id); if(!m) return; var c = (document.getElementById('mkaC' + id) || {}).value, n = String((document.getElementById('mkaN' + id) || {}).value || '').trim();
+  if(!c || !n) return alert('Pick the campaign and type the name that campaign uses for this market.');
+  var other = (MARKETS || []).find(function(x){ return x && x.id !== m.id && _mkaKeysOf(x)[_wmamRawKey(n)]; }); if(other) return alert('“' + n + '” already belongs to “' + other.name + '”. If they are the same market, merge them in Step 1.');
+  _mkaAddAlias(m, n, c); m.updatedAt = new Date().toISOString(); _wmamAliasMap = null; wmamMarketsChanged(); await wmamSaveMarketsNow('audit-campaign-name'); await _mkaLog({ kind:'campaign-name', marketId:m.id, campaign:c, name:n }); gotoPanel('markets-audit');
+}
+async function mkaAttach(name, i){ var v = (document.getElementById('mkaU' + i) || {}).value; if(!v) return alert('Pick the market it belongs to.'); var m = marketGetById(Number(v)); if(!m) return; _mkaAddAlias(m, name, _wmamCampaignOfName(name)); m.updatedAt = new Date().toISOString(); _wmamAliasMap = null; wmamMarketsChanged(); await wmamSaveMarketsNow('audit-attach'); await _mkaLog({ kind:'attach', marketId:m.id, name:name }); gotoPanel('markets-audit'); }
+async function mkaRemoveEmpty(ids){
+  ids = (ids || []).filter(function(id){ var m = marketGetById(id); if(!m) return false; var st = _mkaStats(m); return !st.peopleN && !st.unsold && !st.sold; });
+  if(!ids.length) return alert('Nothing to remove — a market with people or phones (sold or unsold) must be merged instead, so nothing is lost.');
+  if(!confirm('Remove ' + ids.length + ' empty market' + (ids.length === 1 ? '' : 's') + '? They have no people and no phones (sold or unsold). A copy is saved in the audit log.')) return;
+  var backup = ids.map(marketGetById).map(function(m){ return JSON.parse(JSON.stringify(m)); });
+  ids.forEach(function(id){ var i = MARKETS.findIndex(function(x){ return x && x.id === id; }); if(i >= 0) MARKETS.splice(i, 1); });
+  for(var k = 0; k < ids.length; k++){ try{ await wmamRecordMarketDeleted(ids[k]); }catch(e){} }
+  _wmamAliasMap = null; wmamMarketsChanged(); await wmamSaveMarketsNow('audit-remove-empty'); await _mkaLog({ kind:'remove-empty', removed:backup });
+  gotoPanel('markets-audit');
+}
+async function mkaDropInactivePeople(){
+  var n = 0; (MARKETS || []).forEach(function(m){ Object.keys(m.programs || {}).forEach(function(k){ var x = m.programs[k]; if(!x) return; var off = function(id){ var a = (DB.agents || []).find(function(y){ return y && String(y.id) === String(id); }); return !a || a.deletedAt || a.active === false; };
+    ['tlIds', 'faIds'].forEach(function(f){ var b = (x[f] || []).length; x[f] = (x[f] || []).filter(function(id){ return !off(id); }); n += b - x[f].length; }); }); });
+  if(!n) return alert('No inactive people are on any market.');
+  if(!confirm('Take ' + n + ' inactive ' + (n === 1 ? 'person' : 'people') + ' off market rosters? Their profiles, sales and pay history stay — they are only taken off the market lists.')) { gotoPanel('markets-audit'); return; }
+  _wmamAliasMap = null; wmamMarketsChanged(); await wmamSaveMarketsNow('audit-drop-inactive'); await _mkaLog({ kind:'drop-inactive', count:n }); gotoPanel('markets-audit');
+}
+async function mkaDoMerge(gi){
+  var groups = mkaDuplicateGroups(), g = groups[gi]; if(!g) return; var keepId = Number(MKA.keep[gi] || _mkaDefaultKeep(g).id);
+  var name = String((document.getElementById('mkaNm' + gi) || {}).value || '').trim();
+  var dupIds = g.map(function(m){ return m.id; }).filter(function(id){ return id !== keepId && !(MKA.skip && MKA.skip[gi + ':' + id]); });
+  if(!dupIds.length) return alert('Pick at least one market to merge in.');
+  if(!confirm('Merge ' + dupIds.length + ' market' + (dupIds.length === 1 ? '' : 's') + ' into “' + name + '”?\n\nPeople move over, every phone and sale stays counted (old names are kept as “also called”), and it is checked before saving.')) return;
+  MKA.busy = true; _mkaPaint(); var r = await mkaMerge(keepId, dupIds, name); MKA.busy = false;
+  MKA.msg = r.ok ? '✔ Merged into “' + r.keep.name + '” — checked: ' + r.after.peopleN + ' people, ' + r.after.unsold + ' unsold phones, ' + r.after.sold + ' sold phones all still counted.' : '⛔ ' + (r.error || 'Not saved — try again.');
+  MKA.keep = {}; gotoPanel('markets-audit');
+}
+function _mkaDefaultKeep(g){ return g.slice().sort(function(a, b){ var sa = _mkaStats(a), sb = _mkaStats(b); return (b.active !== false) - (a.active !== false) || (sb.peopleN + sb.unsold + sb.sold) - (sa.peopleN + sa.unsold + sa.sold) || a.id - b.id; })[0]; }
+function _mkaPaint(){ var el = document.getElementById('mkaRoot'); if(el) el.outerHTML = _mkaBody(); }
+function mkaCsv(){
+  var rows = [['Market #', 'WMAMinc name', 'Active', 'Campaign names (also called)', 'Managers', 'People', 'Inactive on roster', 'Unsold phones', 'Sold phones', 'Sales this month']];
+  (MARKETS || []).filter(Boolean).forEach(function(m){ var st = _mkaStats(m); rows.push([m.id, m.name, m.active === false ? 'paused' : 'yes', (m.aliases || []).map(function(a){ return (a.campaign ? a.campaign + ': ' : '') + (a.name || a); }).join(' | '), _mkaManagers(m).join(' | '), st.peopleN, st.inactiveN, st.unsold, st.sold, st.sales]); });
+  var csv = rows.map(function(r){ return r.map(function(v){ v = String(v == null ? '' : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(','); }).join('\n');
+  var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type:'text/csv' })); a.download = 'WMAMinc_market_audit_' + _ctToday() + '.csv'; document.body.appendChild(a); a.click(); a.remove();
+}
+function _mkaBody(){
+  var esc = _escapeHtml, L = (MARKETS || []).filter(Boolean).slice().sort(function(a, b){ return String(a.name).localeCompare(String(b.name)); });
+  var groups = mkaDuplicateGroups(), un = mkaUnattached(), stats = {}; L.forEach(function(m){ stats[m.id] = _mkaStats(m); });
+  var empty = L.filter(function(m){ var s = stats[m.id]; return !s.peopleN && !s.unsold && !s.sold; }), paused = L.filter(function(m){ return m.active === false; });
+  var inactiveOnRosters = L.reduce(function(t, m){ return t + stats[m.id].inactiveN; }, 0);
+  var camps = ['Gen Mobile', 'TruConnect', 'Assurance Wireless', 'Excess Telecom', 'DART']; try{ var lc = (_buildAPProgramCampaigns()['Lifeline'] || []).map(function(x){ return ({ 'Assurance':'Assurance Wireless', 'Excess':'Excess Telecom' })[x] || x; }); lc.forEach(function(c){ if(camps.indexOf(c) < 0) camps.push(c); }); }catch(e){}
+  var card = 'background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;margin-bottom:14px';
+  var stat = function(n, l, c){ return '<div style="flex:1 1 120px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px"><div style="font-size:1.6rem;font-weight:900;color:' + (c || '#003594') + '">' + n + '</div><div style="font-size:.74rem;font-weight:800;color:#6b7280;text-transform:uppercase;letter-spacing:1px">' + l + '</div></div>'; };
+  var h = '<div id="mkaRoot">';
+  if(MKA.msg) h += '<div style="' + card + ';border:2px solid ' + (/^✔/.test(MKA.msg) ? '#86efac' : '#fca5a5') + ';font-weight:800">' + esc(MKA.msg) + '</div>';
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">' + stat(L.length, 'Markets') + stat(groups.length, 'Duplicate groups', groups.length ? '#b91c1c' : '#166534') + stat(un.length, 'Names not attached', un.length ? '#c2410c' : '#166534') + stat(empty.length, 'Empty markets', empty.length ? '#92400e' : '#166534') + stat(paused.length, 'Paused') + stat(inactiveOnRosters, 'Inactive people on rosters', inactiveOnRosters ? '#92400e' : '#166534') + '</div>'
+    + '<div style="' + card + ';background:#eef3ff;border-color:#c7d2fe;font-size:.88rem;color:#1e3a8a"><b>How this works:</b> one WMAMinc market can have a different name on each campaign’s reports. Work top to bottom: <b>1.</b> merge duplicates, <b>2.</b> give each market its WMAMinc name and each campaign’s name for it, <b>3.</b> attach leftover names, <b>4.</b> remove empty markets. Phones are never changed, and every merge is checked so no phone, sale or person is lost. <a href="javascript:void(0)" onclick="mkaCsv()" style="font-weight:800">Download this audit (Excel/CSV)</a></div>';
+  // 1. duplicates
+  h += '<div style="' + card + '"><div style="font-weight:900;font-size:1.05rem;color:#003594">1. Duplicate markets (' + groups.length + ')</div>';
+  if(!groups.length) h += '<div style="color:#166534;font-weight:700;margin-top:6px">✔ No duplicates found.</div>';
+  groups.forEach(function(g, gi){ var def = _mkaDefaultKeep(g), keepId = Number(MKA.keep[gi] || def.id), kept = g.find(function(m){ return m.id === keepId; }) || def;
+    h += '<div style="border:2px solid #fca5a5;border-radius:12px;padding:10px 12px;margin-top:10px"><div style="font-weight:800;margin-bottom:6px">These ' + g.length + ' look like the same market:</div>'
+      + g.map(function(m){ var s = stats[m.id] || _mkaStats(m), on = m.id === keepId;
+          return '<div style="display:flex;gap:10px;align-items:flex-start;padding:8px;border-radius:8px;margin-top:4px;background:' + (on ? '#ecfdf5' : '#f8fafc') + '"><label style="white-space:nowrap;font-weight:800;cursor:pointer"><input type="radio" name="mkaK' + gi + '" ' + (on ? 'checked' : '') + ' onchange="MKA.keep[' + gi + ']=' + m.id + ';_mkaPaint()"> Keep</label>'
+            + '<div style="flex:1"><div style="font-weight:800">#' + m.id + ' · ' + esc(m.name) + (m.active === false ? ' <span style="color:#92400e">(paused)</span>' : '') + '</div><div style="font-size:.8rem;color:#374151">' + s.peopleN + ' people · ' + s.unsold + ' unsold phones · ' + s.sold + ' sold · ' + s.sales + ' sales this month' + (s.inactiveN ? ' · ' + s.inactiveN + ' inactive on roster' : '') + '</div>'
+            + '<div style="font-size:.76rem;color:#6b7280">' + (esc(_mkaManagers(m).join(' — ')) || 'No managers set') + ((m.aliases || []).length ? ' · also called: ' + (m.aliases || []).map(function(a){ return esc((a.campaign ? a.campaign + ' ' : '') + '“' + (a.name || a) + '”'); }).join(', ') : '') + '</div></div></div>'; }).join('')
+      + '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center"><span style="font-weight:800;font-size:.86rem">WMAMinc name:</span><input id="mkaNm' + gi + '" value="' + esc(kept.name) + '" style="flex:1 1 220px;padding:9px;border:1px solid #cbd5e1;border-radius:8px;font-size:15px">'
+      + '<button onclick="mkaDoMerge(' + gi + ')" ' + (MKA.busy ? 'disabled' : '') + ' style="padding:10px 16px;border:none;border-radius:8px;background:#b91c1c;color:#fff;font-weight:900;cursor:pointer">' + (MKA.busy ? 'Merging…' : 'Merge into the one I keep') + '</button></div></div>'; });
+  h += '</div>';
+  // 2. every market
+  h += '<div style="' + card + '"><div style="font-weight:900;font-size:1.05rem;color:#003594">2. Every market — WMAMinc name and each campaign’s name (' + L.length + ')</div><div style="font-size:.82rem;color:#6b7280;margin:2px 0 6px">“Names on the uploads” shows exactly what each campaign’s files call this market. Managers are set with <b>Edit managers</b> (the Markets page editor), including different managers for one campaign.</div>';
+  L.forEach(function(m){ var s = stats[m.id], names = {}; Object.keys(s.names).forEach(function(k){ var c = k.split('|')[0], n = k.slice(c.length + 1); (names[c] = names[c] || []).push(n + ' (' + s.names[k] + ')'); });
+    h += '<div style="border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin-top:8px;' + (m.active === false ? 'background:#fffbeb' : '') + '">'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><span style="font-size:.78rem;color:#6b7280">#' + m.id + '</span><input id="mkaR' + m.id + '" value="' + esc(m.name) + '" style="flex:1 1 200px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:8px;font-weight:800;font-size:15px">'
+      + '<button onclick="mkaRename(' + m.id + ', document.getElementById(\'mkaR' + m.id + '\').value)" style="padding:7px 12px;border:1px solid #003594;border-radius:8px;background:#fff;color:#003594;font-weight:800;cursor:pointer">Save name</button>'
+      + '<button onclick="gotoPanel(\'markets-admin\');setTimeout(function(){ try{ marketEdit(' + m.id + '); }catch(e){} },300)" style="padding:7px 12px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Edit managers</button>'
+      + (m.active === false ? '<span style="font-weight:800;color:#92400e">paused</span>' : '') + '</div>'
+      + '<div style="font-size:.84rem;margin-top:6px">' + s.peopleN + ' people · <b>' + s.unsold + '</b> unsold phones · ' + s.sold + ' sold · <b>' + s.sales + '</b> sales this month' + (s.inactiveN ? ' · <span style="color:#92400e">' + s.inactiveN + ' inactive on roster</span>' : '') + '</div>'
+      + '<div style="font-size:.8rem;color:#374151;margin-top:2px">' + (esc(_mkaManagers(m).join(' — ')) || '<span style="color:#b91c1c">No managers set</span>') + '</div>'
+      + '<div style="font-size:.8rem;margin-top:4px"><b>Names on the uploads:</b> ' + (Object.keys(names).length ? Object.keys(names).map(function(c){ return esc(c) + ': ' + names[c].map(esc).join(', '); }).join(' · ') : '<span style="color:#6b7280">none</span>') + '</div>'
+      + '<div style="font-size:.8rem;margin-top:2px"><b>Also called:</b> ' + ((m.aliases || []).length ? (m.aliases || []).map(function(a){ return '<span style="display:inline-block;background:#eef3ff;border-radius:999px;padding:1px 8px;margin:1px">' + esc((a.campaign ? a.campaign + ': ' : '') + (a.name || a)) + '</span>'; }).join('') : '<span style="color:#6b7280">none</span>') + '</div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"><select id="mkaC' + m.id + '" style="padding:6px;border:1px solid #cbd5e1;border-radius:8px"><option value="">Campaign…</option>' + camps.map(function(c){ return '<option>' + esc(c) + '</option>'; }).join('') + '</select><input id="mkaN' + m.id + '" placeholder="Name that campaign uses for this market" style="flex:1 1 200px;padding:6px 8px;border:1px solid #cbd5e1;border-radius:8px"><button onclick="mkaAddCampaignName(' + m.id + ')" style="padding:6px 12px;border:1px solid #16a34a;border-radius:8px;background:#ecfdf5;color:#166534;font-weight:800;cursor:pointer">+ Add campaign name</button></div></div>'; });
+  h += '</div>';
+  // 3. unattached
+  h += '<div style="' + card + '"><div style="font-weight:900;font-size:1.05rem;color:#003594">3. Names on uploads or profiles not attached to a market (' + un.length + ')</div>';
+  if(!un.length) h += '<div style="color:#166534;font-weight:700;margin-top:6px">✔ Every name belongs to a market.</div>';
+  var opts = L.filter(function(m){ return m.active !== false; }).map(function(m){ return '<option value="' + m.id + '">' + esc(m.name) + '</option>'; }).join('');
+  un.forEach(function(x, i){ h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-top:1px solid #f1f5f9"><div style="flex:1 1 220px"><b>“' + esc(x.name) + '”</b> <span style="font-size:.8rem;color:#6b7280">' + esc(Object.keys(x.camps).join(', ')) + ' · ' + x.unsold + ' unsold · ' + x.sold + ' sold · ' + x.people + ' people</span></div>'
+    + '<select id="mkaU' + i + '" style="padding:7px;border:1px solid #cbd5e1;border-radius:8px;max-width:220px"><option value="">Belongs to…</option>' + opts + '</select><button data-n="' + _escapeAttr(x.name) + '" onclick="mkaAttach(this.dataset.n,' + i + ')" style="padding:7px 12px;border:none;border-radius:8px;background:#ea580c;color:#fff;font-weight:800;cursor:pointer">Attach</button>'
+    + '<button data-n="' + _escapeAttr(x.name) + '" onclick="wmamAddMarketNamed(this.dataset.n)" style="padding:7px 12px;border:1px solid #ea580c;border-radius:8px;background:#fff;color:#c2410c;font-weight:800;cursor:pointer">+ New market</button></div>'; });
+  h += '</div>';
+  // 4. empty / paused / inactive people
+  h += '<div style="' + card + '"><div style="font-weight:900;font-size:1.05rem;color:#003594">4. Clean up</div>'
+    + '<div style="margin-top:6px;font-size:.88rem"><b>' + empty.length + ' empty market' + (empty.length === 1 ? '' : 's') + '</b> (no people, no phones sold or unsold)' + (empty.length ? ': ' + empty.map(function(m){ return esc(m.name) + (m.active === false ? ' (paused)' : ''); }).join(', ') : '') + '</div>'
+    + (empty.length ? '<button onclick="mkaRemoveEmpty([' + empty.map(function(m){ return m.id; }).join(',') + '])" style="margin-top:6px;padding:9px 14px;border:none;border-radius:8px;background:#92400e;color:#fff;font-weight:800;cursor:pointer">Remove the ' + empty.length + ' empty market' + (empty.length === 1 ? '' : 's') + '</button>' : '')
+    + '<div style="margin-top:10px;font-size:.88rem"><b>' + paused.filter(function(m){ return empty.indexOf(m) < 0; }).length + ' paused market' + (paused.length === 1 ? '' : 's') + ' still have people or phones</b> — merge them into the right market in Step 1 (or attach in Step 2) so nothing is lost: ' + (paused.filter(function(m){ return empty.indexOf(m) < 0; }).map(function(m){ return esc(m.name); }).join(', ') || 'none') + '</div>'
+    + '<div style="margin-top:10px;font-size:.88rem"><b>' + inactiveOnRosters + ' inactive ' + (inactiveOnRosters === 1 ? 'person is' : 'people are') + '</b> still listed on market rosters.</div>'
+    + (inactiveOnRosters ? '<button onclick="mkaDropInactivePeople()" style="margin-top:6px;padding:9px 14px;border:none;border-radius:8px;background:#92400e;color:#fff;font-weight:800;cursor:pointer">Take inactive people off the rosters</button>' : '') + '</div>';
+  return h + '</div>';
+}
+function panelMarketsAudit(){ var u = DB.current; if(!u || !canManageMarkets(u)) return panelHeader('🗺️ Market Audit') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">🔒 Owner and office staff only.</div></div>';
+  var out = panelHeader('🗺️ Market Audit') + _mkaBody(); MKA.msg = ''; return out; }
+if(typeof window !== 'undefined'){ Object.assign(window, { MKA:MKA, panelMarketsAudit:panelMarketsAudit, mkaMerge:mkaMerge, mkaDoMerge:mkaDoMerge, mkaRename:mkaRename, mkaAddCampaignName:mkaAddCampaignName, mkaAttach:mkaAttach, mkaRemoveEmpty:mkaRemoveEmpty, mkaDropInactivePeople:mkaDropInactivePeople, mkaDuplicateGroups:mkaDuplicateGroups, mkaUnattached:mkaUnattached, mkaCsv:mkaCsv, _mkaPaint:_mkaPaint, _mkaStats:_mkaStats }); }
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  MARKET CLEANUP — Calvin's list (2026-10-14, v2026.10.15.0200)  People → Agents & Teams → Market Cleanup
+//  The 11 open Lifeline markets, exactly as Calvin gave them. Everything else is removed.
+//  • Every old market / upload name for the same place is combined into the one market (old names are
+//    kept as "also called", so every phone, sold phone, sale and person still counts there).
+//  • "Team Lafayette LA" (no letter) goes to Lafayette B (Calvin's answer).
+//  • Managers on the list are set; a market keeps its current Campaign Manager, Team Leaders and agents
+//    unless the list names someone else. Juan stays an IBO (pay routing unchanged).
+//  • Phones are never edited. Anything with phones, sales or people that is NOT on the list is shown for
+//    the office to place — it is never deleted without a home. The whole cleanup is checked before saving.
+// ══════════════════════════════════════════════════════════════════════
+var MARKET_PLAN_20261014 = [
+  { name:'Lafayette B',    match:/^lafayette(b)?$/,  camps:['Gen Mobile'],                                   mm:'Robert Shaw' },
+  { name:'Lafayette C',    match:/^lafayettec$/,     camps:['Gen Mobile','enTouch Wireless','Assurance Wireless'], mm:'Brittany Faulk' },
+  { name:'Biloxi MS',      match:/^biloxi$/,         camps:['Gen Mobile'],                                   mm:'Robert Shaw', tl:'William McMickle' },
+  { name:'Corpus Christi', match:/^corpuschristi$/,  camps:['Gen Mobile','TruConnect'],                      mm:'Valerie Lara' },
+  { name:'Dallas B',       match:/^dallasb$/,        camps:['Gen Mobile'],                                   cm:'Brandon Smith' },
+  { name:'Dallas C',       match:/^dallasc$/,        camps:['Gen Mobile','Assurance Wireless'],              mm:'Emmanuel Davis' },
+  { name:'Davenport FL',   match:/^davenport$/,      camps:['Assurance Wireless','Gen Mobile'],              mm:'Tamea Dixon' },
+  { name:'San Antonio',    match:/^sanantonio$/,     camps:['Gen Mobile','TruConnect','Assurance Wireless'], mm:'Juan Rincon' },
+  { name:'Suffolk VA',     match:/^suffolk$/,        camps:['Gen Mobile'],                                   mm:'Jason Barnes' },
+  { name:'Tulsa',          match:/^tulsa$/,          camps:['Gen Mobile','TruConnect','DART','enTouch Wireless','Assist Wireless'], cm:'Tanita Flowers' },
+  { name:'Waco',           match:/^waco$/,           camps:['Gen Mobile','Assurance Wireless'],              mm:'Jerry McDonald' }
+];
+var MKC = { place:{}, msg:'', busy:false };
+function _mkcPlanFor(name){ var k = _wmamRawKey(name); if(!k) return null; return MARKET_PLAN_20261014.find(function(p){ return p.match.test(k) || _wmamRawKey(p.name) === k; }) || null; }
+function _mkcPerson(name){ var n = _oiNorm(name), L = (DB.agents || []).filter(function(a){ return a && !a.deletedAt && a.active !== false && _oiNorm(a.name) === n; }); return L.length === 1 ? L[0] : null; }
+// what happens to every market and every name
+function mkcPreview(){
+  var out = { plans:MARKET_PLAN_20261014.map(function(p){ return { plan:p, markets:[], names:{}, people:{}, unsold:0, sold:0, missing:[] }; }), leftovers:[], empty:[], names:[] };
+  var byPlan = function(p){ return out.plans.find(function(x){ return x.plan === p; }); };
+  (MARKETS || []).filter(Boolean).forEach(function(m){
+    var p = _mkcPlanFor(m.name) || (m.aliases || []).map(function(a){ return _mkcPlanFor(a && (a.name || a)); }).filter(Boolean)[0] || null;
+    var placed = !p && MKC.place['m' + m.id] ? MARKET_PLAN_20261014.find(function(x){ return x.name === MKC.place['m' + m.id]; }) : null;
+    var st = _mkaStats(m), item = { m:m, st:st };
+    if(p || placed){ var g = byPlan(p || placed); g.markets.push(item); Object.keys(st.people).forEach(function(id){ g.people[id] = 1; }); g.unsold += st.unsold; g.sold += st.sold; }
+    else if(!st.peopleN && !st.unsold && !st.sold) out.empty.push(item); else out.leftovers.push(item);
+  });
+  // names on phones/profiles no market claims yet
+  mkaUnattached().forEach(function(x){ var p = _mkcPlanFor(x.name) || (MKC.place['n' + x.name] ? MARKET_PLAN_20261014.find(function(y){ return y.name === MKC.place['n' + x.name]; }) : null); if(p){ var g = byPlan(p); g.names[x.name] = x; g.unsold += x.unsold; g.sold += x.sold; } else out.names.push(x); });
+  out.plans.forEach(function(g){ var p = g.plan; [['mm', p.mm], ['cm', p.cm], ['tl', p.tl]].forEach(function(r){ if(r[1] && !_mkcPerson(r[1])) g.missing.push(r[1]); }); });
+  return out;
+}
+function _mkcAllClaimed(){ var U = {}, S = {}, P = {}; (MARKETS || []).filter(Boolean).forEach(function(m){ var st = _mkaStats(m); Object.keys(st.devU).forEach(function(k){ U[k] = 1; }); Object.keys(st.devS).forEach(function(k){ S[k] = 1; }); Object.keys(st.people).forEach(function(k){ P[k] = 1; }); }); return { U:U, S:S, P:P }; }
+async function mkcApply(){
+  var u = DB.current; if(!canManageMarkets(u)) return alert('Only the owner or office can do this.');
+  var pv = mkcPreview(), missing = [].concat.apply([], pv.plans.map(function(g){ return g.missing; }));
+  if(missing.length) return alert('These people on your list were not found in the agent list (check the spelling on their profile): ' + missing.join(', '));
+  if(!confirm('Apply the market cleanup now?\n\n• ' + pv.plans.length + ' markets set exactly as your list\n• ' + pv.empty.length + ' empty markets removed\n• ' + pv.leftovers.length + ' market(s) with phones/people not on the list are left alone until placed\n\nEverything is checked before saving.')) return;
+  MKC.busy = true; _mkcPaint();
+  var before = _mkcAllClaimed(), backup = JSON.parse(JSON.stringify(MARKETS)), teams = (DB.agents || []).map(function(a){ return [a, a && a.team]; }), log = [], saveP = [], mergedIds = [];
+  try{
+    for(var i = 0; i < pv.plans.length; i++){
+      var g = pv.plans[i], p = g.plan, keep;
+      if(g.markets.length){ keep = g.markets.slice().sort(function(a, b){ return (b.st.peopleN + b.st.unsold + b.st.sold) - (a.st.peopleN + a.st.unsold + a.st.sold) || a.m.id - b.m.id; })[0].m;
+        var r = await mkaMerge(keep.id, g.markets.map(function(x){ return x.m.id; }).filter(function(id){ return id !== keep.id; }), p.name, { noSave:true }); if(!r.ok) throw new Error(p.name + ': ' + r.error); keep = r.keep; saveP = saveP.concat(r.saveP || []); mergedIds = mergedIds.concat(r.removedIds || []); }
+      else { var now = new Date().toISOString(), id = (typeof MARKET_NEXT_ID !== 'undefined') ? MARKET_NEXT_ID++ : (1 + MARKETS.reduce(function(t, m){ return Math.max(t, Number(m.id) || 0); }, 0));
+        keep = { id:id, name:p.name, city:'', state:'', notes:'', active:true, programs:{ lifeline:_emptyProgramSection(), internet:_emptyProgramSection(), aca:_emptyProgramSection() }, createdAt:now, updatedAt:now }; MARKETS.push(keep); }
+      Object.keys(g.names).forEach(function(n){ _mkaAddAlias(keep, n, _wmamCampaignOfName(n)); });
+      ensureMarketSections(keep); var ll = keep.programs.lifeline; ll.active = true; ll.campaigns = p.camps.slice();
+      if(p.mm){ ll.mmId = _mkcPerson(p.mm).id; } if(p.cm){ ll.cmId = _mkcPerson(p.cm).id; }
+      if(p.tl){ var tid = _mkcPerson(p.tl).id; ll.tlIds = (ll.tlIds || []).map(Number).indexOf(tid) >= 0 ? ll.tlIds : (ll.tlIds || []).concat([tid]); ll.faIds = (ll.faIds || []).filter(function(x){ return Number(x) !== tid; }); }
+      keep.active = true; keep.updatedAt = new Date().toISOString();
+      log.push({ market:p.name, id:keep.id, merged:g.markets.map(function(x){ return x.m.name; }), names:Object.keys(g.names) });
+    }
+    // empty markets not on the list are removed
+    var removed = [];
+    pv.empty.forEach(function(x){ var i = MARKETS.indexOf(x.m); if(i >= 0){ MARKETS.splice(i, 1); removed.push(x.m); } });
+    // check: every phone, sold phone and person that counted under a market before still does
+    var after = _mkcAllClaimed(), lost = [];
+    Object.keys(before.U).forEach(function(k){ if(!after.U[k]) lost.push('unsold phone ' + k.split('|').pop()); });
+    Object.keys(before.S).forEach(function(k){ if(!after.S[k]) lost.push('sold phone ' + k.split('|').pop()); });
+    Object.keys(before.P).forEach(function(k){ if(!after.P[k]) lost.push(_mkaName(k) || ('#' + k)); });
+    if(lost.length) throw new Error('the check found ' + lost.length + ' item(s) that would no longer count under a market (' + lost.slice(0, 5).join(', ') + (lost.length > 5 ? '…' : '') + ')');
+    var gone = removed.map(function(m){ return m.id; }).concat(mergedIds);
+    for(var j = 0; j < gone.length; j++){ try{ await wmamRecordMarketDeleted(gone[j]); }catch(e){} }
+    saveP.forEach(function(a){ try{ saveAgentToSupabase(a); }catch(e){} });
+    _wmamAliasMap = null; wmamMarketsChanged();
+    var ok = await wmamSaveMarketsNow('market-cleanup-20261014');
+    await _mkaLog({ kind:'market-cleanup-plan', plan:log, removedEmpty:removed.map(function(m){ return { id:m.id, name:m.name }; }), backup:backup });
+    MKC.msg = (ok ? '✔ Done — ' : '⚠ Done on this screen, still saving — ') + pv.plans.length + ' markets set, ' + removed.length + ' empty markets removed. Checked: every phone, sold phone and person still counts under a market.';
+  }catch(e){
+    MARKETS.length = 0; backup.forEach(function(m){ MARKETS.push(m); }); teams.forEach(function(x){ if(x[0]) x[0].team = x[1]; }); _wmamAliasMap = null; _wmamTeamsSig = ''; try{ wmamDeriveTeamsFromMarkets(); }catch(e2){}
+    MKC.msg = '⛔ Stopped and put back exactly as it was — ' + (e && e.message || e);
+  }
+  MKC.busy = false; gotoPanel('market-cleanup');
+}
+function _mkcPaint(){ var el = document.getElementById('mkcRoot'); if(el) el.outerHTML = _mkcBody(); }
+function mkcPlace(key, v){ if(v) MKC.place[key] = v; else delete MKC.place[key]; _mkcPaint(); }
+function _mkcBody(){
+  var esc = _escapeHtml, pv = mkcPreview(), card = 'background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;margin-bottom:14px';
+  var col = { 'Gen Mobile':'#16a34a', 'TruConnect':'#0891b2', 'Assurance Wireless':'#2563eb', 'DART':'#b45309', 'enTouch Wireless':'#7c3aed', 'Assist Wireless':'#db2777' };
+  var opts = function(key){ return '<select onchange="mkcPlace(\'' + key + '\', this.value)" style="padding:7px;border:1px solid #cbd5e1;border-radius:8px"><option value="">Goes to…</option>' + MARKET_PLAN_20261014.map(function(p){ return '<option' + (MKC.place[key] === p.name ? ' selected' : '') + '>' + esc(p.name) + '</option>'; }).join('') + '</select>'; };
+  var h = '<div id="mkcRoot">' + (MKC.msg ? '<div style="' + card + ';border:2px solid ' + (/^✔/.test(MKC.msg) ? '#86efac' : '#fca5a5') + ';font-weight:800">' + esc(MKC.msg) + '</div>' : '');
+  h += '<div style="' + card + ';background:#eef3ff;border-color:#c7d2fe;font-size:.9rem;color:#1e3a8a">Your 11 open Lifeline markets. Below each one: the old markets and upload names that go into it. Phones are never changed and keep counting under the market. Press <b>Apply</b> at the bottom when it looks right.</div>';
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin-bottom:14px">' + pv.plans.map(function(g){ var p = g.plan;
+      var mg = [['Campaign Manager', p.cm], ['Market Manager', p.mm], ['Team Leader', p.tl]].filter(function(r){ return r[1]; });
+      return '<div style="background:#fff;border:1px solid #e5e7eb;border-left:5px solid #003594;border-radius:12px;padding:12px 14px"><div style="font-size:1.1rem;font-weight:900">' + esc(p.name) + '</div>'
+        + '<div style="margin:5px 0">' + p.camps.map(function(c){ return '<span style="display:inline-block;color:#fff;font-size:11px;font-weight:800;border-radius:999px;padding:3px 9px;margin:2px 3px 2px 0;background:' + (col[c] || '#475569') + '">' + esc(c) + '</span>'; }).join('') + '</div>'
+        + mg.map(function(r){ var ok = !!_mkcPerson(r[1]); return '<div style="font-size:.86rem"><span style="display:inline-block;min-width:140px;color:#6b7280;font-weight:700">' + r[0] + '</span> ' + esc(r[1]) + (ok ? '' : ' <b style="color:#b91c1c">— not found in agents</b>') + '</div>'; }).join('')
+        + '<div style="font-size:.82rem;margin-top:4px">' + Object.keys(g.people).length + ' people · <b>' + g.unsold + '</b> unsold phones · ' + g.sold + ' sold</div>'
+        + '<div style="font-size:.76rem;color:#6b7280;margin-top:6px;border-top:1px dashed #e5e7eb;padding-top:6px">Combines: ' + (g.markets.map(function(x){ return '“' + esc(x.m.name) + '”'; }).concat(Object.keys(g.names).map(function(n){ return '“' + esc(n) + '” (upload name)'; })).join(', ') || '<i>nothing yet — a new market is made</i>') + '</div></div>'; }).join('') + '</div>';
+  if(pv.leftovers.length || pv.names.length){
+    h += '<div style="' + card + ';border:2px solid #fca5a5"><div style="font-weight:900;color:#b91c1c">Not on your list but has phones, sales or people — pick where each goes (nothing here is deleted)</div>'
+      + pv.leftovers.map(function(x){ return '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-top:1px solid #fee2e2"><div style="flex:1 1 240px"><b>' + esc(x.m.name) + '</b> <span style="font-size:.8rem;color:#6b7280">market #' + x.m.id + ' · ' + x.st.peopleN + ' people · ' + x.st.unsold + ' unsold · ' + x.st.sold + ' sold' + (x.m.active === false ? ' · paused' : '') + '</span></div>' + opts('m' + x.m.id) + '</div>'; }).join('')
+      + pv.names.map(function(x){ return '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-top:1px solid #fee2e2"><div style="flex:1 1 240px"><b>“' + esc(x.name) + '”</b> <span style="font-size:.8rem;color:#6b7280">upload/profile name · ' + esc(Object.keys(x.camps).join(', ')) + ' · ' + x.unsold + ' unsold · ' + x.sold + ' sold · ' + x.people + ' people</span></div>' + opts('n' + x.name) + '</div>'; }).join('')
+      + '<div style="font-size:.8rem;color:#6b7280;margin-top:6px">If you leave one unpicked it stays as it is (not removed) so nothing is lost.</div></div>';
+  }
+  h += '<div style="' + card + '"><b>' + pv.empty.length + ' empty market' + (pv.empty.length === 1 ? '' : 's') + ' will be removed</b> (no people, no phones sold or unsold): <span style="font-size:.86rem;color:#374151">' + (pv.empty.map(function(x){ return esc(x.m.name); }).join(', ') || 'none') + '</span></div>';
+  h += '<button onclick="mkcApply()" ' + (MKC.busy ? 'disabled' : '') + ' style="width:100%;padding:15px;border:none;border-radius:12px;background:#003594;color:#fff;font-weight:900;font-size:1.05rem;cursor:pointer">' + (MKC.busy ? '⏳ Applying and checking…' : 'Apply the market cleanup') + '</button>';
+  return h + '</div>';
+}
+function panelMarketCleanup(){ var u = DB.current; if(!u || !canManageMarkets(u)) return panelHeader('🗺️ Market Cleanup') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">🔒 Owner and office staff only.</div></div>';
+  var out = panelHeader('🗺️ Market Cleanup') + _mkcBody(); MKC.msg = ''; return out; }
+if(typeof window !== 'undefined'){ Object.assign(window, { MKC:MKC, MARKET_PLAN_20261014:MARKET_PLAN_20261014, mkcPreview:mkcPreview, mkcApply:mkcApply, mkcPlace:mkcPlace, panelMarketCleanup:panelMarketCleanup, _mkcPaint:_mkcPaint }); }
+
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
 //  voice back in about a second (OpenAI Realtime over WebRTC). The same
@@ -22282,6 +22608,8 @@ function canAccess(u, area){
       return canSubmitTicket(u, 'TruConnect');
     case 'carrier-tickets':
       return canViewAllTickets(u);
+    case 'markets-audit':
+    case 'market-cleanup':
     case 'markets-admin':
       return isOwner(u) || isOfficeRole(u);   // v2026.09.30: all office staff can see + add markets
     case 'my-profile':
@@ -49277,7 +49605,7 @@ function gotoPanel(id, params){
     'gm-ticket':panelGmTicket,
     'tc-ticket':panelTcTicket,
     'carrier-tickets':panelCarrierTickets,
-    'markets-admin':panelMarketsAdmin,
+    'markets-admin':panelMarketsAdmin,'markets-audit':function(){ return panelMarketsAudit(); },'market-cleanup':function(){ return panelMarketCleanup(); },
     'my-profile':panelMyProfile,
     'imei-search':panelImeiSearch,
     'sold-reports':panelSoldReports,
