@@ -3795,7 +3795,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.15.0200';
+var BUILD_VERSION = '2026.10.15.0600';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -10703,7 +10703,7 @@ function parseTruConnectFile(arrayBuffer){
       var value  = r[4];           // col E
       var label  = labelA || labelD;
       if(!label) return;
-      if(/AW Period/i.test(label) && value){
+      if(/^\s*(AW\s*)?Period\b/i.test(label) && value && !result.periodStart){   // v2026.10.15: WIL-Invoice-319 labels it just "Period"
         var m = String(value).match(/(\d+\/\d+\/\d+)\s*[-\u2013]\s*(\d+\/\d+\/\d+)/);
         if(m){ result.periodStart = m[1]; result.periodEnd = m[2]; }
         else  { result.periodStart = String(value); }
@@ -21874,6 +21874,175 @@ function _mkcBody(){
 function panelMarketCleanup(){ var u = DB.current; if(!u || !canManageMarkets(u)) return panelHeader('🗺️ Market Cleanup') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">🔒 Owner and office staff only.</div></div>';
   var out = panelHeader('🗺️ Market Cleanup') + _mkcBody(); MKC.msg = ''; return out; }
 if(typeof window !== 'undefined'){ Object.assign(window, { MKC:MKC, MARKET_PLAN_20261014:MARKET_PLAN_20261014, mkcPreview:mkcPreview, mkcApply:mkcApply, mkcPlace:mkcPlace, panelMarketCleanup:panelMarketCleanup, _mkcPaint:_mkcPaint }); }
+
+
+// v2026.10.15: the "Pay" column on a pay-file preview is the person's WHOLE pay for the file. Show it split
+// (own orders vs. pay from their team's orders) so it is never read as "pay per activation".
+function _ppPayCell(cents, entry){
+  if(!cents) return '<td style="padding:8px 10px;text-align:right;color:var(--muted2)">—</td>';
+  var sp = payrollSplitPersonalVsOverrides((entry && entry.breakdown) || []);
+  return '<td style="padding:8px 10px;text-align:right"><div style="color:#059669;font-weight:700">$' + (cents / 100).toFixed(2) + '</div>'
+    + (sp.overrideCents ? '<div style="font-size:.7rem;color:#6b7280;white-space:nowrap">personal $' + (sp.personalCents / 100).toFixed(2) + ' + overrides $' + (sp.overrideCents / 100).toFixed(2) + '</div>' : '') + '</td>';
+}
+if(typeof window !== 'undefined') window._ppPayCell = _ppPayCell;
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  ITEMIZED PAY STATEMENT — every person, same layout (Calvin 2026-10-14, v2026.10.15.0400)
+//  On the pay-file preview (before Save), click a name → a clear statement:
+//    1. Own orders (count × rate)   2. Pay from the team's orders, one line per person
+//    3. Add-ons   4. Deductions (each cancel/chargeback: whose order, what share)   5. Credits
+//    6. Prior debt   → Final pay (+ carryover). "Print for approval" prints one or all.
+//  The AI assistant reads the same numbers from the preview (tool: payroll_preview), so it can
+//  help find discrepancies before the file is saved.
+// ══════════════════════════════════════════════════════════════════════
+function _ppComputePreview(carrier, parsed){
+  var match = ppMatchRowsToAgents(parsed, carrier), commissions = ppComputeAgentCommissions(parsed, carrier);
+  var manualAdj = (window._ppManualAdjustments && window._ppManualAdjustments[carrier]) || { deductions:[], credits:[] };
+  var allDeductions = (parsed.deductions || []).slice(), allCredits = (parsed.credits || []).slice();
+  manualAdj.deductions.forEach(function(d){ allDeductions.push({ type:d.reason || 'Manual Deduction', agentName:d.agentName, orderNum:'MANUAL-DD-' + (d.id || ''), amountCents:d.amountCents, isManual:true }); });
+  manualAdj.credits.forEach(function(c){ allCredits.push({ type:c.reason || 'Manual Credit', agentName:c.agentName, orderNum:'MANUAL-CR-' + (c.id || ''), amountCents:c.amountCents, isManual:true }); });
+  if(carrier === 'Gen Mobile') ppInjectGMChargebacksAsCascadeDeductions(match, commissions, allDeductions);
+  var cascade = null; try{ cascade = payrollApplyDeductions({ commissions:commissions, deductions:allDeductions, credits:allCredits, carrier:carrier, weekId:'preview', dryRun:true }); }catch(e){}
+  return { match:match, commissions:commissions, cascade:cascade };
+}
+function _ppStagedParsed(carrier){ var st = window._ppStaged, ds = (st && st.detections) || []; var d = ds.find(function(x){ return x && x.carrier === carrier && x.confirmed !== false; }) || ds.find(function(x){ return x && x.carrier === carrier; }); return d ? d.parsed : null; }
+var _PP_ROLE_TXT = { 'agent':'own enrollment', 'tl-personal':'own enrollment', 'mm-personal':'own enrollment', 'cm-personal':'own enrollment', 'ibo-personal':'own enrollment', 'owner-personal':'own enrollment', 'tl-diff':'Team Leader override', 'mm-diff':'Market Manager override', 'cm-fill':'Campaign Manager override', 'ibo-consolidated':'order routed to you' };
+function ppStatementData(aid, carrier, pre){
+  var parsed = pre ? null : _ppStagedParsed(carrier); if(!pre && !parsed) return null;
+  pre = pre || _ppComputePreview(carrier, parsed);
+  var a = (DB.agents || []).find(function(x){ return x && x.id === aid; }) || { name:'Agent #' + aid };
+  var entry = (pre.commissions.byAgent || {})[aid] || { breakdown:[] }, n = ((pre.cascade && pre.cascade.netByAgent) || {})[aid] || {};
+  var sp = payrollSplitPersonalVsOverrides(entry.breakdown || []), c = function(x){ return Math.round((x || 0) * 100); };
+  var line = function(b){ return { label:_ppPlainLabel(b.label), count:b.count || 0, rate:b.rate || 0, cents:c(b.amount) }; };
+  var own = [], addons = [], fileCb = [];
+  sp.personalLines.forEach(function(b){ if(/^chargebacks/i.test(b.label || '')) fileCb.push(line(b)); else if(/add-on|bonus|port-in|top-up/i.test(b.label || '') && !/^own tribal top-up/i.test(b.label || '')) addons.push(line(b)); else own.push(line(b)); });
+  var team = sp.overrideLines.map(line);
+  // deductions: group the same kind of charge on the same person's orders
+  var dg = {}; (n.cascade || []).forEach(function(x){ var role = _PP_ROLE_TXT[x.paidByRole] || x.paidByRole || ''; var mine = /own enrollment/.test(role) || (!!x.fromName && x.fromName === a.name);
+    var k = (x.type || 'Deduction') + '|' + (mine ? '' : (x.fromName || '')) + '|' + role + '|' + x.amountCents;
+    var g = dg[k] = dg[k] || { type:x.type || 'Deduction', whose:mine ? (/upgrade/i.test(x.type || '') ? 'your device' : 'your own enrollment') : (x.fromName ? x.fromName + '’s enrollment' : ''), share:role, each:x.amountCents, count:0, orders:[] }; g.count++; if(x.orderNum) g.orders.push(x.orderNum); });
+  var deductions = Object.keys(dg).map(function(k){ var g = dg[k]; g.cents = g.each * g.count; return g; });
+  var credits = (((pre.cascade && pre.cascade.audit) || []).filter(function(x){ return x.kind === 'credit' && x.appliedTo === aid; })).map(function(x){ return { type:x.type, order:x.orderNum, cents:x.amountCents }; });
+  var sum = function(L){ return L.reduce(function(t, x){ return t + (x.cents || 0); }, 0); };
+  return { agentId:aid, name:a.name, role:a.role || '', carrier:carrier, periodStart:(parsed && parsed.periodStart) || '', periodEnd:(parsed && parsed.periodEnd) || '',
+    own:own, team:team, addons:addons, deductions:deductions, credits:credits,
+    ownCents:sum(own), teamCents:sum(team), addonCents:sum(addons), grossCents:n.grossCents != null ? n.grossCents : c(entry.amount),
+    deductionCents:n.deductionsCents || 0, creditCents:n.creditsCents || 0, priorDebtCents:n.debtPaidCents || 0, finalCents:n.netCents != null ? n.netCents : c(entry.amount), carryoverCents:n.carryoverCents || 0 };
+}
+function _ppM(c){ c = c || 0; return (c < 0 ? '−' : '') + '$' + (Math.abs(c) / 100).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function ppStatementHtml(S){
+  var esc = _escapeHtml, row = function(l, r, o){ o = o || {}; return '<tr><td style="padding:5px 10px;' + (o.indent ? 'padding-left:24px;' : '') + (o.b ? 'font-weight:800;' : '') + 'color:' + (o.c || '#111827') + '">' + l + '</td><td style="padding:5px 10px;text-align:right;white-space:nowrap;' + (o.b ? 'font-weight:900;' : '') + 'color:' + (o.c || '#111827') + '">' + r + '</td></tr>'; };
+  var _secN = 0, sec = function(t, n){ t = (++_secN) + '. ' + t.replace(/^\d+\.\s*/, ''); return '<tr><td colspan="2" style="padding:10px 10px 4px;font-weight:900;color:#003594;font-size:.82rem;letter-spacing:1px;text-transform:uppercase;border-top:1px solid #e5e7eb">' + t + (n != null ? ' <span style="color:#6b7280;font-weight:700">(' + n + ')</span>' : '') + '</td></tr>'; };
+  var qty = function(x){ return x.count ? x.count + ' × ' + _ppM(Math.round(x.rate * 100)) + ' = ' : ''; };
+  var h = '<div class="ppStmt" style="font-family:Arial,sans-serif;max-width:720px;margin:0 auto 18px;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden;background:#fff;page-break-inside:avoid">'
+    + '<div style="background:#003594;color:#fff;padding:12px 16px"><div style="font-size:1.15rem;font-weight:900">' + esc(S.name) + ' <span style="font-weight:400;font-size:.85rem;opacity:.85">' + esc(S.role) + '</span></div><div style="font-size:.84rem;opacity:.9">' + esc(S.carrier) + ' pay statement' + (S.periodStart ? ' · ' + esc(S.periodStart) + (S.periodEnd ? ' – ' + esc(S.periodEnd) : '') : '') + ' · PREVIEW — not saved yet</div></div>'
+    + '<table style="width:100%;border-collapse:collapse;font-size:.88rem">';
+  h += sec('Personal Enrollments', S.own.length) + (S.own.length ? S.own.map(function(x){ return row(esc(x.label), qty(x) + '<b>' + _ppM(x.cents) + '</b>', { indent:1 }); }).join('') : row('No personal enrollments on this file', '—', { indent:1, c:'#6b7280' })) + row('Personal enrollments total', _ppM(S.ownCents), { b:1 });
+  if(S.team.length) h += sec('Team Overrides', S.team.length) + S.team.map(function(x){ return row(esc(x.label), qty(x) + '<b>' + _ppM(x.cents) + '</b>', { indent:1 }); }).join('') + row('Team overrides total', _ppM(S.teamCents), { b:1, c:'#0f766e' });
+  if(S.addons.length) h += sec('Add-ons', S.addons.length) + S.addons.map(function(x){ return row(esc(x.label), qty(x) + '<b>' + _ppM(x.cents) + '</b>', { indent:1 }); }).join('') + row('Add-ons total', _ppM(S.addonCents), { b:1 });
+  h += row('GROSS PAY', _ppM(S.grossCents), { b:1 });
+  h += sec('Deductions', S.deductions.length) + (S.deductions.length ? S.deductions.map(function(g){ return row(esc(g.type) + ' — ' + esc(g.whose || '') + (g.share && !/own enrollment/.test(g.share) && !/^your /.test(g.whose || '') ? ' <span style="color:#6b7280">(your ' + esc(g.share) + ')</span>' : '') + (g.orders.length ? '<div style="font-size:.72rem;color:#6b7280">Order' + (g.orders.length === 1 ? '' : 's') + ': ' + esc(g.orders.slice(0, 12).join(', ')) + (g.orders.length > 12 ? '…' : '') + '</div>' : ''), g.count + ' × ' + _ppM(g.each) + ' = <b>−' + _ppM(g.cents) + '</b>', { indent:1, c:'#991b1b' }); }).join('') : row('No deductions', '—', { indent:1, c:'#6b7280' })) + (S.deductions.length ? row('Deductions total', '−' + _ppM(S.deductionCents), { b:1, c:'#991b1b' }) : '');
+  if(S.credits.length) h += sec('Credits', S.credits.length) + S.credits.map(function(x){ return row(esc(x.type) + (x.order ? ' <span style="color:#6b7280;font-size:.75rem">' + esc(x.order) + '</span>' : ''), '+' + _ppM(x.cents), { indent:1, c:'#166534' }); }).join('') + row('Credits total', '+' + _ppM(S.creditCents), { b:1, c:'#166534' });
+  if(S.priorDebtCents) h += sec('Prior debt') + row('Carried from an earlier payroll (click Prior Debt on the summary for the history)', '−' + _ppM(S.priorDebtCents), { indent:1, c:'#b45309' });
+  h += '<tr style="background:#ecfdf5"><td style="padding:10px;font-weight:900;font-size:1rem">FINAL PAY</td><td style="padding:10px;text-align:right;font-weight:900;font-size:1.15rem;color:#166534">' + _ppM(S.finalCents) + '</td></tr>'
+    + (S.carryoverCents ? row('Carried to next payroll (deductions bigger than pay)', _ppM(S.carryoverCents), { c:'#b45309' }) : '')
+    + '</table><div style="display:flex;justify-content:space-between;padding:10px 16px;font-size:.78rem;color:#6b7280;border-top:1px solid #e5e7eb"><span>Approved by: ____________________</span><span>Date: ____________</span></div></div>';
+  return h;
+}
+function ppStatementShow(aid, carrier){
+  var S = ppStatementData(aid, carrier); if(!S) return alert('No pay file preview is open for ' + carrier + '.');
+  var old = document.getElementById('ppStmtOv'); if(old) old.remove();
+  var ov = document.createElement('div'); ov.id = 'ppStmtOv'; ov.style.cssText = 'position:fixed;inset:0;z-index:100800;background:rgba(0,0,0,.55);overflow-y:auto;padding:16px';
+  ov.innerHTML = '<div style="max-width:760px;margin:20px auto"><div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:8px"><button onclick="ppStatementPrint([' + aid + '], ' + JSON.stringify(carrier).replace(/"/g, '&quot;') + ')" style="padding:9px 14px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">🖨 Print for approval</button><button onclick="ppStatementPrint(null, ' + JSON.stringify(carrier).replace(/"/g, '&quot;') + ')" style="padding:9px 14px;border:none;border-radius:8px;background:#0f766e;color:#fff;font-weight:800;cursor:pointer">🖨 Print everyone on this file</button><button onclick="document.getElementById(\'ppStmtOv\').remove()" style="padding:9px 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;font-weight:800;cursor:pointer">Close</button></div>' + ppStatementHtml(S) + '</div>';
+  document.body.appendChild(ov);
+}
+function ppStatementPrint(ids, carrier){
+  var parsed = _ppStagedParsed(carrier); if(!parsed) return; var pre = _ppComputePreview(carrier, parsed);
+  if(!ids){ ids = Object.keys((pre.cascade && pre.cascade.netByAgent) || pre.commissions.byAgent || {}).map(Number).sort(function(x, y){ var a = ((DB.agents || []).find(function(z){ return z && z.id === x; }) || {}).name || '', b = ((DB.agents || []).find(function(z){ return z && z.id === y; }) || {}).name || ''; return a.localeCompare(b); }); }
+  var body = ids.map(function(id){ var S = ppStatementData(id, carrier, pre); if(S){ S.periodStart = parsed.periodStart || ''; S.periodEnd = parsed.periodEnd || ''; } return S ? ppStatementHtml(S) : ''; }).join('');
+  var w = window.open('', '_blank'); if(!w) return alert('Allow pop-ups to print.');
+  w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>' + _escapeHtml(carrier) + ' pay statements</title><style>body{margin:16px;font-family:Arial,sans-serif}@media print{.ppStmt{page-break-after:always}}</style></head><body>' + body + '<script>setTimeout(function(){ window.print(); }, 400);<\/script></body></html>'); w.document.close();
+}
+// AI assistant: read the pay-file preview that is open right now (before it is saved)
+try{
+  WAGENT_TOOLS.push({ name:'payroll_preview', description:'The pay file that is uploaded and OPEN IN PREVIEW right now (not saved/finalized yet). Returns each person\'s gross, deductions, credits, prior debt and final pay; with person, the full itemized statement (own orders, team overrides, add-ons, each deduction and whose order it was). Use this to help payroll find discrepancies before saving. Payroll staff only.', parameters:{ type:'object', properties:{ person:{ type:'string', description:'name of one person for the itemized statement (optional)' }, carrier:{ type:'string', description:'TruConnect, Gen Mobile, Assurance (optional)' } } } });
+  var _wagentRunPreview = wagentRun;
+  wagentRun = function(name, args){
+    if(name !== 'payroll_preview') return _wagentRunPreview.apply(this, arguments);
+    if(!(typeof wmamIsPayrollStaff === 'function' && wmamIsPayrollStaff(DB.current))) return { error:'payroll is limited to payroll staff' };
+    var st = window._ppStaged, ds = ((st && st.detections) || []).filter(function(d){ return d && d.parsed; });
+    if(!ds.length) return { error:'No pay file is open in preview right now. Upload the pay file (Payroll → Upload Pay File) and leave the preview open, then ask again.' };
+    if(args && args.carrier) ds = ds.filter(function(d){ return String(d.carrier).toLowerCase().indexOf(String(args.carrier).toLowerCase()) >= 0; });
+    var who = args && args.person ? _waFindPerson(args.person) : null; if(args && args.person && !who) return { error:'person not found: ' + args.person };
+    return { status:'PREVIEW — not saved yet', files:ds.map(function(d){ var pre = _ppComputePreview(d.carrier, d.parsed), ids = Object.keys((pre.cascade && pre.cascade.netByAgent) || pre.commissions.byAgent || {}).map(Number);
+      var people = ids.map(function(id){ var S = ppStatementData(id, d.carrier, pre); return S && { name:S.name, gross:S.grossCents / 100, own:S.ownCents / 100, team:S.teamCents / 100, deductions:S.deductionCents / 100, credits:S.creditCents / 100, prior_debt:S.priorDebtCents / 100, final_pay:S.finalCents / 100, carryover:S.carryoverCents / 100 }; }).filter(Boolean);
+      var out = { carrier:d.carrier, period:(d.parsed.periodStart || '') + ' to ' + (d.parsed.periodEnd || ''), people_count:people.length, unmatched_report_names:(pre.match.unmatched || []).map(function(m){ return (m && (m.agentName || m.agentCode || m.name)) || ''; }).slice(0, 40), unresolved_deductions:((pre.cascade && pre.cascade.unresolved) || []).length, totals:{ gross:people.reduce(function(t, x){ return t + x.gross; }, 0), final:people.reduce(function(t, x){ return t + x.final_pay; }, 0) } };
+      if(who){ var S = ppStatementData(who.id, d.carrier, pre); if(S) out.statement = { name:S.name, own_orders:S.own.map(function(x){ return { line:x.label, count:x.count, rate:x.rate, amount:x.cents / 100 }; }), team_orders:S.team.map(function(x){ return { line:x.label, count:x.count, rate:x.rate, amount:x.cents / 100 }; }), add_ons:S.addons.map(function(x){ return { line:x.label, count:x.count, amount:x.cents / 100 }; }), deductions:S.deductions.map(function(g){ return { type:g.type, whose_order:g.whose, share:g.share, count:g.count, each:g.each / 100, total:g.cents / 100, orders:g.orders.slice(0, 20) }; }), credits:S.credits.map(function(x){ return { type:x.type, amount:x.cents / 100 }; }), gross:S.grossCents / 100, prior_debt:S.priorDebtCents / 100, final_pay:S.finalCents / 100 }; }
+      else out.people = people;
+      return out; }) };
+  };
+  window.wagentRun = wagentRun;
+}catch(e){ console.warn('[payroll_preview tool]', e); }
+if(typeof window !== 'undefined'){ Object.assign(window, { ppStatementData:ppStatementData, ppStatementHtml:ppStatementHtml, ppStatementShow:ppStatementShow, ppStatementPrint:ppStatementPrint, _ppComputePreview:_ppComputePreview }); }
+
+
+// plain-English line names for statements (the payroll math itself is unchanged)
+function _ppPlainLabel(l){
+  l = String(l || ''); var m, kind = function(x){ return /nlad/i.test(x) ? 'NLAD' : 'Tribal'; };
+  if((m = l.match(/^CM (NLAD|Tribal) (?:diff|fill) on (.+?)(?: consolidated)? \(/i))) return 'Override on ' + m[2] + '’s ' + m[1] + ' enrollments';
+  if((m = l.match(/^TL Tribal override on (.+?) \(/i))) return 'Team Leader override on ' + m[1] + '’s Tribal enrollments';
+  if((m = l.match(/^MM NLAD override on (.+?) \(/i))) return 'Market Manager override on ' + m[1] + '’s NLAD enrollments';
+  if((m = l.match(/^Direct manager override on (.+?) (NLAD|Tribal)$/i))) return 'Manager override on ' + m[1] + '’s ' + m[2] + ' enrollments';
+  if((m = l.match(/^Tribal campaign share on (.+)$/i))) return 'Override on ' + m[1] + '’s Tribal enrollments';
+  if(/^Own Tribal top-up to \$(\d+)/i.test(l)) return 'Top-up on personal Tribal enrollments (to $' + l.match(/\$(\d+)/)[1] + ' each)';
+  if(/^(Personal (NLAD|Tribal)|Tribal enrollments|NLAD enrollments|Gen Mobile (NLAD|Tribal)$|TruConnect (NLAD|Tribal))/i.test(l)) return 'Personal ' + kind(l) + ' enrollments';
+  if((m = l.match(/^Gen Mobile (NLAD|Tribal) \((.+), paid to (.+)\)$/i))) return m[2] + '’s ' + m[1] + ' enrollments (paid to you)';
+  if((m = l.match(/^(NLAD|Tribal) \((.+) consolidated\)$/i))) return /\(consolidated\)$/i.test(m[2]) ? 'Personal ' + m[1] + ' enrollments' : m[1] + ' enrollments in ' + m[2] + ' (all routed to you)';
+  if(/^Port-in\/out bonus/i.test(l)) return 'Port-in bonus';
+  return l;
+}
+if(typeof window !== 'undefined') window._ppPlainLabel = _ppPlainLabel;
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  TANITA LOSES HER OVERRIDE ON EVERY CHARGEBACK SHE WAS PAID ON (Calvin 2026-10-14, permanent, v2026.10.15.0600)
+//  "Anyone she gets paid off of — Juan included — if the company charges us back, she loses the
+//  override she received as well." For every TruConnect 14-day cancel / chargeback on someone else's
+//  enrollment, Tanita is charged her override share by the current plan ($3 on Sheila, Najee, Juan,
+//  the difference to $28 on an agent) — even when an older saved pay record left her share out.
+//  Never charged twice: if the record already took her share on that order, nothing is added.
+//  Device upgrades are a device fee, not a chargeback, so they are not included here.
+// ══════════════════════════════════════════════════════════════════════
+function _tanFindAgent(name){ var n = String(name || '').trim().toLowerCase(); if(!n) return null;
+  return (DB.agents || []).find(function(a){ var ac = a && a.agentCodes; if(typeof ac === 'string'){ try{ ac = JSON.parse(ac); }catch(e){ ac = {}; } } return a && ac && ac.TruConnect && String(ac.TruConnect).trim().toLowerCase() === n; })
+      || (DB.agents || []).find(function(a){ return a && a.name && a.name.trim().toLowerCase() === n; }) || null; }
+var _payrollApplyDeductionsTan = payrollApplyDeductions;
+payrollApplyDeductions = function(opts){
+  var res = _payrollApplyDeductionsTan.apply(this, arguments);
+  try{
+    if(!res || !opts || (opts.carrier || 'TruConnect') !== 'TruConnect') return res;
+    var P = _tcLockPeople(), T = P.tanita; if(!T) return res;
+    var nb = res.netByAgent = res.netByAgent || {}, tb = nb[T.id] = nb[T.id] || { grossCents:0, deductionsCents:0, creditsCents:0, debtPaidCents:0, netCents:0, cascade:[], carryoverCents:0 };
+    tb.cascade = tb.cascade || [];
+    (opts.deductions || []).forEach(function(d){
+      if(!d || /upgrade/i.test(d.type || '')) return;                       // device fee, not a chargeback
+      if(!/cancel|chargeback|clawback|disconnect/i.test(d.type || '')) return;
+      var ag = _tanFindAgent(d.agentName); if(!ag || ag.id === T.id || isOwner(ag)) return;
+      var split = []; try{ split = payrollComputeDealSplit({ carrier:'TruConnect', agentId:ag.id, isTribal:!!d.isTribal, agentTribalTotalThatWeek:31, agentNladTotalThatWeek:31 }) || []; }catch(e){ split = []; }
+      var share = split.filter(function(x){ return x && x.aid === T.id; }).reduce(function(t, x){ return t + (x.cents || 0); }, 0); if(share <= 0) return;
+      var already = tb.cascade.filter(function(x){ return x && String(x.orderNum) === String(d.orderNum || '') && (x.paidByAid === T.id || /cm-fill|cm-diff/.test(x.paidByRole || '')); }).reduce(function(t, x){ return t + (x.amountCents || 0); }, 0);
+      var owe = share - already; if(owe <= 0) return;
+      var paid = Math.max(0, Math.min(tb.netCents || 0, owe)), short = owe - paid;
+      tb.netCents = (tb.netCents || 0) - paid; tb.deductionsCents = (tb.deductionsCents || 0) + paid;
+      tb.cascade.push({ type:d.type, orderNum:d.orderNum, amountCents:owe, fromName:ag.name, paidByRole:'cm-fill', paidByAid:T.id, addedBy:'override-chargeback-rule' });
+      if(short > 0){ tb.carryoverCents = (tb.carryoverCents || 0) + short; if(!opts.dryRun && typeof payrollAddDebt === 'function') payrollAddDebt(T.id, short, (d.type || 'Chargeback') + ' ' + (d.orderNum || '') + ' — override on ' + ag.name + '’s enrollment (more than this week’s pay)', opts.weekId || ''); }
+      (res.audit = res.audit || []).push({ kind:'override-chargeback', type:d.type, orderNum:d.orderNum, amountCents:owe, appliedTo:T.id, appliedToName:T.name, enroller:ag.name, via:'Tanita override rule' });
+    });
+  }catch(e){ console.warn('[tanita override chargeback]', e); }
+  return res;
+};
+window.payrollApplyDeductions = payrollApplyDeductions;
 
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
@@ -53763,7 +53932,9 @@ function payrollSplitPersonalVsOverrides(breakdown){
       label.indexOf(' override on ') >= 0 ||
       label.indexOf(' diff on ')     >= 0 ||
       label.indexOf(' fill on ')     >= 0 ||
-      label.indexOf(' bonus on ')    >= 0;
+      label.indexOf(' bonus on ')    >= 0 ||
+      label.indexOf(' share on ')    >= 0 ||   // v2026.10.15: Gen Mobile 2026-10 "Tribal campaign share on X" (Tanita) is pay from someone else's order
+      label.indexOf(', paid to ')    >= 0;     // v2026.10.15: an order routed to the IBO from one of his agents
 
     if(isOverride){
       overrideCents += amountCents;
@@ -54243,7 +54414,7 @@ function ppRenderCarrierPreview(carrier, parsed){
         h += '<td style="padding:8px 10px;text-align:right">'+(act.Tribal||0)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right">'+(act.MyTcApp||0)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right">'+(act.TcPlus||0)+'</td>';
-        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(commCents?'$'+(commCents/100).toFixed(2):'—')+'</td>';
+        h += _ppPayCell(commCents, commEntry);
       } else if(carrier === 'Gen Mobile'){
         // Calvin 2026-06-11 v0330b: GM bonus columns (Tribal/BYOD/Email) to match TC's layout
         var gAct = m.row.activations || {};
@@ -54251,11 +54422,11 @@ function ppRenderCarrierPreview(carrier, parsed){
         h += '<td style="padding:8px 10px;text-align:right">'+(gAct.TRB||0)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right">'+(gAct.BYOD_SIM||0)+'</td>';
         h += '<td style="padding:8px 10px;text-align:right">'+(gAct.Email||0)+'</td>';
-        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(commCents?'$'+(commCents/100).toFixed(2):'—')+'</td>';
+        h += _ppPayCell(commCents, commEntry);
         h += '<td style="padding:8px 10px;text-align:right;color:'+(gCb?'#991B1B':'var(--muted2)')+'">'+(gCb?'$'+(gCb/100).toFixed(2):'—')+'</td>';
       } else {
         var cb = m.row.chargebackTotal || 0;
-        h += '<td style="padding:8px 10px;text-align:right;color:#059669;font-weight:700">'+(commCents?'$'+(commCents/100).toFixed(2):'—')+'</td>';
+        h += _ppPayCell(commCents, commEntry);
         h += '<td style="padding:8px 10px;text-align:right;color:'+(cb?'#991B1B':'var(--muted2)')+'">'+(cb?'$'+(cb/100).toFixed(2):'—')+'</td>';
       }
       h += '</tr>';
@@ -54536,7 +54707,7 @@ function ppRenderCarrierPreview(carrier, parsed){
         var manCred = manAdj.credCents || 0;
 
         h += '<tr style="border-bottom:1px solid rgba(0,0,0,.05)">';
-        h += '<td style="padding:6px 8px;font-size:.78rem"><strong>'+ag.name+'</strong></td>';
+        h += '<td style="padding:6px 8px;font-size:.78rem"><strong>'+ag.name+'</strong><div><a href="javascript:void(0)" onclick="ppStatementShow('+parseInt(aid,10)+', '+JSON.stringify(carrier).replace(/"/g,'&quot;')+')" style="font-size:.68rem;color:#003594;font-weight:700">\uD83D\uDCC4 Itemized statement</a></div></td>';
         h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:var(--ink)">'+(split.personalCents?'$'+(split.personalCents/100).toFixed(2):'—')+'</td>';
         h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:'+(split.overrideCents?'#0F766E':'var(--muted2)')+';font-weight:'+(split.overrideCents?'600':'400')+'">'+(split.overrideCents?'+$'+(split.overrideCents/100).toFixed(2):'—')+'</td>';
         h += '<td style="padding:6px 8px;text-align:right;font-size:.78rem;color:var(--muted)"><strong>$'+(n.grossCents/100).toFixed(2)+'</strong></td>';
