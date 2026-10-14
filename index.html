@@ -3795,7 +3795,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.14.0700';
+var BUILD_VERSION = '2026.10.14.0800';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -19378,6 +19378,9 @@ var AI_EXAM = [
     expect:function(t){ return 'an email draft to office@wmaminc.com with ' + (t ? t.market + ' and ' + t.unsold : 'no unsold inventory'); },
     grade:function(a, t, tools, drafts){ var d = (drafts || []).find(function(x){ return x && x.kind === 'email' && /office@wmaminc\.com/i.test(x.to); }) || (drafts || []).find(function(x){ return x && x.kind === 'message'; });
       if(!d) return /no mailbox|connect/i.test(a) ? null : false; var body = d.text || d.body || ''; return t ? (_exHas(body, String(t.market).split(/[ (]/)[0]) && _exNum(body, t.unsold)) : /no|none|zero/i.test(body); } },
+  { id:'desk_queue', q:'What is waiting on the office desks right now \u2014 inventory, payroll and HR?',
+    truth:async function(){ var q = await wmamMyWorkQueue(); return { weeks:(q.payroll_weeks_waiting_approval || []).length }; }, expect:function(t){ return 'a rundown from the live work queue (' + t.weeks + ' payroll week(s) waiting approval)'; },
+    grade:function(a, t, tools){ return _exUsed(tools, ['my_work_queue']) && _exNum(a, t.weeks); } },
   { id:'team_activity', q:'What has Makenzie Gibson done in the back office in the last 7 days?', ownerOnly:true,
     truth:function(){ return null; }, expect:function(){ return 'a summary from her logged activity'; },
     grade:function(a, t, tools){ return _exUsed(tools, ['team_activity']) && _exHas(a, 'makenzie'); } }
@@ -20110,7 +20113,7 @@ if(typeof window !== 'undefined'){ Object.assign(window, { gmSwapOpen:gmSwapOpen
 
 
 // ══════════════════════════════════════════════════════════════════════
-//  DART PAYROLL — 3-point plan (Calvin 2026-10-13)  v2026.10.14.0700
+//  DART PAYROLL — 3-point plan (Calvin 2026-10-13)  v2026.10.14.0800
 //  • Per point: Agent $20/3 · Manager (TL/MM) $24/3 = $8 · Campaign Manager $28/3. Every point pays.
 //  • Overrides = differences: manager gets (mgr − agent), the campaign manager gets ($28 tier − next tier).
 //  • GOOD orders only (DART's Order Status). Bad orders pay $0.
@@ -20343,6 +20346,131 @@ function _wmamCompanyWeekCard(){
   }
   return h + '</div></div>';
 }
+// ══════════════════════════════════════════════════════════════════════
+//  AI EMPLOYEE — Part 2 (payroll: K-Anna's desk) + Part 3 (HR, agents & markets: the office desk)
+//  v2026.10.14. Every task runs the SAME back-office function the button runs, under the
+//  logged-in person's own permissions, then CHECKS the result before it reports "done".
+//  Nothing is guessed: a name that matches more than one person, a week that is already
+//  in the system, or a file it doesn't recognize stops the task and says exactly why.
+// ══════════════════════════════════════════════════════════════════════
+function _aiPerson(q){
+  var all = (DB.agents || []).filter(function(a){ return a && !a.deletedAt; });
+  var byId = all.find(function(a){ return String(a.id) === String(q); }); if(byId) return { p:byId };
+  var s = String(q || '').toLowerCase().trim(); if(!s) return { err:'No person was given.' };
+  var exact = all.filter(function(a){ return String(a.name || '').toLowerCase() === s; }); if(exact.length === 1) return { p:exact[0] };
+  var part = all.filter(function(a){ return String(a.name || '').toLowerCase().indexOf(s) >= 0 || String(a.username || '').toLowerCase() === s; });
+  if(part.length === 1) return { p:part[0] };
+  if(!part.length) return { err:'Nobody named “' + q + '” is in the agent list.' };
+  return { err:'“' + q + '” matches more than one person (' + part.slice(0, 6).map(function(a){ return a.name + ' #' + a.id; }).join(', ') + ') — say which one.' };
+}
+function _aiWeekLabel(w){ return (w.carrier || 'Pay file') + ' ' + (w.periodStart || '?') + ' → ' + (w.periodEnd || '?'); }
+function _aiCents(c){ return '$' + ((Number(c) || 0) / 100).toFixed(2); }
+async function _aiAttachment(message_id, index){
+  var r = await wmamInvoke('email-center', { body:{ action:'attachment', message_id:message_id, index:index || 0 } }); var d = (r && r.data) || {};
+  if(r.error || !d.ok) return { err:'Could not open the attachment: ' + ((r.error && r.error.message) || d.error || 'unknown') };
+  var bin = atob(d.data), u8 = new Uint8Array(bin.length); for(var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return { name:d.name, type:d.type, u8:u8 };
+}
+Object.assign(AI_TASKS, {
+  // ---------- PAYROLL ----------
+  process_pay_file:{ group:'payroll_files', label:function(a){ return 'Load the emailed pay file into payroll (' + (a.file_name || 'attachment') + ')'; },
+    run:async function(a){
+      var f = await _aiAttachment(a.message_id, a.index); if(f.err) return { ok:false, messages:[f.err] };
+      var text = /\.(csv|txt)$/i.test(f.name) ? new TextDecoder().decode(f.u8) : '';
+      window._ppFileNameLast = f.name; window._ppFileBuffer = f.u8.buffer; window._ppRawText = text;
+      var dets = []; try{ dets = ppDetectCarriers({ text:text, arrayBuffer:f.u8.buffer }) || []; }catch(e){ return { ok:false, messages:['Could not read ' + f.name + ': ' + (e.message || e)] }; }
+      var conf = dets.filter(function(d){ return d && d.confirmed; }); if(!conf.length) return { ok:false, messages:['File: ' + f.name, 'I could not tell which company this pay file is from, so I did not load it. Open Payroll → Upload to load it by hand.'] };
+      var before = (PAYROLL_WEEKS || []).length, dup = [];
+      conf.forEach(function(d){ var p = d.parsed || d.data || d; var pe = p.periodEnd || (p.period && p.period.end), ca = d.carrier || p.carrier;
+        (PAYROLL_WEEKS || []).forEach(function(w){ if(w && ca && pe && String(w.carrier) === String(ca) && String(w.periodEnd) === String(pe)) dup.push(_aiWeekLabel(w)); }); });
+      if(dup.length) return { ok:false, messages:['File: ' + f.name, 'This pay week is already in payroll (' + dup.join(', ') + '). I did not load it twice.'] };
+      window._ppDetections = dets;
+      var s1 = await _aiRunLikeButton(function(){ return ppProceedToPreview(); }); if(!s1.ok) return s1;
+      var s2 = await _aiRunLikeButton(function(){ return ppCommitStaged(); });
+      var added = (PAYROLL_WEEKS || []).slice(before);
+      if(!added.length) return { ok:false, messages:['File: ' + f.name, 'The file was read but no pay week was saved.'].concat(s2.messages || []) };
+      return { ok:true, messages:['File: ' + f.name].concat(added.map(function(w){ return 'Saved ' + _aiWeekLabel(w) + ' — ' + ((w.rows || []).length) + ' people, status ' + (w.status || 'draft') + ' (still needs approval)'; })) }; } },
+  approve_payroll_week:{ group:'payroll_approve', label:function(a){ var w = _aiFind(PAYROLL_WEEKS, a.week_id); return 'Approve the payroll week ' + (w ? _aiWeekLabel(w) : '#' + a.week_id); },
+    run:async function(a){ var w = _aiFind(PAYROLL_WEEKS, a.week_id); if(!w) return { ok:false, messages:['No payroll week #' + a.week_id] };
+      if(w.status === 'approved' || w.status === 'finalized') return { ok:false, messages:[_aiWeekLabel(w) + ' is already ' + w.status + '.'] };
+      var r = await _aiRunLikeButton(function(){ return payrollPromptApprove(w.id); });
+      return w.status === 'approved' ? { ok:true, messages:['Approved ' + _aiWeekLabel(w)] } : { ok:false, messages:['Not approved — you may not have payroll permission.'].concat(r.messages) }; } },
+  waive_expired_charge:{ group:'payroll_charges', label:function(a){ var c = _aiFind(EXPIRED_DEVICE_CHARGES, a.charge_id); return 'Waive the expired-phone charge ' + (c ? (c.imei ? 'IMEI ' + c.imei : '#' + c.id) + (c.agentName ? ' for ' + c.agentName : '') : '#' + a.charge_id) + (a.reason ? ' — ' + a.reason : ''); },
+    run:async function(a){ var c = _aiFind(EXPIRED_DEVICE_CHARGES, a.charge_id); if(!c) return { ok:false, messages:['No expired-phone charge #' + a.charge_id] };
+      if(c.status === 'waived') return { ok:false, messages:['That charge is already waived.'] };
+      if(!a.reason) return { ok:false, messages:['A reason is required to waive a charge.'] };
+      var r = await _aiRunLikeButton(function(){ return expChargeWaive(c.id); }); if(c.status === 'waived'){ c.waiveReason = a.reason; try{ saveExpiredCharges(); }catch(e){} return { ok:true, messages:['Waived — ' + a.reason] }; }
+      return { ok:false, messages:['Not waived.'].concat(r.messages) }; } },
+  // ---------- HR / ONBOARDING ----------
+  bg_check_decision:{ group:'hr_decisions', label:function(a){ return 'Mark ' + a.agent + '’s ' + a.campaign + ' background check ' + String(a.decision).toUpperCase() + (a.reason ? ' — ' + a.reason : ''); },
+    run:async function(a){ var f = _aiPerson(a.agent); if(f.err) return { ok:false, messages:[f.err] }; var st = String(a.decision).toLowerCase(); if(['passed','failed'].indexOf(st) < 0) return { ok:false, messages:['decision must be passed or failed'] };
+      var r = await _aiRunLikeButton(function(){ return bgDecideClick(f.p.id, a.campaign, st); }, a.reason || '');
+      var bc = f.p.bgChecks && f.p.bgChecks[a.campaign]; return (bc && bc.status === st) ? { ok:true, messages:[f.p.name + ' — ' + a.campaign + ' background check is now ' + st] } : { ok:false, messages:['Not changed.'].concat(r.messages) }; } },
+  applicant_decision:{ group:'hr_decisions', label:function(a){ var x = _aiFind(APPLICANTS_PRE_BG, a.applicant_id); return (a.decision === 'approve' ? 'Approve' : 'Reject') + ' applicant ' + (x ? x.name : '#' + a.applicant_id) + (a.reason ? ' — ' + a.reason : ''); },
+    run:async function(a){ var x = _aiFind(APPLICANTS_PRE_BG, a.applicant_id); if(!x) return { ok:false, messages:['No applicant #' + a.applicant_id] };
+      var r = await _aiRunLikeButton(function(){ return a.decision === 'approve' ? _uiApproveApplicant(x.id) : _uiRejectApplicant(x.id); }, a.reason || '');
+      var want = a.decision === 'approve' ? 'approved' : 'rejected'; return x.stage === want ? { ok:true, messages:[x.name + ' ' + want].concat(r.messages.slice(0, 1)) } : { ok:false, messages:['Not ' + want + '.'].concat(r.messages) }; } },
+  code_approval:{ group:'hr_decisions', label:function(a){ var c = _aiFind(TRAINING_COMPLETIONS, a.completion_id); return (a.decision === 'approve' ? 'Approve' : 'Reject') + ' the agent-code request' + (c ? ' for ' + (c.agentName || '') + (c.campaign ? ' (' + c.campaign + ')' : '') : ' #' + a.completion_id); },
+    run:async function(a){ var c = _aiFind(TRAINING_COMPLETIONS, a.completion_id); if(!c) return { ok:false, messages:['No code request #' + a.completion_id] };
+      var r = await _aiRunLikeButton(function(){ return a.decision === 'approve' ? tcApprove(c.id) : tcReject(c.id); }, a.code || a.reason || '');
+      var good = a.decision === 'approve' ? /approved/.test(c.approvalStatus || '') : c.approvalStatus === 'rejected'; return good ? { ok:true, messages:['Code request is now ' + c.approvalStatus] } : { ok:false, messages:['Not changed (status ' + c.approvalStatus + ').'].concat(r.messages) }; } },
+  grant_login:{ group:'hr_decisions', label:function(a){ return 'Give ' + (a.agents || []).join(', ') + ' a back-office login now'; },
+    run:async function(a){ var ids = [], bad = []; (a.agents || []).forEach(function(n){ var f = _aiPerson(n); if(f.err) bad.push(f.err); else ids.push(f.p.id); }); if(bad.length) return { ok:false, messages:bad };
+      await wmamGrantLoginNow(ids); var still = ids.map(function(id){ return _aiFind(DB.agents, id); }).filter(function(p){ return p && p.pendingAgent === true; });
+      return still.length ? { ok:false, messages:['Still pending: ' + still.map(function(p){ return p.name; }).join(', ')] } : { ok:true, messages:['Login given: ' + ids.map(function(id){ return _aiFind(DB.agents, id).name; }).join(', ')] }; } },
+  // ---------- AGENTS & MARKETS ----------
+  set_agent_code:{ group:'agent_profiles', label:function(a){ return 'Set ' + a.agent + '’s ' + a.campaign + ' agent code to “' + a.code + '”'; },
+    run:async function(a){ var f = _aiPerson(a.agent); if(f.err) return { ok:false, messages:[f.err] }; if(!canEditAgentProfiles(DB.current)) return { ok:false, messages:['You don’t have permission to edit agent profiles.'] };
+      var code = String(a.code || '').trim(), camp = String(a.campaign || '').trim(); if(!code || !camp) return { ok:false, messages:['Need both the campaign and the code.'] };
+      var clash = (DB.agents || []).find(function(x){ return x && x.id !== f.p.id && x.agentCodes && String(x.agentCodes[camp] || '').toLowerCase() === code.toLowerCase(); }); if(clash) return { ok:false, messages:['That ' + camp + ' code already belongs to ' + clash.name + '.'] };
+      var old = (f.p.agentCodes || {})[camp] || ''; f.p.agentCodes = Object.assign({}, f.p.agentCodes || {}); f.p.agentCodes[camp] = code;
+      if(!Array.isArray(f.p.campaigns)) f.p.campaigns = []; if(f.p.campaigns.indexOf(camp) < 0) f.p.campaigns.push(camp);
+      try{ await saveAgentToSupabase(f.p); }catch(e){ return { ok:false, messages:['Could not save: ' + (e.message || e)] }; }
+      return { ok:true, messages:[f.p.name + ' — ' + camp + ' code ' + (old ? 'changed from “' + old + '” to' : 'set to') + ' “' + code + '”'] }; } },
+  set_upline:{ group:'agent_profiles', label:function(a){ return 'Set ' + a.agent + '’s ' + a.campaign + ' upline to ' + a.upline; },
+    run:async function(a){ var f = _aiPerson(a.agent), g = _aiPerson(a.upline); if(f.err) return { ok:false, messages:[f.err] }; if(g.err) return { ok:false, messages:[g.err] }; if(!canEditAgentProfiles(DB.current)) return { ok:false, messages:['You don’t have permission to edit agent profiles.'] };
+      if(f.p.id === g.p.id) return { ok:false, messages:['Someone can’t report to themselves.'] };
+      var old = (f.p.reportsTo || {})[a.campaign]; f.p.reportsTo = Object.assign({}, f.p.reportsTo || {}); f.p.reportsTo[a.campaign] = g.p.id;
+      try{ await saveAgentToSupabase(f.p); }catch(e){ return { ok:false, messages:['Could not save: ' + (e.message || e)] }; }
+      var oldP = old != null ? _aiFind(DB.agents, old) : null; return { ok:true, messages:[f.p.name + ' now reports to ' + g.p.name + ' for ' + a.campaign + (oldP ? ' (was ' + oldP.name + ')' : '')] }; } },
+  add_market:{ group:'markets', label:function(a){ return 'Add the market “' + a.name + '”'; },
+    run:async function(a){ var n = String(a.name || '').trim(); if(!n) return { ok:false, messages:['Need the market name.'] }; if(!canManageMarkets(DB.current)) return { ok:false, messages:['You don’t have permission to add markets.'] };
+      if((MARKETS || []).some(function(m){ return m && String(m.name).toLowerCase() === n.toLowerCase(); })) return { ok:false, messages:['A market named “' + n + '” already exists.'] };
+      await _aiRunLikeButton(function(){ return wmamAddMarketNamed(n); }); return (MARKETS || []).some(function(m){ return m && m.name === n; }) ? { ok:true, messages:['Added market “' + n + '”'] } : { ok:false, messages:['The market was not added.'] }; } },
+  agent_status:{ group:'agent_status', label:function(a){ return (a.action === 'reactivate' ? 'Reactivate ' : 'Deactivate ') + a.agent + (a.reason ? ' — ' + a.reason : ''); },
+    run:async function(a){ var f = _aiPerson(a.agent); if(f.err) return { ok:false, messages:[f.err] }; var on = a.action === 'reactivate';
+      var r = await _aiRunLikeButton(function(){ return on ? reactivateAgent(f.p.id, f.p.name) : deactivateAgent(f.p.id, f.p.name); }, a.reason || '');
+      var p = _aiFind(DB.agents, f.p.id) || f.p; return (!!p.active === on) ? { ok:true, messages:[p.name + (on ? ' can log in again' : ' is deactivated')] } : { ok:false, messages:['Not changed.'].concat(r.messages) }; } }
+});
+AI_TASK_GROUPS.push(
+  { id:'payroll_files', label:'Load pay files that arrive by email into payroll (saved as a draft week, not approved)', def:'ask' },
+  { id:'payroll_approve', label:'Approve payroll weeks', def:'ask' },
+  { id:'payroll_charges', label:'Waive expired-phone charges', def:'ask' },
+  { id:'hr_decisions', label:'Background checks, applicants, agent-code requests, giving logins', def:'ask' },
+  { id:'agent_profiles', label:'Enter agent codes and uplines on profiles', def:'ask' },
+  { id:'markets', label:'Add markets', def:'ask' },
+  { id:'agent_status', label:'Deactivate / reactivate agents', def:'ask' }
+);
+// the do_task tool lists every task, old and new
+(function(){ var t = WAGENT_TOOLS.find(function(x){ return x && x.name === 'do_task'; }); if(!t) return;
+  t.parameters.properties.task.enum = Object.keys(AI_TASKS);
+  t.description += ' PAYROLL: process_pay_file {message_id, index, file_name} (saves a draft pay week, never approves it); approve_payroll_week {week_id}; waive_expired_charge {charge_id, reason}. HR: bg_check_decision {agent, campaign, decision: passed|failed, reason}; applicant_decision {applicant_id, decision: approve|reject, reason}; code_approval {completion_id, decision: approve|reject, code}; grant_login {agents[]}. AGENTS & MARKETS: set_agent_code {agent, campaign, code}; set_upline {agent, campaign, upline}; add_market {name}; agent_status {agent, action: deactivate|reactivate, reason}. Use exact names or ids from find_people / my_work_queue — a name that matches more than one person is refused.';
+})();
+// the work queue now covers every desk: inventory, payroll and HR
+var _wmamMyWorkQueueP1 = wmamMyWorkQueue;
+wmamMyWorkQueue = async function(){
+  var q = await _wmamMyWorkQueueP1();
+  try{ q.payroll_weeks_waiting_approval = (PAYROLL_WEEKS || []).filter(function(w){ return w && w.status !== 'approved' && w.status !== 'finalized'; }).slice(-20).map(function(w){ return { week_id:w.id, week:_aiWeekLabel(w), status:w.status || 'draft', people:(w.rows || []).length, gross:_aiCents(w.grossCents) }; }); }catch(e){}
+  try{ q.expired_phone_charges_open = (EXPIRED_DEVICE_CHARGES || []).filter(function(c){ return c && !/waived|collected|reimbursed|revoked/.test(c.status || ''); }).slice(0, 40).map(function(c){ return { charge_id:c.id, agent:c.agentName || c.holderName || '', imei:c.imei || '', amount:c.amountCents != null ? _aiCents(c.amountCents) : (c.amount || ''), status:c.status || '' }; }); }catch(e){}
+  try{ q.debts_owed = Object.keys(PAYROLL_DEBT_LEDGER || {}).map(function(id){ var l = PAYROLL_DEBT_LEDGER[id], p = _aiFind(DB.agents, id); return (l && l.balanceCents > 0) ? { agent:p ? p.name : '#' + id, owes:_aiCents(l.balanceCents) } : null; }).filter(Boolean).slice(0, 40); }catch(e){}
+  try{ q.applicants_waiting = (APPLICANTS_PRE_BG || []).filter(function(x){ return x && ['approved','rejected','cancelled','canceled'].indexOf(x.stage) < 0; }).slice(0, 30).map(function(x){ return { applicant_id:x.id, name:x.name, stage:x.stage || '', manager:x.invitedByName || '', program:x.program || '' }; }); }catch(e){}
+  try{ var bgs = []; (DB.agents || []).forEach(function(a){ if(!a || a.active === false || !a.bgChecks) return; Object.keys(a.bgChecks).forEach(function(c){ var b = a.bgChecks[c]; if(b && !/passed|failed|waived/.test(b.status || '')) bgs.push({ agent:a.name, agent_id:a.id, campaign:c, status:b.status || 'pending' }); }); }); q.background_checks_waiting = bgs.slice(0, 40); }catch(e){}
+  try{ q.code_requests_waiting = (TRAINING_COMPLETIONS || []).filter(function(c){ return c && /^pending/.test(c.approvalStatus || ''); }).slice(0, 30).map(function(c){ return { completion_id:c.id, agent:c.agentName || '', campaign:c.campaign || c.program || '', status:c.approvalStatus }; }); }catch(e){}
+  try{ q.pending_agents_without_login = wmamPendingAgents().slice(0, 30).map(function(a){ return { agent:a.name, agent_id:a.id }; }); }catch(e){}
+  q.how_to_work = (q.how_to_work || '') + ' Pay files in emailed_reports_last_4_days are loaded with process_pay_file; sales and inventory files with process_report. Before you act, check the facts with your tools; after you act, report exactly what changed.';
+  return q;
+};
+window.wmamMyWorkQueue = wmamMyWorkQueue;
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
 //  voice back in about a second (OpenAI Realtime over WebRTC). The same
