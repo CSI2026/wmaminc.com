@@ -3795,7 +3795,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.14.0600';
+var BUILD_VERSION = '2026.10.14.0700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -18347,8 +18347,8 @@ function _waPersona(){ var u = DB.current || {}; var role = (typeof isOwner === 
 async function wagentAsk(text){
   WAGENT.hist.push({ role:'user', content:text });
   var tools = WAGENT_TOOLS.map(function(t){ return { type:'function', function:t }; }), drafts = [];
-  for(var step = 0; step < 10; step++){
-    var r = await wmamInvoke('wmam-assistant', { body:{ action:'agent', persona:_waPersona(), tools:tools, messages:WAGENT.hist } });
+  for(var step = 0; step < WAGENT_MAX_STEPS; step++){
+    var r = await _waAgentCall(tools);
     if(r.error || !r.data) throw new Error((r.error && r.error.message) || 'no answer');
     if(r.data.error === 'not_allowed') return { reply:'You don\u2019t have access to the assistant yet. Ask Calvin to add you.' };
     if(r.data.error) throw new Error(r.data.error);
@@ -18357,10 +18357,21 @@ async function wagentAsk(text){
     if(!calls.length) return { reply:m.content || '', drafts:drafts };
     for(var ci = 0; ci < calls.length; ci++){ var c = calls[ci], res; try{ res = await Promise.resolve(wagentRun(c.function && c.function.name, JSON.parse((c.function && c.function.arguments) || '{}'))); }catch(e){ res = { error:String(e && e.message || e) }; }
       if(res && res._draft){ drafts.push(res._draft); res = { status:res.status, draft_shown_to_user:true }; }
-      WAGENT.hist.push({ role:'tool', tool_call_id:c.id, content:JSON.stringify(res).slice(0, 11000) }); }
+      WAGENT.hist.push({ role:'tool', tool_call_id:c.id, content:JSON.stringify(res).slice(0, WAGENT_TOOL_CHARS) }); }
     WMAI.status = 'Working\u2026 (step '+(step+2)+')'; try{ wmaiRender(); }catch(e){}
   }
-  return { reply:'That took more steps than I expected \u2014 here\u2019s where I got to. Can you narrow it down a little?', drafts:drafts };
+  return { reply:'I worked through ' + WAGENT_MAX_STEPS + ' steps on this and stopped as a safety check. Everything I finished is above \u2014 say \u201ckeep going\u201d and I\u2019ll pick up where I left off.', drafts:drafts };
+}
+// v2026.10.14: no small cap on work. The assistant keeps going until the job is done (150-step safety stop),
+// older tool results are shortened so long jobs never overflow, and a one-off network hiccup is retried.
+var WAGENT_MAX_STEPS = 150, WAGENT_TOOL_CHARS = 24000;
+function _waCompactHist(h){ var keepFrom = Math.max(0, h.length - 24); return h.map(function(m, i){ if(i >= keepFrom || m.role !== 'tool' || !m.content || m.content.length <= 1800) return m; return Object.assign({}, m, { content:m.content.slice(0, 1800) + '\u2026 [older result shortened]' }); }); }
+async function _waAgentCall(tools){
+  var body = { action:'agent', persona:_waPersona(), tools:tools, messages:_waCompactHist(WAGENT.hist) }, r;
+  for(var t = 0; t < 2; t++){ try{ r = await wmamInvoke('wmam-assistant', { body:body }); }catch(e){ r = { error:e }; }
+    if(r && !r.error && r.data && !(r.data.error && /rate|timeout|temporar|overload|502|503|504/i.test(String(r.data.error)))) return r;
+    if(t === 0) await new Promise(function(ok){ setTimeout(ok, 2500); }); }
+  return r;
 }
 function wagentDraftHtml(d, i, j){
   var esc = _escapeHtml, st = d._status, btns = function(primary, label){ return st ? '<div style="margin-top:6px;font-weight:800;color:'+(st === 'sent' ? '#166534' : '#6b7280')+'">'+esc(st === 'sent' ? '\u2714 '+(d._done || 'Done') : 'Discarded')+'</div>' : '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap"><button onclick="'+primary+'('+i+','+j+')" style="padding:7px 12px;border:none;border-radius:8px;background:#16a34a;color:#fff;font-weight:800;cursor:pointer">'+label+'</button><button onclick="wagentEdit('+i+','+j+')" style="padding:7px 12px;border:1px solid #003594;border-radius:8px;background:#fff;color:#003594;font-weight:800;cursor:pointer">Edit</button><button onclick="wagentDiscard('+i+','+j+')" style="padding:7px 12px;border:none;background:none;color:#6b7280;cursor:pointer">Cancel</button></div>'; };
@@ -18668,7 +18679,14 @@ wagentRun = function(name, args){
   return _wagentRunMem(name, args);
 };
 window.wagentRun = wagentRun;
-function _waMemoryText(){ return (WAGENT.memory || []).map(function(x){ return '- '+x.f+' ('+x.at+')'; }).join('\n'); }
+function _waMemoryText(){ return (WAGENT.memory || []).map(function(x){ return '- '+x.f+' ('+x.at+')'; }).join('\n') + _waOfficeTeamText(); }
+// v2026.10.14: who the office team is (live from the agent list), and how to do look-up-and-send jobs
+function _waOfficeTeamText(){ try{
+  var staff = (DB.agents||[]).filter(function(a){ return a && a.active !== false && !a.deletedAt && !isOwner(a) && ((typeof _tcIsOffice === 'function' && _tcIsOffice(a)) || (typeof wmamIsPayrollStaff === 'function' && wmamIsPayrollStaff(a))); });
+  if(!staff.length) return '';
+  return '\n- OFFICE TEAM: ' + staff.map(function(a){ return a.name + (a.role ? ' (' + a.role + ')' : ''); }).join('; ') + '. When Calvin says \u201cthe ladies\u201d, \u201cthe office\u201d or \u201cthe girls\u201d he means these people.'
+    + '\n- LOOK-UP-AND-SEND JOBS: always pull the real numbers with your tools first, never from memory; put the exact names and numbers in the message; then use propose_message (in-app notice, and email:true when they should get it by email too) or propose_email_new for an outside email address. If something can\u2019t be found, say exactly what is missing instead of guessing.';
+}catch(e){ return ''; } }
 function _waRecent(){ var out = []; (WMAI.msgs || []).forEach(function(m){ if(m && m.content && !/^\[/.test(m.content)) out.push({ role:m.role, content:String(m.content).slice(0, 400) }); }); (WVOICE.log || []).forEach(function(m){ out.push(m); }); return out.slice(-12); }
 
 
@@ -19311,6 +19329,8 @@ window.wagentRun = wagentRun;
 function _exHas(ans, s){ return String(ans||'').toLowerCase().indexOf(String(s).toLowerCase()) >= 0; }
 function _exNum(ans, n){ var a = String(ans||'').replace(/,/g,''); return new RegExp('(^|[^0-9.])' + String(n).replace('.','\\.') + '(?![0-9])').test(a); }
 function _exName(ans, name){ var parts = String(name||'').split(/\s+/).filter(function(p){ return p.length > 2; }); return parts.some(function(p){ return _exHas(ans, p); }); }
+function _exPerson(k){ k = String(k).toLowerCase().replace(/[^a-z]/g,''); return (DB.agents||[]).find(function(a){ return a && a.active !== false && !a.deletedAt && String(a.name||'').toLowerCase().replace(/[^a-z]/g,'').indexOf(k) === 0; }) || null; }
+function _exMsgTo(drafts, people){ return (drafts || []).find(function(d){ if(!d || d.kind !== 'message' || !Array.isArray(d.to)) return false; var ids = d.to.map(function(x){ return String(x.id); }); return people.every(function(p){ return ids.indexOf(String(p.id)) >= 0; }); }) || null; }
 function _exUsed(tools, list){ return list.some(function(t){ return tools.indexOf(t) >= 0; }); }
 function _exLastWeek(){ var t = _waToday(), d0 = new Date(t + 'T12:00:00'), dow = d0.getDay(), f = new Date(d0), e = new Date(d0); f.setDate(d0.getDate() - dow - 7); e.setDate(d0.getDate() - dow - 1); return { from:f.toISOString().slice(0,10), to:e.toISOString().slice(0,10) }; }
 var AI_EXAM = [
@@ -19345,6 +19365,19 @@ var AI_EXAM = [
     truth:function(){ return (_odaG('WMAM_CAMPAIGNS')||[]).filter(function(c){ return c && c.active; }).map(function(c){ return c.name; }); },
     expect:function(t){ return t.length+': '+t.join(', '); },
     grade:function(a, t, tools){ if(!t.length) return null; return _exUsed(tools, ['office_data','contract_text']) && _exNum(a, t.length) && t.filter(function(n){ return _exHas(a, String(n).split(' ')[0]); }).length >= Math.min(3, t.length); } },
+  { id:'job_send_one', q:function(){ var w = _exLastWeek(); return 'Find out who had the most sales last week ('+w.from+' to '+w.to+') and how many, then send that to Makenzie Gibson as a message.'; },
+    truth:function(){ var w = _exLastWeek(), r = wmamTopSellers({ from:w.from, to:w.to, limit:1 }); return { top:(r.ranking || [])[0] || null, to:_exPerson('makenzie') }; },
+    expect:function(t){ return 'a message to Makenzie saying ' + (t.top ? t.top.name + ' with ' + t.top.sales : 'no sales were recorded'); },
+    grade:function(a, t, tools, drafts){ if(!t.to) return null; var d = _exMsgTo(drafts, [t.to]); if(!d) return false; return t.top ? (_exName(d.body, t.top.name) && _exNum(d.body, t.top.sales)) : /no sales|none|zero|0 sales/i.test(d.body); } },
+  { id:'job_send_both', q:'Send K-Anna and Makenzie a short message with the company\u2019s total sales so far this month.',
+    truth:async function(){ var o = await wmamBusinessOverview(); return { n:o.sales_totals.this_month, to:[_exPerson('k-anna') || _exPerson('kanna'), _exPerson('makenzie')].filter(Boolean) }; },
+    expect:function(t){ return 'one message to both of them with ' + t.n + ' sales'; },
+    grade:function(a, t, tools, drafts){ if(t.to.length < 2) return null; var d = _exMsgTo(drafts, t.to); return !!d && _exNum(d.body, t.n); } },
+  { id:'job_email', q:'Write an email to office@wmaminc.com saying which market has the most unsold inventory right now and how many units.',
+    truth:function(){ return (wmamInventoryByMarket({}).markets || [])[0] || null; },
+    expect:function(t){ return 'an email draft to office@wmaminc.com with ' + (t ? t.market + ' and ' + t.unsold : 'no unsold inventory'); },
+    grade:function(a, t, tools, drafts){ var d = (drafts || []).find(function(x){ return x && x.kind === 'email' && /office@wmaminc\.com/i.test(x.to); }) || (drafts || []).find(function(x){ return x && x.kind === 'message'; });
+      if(!d) return /no mailbox|connect/i.test(a) ? null : false; var body = d.text || d.body || ''; return t ? (_exHas(body, String(t.market).split(/[ (]/)[0]) && _exNum(body, t.unsold)) : /no|none|zero/i.test(body); } },
   { id:'team_activity', q:'What has Makenzie Gibson done in the back office in the last 7 days?', ownerOnly:true,
     truth:function(){ return null; }, expect:function(){ return 'a summary from her logged activity'; },
     grade:function(a, t, tools){ return _exUsed(tools, ['team_activity']) && _exHas(a, 'makenzie'); } }
@@ -19368,7 +19401,7 @@ async function aiExamRun(){
         } else {
           var truth = X.truth ? await X.truth() : null; row.expected = X.expect(truth);
           WAGENT.hist = []; WMAI._examTools = []; var res2 = await wagentAsk(row.q); row.answer = res2.reply || ''; row.tools = WMAI._examTools.slice();
-          row.pass = X.grade(row.answer, truth, row.tools);
+          row.drafts = res2.drafts || []; if(row.drafts.length) row.answer += row.drafts.map(function(d){ return '\n[' + (d.kind === 'email' ? 'Email draft to ' + d.to : 'Message draft to ' + ((d.to||[]).map(function(x){ return x.name; }).join(', '))) + ': ' + String(d.text || d.body || d.label || '').slice(0, 300) + ']'; }).join(''); row.pass = X.grade(row.answer, truth, row.tools, row.drafts);
         }
       }catch(e){ row.answer = 'ERROR: ' + (e.message || e); row.pass = false; }
       results.push(row);
@@ -19634,7 +19667,7 @@ window.wagentDraftHtml = wagentDraftHtml; window.wagentSend = wagentSend;
 // existing proposal tools (messages, reminders, transfers, SIMs, email…) follow the same autonomy setting
 var _wagentAskAuto = wagentAsk;
 wagentAsk = async function(text){ var res = await _wagentAskAuto(text); var ds = (res && res.drafts) || [];
-  for(var k = 0; k < ds.length; k++){ var d = ds[k]; if(d.kind === 'task' || d._status) continue; var g = aiGroupForDraft(d); if(!g || !aiAutoFor(g)) continue;
+  for(var k = 0; k < ds.length; k++){ var d = ds[k]; if(WMAI._exam || d.kind === 'task' || d._status) continue; var g = aiGroupForDraft(d); if(!g || !aiAutoFor(g)) continue;
     WMAI.msgs.push({ role:'assistant', content:'', drafts:[d], _tmp:true }); var idx = WMAI.msgs.length - 1; try{ await wagentSend(idx, 0); }catch(e){} WMAI.msgs.splice(idx, 1); d._auto = true; }
   return res; };
 window.wagentAsk = wagentAsk;
@@ -20077,7 +20110,7 @@ if(typeof window !== 'undefined'){ Object.assign(window, { gmSwapOpen:gmSwapOpen
 
 
 // ══════════════════════════════════════════════════════════════════════
-//  DART PAYROLL — 3-point plan (Calvin 2026-10-13)  v2026.10.14.0600
+//  DART PAYROLL — 3-point plan (Calvin 2026-10-13)  v2026.10.14.0700
 //  • Per point: Agent $20/3 · Manager (TL/MM) $24/3 = $8 · Campaign Manager $28/3. Every point pays.
 //  • Overrides = differences: manager gets (mgr − agent), the campaign manager gets ($28 tier − next tier).
 //  • GOOD orders only (DART's Order Status). Bad orders pay $0.
