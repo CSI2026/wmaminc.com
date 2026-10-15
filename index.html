@@ -3795,7 +3795,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.15.0800';
+var BUILD_VERSION = '2026.10.15.1000';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -8048,8 +8048,10 @@ function payrollApproveWeek(weekId){
   if(typeof saveToStorage === 'function') saveToStorage();
   // v2026.10.11 (Calvin): finalize automatically once the LAST campaign file for this pay period is approved
   try{
-    var _pe = w.periodEnd, _left = PAYROLL_WEEKS.filter(function(x){ return x && x.periodEnd === _pe && x.status !== 'approved' && x.status !== 'rejected'; }).length;
-    if(_left === 0 && typeof OBLIGATION_COMMITS !== 'undefined' && !OBLIGATION_COMMITS[_pe] && typeof payrollCommitObligations === 'function'){
+    // v2026.10.15: one finalize per FRIDAY deposit (all campaigns together), not per campaign week — so loans/fees are never taken twice
+    var _pe = w.periodEnd, _F = (typeof ppWeekPayDate === 'function') ? ppWeekPayDate(w) : '', _key = _F ? payDepositKey(_F) : _pe;
+    var _left = PAYROLL_WEEKS.filter(function(x){ return x && !x.deleted && x.status !== 'approved' && x.status !== 'finalized' && x.status !== 'rejected' && (_F ? ppWeekPayDate(x) === _F : x.periodEnd === _pe); }).length;
+    if(_left === 0 && typeof OBLIGATION_COMMITS !== 'undefined' && !OBLIGATION_COMMITS[_key] && !OBLIGATION_COMMITS[_pe] && typeof payrollCommitObligations === 'function'){
       w.autoFinalized = true;
       if(payrollCommitObligations(_pe)){ try{ showToast('Week ending '+_pe+' finalized automatically \u2014 surplus, disputes and expired phones recorded'); }catch(e){} }
     } else if(_left > 0){ try{ showToast(_left+' more campaign file'+(_left===1?'':'s')+' to approve for this week \u2014 it finalizes automatically after the last one'); }catch(e){} }
@@ -21907,7 +21909,7 @@ function _ppComputePreview(carrier, parsed){
   return { match:match, commissions:commissions, cascade:cascade };
 }
 function _ppStagedParsed(carrier){ var st = window._ppStaged, ds = (st && st.detections) || []; var d = ds.find(function(x){ return x && x.carrier === carrier && x.confirmed !== false; }) || ds.find(function(x){ return x && x.carrier === carrier; }); return d ? d.parsed : null; }
-var _PP_ROLE_TXT = { 'agent':'own enrollment', 'tl-personal':'own enrollment', 'mm-personal':'own enrollment', 'cm-personal':'own enrollment', 'ibo-personal':'own enrollment', 'owner-personal':'own enrollment', 'tl-diff':'Team Leader override', 'mm-diff':'Market Manager override', 'cm-fill':'Campaign Manager override', 'ibo-consolidated':'order routed to you' };
+var _PP_ROLE_TXT = { 'override':'override', 'agent':'own enrollment', 'tl-personal':'own enrollment', 'mm-personal':'own enrollment', 'cm-personal':'own enrollment', 'ibo-personal':'own enrollment', 'owner-personal':'own enrollment', 'tl-diff':'Team Leader override', 'mm-diff':'Market Manager override', 'cm-fill':'Campaign Manager override', 'ibo-consolidated':'order routed to you' };
 function ppStatementData(aid, carrier, pre){
   var parsed = pre ? null : _ppStagedParsed(carrier); if(!pre && !parsed) return null;
   pre = pre || _ppComputePreview(carrier, parsed);
@@ -22018,29 +22020,41 @@ function _tanFindAgent(name){ var n = String(name || '').trim().toLowerCase(); i
   return (DB.agents || []).find(function(a){ var ac = a && a.agentCodes; if(typeof ac === 'string'){ try{ ac = JSON.parse(ac); }catch(e){ ac = {}; } } return a && ac && ac.TruConnect && String(ac.TruConnect).trim().toLowerCase() === n; })
       || (DB.agents || []).find(function(a){ return a && a.name && a.name.trim().toLowerCase() === n; }) || null; }
 var _payrollApplyDeductionsTan = payrollApplyDeductions;
+// v2026.10.15.0900 — COMPANY-WIDE: on every TruConnect chargeback, EVERYONE who was paid on that enrollment
+// (enroller + every override: Team Leader, Market Manager, Campaign Manager, IBO, Tanita) gives back exactly
+// what the live pay engine pays them on it. Anyone an older saved record left out is added; nobody is charged twice.
+function _ovExpectedSplit(ag, d){
+  var hist = null; try{ hist = (typeof payrollLookupAgentTierAtDate === 'function') ? payrollLookupAgentTierAtDate(ag.id, d.date, 'TruConnect') : null; }catch(e){}
+  var tc = hist ? hist.tribalCount : 31, nc = hist ? hist.nladCount : 31, out = {};
+  try{ (payrollComputeDealSplit({ carrier:'TruConnect', agentId:ag.id, isTribal:!!d.isTribal, agentTribalTotalThatWeek:tc, agentNladTotalThatWeek:nc }) || []).forEach(function(x){ if(x && x.aid && x.cents > 0) out[x.aid] = (out[x.aid] || 0) + x.cents; }); }catch(e){}
+  // Tanita: her share is exactly what the live TruConnect pay engine pays her on this one enrollment
+  try{ var P = _tcLockPeople(), T = P.tanita; if(T && T.id !== ag.id){ var one = tcCalculateWeek([{ agentId:ag.id, isTribal:!!d.isTribal }]), te = one && one.perAgent && one.perAgent[T.id]; var c = te ? Math.round((te.amount || 0) * 100) : 0; if(c > 0) out[T.id] = Math.max(out[T.id] || 0, c); } }catch(e){}
+  return out;
+}
 payrollApplyDeductions = function(opts){
   var res = _payrollApplyDeductionsTan.apply(this, arguments);
   try{
     if(!res || !opts || (opts.carrier || 'TruConnect') !== 'TruConnect') return res;
-    var P = _tcLockPeople(), T = P.tanita; if(!T) return res;
-    var nb = res.netByAgent = res.netByAgent || {}, tb = nb[T.id] = nb[T.id] || { grossCents:0, deductionsCents:0, creditsCents:0, debtPaidCents:0, netCents:0, cascade:[], carryoverCents:0 };
-    tb.cascade = tb.cascade || [];
+    var nb = res.netByAgent = res.netByAgent || {};
+    var bal = function(id){ var b = nb[id] = nb[id] || { grossCents:0, deductionsCents:0, creditsCents:0, debtPaidCents:0, netCents:0, cascade:[], carryoverCents:0 }; b.cascade = b.cascade || []; return b; };
     (opts.deductions || []).forEach(function(d){
       if(!d || /upgrade/i.test(d.type || '')) return;                       // device fee, not a chargeback
       if(!/cancel|chargeback|clawback|disconnect/i.test(d.type || '')) return;
-      var ag = _tanFindAgent(d.agentName); if(!ag || ag.id === T.id || isOwner(ag)) return;
-      // what Tanita is paid on ONE such enrollment, straight from the live TruConnect pay engine (same math as her pay)
-      var share = 0; try{ var one = tcCalculateWeek([{ agentId:ag.id, isTribal:!!d.isTribal }]), te = one && one.perAgent && one.perAgent[T.id]; share = te ? Math.round((te.amount || 0) * 100) : 0; }catch(e){ share = 0; }
-      if(share <= 0) return;
-      var already = tb.cascade.filter(function(x){ return x && String(x.orderNum) === String(d.orderNum || '') && (x.paidByAid === T.id || /cm-fill|cm-diff/.test(x.paidByRole || '')); }).reduce(function(t, x){ return t + (x.amountCents || 0); }, 0);
-      var owe = share - already; if(owe <= 0) return;
-      var paid = Math.max(0, Math.min(tb.netCents || 0, owe)), short = owe - paid;
-      tb.netCents = (tb.netCents || 0) - paid; tb.deductionsCents = (tb.deductionsCents || 0) + paid;
-      tb.cascade.push({ type:d.type, orderNum:d.orderNum, amountCents:owe, fromName:ag.name, paidByRole:'cm-fill', paidByAid:T.id, addedBy:'override-chargeback-rule' });
-      if(short > 0){ tb.carryoverCents = (tb.carryoverCents || 0) + short; if(!opts.dryRun && typeof payrollAddDebt === 'function') payrollAddDebt(T.id, short, (d.type || 'Chargeback') + ' ' + (d.orderNum || '') + ' — override on ' + ag.name + '’s enrollment (more than this week’s pay)', opts.weekId || ''); }
-      (res.audit = res.audit || []).push({ kind:'override-chargeback', type:d.type, orderNum:d.orderNum, amountCents:owe, appliedTo:T.id, appliedToName:T.name, enroller:ag.name, via:'Tanita override rule' });
+      var ag = _tanFindAgent(d.agentName); if(!ag || isOwner(ag)) return;   // nobody earns on Calvin's orders
+      var exp = _ovExpectedSplit(ag, d);
+      Object.keys(exp).forEach(function(k){ var aid = Number(k); if(aid === ag.id) return;   // the enroller's own share is charged by the normal cancel
+        var p = (DB.agents || []).find(function(a){ return a && a.id === aid; }); if(!p || isOwner(p)) return;
+        var b = bal(aid), already = b.cascade.filter(function(x){ return x && String(x.orderNum) === String(d.orderNum || '') && (x.paidByAid === aid || x.paidByAid == null); }).reduce(function(t, x){ return t + (x.amountCents || 0); }, 0);
+        if(already > 0) return;                                              // the saved record already took this person's share: keep exactly that
+        var owe = exp[k]; if(owe <= 0) return;
+        var paid = Math.max(0, Math.min(b.netCents || 0, owe)), short = owe - paid;
+        b.netCents = (b.netCents || 0) - paid; b.deductionsCents = (b.deductionsCents || 0) + paid;
+        b.cascade.push({ type:d.type, orderNum:d.orderNum, amountCents:owe, fromName:ag.name, paidByRole:'override', paidByAid:aid, addedBy:'override-chargeback-rule' });
+        if(short > 0){ b.carryoverCents = (b.carryoverCents || 0) + short; if(!opts.dryRun && typeof payrollAddDebt === 'function') payrollAddDebt(aid, short, (d.type || 'Chargeback') + ' ' + (d.orderNum || '') + ' — override on ' + ag.name + '’s enrollment (more than this week’s pay)', opts.weekId || ''); }
+        (res.audit = res.audit || []).push({ kind:'override-chargeback', type:d.type, orderNum:d.orderNum, amountCents:owe, appliedTo:aid, appliedToName:p.name, enroller:ag.name, via:'company override chargeback rule' });
+      });
     });
-  }catch(e){ console.warn('[tanita override chargeback]', e); }
+  }catch(e){ console.warn('[override chargeback]', e); }
   return res;
 };
 window.payrollApplyDeductions = payrollApplyDeductions;
@@ -22059,6 +22073,7 @@ var COMP_RULE_ENGINE = {   // rule_key -> the number the payroll code actually u
   'tc.tanita.tribal.own':function(){ return TC_TANITA_LOCK.cmTribal; }, 'tc.tanita.nlad.own':function(){ return TC_TANITA_LOCK.cmNlad; }, 'tc.tanita.tribal.ceiling':function(){ return TC_TANITA_LOCK.cmTribal; },
   'tc.tanita.juan':function(){ return TC_TANITA_LOCK.cmTribal - TC_RATES.cmConsolidated.tribalFlat; }, 'tc.juan.nlad':function(){ return TC_RATES.cmConsolidated.nladFlat; }, 'tc.juan.tribal':function(){ return TC_RATES.cmConsolidated.tribalFlat; },
   'tc.port_in':function(){ return TC_RATES.portInOut; },
+  'tc.chargeback.tanita':function(){ return TC_TANITA_LOCK.cmTribal - TC_TANITA_LOCK.tl; },
   'gm.nlad':function(){ return GM_PLAN_2026_10.nlad; }, 'gm.tribal':function(){ return GM_PLAN_2026_10.tribal; }, 'gm.addon.email':function(){ return GM_PLAN_2026_10.email; }, 'gm.addon.byod':function(){ return GM_PLAN_2026_10.byod; },
   'gm.addon.plan10':function(){ return GM_PLAN_2026_10.plans.m10; }, 'gm.addon.plan20':function(){ return GM_PLAN_2026_10.plans.m20; }, 'gm.addon.plan30':function(){ return GM_PLAN_2026_10.plans.m30; },
   'gm.mgr.nlad':function(){ return GM_PLAN_2026_10.mgrNlad; }, 'gm.mgr.tribal':function(){ return GM_PLAN_2026_10.mgrTribal; }, 'gm.tanita.ceiling':function(){ return GM_PLAN_2026_10.tribalPot; }, 'gm.juan':function(){ return GM_PLAN_2026_10.iboNlad; }, 'gm.brandon':function(){ return GM_PLAN_2026_10.nlad; },
@@ -22105,6 +22120,630 @@ panelCompPlans = function(){ var h = _panelCompPlansSaved.apply(this, arguments)
 window.panelCompPlans = panelCompPlans;
 setTimeout(function(){ try{ if(DB.current && (isOwner(DB.current) || (typeof wmamIsPayrollStaff === 'function' && wmamIsPayrollStaff(DB.current)) || WMAI.allowed)) compRulesLoad(); }catch(e){} }, 4000);
 if(typeof window !== 'undefined'){ Object.assign(window, { COMP_RULES:COMP_RULES, compRulesLoad:compRulesLoad, compRulesDrift:compRulesDrift, compRulesBannerHtml:compRulesBannerHtml }); }
+
+// ══════════════════════════════════════════════════════════════════════
+//  COMP PLAN 2026-10-15 (Calvin approved, v2026.10.15.1000)
+//  ASSURANCE WIRELESS
+//   • SIM enrollment: $10 to whoever enrolled it (agent or manager) — same for everyone
+//   • $4 override on every agent SIM order, paid ONLY to that market's Market Manager (no Campaign Managers yet)
+//     A Market Manager's own SIM: $10, no override
+//   • Phone enrollments / phone sales: nobody is paid and nobody gets an override — except Calvin ($10 each)
+//   • Juan Rincon (IBO): $14 on every SIM his agency enrolls, his own included — he pays his people (they get $0 from us)
+//  TRUCONNECT
+//   • Market Managers: no overrides (the old $2 MM NLAD override is gone)
+//   • Tanita NLAD: $10 on her own; $2 (difference up to $10) ONLY on Sheila Love's and Najee Burns' NLAD — nothing on anyone else's NLAD
+//  GEN MOBILE
+//   • Tanita: $1 on every NLAD order paid at $9, on any team (agents and managers, Brandon too) — on top of the direct manager's $1.
+//     Nothing on Juan's ($13) or Calvin's orders.
+// ══════════════════════════════════════════════════════════════════════
+var AW_PAY_2610 = { sim:10, mmOverride:4, ibo:14, phone:0 };
+var TC_PLAN_2610 = { tanitaNladOnTl:2, mmOverride:0 };
+GM_PLAN_2026_10.tanitaNlad = 1;
+TC_RATES.nlad.mmOverridePerAgentEnrollment = TC_PLAN_2610.mmOverride;
+
+// ── Assurance: who is paid on one enrollment
+function _aw26Ibo(a, team){
+  if(!a) return null;
+  if(a.role === 'IBO') return a;
+  var up = (typeof agentIsUnderIBO === 'function') ? agentIsUnderIBO(a.id) : null; if(up) return up;
+  var mm = team && team.marketManager != null ? _gm26Person(team.marketManager) : null; if(mm && mm.role === 'IBO') return mm;
+  var cm = team && team.campaignManager != null ? _gm26Person(team.campaignManager) : null;
+  if(cm && (cm.role === 'IBO' || (typeof awCmModelOf === 'function' && awCmModelOf(cm) === 'aw-cm-consolidated'))) return cm;
+  return null;
+}
+function _aw26Split(a){   // one SIM enrollment by agent record a (never the owner — the owner wrapper pays Calvin)
+  var team = (typeof gmAgentTeam === 'function') ? gmAgentTeam(a.id) : null, ibo = _aw26Ibo(a, team);
+  if(ibo) return { ibo:ibo, team:team, parts:[{ aid:ibo.id, role:(ibo.id === a.id ? 'ibo-personal' : 'ibo-consolidated'), cents:AW_PAY_2610.ibo * 100 }] };
+  var parts = [{ aid:a.id, role:'enroller', cents:AW_PAY_2610.sim * 100 }];
+  var mm = team && team.marketManager != null ? _gm26Person(team.marketManager) : null;
+  if(mm && mm.id !== a.id && !isOwner(mm) && mm.active !== false && !mm.deletedAt) parts.push({ aid:mm.id, role:'mm-override', cents:AW_PAY_2610.mmOverride * 100 });
+  return { ibo:null, team:team, mm:mm, parts:parts };
+}
+function awCalculateWeek2610(weekRows){
+  var byAgent = {}, warnings = [];
+  if(!Array.isArray(weekRows)) return { perAgent:{}, byTeam:{}, warnings:['Invalid input: weekRows must be an array'], model:'assurance-2026-10' };
+  function bump(id, amt, label, count, rate){ var e = byAgent[id] = byAgent[id] || { amount:0, breakdown:[], rows:0 }; e.amount = Math.round((e.amount + amt) * 100) / 100; e.breakdown.push({ label:label, count:count, rate:rate, amount:Math.round(amt * 100) / 100 }); }
+  var T = {};
+  weekRows.forEach(function(r, i){
+    if(!r || typeof r.agentId !== 'number'){ warnings.push('Row ' + i + ' has no agent'); return; }
+    var t = T[r.agentId] = T[r.agentId] || { sim:0, phone:0, cb:0 };
+    if(r.chargebackCents){ if(r.chargebackCents > 0) warnings.push('Row ' + i + ' had a positive chargeback — treated as 0'); else t.cb += r.chargebackCents; }
+    if(r._chargebackOnly) return;
+    if(r.isTribal){ warnings.push('Row ' + i + ' marked Tribal — Assurance has no Tribal program; not paid.'); return; }
+    if(r.isPhone) t.phone++; else t.sim++; });
+  var mmNoMarket = {};
+  Object.keys(T).forEach(function(k){ var id = Number(k), t = T[k], a = _gm26Person(id), name = a ? a.name : ('#' + id);
+    if(!a){ warnings.push('Assurance enrollments for agent #' + id + ' — agent not found; $0 paid.'); return; }
+    if(t.phone){ var e0 = byAgent[id] = byAgent[id] || { amount:0, breakdown:[], rows:0 }; e0.breakdown.push({ label:'Assurance phone enrollments — no commission (phone sales are not paid)', count:t.phone, rate:0, amount:0 }); e0.rows += t.phone; }
+    var sp = _aw26Split(a), teamLabel = sp.team ? (sp.team.name || sp.team.city || sp.team.id) : 'no market';
+    if(t.sim){
+      if(sp.ibo){ var routed = sp.ibo.id !== id;
+        bump(sp.ibo.id, t.sim * AW_PAY_2610.ibo, routed ? 'Assurance SIM enrollments (' + name + ', paid to ' + sp.ibo.name + ')' : 'Assurance SIM enrollments ($' + AW_PAY_2610.ibo + ' IBO rate)', t.sim, AW_PAY_2610.ibo);
+        byAgent[sp.ibo.id].rows += t.sim;
+        if(routed){ var e1 = byAgent[id] = byAgent[id] || { amount:0, breakdown:[], rows:0 }; e1.breakdown.push({ label:'Assurance SIM enrollments — paid to ' + sp.ibo.name + ' (IBO)', count:t.sim, rate:0, amount:0 }); }
+      } else {
+        bump(id, t.sim * AW_PAY_2610.sim, 'Assurance SIM enrollments', t.sim, AW_PAY_2610.sim); byAgent[id].rows += t.sim;
+        if(sp.mm && sp.mm.id !== id && sp.parts.length > 1) bump(sp.mm.id, t.sim * AW_PAY_2610.mmOverride, 'Market Manager override on ' + name + ' Assurance SIM', t.sim, AW_PAY_2610.mmOverride);
+        else if(!sp.mm && !mmNoMarket[teamLabel]){ mmNoMarket[teamLabel] = 1; warnings.push('Assurance market “' + teamLabel + '” has no Market Manager — the $4 override on its agents’ SIM orders was not paid to anyone. Set the Market Manager in Markets if one should get it.'); }
+      }
+    }
+    if(t.cb) bump(sp.ibo ? sp.ibo.id : id, t.cb / 100, 'Assurance chargebacks' + (sp.ibo && sp.ibo.id !== id ? ' (' + name + ')' : ''), 0, 0);
+  });
+  return { perAgent:byAgent, byTeam:{}, warnings:warnings, model:'assurance-2026-10' };
+}
+// the owner wrapper (Calvin $10 on his own SIM or phone) now runs on top of the 2026-10 engine
+_awCalculateWeekOwner = awCalculateWeek2610;
+window.awCalculateWeek = awCalculateWeek;
+// chargebacks: everyone paid on the order gives back what they were paid
+var _payrollComputeDealSplit2610 = payrollComputeDealSplit;
+payrollComputeDealSplit = function(o){
+  try{
+    if(o && /^Assurance/i.test(o.carrier || '')){ var a = _gm26Person(o.agentId); if(!a) return [];
+      if(isOwner(a)) return [{ aid:a.id, role:'owner-personal', cents:OWNER_PAY.aw.each * 100 }];
+      if(o.isPhone) return [];
+      return _aw26Split(a).parts; }
+    if(o && o.carrier === 'TruConnect'){ var ag = _gm26Person(o.agentId); if(ag && !isOwner(ag)){
+      if(!o.isTribal){ var base = _payrollComputeDealSplit2610.apply(this, arguments) || [];
+        if(base.some(function(x){ return /^ibo/.test(x.role || ''); })) return base;
+        return _tc26NladSplit(ag); }
+      var sp = (_payrollComputeDealSplit2610.apply(this, arguments) || []).filter(function(x){ return x.role !== 'mm-diff'; });   // no Market Manager overrides
+      var tier = (Number(o.agentTribalTotalThatWeek) || 0) > TC_RATES.tribal.agentTier.tier1Cap ? TC_RATES.tribal.agentTier.tier2 : TC_RATES.tribal.agentTier.tier1;
+      sp.forEach(function(x){ if(x.role === 'mm-personal') x.cents = tier * 100; });   // a Market Manager's own Tribal is paid as an agent
+      var T = _tcLockPeople().tanita;
+      var LP = _tcLockPeople(), lockTl = [LP.sheila, LP.najee].filter(Boolean).map(function(x){ return x.id; }), tm = (typeof gmAgentTeam === 'function') ? gmAgentTeam(ag.id) : null;
+      sp = sp.filter(function(x){ if(x.role !== 'cm-fill') return true;   // the CM share goes only to this person's own Campaign Manager (same as the pay run)
+        if(tm && Number(tm.campaignManager) === Number(x.aid)) return true; if(Number(ag.campaignManagerId) === Number(x.aid)) return true;
+        return !!(T && x.aid === T.id && (ag.id === T.id || lockTl.indexOf(ag.id) >= 0 || lockTl.indexOf(Number(ag.teamLeaderId)) >= 0)); });
+      sp.forEach(function(x){ if(x.role !== 'cm-fill' || (T && x.aid === T.id)) return; var cm = _gm26Person(x.aid); if(!cm) return; var tg = tcCmTargetsFor(cm).tribalTarget;
+        var paid = sp.filter(function(y){ return y !== x && y.role !== 'cm-fill'; }).reduce(function(s, y){ return s + (y.cents || 0); }, 0); x.cents = Math.max(0, tg * 100 - paid); });
+      return sp.filter(function(x){ return x.cents > 0; }); } }
+  }catch(e){ console.warn('[deal split 2610]', e); }
+  return _payrollComputeDealSplit2610.apply(this, arguments);
+};
+window.payrollComputeDealSplit = payrollComputeDealSplit;
+function _tc26NladSplit(a){
+  var P = _tcLockPeople(), T = P.tanita, tlIds = [P.sheila, P.najee].filter(Boolean).map(function(x){ return x.id; });
+  if(T && a.id === T.id) return [{ aid:a.id, role:'cm-personal', cents:TC_TANITA_LOCK.cmNlad * 100 }];
+  var ibo = a.role === 'IBO' ? a : ((typeof agentIsUnderIBO === 'function') ? agentIsUnderIBO(a.id) : null);
+  if(ibo) return [{ aid:ibo.id, role:(ibo.id === a.id ? 'ibo-personal' : 'ibo-consolidated'), cents:TC_RATES.cmConsolidated.nladFlat * 100 }];
+  var isCM = a.role === 'Campaign Manager' && tcCmModelOf(a) === 'tc-cm-difference';
+  if(isCM) return [{ aid:a.id, role:'cm-personal', cents:tcCmTargetsFor(a).nladTarget * 100 }];
+  var rate = a.role === 'Market Manager' ? TC_RATES.nlad.mm : (a.role === 'Team Leader' ? TC_RATES.nlad.tl : TC_RATES.nlad.agent);
+  var out = [{ aid:a.id, role:(a.role === 'Team Leader' ? 'tl-personal' : a.role === 'Market Manager' ? 'mm-personal' : 'agent'), cents:rate * 100 }];
+  if(T && tlIds.indexOf(a.id) >= 0){ out.push({ aid:T.id, role:'cm-fill', cents:TC_PLAN_2610.tanitaNladOnTl * 100 }); return out; }
+  var team = (typeof gmAgentTeam === 'function') ? gmAgentTeam(a.id) : null, cm = team && team.campaignManager != null ? _gm26Person(team.campaignManager) : null;
+  if(!cm && a.campaignManagerId != null) cm = _gm26Person(a.campaignManagerId);
+  if(cm && cm.id !== a.id && !isOwner(cm) && (!T || cm.id !== T.id) && tcCmModelOf(cm) === 'tc-cm-difference'){ var fill = tcCmTargetsFor(cm).nladTarget - rate; if(fill > 0) out.push({ aid:cm.id, role:'cm-fill', cents:fill * 100 }); }
+  return out;
+}
+
+// ── TruConnect: no MM override lines; Tanita's NLAD difference only on Sheila's and Najee's NLAD
+var _tcCalculateWeek2610 = tcCalculateWeek;
+tcCalculateWeek = function(rows){
+  var res = _tcCalculateWeek2610.apply(this, arguments);
+  try{ if(res && res.perAgent){ var P = _tcLockPeople(), T = P.tanita, tlNames = [P.sheila, P.najee].filter(Boolean).map(function(a){ return a.name; });
+    Object.keys(res.perAgent).forEach(function(k){ var e = res.perAgent[k]; e.breakdown = (e.breakdown || []).filter(function(b){
+      var l = String(b.label || ''), drop = false;
+      if(/^MM NLAD override on /.test(l) && TC_PLAN_2610.mmOverride === 0) drop = true;
+      if(T && Number(k) === T.id){ var m = l.match(/^CM NLAD diff on (.+?) \(/); if(m && tlNames.indexOf(m[1]) < 0) drop = true;
+        if(m && tlNames.indexOf(m[1]) >= 0 && (b.amount || 0) !== (b.count || 0) * TC_PLAN_2610.tanitaNladOnTl){ var old = b.amount || 0; b.rate = TC_PLAN_2610.tanitaNladOnTl; b.amount = (b.count || 0) * b.rate; b.label = l.replace(/\(\$[0-9.]+\/each/, '($' + b.rate + '/each'); e.amount = Math.round((e.amount - old + b.amount) * 100) / 100; } }
+      if(drop){ e.amount = Math.round((e.amount - (b.amount || 0)) * 100) / 100; return false; } return true; }); });
+    Object.keys(res.perAgent).forEach(function(k){ var e = res.perAgent[k]; if(!e.breakdown.length && !e.amount && !e.rows) delete res.perAgent[k]; });
+  } }catch(e){ console.warn('[tc 2610]', e); }
+  return res;
+};
+window.tcCalculateWeek = tcCalculateWeek;
+
+// ── Gen Mobile: Tanita $1 on every $9 NLAD, any team
+var _gmCalculateWeek2610Base = gmCalculateWeek2610;
+gmCalculateWeek2610 = function(rows){
+  var res = _gmCalculateWeek2610Base.apply(this, arguments), P = GM_PLAN_2026_10, tan = _gm26Tanita();
+  try{ if(res && res.perAgent && tan && P.tanitaNlad > 0 && Array.isArray(rows)){
+    var n = {}; rows.forEach(function(r){ if(r && typeof r.agentId === 'number' && !r._chargebackOnly && !r.isTribal) n[r.agentId] = (n[r.agentId] || 0) + 1; });
+    Object.keys(n).forEach(function(k){ var id = Number(k), a = _gm26Person(id); if(!a || isOwner(a) || id === tan.id) return;
+      var ibo = _gm26Ibo(id); if(ibo) return;   // Juan's markets pay $13 — not a $9 order
+      var e = res.perAgent[tan.id] = res.perAgent[tan.id] || { amount:0, breakdown:[], rows:0 }, amt = n[k] * P.tanitaNlad;
+      e.amount = Math.round((e.amount + amt) * 100) / 100; e.breakdown.push({ label:'NLAD campaign share on ' + a.name, count:n[k], rate:P.tanitaNlad, amount:amt }); });
+  } }catch(e){ console.warn('[gm 2610 tanita nlad]', e); }
+  return res;
+};
+window.gmCalculateWeek2610 = gmCalculateWeek2610;
+
+// ── pay statements: plain wording for the new lines
+var _ppPlainLabel2610 = _ppPlainLabel;
+_ppPlainLabel = function(l){ var s = String(l || ''), m;
+  if((m = s.match(/^NLAD campaign share on (.+)$/i))) return 'Override on ' + m[1] + '’s NLAD enrollments';
+  if((m = s.match(/^Market Manager override on (.+?) Assurance SIM$/i))) return 'Market Manager override on ' + m[1] + '’s Assurance SIM enrollments';
+  if((m = s.match(/^Assurance SIM enrollments \((.+), paid to (.+)\)$/i))) return m[1] + '’s Assurance SIM enrollments (paid to you)';
+  if(/^Assurance SIM enrollments/i.test(s)) return 'Personal Assurance SIM enrollments';
+  return _ppPlainLabel2610.apply(this, arguments); };
+window._ppPlainLabel = _ppPlainLabel;
+
+// ── Assurance pay file: split SIM vs phone (phones are not paid)
+function _aw26ParseCols(text){
+  var out = {}, lines = String(text || '').replace(/\r/g, '').split('\n'), i = 0;
+  for(; i < lines.length; i++){ if(/^\s*ASSURANCE\b/i.test(lines[i])) break; } if(i >= lines.length) return out;
+  for(i++; i < lines.length && !lines[i].trim(); i++){}
+  if(i >= lines.length) return out;
+  var hd = _awSplitRow(lines[i]).map(function(h){ return String(h).trim().toLowerCase(); }), col = function(t){ return hd.indexOf(t); };
+  var ci = { agent:col('agent'), caSim:col('ca sim'), caPh:col('ca phone'), nlSim:col('nlad sim'), nlPh:col('nlad phone'), total:col('total') };
+  if(ci.agent < 0 || ci.total < 0) return out;
+  for(i++; i < lines.length; i++){ var raw = lines[i]; if(!raw.trim()) break; var c = _awSplitRow(raw), code = String(c[ci.agent] || '').trim(); if(!code) continue;
+    var num = function(x){ if(x < 0) return 0; var v = parseInt(String(c[x] || '0').replace(/[^0-9-]/g, ''), 10); return isNaN(v) ? 0 : v; };
+    out[_awNormCode(code)] = { sim:num(ci.caSim) + num(ci.nlSim), phone:num(ci.caPh) + num(ci.nlPh), total:num(ci.total), hasCols:(ci.caPh >= 0 || ci.nlPh >= 0) }; }
+  return out;
+}
+function _aw26Counts(total, sim, phone, hasCols, label, warnings){
+  total = Number(total) || 0; if(!hasCols) return { sim:total, phone:0 };
+  var ph = Math.max(0, Math.min(total, Number(phone) || 0));
+  if((Number(sim) || 0) + (Number(phone) || 0) !== total && warnings) warnings.push(label + ': SIM (' + (sim || 0) + ') + phone (' + (phone || 0) + ') columns do not add up to Total (' + total + '). Paid ' + (total - ph) + ' SIM and ' + ph + ' phone — check the pay file.');
+  return { sim:total - ph, phone:ph };
+}
+awImportPayFileText = function(text){
+  var parsed = awParsePayFileAssurance(text), cols = _aw26ParseCols(text);
+  var result = { period:parsed.period, found:parsed.found, byCode:[], unmatched:[], recipients:[], enrollers:[], reconciliation:{}, warnings:[], totalRow:parsed.totalRow };
+  if(!parsed.found){ result.warnings.push('No ASSURANCE section found in the pasted pay file.'); return result; }
+  var weekRows = [], sumTotal = 0, sumDeact = 0, sumNoUsage = 0, sumBE = 0, sumSim = 0, sumPhone = 0;
+  parsed.rows.forEach(function(r){ sumTotal += r.total; sumDeact += r.deact; sumNoUsage += r.noUsage; sumBE += r.be;
+    var cc = cols[_awNormCode(r.code)] || {}, n = _aw26Counts(r.total, cc.sim, cc.phone, cc.hasCols, 'Agency code ' + r.code, result.warnings); sumSim += n.sim; sumPhone += n.phone;
+    var agent = awFindAgentByCode(r.code), team = (agent && typeof gmAgentTeam === 'function') ? gmAgentTeam(agent.id) : null;
+    result.byCode.push({ code:r.code, total:r.total, sim:n.sim, phone:n.phone, be:r.be, noUsage:r.noUsage, deact:r.deact, agentId:agent ? agent.id : null, agentName:agent ? agent.name : null, market:team ? (team.name || team.city || ('#' + team.id)) : null });
+    if(!agent){ if(result.unmatched.indexOf(r.code) < 0) result.unmatched.push(r.code); return; }
+    for(var k = 0; k < n.sim; k++) weekRows.push({ agentId:agent.id, isTribal:false });
+    for(var p = 0; p < n.phone; p++) weekRows.push({ agentId:agent.id, isTribal:false, isPhone:true }); });
+  var calc = awCalculateWeek(weekRows); if(calc.warnings && calc.warnings.length) result.warnings = result.warnings.concat(calc.warnings);
+  var formatted = awFormatBreakdown(calc.perAgent);
+  result.recipients = formatted.filter(function(r){ return r.total > 0; }); result.enrollers = formatted.filter(function(r){ return r.total === 0; });
+  var expected = 0; weekRows.forEach(function(w){ var a = _gm26Person(w.agentId); if(!a) return; if(isOwner(a)){ expected += OWNER_PAY.aw.each; return; } if(w.isPhone) return; _aw26Split(a).parts.forEach(function(x){ expected += x.cents / 100; }); });
+  result.reconciliation = { commissionableTotal:sumTotal, simTotal:sumSim, phoneTotal:sumPhone, deactTotal:sumDeact, noUsageTotal:sumNoUsage, beTotal:sumBE, expectedMMPay:Math.round(expected * 100) / 100, actualMMPay:Math.round(result.recipients.reduce(function(s, r){ return s + r.total; }, 0) * 100) / 100, fileTotalRow:parsed.totalRow };
+  return result;
+};
+window.awImportPayFileText = awImportPayFileText;
+var _panelAWPayFile2610 = panelAWPayFile;
+panelAWPayFile = function(){ var h = _panelAWPayFile2610.apply(this, arguments), R = window.__awpfResult, rc = R && R.reconciliation;
+  h = h.replace('Each market manager earns <strong>$5 per commissionable order</strong>.', 'Each <strong>SIM enrollment pays $10</strong> to whoever enrolled it, plus a <strong>$4 override to that market’s Market Manager</strong> on agent orders. <strong>Phone enrollments are not paid</strong> (only Calvin’s own). Juan’s agency: $14 per SIM, paid to Juan.')
+       .replace('Agents earn $0 on Assurance.', '').replace('>MM Pay<', '>Assurance Pay<').replace('>Manager Commissions<', '>Assurance Pay by Person<').replace('>Manager<', '>Person<');
+  if(rc) h = h.replace(/✓ Reconciled — \$5 × [^<]*/, '✓ Reconciled — ' + (rc.simTotal || 0) + ' SIM enrollments (' + (rc.phoneTotal || 0) + ' phone enrollments not paid) = $' + rc.actualMMPay + ' assigned.').replace(/Expected MM pay/, 'Expected Assurance pay');
+  return h; };
+window.panelAWPayFile = panelAWPayFile;
+
+// ── the AI and Comp Plans quote the approved plan
+var _wmamPayRules2610b = wmamPayRules;
+wmamPayRules = function(args){ var out = _wmamPayRules2610b.apply(this, arguments);
+  out.assurance_wireless = { sim_enrollment:'$10 per SIM enrollment to whoever enrolled it — agent or manager, everyone gets the same', override:'$4 per agent SIM order, paid ONLY to the Market Manager of that market (there are no Campaign Managers on Assurance yet). A Market Manager’s own SIM pays $10 with no override.', phones:'Nobody is paid and nobody gets an override on Assurance phone enrollments or phone sales — except Calvin. Pay Link on an Assurance phone: every dollar is the agent’s surplus, no company fees.', juan:'Juan Rincon (IBO): $14 per SIM on every SIM his agency enrolls (his own included). He pays his people; they get $0 from the company.', calvin:'$10 per enrollment, SIM or phone, on his own enrollments', sim_cards:'$1 each, packs of 50', source:'the Assurance payroll engine (2026-10 plan)' };
+  if(out.truconnect){ out.truconnect.market_manager = 'Market Managers: NLAD $10 personal, Tribal paid as an agent. NO Market Manager overrides.'; out.truconnect.tanita_nlad = 'Tanita: $10 on her own NLAD; $2 (the difference up to $10) ONLY on Sheila Love’s and Najee Burns’ NLAD SIM orders — nothing on anyone else’s TruConnect NLAD.'; }
+  if(out.gen_mobile_2026_10_plan && out.gen_mobile_2026_10_plan.nlad){ out.gen_mobile_2026_10_plan.nlad.direct_manager = '$1 per customer (Team Leader, or Market Manager if no Team Leader)'; out.gen_mobile_2026_10_plan.nlad.tanita = '$1 on every NLAD order paid at $9, on any team (agents and managers, Brandon too) — on top of the direct manager’s $1. Nothing on Juan’s ($13) or Calvin’s orders.'; }
+  return out; };
+window.wmamPayRules = wmamPayRules;
+var _compLoad2610 = compLoad;
+compLoad = async function(){ var C = await _compLoad2610.apply(this, arguments);
+  try{ (C.plans || []).forEach(function(p){ if(p && p.id === 'aw-std' && !p._plan2610){ p.positions = ['Field Agent','Team Leader','Market Manager']; p.rates = { nlad:_cpFlat(AW_PAY_2610.sim), phone:_cpFlat(0) };
+    p.conditions = ['SIM enrollment: $10 to whoever enrolled it (agent or manager).', 'Market Manager: $4 override on every agent SIM order in their market (Market Manager only — no Campaign Managers yet).', 'Phones: nobody is paid and nobody gets an override, except Calvin. Pay Link phone sales: every dollar is the agent’s surplus.', 'Juan Rincon (IBO): $14 per SIM on every SIM his agency enrolls; he pays his people.']; p._plan2610 = true; } }); }catch(e){}
+  return C; };
+window.compLoad = compLoad;
+
+// ── saved comp rules check these numbers
+Object.assign(COMP_RULE_ENGINE, {
+  'aw.sim':function(){ return AW_PAY_2610.sim; }, 'aw.mm_override':function(){ return AW_PAY_2610.mmOverride; }, 'aw.juan':function(){ return AW_PAY_2610.ibo; }, 'aw.phone':function(){ return AW_PAY_2610.phone; },
+  'tc.mm.override':function(){ return TC_RATES.nlad.mmOverridePerAgentEnrollment; }, 'tc.tanita.nlad.tl':function(){ return TC_PLAN_2610.tanitaNladOnTl; },
+  'gm.tanita.nlad':function(){ return GM_PLAN_2026_10.tanitaNlad; },
+  'en.hourly':function(){ return WMAM_HOURLY_RULES.rate; }, 'en.hours_cap':function(){ return WMAM_HOURLY_RULES.cap; }
+});
+delete COMP_RULE_ENGINE['aw.enrollment'];
+Object.assign(window, { AW_PAY_2610:AW_PAY_2610, TC_PLAN_2610:TC_PLAN_2610, awCalculateWeek2610:awCalculateWeek2610 });
+
+// ══════════════════════════════════════════════════════════════════════
+//  PAYROLL DEPOSIT + PAY STUBS (Calvin approved design B — ADP-style, v2026.10.15.1000)
+//  One deposit per person per FRIDAY, combining every campaign pay file approved for that Friday
+//  (each campaign keeps its own week: Gen Mobile Sun–Sat, TruConnect Mon–Sun, DART 2 weeks behind, …)
+//  plus hourly pay, Pay Link surplus, Tribal manager overrides, and the company deductions
+//  (prior debt, loans/fees, invoice plans, expired phones, disputes). Same math as the Weekly Rollup
+//  (payrollBuildWeeklyRollup) — this only groups the weeks by pay date and itemizes every line.
+//  A week's pay date = the first Friday on/after it was approved (office can move it to another Friday).
+//  Fixes: the rollup subtracted a carrier row's chargeback total again even though the pay engine had
+//  already taken it out of that row (Gen Mobile device charges were added back) — the deposit uses the
+//  row's own net, never twice. Approved AND finalized weeks both count.
+//  Who: owner + payroll staff (K-Anna). Agents later.
+// ══════════════════════════════════════════════════════════════════════
+function _payYmd(d){ var x = new Date(d.getTime()); return x.getFullYear() + '-' + ('0' + (x.getMonth() + 1)).slice(-2) + '-' + ('0' + x.getDate()).slice(-2); }
+function _payAddDays(ymd, n){ var d = new Date(String(ymd).slice(0, 10) + 'T12:00:00'); d.setDate(d.getDate() + n); return _payYmd(d); }
+function _payFridayOnOrAfter(ymd){ if(!ymd) return ''; var d = new Date(String(ymd).slice(0, 10) + 'T12:00:00'); if(isNaN(d)) return ''; d.setDate(d.getDate() + ((5 - d.getDay() + 7) % 7)); return _payYmd(d); }
+function _payCtDay(iso){ try{ return _ctToday(new Date(iso)); }catch(e){ return String(iso || '').slice(0, 10); } }
+function ppWeekPayDate(w){
+  if(!w) return '';
+  if(w.payDate) return w.payDate;
+  var when = w.approvedAt || w.finalizedAt;
+  if(when) return _payFridayOnOrAfter(_payCtDay(when));
+  return _payFridayOnOrAfter(_payAddDays(_payIso(w.periodEnd) || _ctToday(), 1));
+}
+function _payIso(v){ v = String(v || '').trim(); var m = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/); if(m){ var y = m[3].length === 2 ? '20' + m[3] : m[3]; return y + '-' + ('0' + m[1]).slice(-2) + '-' + ('0' + m[2]).slice(-2); } return v.slice(0, 10); }
+function _payWeekCounts(w){ return !!(w && !w.deleted && (w.status === 'approved' || w.status === 'finalized')); }
+function payDepositWeeks(F){ return (PAYROLL_WEEKS || []).filter(function(w){ return _payWeekCounts(w) && ppWeekPayDate(w) === F; }); }
+function payDepositFridays(){ var s = {}; (PAYROLL_WEEKS || []).forEach(function(w){ if(_payWeekCounts(w)){ var f = ppWeekPayDate(w); if(f) s[f] = 1; } }); return Object.keys(s).sort().reverse(); }
+// the key the rollup / deductions finalize use for this Friday: the latest period end inside that Friday's Thu–Wed pay week (same "anchor" the hourly pay already uses), else that Wednesday
+function payDepositKey(F, weeks){
+  var wed = _payAddDays(F, -2), wk = _payWeekKey(wed);
+  var ends = (weeks || payDepositWeeks(F)).map(function(w){ return _payIso(w.periodEnd); }).filter(function(e){ return e && _payWeekKey(e) === wk; }).sort();
+  return ends.length ? ends[ends.length - 1] : wed;
+}
+var _PAY_SWAP = { on:false, wanted:false };
+var _savePayrollWeeksDeposit = savePayrollWeeks;
+savePayrollWeeks = function(){ if(_PAY_SWAP.on){ _PAY_SWAP.wanted = true; return; } return _savePayrollWeeksDeposit.apply(this, arguments); };
+window.savePayrollWeeks = savePayrollWeeks;
+// run fn while the rollup sees ONLY this Friday's weeks, all keyed to one period end
+function _payWithDepositWeeks(F, fn){
+  var weeks = payDepositWeeks(F), key = payDepositKey(F, weeks);
+  var copies = weeks.map(function(w){ return Object.assign({}, w, { periodEnd:key, status:'approved', _origPeriodEnd:w.periodEnd, _orig:w,
+    rows:(w.rows || []).map(function(r){ return Object.assign({}, r, { chargebackTotal:0 }); }) }); });   // the row's net already has its chargebacks taken out
+  var saved = PAYROLL_WEEKS; _PAY_SWAP.on = true; PAYROLL_WEEKS = copies;
+  try{ return fn(key, weeks); }
+  finally{ PAYROLL_WEEKS = saved; _PAY_SWAP.on = false; if(_PAY_SWAP.wanted){ _PAY_SWAP.wanted = false; try{ _savePayrollWeeksDeposit(); }catch(e){} } }
+}
+function payrollBuildDeposit(F){
+  return _payWithDepositWeeks(F, function(key, weeks){
+    var rollup = payrollBuildWeeklyRollup(key), warn = [];
+    var otherCommits = weeks.map(function(w){ return w.periodEnd; }).filter(function(e, i, a){ return e !== key && a.indexOf(e) === i && typeof OBLIGATION_COMMITS !== 'undefined' && OBLIGATION_COMMITS[e] && OBLIGATION_COMMITS[e].viaDeposit !== F; });
+    if(otherCommits.length) warn.push('Loans/fees were already finalized on an older Weekly Rollup for ' + otherCommits.join(', ') + '. Check those people’s loan balances before finalizing this deposit so nothing is taken twice.');
+    var cm = (typeof OBLIGATION_COMMITS !== 'undefined') ? (OBLIGATION_COMMITS[key] || null) : null;
+    return { payDate:F, key:key, weeks:weeks, rollup:rollup, committed:!!cm, committedAt:cm ? cm.committedAt : '', warnings:warn };
+  });
+}
+// every finalize (approval auto-finalize, This Week's Payroll button, old rollup button) goes through the Friday deposit
+function _payMarkWeeksCommitted(F, key){ var c = OBLIGATION_COMMITS[key]; if(!c) return; payDepositWeeks(F).forEach(function(x){ if(x.periodEnd && x.periodEnd !== key && !OBLIGATION_COMMITS[x.periodEnd]) OBLIGATION_COMMITS[x.periodEnd] = { committedAt:c.committedAt, by:c.by, viaDeposit:F }; }); try{ saveObligations(); }catch(e){} }
+var _payrollCommitObligationsBase = payrollCommitObligations;
+payrollCommitObligations = function(pe){
+  if(_PAY_SWAP.on) return _payrollCommitObligationsBase.apply(this, arguments);
+  var w = (PAYROLL_WEEKS || []).find(function(x){ return x && _payWeekCounts(x) && (x.periodEnd === pe || _payIso(x.periodEnd) === _payIso(pe)); });
+  if(!w) return _payrollCommitObligationsBase.apply(this, arguments);
+  var F = ppWeekPayDate(w), key = payDepositKey(F);
+  if(OBLIGATION_COMMITS[key]){ try{ alert('This Friday\u2019s deposit (' + _payLongDate(F) + ') was already finalized on ' + String(OBLIGATION_COMMITS[key].committedAt || '').slice(0, 10) + '.'); }catch(e){} return false; }
+  var ok = _payWithDepositWeeks(F, function(k){ return _payrollCommitObligationsBase(k); });
+  if(ok) _payMarkWeeksCommitted(F, key);
+  return ok;
+};
+window.payrollCommitObligations = payrollCommitObligations;
+function payrollCommitDeposit(F){
+  var dep = payrollBuildDeposit(F);
+  if(dep.warnings.length && !confirm(dep.warnings.join('\n') + '\n\nFinalize anyway?')) return false;
+  if(dep.committed){ try{ alert('This Friday\u2019s deposit was already finalized on ' + String(dep.committedAt || '').slice(0, 10) + '.'); }catch(e){} return false; }
+  var ok = _payWithDepositWeeks(F, function(key){ return _payrollCommitObligationsBase(key); });
+  if(ok) _payMarkWeeksCommitted(F, dep.key);
+  return ok;
+}
+// one campaign's itemized lines for a person, from the SAVED week (same builder as the pay-file statement)
+function _payCascadeFromAudit(w, aid){
+  var out = [];
+  (w.deductionAudit || []).forEach(function(x){
+    if(x.kind === 'deduction') (x.trail || []).forEach(function(t){ if(Number(t.aid) === Number(aid) && t.paidCents) out.push({ type:x.type, orderNum:x.orderNum, amountCents:t.paidCents, fromName:x.agentName, paidByRole:t.role }); });
+    else if(x.kind === 'override-chargeback' && Number(x.appliedTo) === Number(aid)) out.push({ type:x.type, orderNum:x.orderNum, amountCents:x.amountCents, fromName:x.enroller, paidByRole:'override' });
+  });
+  return out;
+}
+function payStubCampaign(w, aid){
+  var row = (w.rows || []).find(function(r){ return r && Number(r.agentId) === Number(aid); }); if(!row) return null;
+  var cascaded = row.deductionsApplied !== undefined;
+  var pre = { commissions:{ byAgent:{} }, cascade:{ netByAgent:{}, audit:w.deductionAudit || [] } };
+  pre.commissions.byAgent[aid] = { breakdown:row.commissionBreakdown || [], amount:(row.grossCommissionCents != null ? row.grossCommissionCents : row.grossCents || 0) / 100 };
+  if(cascaded) pre.cascade.netByAgent[aid] = { grossCents:row.grossCommissionCents != null ? row.grossCommissionCents : row.grossCents, deductionsCents:row.deductionsApplied || 0, creditsCents:row.creditsApplied || 0, debtPaidCents:row.priorDebtPaid || 0, netCents:row.grossCents || 0, carryoverCents:row.carryoverDebtAdded || 0, cascade:row.deductionLines || _payCascadeFromAudit(w, aid) };
+  var S = ppStatementData(Number(aid), w.carrier, pre); if(!S) return null;
+  var pos = function(L){ return L.filter(function(x){ return (x.cents || 0) >= 0; }); }, neg = [];
+  [S.own, S.team, S.addons].forEach(function(L){ L.forEach(function(x){ if((x.cents || 0) < 0){ var n0 = x.count || 1; neg.push({ type:x.label, whose:'', share:'', each:Math.round(Math.abs(x.cents) / n0), count:n0, cents:Math.abs(x.cents), orders:[] }); } }); });
+  if(!cascaded) (row.commissionBreakdown || []).forEach(function(b){ if(/^chargebacks/i.test(b.label || '') && b.amount){ neg.push({ type:'Chargebacks on the pay file', whose:'', share:'', each:Math.round(Math.abs(b.amount) * 100), count:1, cents:Math.round(Math.abs(b.amount) * 100), orders:[] }); } });
+  var C = { carrier:w.carrier, weekId:w.id, periodStart:w.periodStart || '', periodEnd:w.periodEnd || '', status:w.status, own:pos(S.own), team:pos(S.team), addons:pos(S.addons), credits:S.credits || [],
+    deductions:(S.deductions || []).concat(neg), priorDebtCents:cascaded ? (row.priorDebtPaid || 0) : 0, carryoverCents:0, netCents:row.grossCents || 0 };
+  var sum = function(L){ return L.reduce(function(t, x){ return t + (x.cents || 0); }, 0); };
+  C.earnCents = sum(C.own) + sum(C.team) + sum(C.addons); C.creditCents = sum(C.credits); var items = sum(C.deductions);
+  C.dedCents = cascaded ? (row.deductionsApplied || 0) : items;            // what was actually taken from this pay
+  C.carryoverCents = Math.max(0, items - C.dedCents);                         // charged but not covered this week -> carried to next payroll as debt
+  C.checkCents = C.earnCents + C.creditCents - C.dedCents - C.priorDebtCents;   // must equal the saved net
+  C.ok = Math.abs(C.checkCents - C.netCents) <= 1;
+  return C;
+}
+var _PAY_OTHER = { hourly:'Hourly pay', salary:'Weekly salary', surplus:'Pay Link surplus', override:'Manager override', 'dispute-won':'Dispute won — returned', 'expired-reimb':'Expired phone refund',
+  carryover:'Prior debt (carried from an earlier payroll)', obligation:'Loan / fee / invoice plan', expired:'Expired phone charge', dispute:'Customer dispute charge' };
+function payStubData(aid, dep){
+  dep = dep || null; if(!dep) return null; var A = dep.rollup.agents[aid]; if(!A) return null;
+  var ag = _gm26Person(aid) || { name:A.agentName }, camps = [], other = [], company = [];
+  (A.lines || []).forEach(function(L){
+    if(L.kind === 'carrier-line'){ var w = (dep.weeks || []).find(function(x){ return x.id === L.weekId; }); var C = w && payStubCampaign(w, aid); if(C) camps.push(C); return; }
+    var item = { label:(L.kind === 'carryover' ? _PAY_OTHER.carryover : (L.carrier || _PAY_OTHER[L.kind] || L.kind)), kind:L.kind, cents:L.grossCents || 0, detail:L };
+    if((L.grossCents || 0) >= 0) other.push(item); else company.push(item);
+  });
+  var team = (typeof gmAgentTeam === 'function') ? gmAgentTeam(Number(aid)) : null;
+  var S = { agentId:Number(aid), name:ag.name || A.agentName, role:ag.role || '', market:(team && (team.name || team.city)) || ag.team || '', payDate:dep.payDate, campaigns:camps, other:other, company:company, netCents:A.netCents || 0 };
+  var sum = function(L, f){ return L.reduce(function(t, x){ return t + f(x); }, 0); };
+  S.grossCents = sum(camps, function(c){ return c.earnCents + c.creditCents; }) + sum(other, function(x){ return x.cents; });
+  S.dedCents = sum(camps, function(c){ return c.dedCents + c.priorDebtCents; }) + sum(company, function(x){ return -x.cents; });
+  S.checkCents = S.grossCents - S.dedCents; S.ok = Math.abs(S.checkCents - S.netCents) <= 1 && camps.every(function(c){ return c.ok; });
+  return S;
+}
+// ── the stub (design B: ADP-style)
+var _PAY_STUB_CSS = '<style>.pstb{font-family:Arial,Helvetica,sans-serif;background:#fff;color:#111827;max-width:880px;margin:0 auto 18px;box-shadow:0 6px 24px rgba(0,0,0,.18);font-size:12px;page-break-inside:avoid;break-inside:avoid}'
+  + '.pstb .hd{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:14px 18px;border-bottom:2px solid #111827}.pstb .co{display:flex;gap:10px;align-items:center}.pstb .co img{width:48px;height:48px;border-radius:50%}.pstb .co .n{font-weight:900;font-size:14px}.pstb .co .a{color:#6b7280;font-size:11px}'
+  + '.pstb .box{border:1px solid #111827;display:grid;grid-template-columns:auto auto;font-size:11px}.pstb .box div{padding:3px 8px;border-bottom:1px solid #e5e7eb}.pstb .box .k{color:#6b7280;text-transform:uppercase;font-weight:700;letter-spacing:.5px}'
+  + '.pstb .cols{display:grid;grid-template-columns:1.6fr 1fr}.pstb .col+.col{border-left:1px solid #111827}'
+  + '.pstb .th{background:#111827;color:#fff;font-weight:800;letter-spacing:1px;text-transform:uppercase;font-size:10px;padding:5px 10px;display:grid;grid-template-columns:1fr 46px 62px 84px}.pstb .thd{grid-template-columns:1fr 84px}'
+  + '.pstb .r{display:grid;grid-template-columns:1fr 46px 62px 84px;padding:4px 10px;border-bottom:1px dotted #d1d5db;gap:4px}.pstb .rd{grid-template-columns:1fr 84px}.pstb .r span:not(:first-child){text-align:right;white-space:nowrap}'
+  + '.pstb .cg{background:#eef2ff;font-weight:900;color:#003594;padding:5px 10px;border-bottom:1px solid #c7d2fe;font-size:11px}.pstb .cg small{font-weight:600;color:#6b7280}.pstb .neg{color:#cc0000}.pstb .sub{color:#6b7280;font-size:10.5px;word-break:break-word;overflow-wrap:anywhere}'
+  + '.pstb .tot{display:grid;grid-template-columns:1fr 90px;padding:5px 10px;font-weight:900;border-top:1px solid #111827}.pstb .tot span:last-child{text-align:right}'
+  + '.pstb .sum{display:grid;grid-template-columns:repeat(4,1fr);border-top:2px solid #111827}.pstb .sum div{padding:9px 12px;border-right:1px solid #e5e7eb}.pstb .sum .k{font-size:9px;color:#6b7280;text-transform:uppercase;font-weight:800;letter-spacing:1px}.pstb .sum .v{font-size:16px;font-weight:900}'
+  + '.pstb .chk{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;gap:12px;flex-wrap:wrap;border-top:2px dashed #9ca3af;background:repeating-linear-gradient(45deg,#f8fafc,#f8fafc 10px,#eef2ff 10px,#eef2ff 20px)}.pstb .chk .amt{font-size:26px;font-weight:900;border:2px solid #111827;padding:6px 14px;background:#fff}'
+  + '.pstb .bad{background:#fee2e2;color:#7f1d1d;font-weight:800;padding:8px 12px;border-top:2px solid #dc2626}'
+  + '.pstb .r span,.pstb .th span{min-width:0;overflow-wrap:anywhere}.pstb .cols,.pstb .col{min-width:0}'
+  + '@media(max-width:640px){.pstb .cols{grid-template-columns:1fr}.pstb .col+.col{border-left:none;border-top:1px solid #111827}.pstb .sum{grid-template-columns:repeat(2,1fr)}.pstb .r,.pstb .th{grid-template-columns:minmax(0,1fr) 30px 78px}.pstb .rd,.pstb .thd{grid-template-columns:minmax(0,1fr) 78px}.pstb .r:not(.rd) span:nth-child(3),.pstb .th:not(.thd) span:nth-child(3){display:none}.pstb .chk .amt{font-size:22px}}'
+  + '@media print{.pstb{box-shadow:none;margin:0 0 12px}}</style>';
+function _payLongDate(ymd){ var d = new Date(String(ymd).slice(0, 10) + 'T12:00:00'); return isNaN(d) ? ymd : ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getDay()] + ', ' + ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear(); }
+function _payWkLabel(c){ var a = _payIso(c.periodStart), b = _payIso(c.periodEnd); return (a ? _gmShort(a) + ' – ' : '') + (b ? _gmShort(b) : ''); }
+function payStubHtml(S){
+  var esc = _escapeHtml, M = _ppM, logo = (typeof WMAM_BUILTIN_LOGO !== 'undefined' && WMAM_BUILTIN_LOGO) || COMPANY_LOGO || '';
+  var er = function(l, q, r, a){ return '<div class="r"><span>' + l + '</span><span>' + (q || q === 0 ? q : '') + '</span><span>' + (r != null ? M(r) : '') + '</span><span>' + M(a) + '</span></div>'; };
+  var h = '<div class="pstb"><div class="hd"><div class="co">' + (logo ? '<img src="' + logo + '" alt="">' : '') + '<div><div class="n">Williams Marketing and Management, Inc.</div><div class="a">Payroll · Commission statement</div></div></div>'
+    + '<div class="box"><div class="k">Employee</div><div>' + esc(S.name) + '</div><div class="k">Position</div><div>' + esc(S.role || '—') + (S.market ? ' · ' + esc(S.market) : '') + '</div><div class="k">Pay date</div><div>' + esc(_payLongDate(S.payDate)) + '</div><div class="k">Pay type</div><div>Direct deposit</div></div></div>';
+  h += '<div class="cols"><div class="col"><div class="th"><span>Earnings</span><span>Qty</span><span>Rate</span><span>This period</span></div>';
+  S.campaigns.forEach(function(c){
+    h += '<div class="cg">' + esc(c.carrier) + ' <small>· ' + esc(_payWkLabel(c)) + '</small></div>';
+    var any = false;
+    [['Personal Enrollments', c.own], ['Team Overrides', c.team], ['Add-ons', c.addons]].forEach(function(g){ if(!g[1].length) return; any = true; h += '<div class="r sub"><span>' + g[0] + '</span><span></span><span></span><span></span></div>'; g[1].forEach(function(x){ h += er(esc(x.label), x.count || '', x.count ? Math.round(x.rate * 100) : null, x.cents); }); });
+    c.credits.forEach(function(x){ any = true; h += er('Credit — ' + esc(x.type) + (x.order ? ' <span class="sub">' + esc(x.order) + '</span>' : ''), '', null, x.cents); });
+    if(!any) h += er('<span class="sub">No earnings on this file</span>', '', null, 0);
+  });
+  if(S.other.length){ h += '<div class="cg">Other pay</div>'; S.other.forEach(function(x){ h += er(esc(x.label), x.detail && x.detail.hours ? x.detail.hours.toFixed(2) : '', x.detail && x.detail.rate ? Math.round(x.detail.rate * 100) : null, x.cents); }); }
+  h += '<div class="tot"><span>GROSS EARNINGS</span><span>' + M(S.grossCents) + '</span></div></div><div class="col"><div class="th thd"><span>Deductions</span><span>This period</span></div>';
+  var anyDed = false;
+  S.campaigns.forEach(function(c){
+    if(!c.deductions.length && !c.priorDebtCents && !c.carryoverCents) return; anyDed = true;
+    h += '<div class="cg">' + esc(c.carrier) + '</div>';
+    c.deductions.forEach(function(g){ var who = g.whose ? '<br><span class="sub">' + esc(g.whose) + (g.share && !/own enrollment/.test(g.share) && !/^your /.test(g.whose) ? ' (your ' + esc(g.share) + ')' : '') + '</span>' : '';
+      var ord = g.orders && g.orders.length ? '<br><span class="sub">Order' + (g.orders.length === 1 ? '' : 's') + ': ' + esc(g.orders.slice(0, 8).join(', ')) + (g.orders.length > 8 ? '…' : '') + '</span>' : '';
+      h += '<div class="r rd"><span>' + esc(g.type) + (g.count > 1 ? ' (' + g.count + ' × ' + M(g.each) + ')' : '') + who + ord + '</span><span class="neg">−' + M(g.cents) + '</span></div>'; });
+    if(c.priorDebtCents) h += '<div class="r rd"><span>Prior debt paid from this pay</span><span class="neg">−' + M(c.priorDebtCents) + '</span></div>';
+    if(c.carryoverCents) h += '<div class="r rd"><span>Not taken this week — carried to next payroll</span><span>+' + M(c.carryoverCents) + '</span></div>';
+  });
+  if(S.company.length){ anyDed = true; h += '<div class="cg" style="color:#b45309;background:#fff7ed;border-color:#fed7aa">Company</div>'; S.company.forEach(function(x){ h += '<div class="r rd"><span>' + esc(x.label) + (x.detail && x.detail.balanceAfterCents != null ? '<br><span class="sub">balance after: ' + M(x.detail.balanceAfterCents) + '</span>' : '') + '</span><span class="neg">−' + M(Math.abs(x.cents)) + '</span></div>'; }); }
+  if(!anyDed) h += '<div class="r rd"><span class="sub">No deductions this pay date</span><span>$0.00</span></div>';
+  h += '<div class="tot"><span>TOTAL DEDUCTIONS</span><span class="neg">' + (S.dedCents ? '−' : '') + M(Math.abs(S.dedCents)) + '</span></div></div></div>';
+  h += '<div class="sum"><div><div class="k">Gross</div><div class="v">' + M(S.grossCents) + '</div></div><div><div class="k">Deductions</div><div class="v neg">' + (S.dedCents ? '−' : '') + M(Math.abs(S.dedCents)) + '</div></div><div><div class="k">Net pay</div><div class="v" style="color:#047857">' + M(S.netCents) + '</div></div><div><div class="k">Campaigns</div><div class="v">' + S.campaigns.length + '</div></div></div>';
+  if(!S.ok) h += '<div class="bad">⛔ These lines add up to ' + M(S.checkCents) + ' but the saved pay is ' + M(S.netCents) + '. Do not pay until payroll checks this person.</div>';
+  h += '<div class="chk"><div><div style="font-size:11px;color:#6b7280;letter-spacing:2px;text-transform:uppercase;font-weight:800">Direct deposit advice — non-negotiable</div><div style="font-weight:800;margin-top:4px">Pay to: ' + esc(S.name) + '</div><div style="font-size:11px;color:#6b7280">' + esc(_payLongDate(S.payDate)) + '</div></div><div class="amt">' + M(S.netCents) + '</div></div></div>';
+  return h;
+}
+function payStubShow(aid, F){
+  var dep = payrollBuildDeposit(F), S = payStubData(aid, dep); if(!S) return alert('No pay for this person on ' + F + '.');
+  var old = document.getElementById('payStubOv'); if(old) old.remove();
+  var ov = document.createElement('div'); ov.id = 'payStubOv'; ov.style.cssText = 'position:fixed;inset:0;z-index:100800;background:rgba(0,0,0,.6);overflow-y:auto;padding:16px';
+  ov.innerHTML = '<div style="max-width:880px;margin:0 auto"><div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:8px"><button onclick="payStubPrint([' + Number(aid) + '],\'' + F + '\')" style="padding:9px 14px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">🖨 Print / PDF</button><button onclick="document.getElementById(\'payStubOv\').remove()" style="padding:9px 14px;border:none;border-radius:8px;background:#fff;font-weight:800;cursor:pointer">✕ Close</button></div>' + _PAY_STUB_CSS + payStubHtml(S) + '</div>';
+  document.body.appendChild(ov);
+}
+function payStubPrint(ids, F){
+  var dep = payrollBuildDeposit(F), list = (ids && ids.length ? ids : Object.keys(dep.rollup.agents)).map(function(id){ return payStubData(id, dep); }).filter(Boolean);
+  var w = window.open('', '_blank'); if(!w){ alert('Allow pop-ups to print the stubs.'); return; }
+  w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Pay stubs ' + F + '</title>' + _PAY_STUB_CSS + '</head><body style="margin:14px;background:#fff">' + list.map(payStubHtml).join('') + '</body></html>'); w.document.close(); setTimeout(function(){ try{ w.print(); }catch(e){} }, 400);
+}
+function payStubMoveWeek(weekId, F){ var w = (PAYROLL_WEEKS || []).find(function(x){ return x && x.id === weekId; }); if(!w || !/^\d{4}-\d{2}-\d{2}$/.test(F || '')) return; var u = DB.current; if(!(isOwner(u) || wmamIsPayrollStaff(u))) return alert('Only payroll can move a pay file to another pay date.');
+  w.payDate = F; (w.approvalHistory = w.approvalHistory || []).push({ action:'pay date set to ' + F, actorId:u.id, actorName:u.name, at:new Date().toISOString() }); savePayrollWeeks(); gotoPanel('payroll-rollup', { payDate:F }); }
+// ── the payroll team's page: one Friday, everyone paid, one company total (replaces the old Pay Stubs / Weekly Rollup tab)
+function panelPayrollDeposit(){
+  var u = DB.current, esc = _escapeHtml, M = _ppM;
+  if(!u || !(isOwner(u) || wmamIsPayrollStaff(u))) return panelHeader('🧾 Pay Stubs') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">Payroll only.</div></div>';
+  var P = (window._panelParams || gotoPanel._params || {}), fr = payDepositFridays(), F = P.payDate && fr.indexOf(P.payDate) >= 0 ? P.payDate : fr[0];
+  if(!P.payDate && P.periodEnd){ var pw = (PAYROLL_WEEKS || []).find(function(x){ return x && _payWeekCounts(x) && (x.periodEnd === P.periodEnd || _payIso(x.periodEnd) === _payIso(P.periodEnd)); }); if(pw) F = ppWeekPayDate(pw); }
+  var h = panelHeader('🧾 Pay Stubs — Friday Deposit');
+  if(!F) return h + '<div class="bo-card" style="padding:40px;text-align:center;color:var(--muted)">No approved pay files yet. Approve a campaign’s pay file in Payroll Processing first.</div>';
+  var dep = payrollBuildDeposit(F), ids = Object.keys(dep.rollup.agents), stubs = {}; ids.forEach(function(id){ stubs[id] = payStubData(id, dep); });
+  ids.sort(function(a, b){ return (stubs[b] ? stubs[b].netCents : 0) - (stubs[a] ? stubs[a].netCents : 0); });
+  var camps = []; dep.weeks.forEach(function(w){ if(camps.indexOf(w.carrier) < 0) camps.push(w.carrier); });
+  var total = ids.reduce(function(t, id){ return t + (stubs[id] ? stubs[id].netCents : 0); }, 0), bad = ids.filter(function(id){ return stubs[id] && !stubs[id].ok; });
+  h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px"><b>Pay date:</b><select onchange="gotoPanel(\'payroll-rollup\',{payDate:this.value})" style="padding:8px;border:1px solid #cbd5e1;border-radius:8px;font-size:15px">' + fr.map(function(f){ return '<option value="' + f + '"' + (f === F ? ' selected' : '') + '>' + esc(_payLongDate(f)) + '</option>'; }).join('') + '</select></div>';
+  h += '<div class="bo-card" style="overflow:hidden;margin-bottom:14px"><div style="background:#003594;color:#fff;padding:14px 18px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><div style="font-weight:900;font-size:1.1rem">' + esc(_payLongDate(F)) + ' — Payroll Deposit</div><div style="font-size:.8rem;opacity:.85">' + ids.length + ' people · ' + dep.weeks.length + ' pay file' + (dep.weeks.length === 1 ? '' : 's') + '</div></div><div style="text-align:right"><div style="font-size:.66rem;letter-spacing:2px;text-transform:uppercase;opacity:.85">Total from business checking</div><div style="font-size:1.9rem;font-weight:900">' + M(total) + '</div></div></div>';
+  h += '<div style="padding:10px 16px;font-size:.84rem;border-bottom:1px solid #e5e7eb"><b>Pay files in this deposit:</b>' + dep.weeks.map(function(w){ var opts = [-7, 7, 14].map(function(n){ var f = _payAddDays(F, n); return '<option value="' + f + '">' + esc(_payLongDate(f)) + '</option>'; }).join('');
+      return '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:4px 0"><span style="min-width:110px;font-weight:800;color:#003594">' + esc(w.carrier) + '</span><span>' + esc(_payWkLabel(w)) + '</span><span style="color:#6b7280">· ' + esc(w.status) + (w.approvedByName ? ' by ' + esc(w.approvedByName) : '') + '</span><select onchange="if(this.value&&confirm(\'Move this ' + esc(w.carrier) + ' pay file to ' + '\'+this.options[this.selectedIndex].text+\'?\')) payStubMoveWeek(\'' + w.id + '\',this.value); else this.value=\'\'" style="padding:4px;border:1px solid #cbd5e1;border-radius:6px;font-size:12px"><option value="">Move to another Friday…</option>' + opts + '</select></div>'; }).join('') + '</div>';
+  dep.warnings.forEach(function(x){ h += '<div style="padding:10px 16px;background:#fef3c7;color:#78350f;font-weight:700">⚠ ' + esc(x) + '</div>'; });
+  if(bad.length) h += '<div style="padding:10px 16px;background:#fee2e2;color:#7f1d1d;font-weight:800">⛔ ' + bad.length + ' stub' + (bad.length === 1 ? '' : 's') + ' do not add up to the saved pay (' + bad.map(function(id){ return esc(stubs[id].name); }).join(', ') + '). Open them before paying.</div>';
+  h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.88rem"><tr style="background:#f4f5f7;color:#6b7280;font-size:.7rem;letter-spacing:1px;text-transform:uppercase"><th style="text-align:left;padding:8px 10px">Person</th>' + camps.map(function(c){ return '<th style="text-align:right;padding:8px 10px">' + esc(c) + '</th>'; }).join('') + '<th style="text-align:right;padding:8px 10px">Other pay</th><th style="text-align:right;padding:8px 10px">Company deductions</th><th style="text-align:right;padding:8px 10px">Net deposit</th><th></th></tr>';
+  ids.forEach(function(id){ var S = stubs[id]; if(!S) return; var byC = {}; S.campaigns.forEach(function(c){ byC[c.carrier] = (byC[c.carrier] || 0) + c.netCents; });
+    var oth = S.other.reduce(function(t, x){ return t + x.cents; }, 0), co = S.company.reduce(function(t, x){ return t + x.cents; }, 0);
+    h += '<tr style="border-top:1px solid #e5e7eb;cursor:pointer' + (S.ok ? '' : ';background:#fef2f2') + '" onclick="payStubShow(' + Number(id) + ',\'' + F + '\')"><td style="padding:8px 10px;font-weight:800">' + esc(S.name) + (S.ok ? '' : ' ⛔') + '</td>' + camps.map(function(c){ return '<td style="padding:8px 10px;text-align:right">' + (byC[c] != null ? M(byC[c]) : '—') + '</td>'; }).join('')
+      + '<td style="padding:8px 10px;text-align:right">' + (oth ? M(oth) : '—') + '</td><td style="padding:8px 10px;text-align:right;color:#cc0000">' + (co ? '−' + M(Math.abs(co)) : '$0.00') + '</td><td style="padding:8px 10px;text-align:right;font-weight:900;color:#047857">' + M(S.netCents) + '</td><td style="padding:8px 10px;color:#003594;font-weight:800;white-space:nowrap">Stub ›</td></tr>'; });
+  var TD = 'padding:9px 10px;background:#111827;color:#fff;font-weight:900;';
+  h += '<tr><td style="' + TD + '">Company total</td>' + camps.map(function(c){ var t = ids.reduce(function(s, id){ var S = stubs[id]; return s + (S ? S.campaigns.filter(function(x){ return x.carrier === c; }).reduce(function(a, x){ return a + x.netCents; }, 0) : 0); }, 0); return '<td style="' + TD + 'text-align:right">' + M(t) + '</td>'; }).join('') + '<td style="' + TD + '"></td><td style="' + TD + '"></td><td style="' + TD + 'text-align:right">' + M(total) + '</td><td style="' + TD + '"></td></tr></table></div>';
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;padding:12px 16px">' + (dep.committed ? '<span style="background:#dcfce7;color:#166534;padding:9px 14px;border-radius:8px;font-weight:800">✓ Deductions finalized ' + esc(String(dep.committedAt || '').slice(0, 10)) + '</span>' : '<button onclick="if(confirm(\'Finalize this Friday\\u2019s loan / fee / expired-phone deductions? Balances update and payments are recorded. This runs once.\')){ if(payrollCommitDeposit(\'' + F + '\')){ alert(\'Deductions finalized.\'); gotoPanel(\'payroll-rollup\',{payDate:\'' + F + '\'}); } }" style="padding:9px 14px;border:none;border-radius:8px;background:#16a34a;color:#fff;font-weight:800;cursor:pointer">✅ Finalize deductions (loans / fees / expired phones)</button>')
+    + '<button onclick="payStubPrint(null,\'' + F + '\')" style="padding:9px 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;font-weight:800;cursor:pointer">🖨 Print all stubs</button><button onclick="payDepositCSV(\'' + F + '\')" style="padding:9px 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;font-weight:800;cursor:pointer">⬇ CSV for the bank</button></div></div>';
+  try{ h += wmamPayBreakdownHtml(dep.rollup, { weekLabel:'Pay date ' + _gmShort(F) }); }catch(e){}
+  return h;
+}
+function payDepositCSV(F){
+  var dep = payrollBuildDeposit(F), q = function(s){ return '"' + String(s == null ? '' : s).replace(/"/g, '""') + '"'; }, L = ['Pay date,Person,Campaign / line,Earnings,Deductions,Net'];
+  Object.keys(dep.rollup.agents).forEach(function(id){ var S = payStubData(id, dep); if(!S) return;
+    S.campaigns.forEach(function(c){ L.push([F, q(S.name), q(c.carrier + ' ' + _payWkLabel(c)), ((c.earnCents + c.creditCents) / 100).toFixed(2), ((c.dedCents + c.priorDebtCents) / 100).toFixed(2), (c.netCents / 100).toFixed(2)].join(',')); });
+    S.other.forEach(function(x){ L.push([F, q(S.name), q(x.label), (x.cents / 100).toFixed(2), '0.00', (x.cents / 100).toFixed(2)].join(',')); });
+    S.company.forEach(function(x){ L.push([F, q(S.name), q(x.label), '0.00', (Math.abs(x.cents) / 100).toFixed(2), (x.cents / 100).toFixed(2)].join(',')); });
+    L.push([F, q(S.name), q('NET DEPOSIT'), (S.grossCents / 100).toFixed(2), (S.dedCents / 100).toFixed(2), (S.netCents / 100).toFixed(2)].join(',')); });
+  var blob = new Blob([L.join('\n')], { type:'text/csv;charset=utf-8' }), a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'payroll-deposit-' + F + '.csv'; document.body.appendChild(a); a.click(); setTimeout(function(){ a.remove(); }, 100);
+}
+panelPayrollRollup = panelPayrollDeposit;
+window.panelPayrollRollup = panelPayrollDeposit;
+Object.assign(window, { ppWeekPayDate:ppWeekPayDate, payDepositWeeks:payDepositWeeks, payDepositFridays:payDepositFridays, payDepositKey:payDepositKey, payrollBuildDeposit:payrollBuildDeposit, payrollCommitDeposit:payrollCommitDeposit,
+  payStubCampaign:payStubCampaign, payStubData:payStubData, payStubHtml:payStubHtml, payStubShow:payStubShow, payStubPrint:payStubPrint, payStubMoveWeek:payStubMoveWeek, panelPayrollDeposit:panelPayrollDeposit, payDepositCSV:payDepositCSV });
+
+// ══════════════════════════════════════════════════════════════════════
+//  CLOSED MARKETS — only the 11 real markets show anywhere (Calvin 2026-10-15)
+//  After the Market Cleanup was applied, every market that is not one of the 11 is closed:
+//   • people whose market was a closed one → no market (office places them); their sales stay with them
+//   • phones labeled with a closed market → no market (UNASSIGNED for the Inventory Dept); holders and
+//     sales are not touched; the old label is kept on the record (marketBeforeClose) so nothing is lost
+//   • the closed market records are removed (recorded as deleted so they never come back)
+//  A market that runs Internet or ACA is never closed here. Runs once, by the owner or office, and logs
+//  every change to markets_audit_log. The dashboard shows only the open markets — no "Set up" cards.
+// ══════════════════════════════════════════════════════════════════════
+var MKC_CLOSE = { ran:false, running:false, result:null };
+function _mkcPlanReady(){ return MARKET_PLAN_20261014.every(function(p){ return (MARKETS || []).some(function(m){ return m && m.name === p.name; }); }); }
+function _mkcKeepMarket(m){ if(!m || !m.name) return false; if(MARKET_PLAN_20261014.some(function(p){ return p.name === m.name; })) return true;
+  var pr = m.programs || {}; return !!((pr.internet && pr.internet.active) || (pr.aca && pr.aca.active)); }
+var _wmamMarketNameForBase = wmamMarketNameFor;
+function _mkcOpenName(raw){
+  var r = String(raw || '').trim(); if(!r) return '';
+  var byId = r.match(/^market-(\d+)$/); if(byId){ var mi = (typeof marketGetById === 'function') ? marketGetById(Number(byId[1])) : null; return mi && _mkcKeepMarket(mi) ? mi.name : ''; }
+  var n = _wmamMarketNameForBase(r), m = (MARKETS || []).find(function(x){ return x && x.name === n; });
+  return m && _mkcKeepMarket(m) ? m.name : '';
+}
+// every place that turns a label into a market name now sees only open markets (once the closing has run)
+wmamMarketNameFor = function(raw){ if(MKC_CLOSE.ran) return _mkcOpenName(raw); return _wmamMarketNameForBase.apply(this, arguments); };
+window.wmamMarketNameFor = wmamMarketNameFor;
+var _marketActiveListBase = marketActiveList;
+marketActiveList = function(){ var L = _marketActiveListBase.apply(this, arguments); return _mkcPlanReady() ? L.filter(_mkcKeepMarket) : L; };
+window.marketActiveList = marketActiveList;
+// the dashboard no longer shows names that aren't open markets ("Set up" cards); new upload names still show on the Markets page
+wmamDiscoveredMarkets = function(){ return []; };
+window.wmamDiscoveredMarkets = wmamDiscoveredMarkets;
+function mkcClosePreview(){
+  var out = { ready:_mkcPlanReady(), markets:[], people:[], phones:0, sold:0, kept:[] };
+  (MARKETS || []).forEach(function(m){ if(!m) return; if(_mkcKeepMarket(m)){ if(!MARKET_PLAN_20261014.some(function(p){ return p.name === m.name; })) out.kept.push(m.name); return; } out.markets.push(m); });
+  (DB.agents || []).forEach(function(a){ if(a && !a.deletedAt && a.team && !_mkcOpenName(a.team)) out.people.push(a); });
+  [GM_INVENTORY, TC_INVENTORY, AW_INVENTORY, EX_INVENTORY, INVENTORY_DEVICES].forEach(function(p){ (p || []).forEach(function(d){ if(!d || d.deletedAt || d.status === 'deleted' || !d.market || _mkcOpenName(d.market)) return; if(d.status === 'sold' || d.status === 'activated' || d.soldAt) out.sold++; else out.phones++; }); });
+  return out;
+}
+async function mkcCloseOldMarkets(opt){
+  opt = opt || {}; var u = DB.current;
+  if(MKC_CLOSE.running) return { ok:false, why:'already running' };
+  if(!u || !canManageMarkets(u)) return { ok:false, why:'only the owner or office' };
+  if(!_mkcPlanReady()) return { ok:false, why:'not all 11 markets exist yet — apply the Market Cleanup first' };
+  MKC_CLOSE.running = true;
+  var now = new Date().toISOString(), log = { kind:'close-old-markets', at:now, by:u.name, markets:[], people:[], phones:[] };
+  var backupM = JSON.parse(JSON.stringify(MARKETS)), undo = [];
+  try{
+    var closed = (MARKETS || []).filter(function(m){ return m && !_mkcKeepMarket(m); });
+    var agentsChanged = [];
+    (DB.agents || []).forEach(function(a){ if(!a || a.deletedAt || !a.team || _mkcOpenName(a.team)) return;
+      undo.push([a, 'team', a.team]); log.people.push({ id:a.id, name:a.name, was:a.team }); a.teamBeforeClose = a.team; a.team = ''; agentsChanged.push(a); });
+    var devCount = 0;
+    [GM_INVENTORY, TC_INVENTORY, AW_INVENTORY, EX_INVENTORY, INVENTORY_DEVICES].forEach(function(p){ (p || []).forEach(function(d){ if(!d || d.deletedAt || d.status === 'deleted' || !d.market || _mkcOpenName(d.market)) return;
+      undo.push([d, 'market', d.market]); if(log.phones.length < 3000) log.phones.push({ imei:d.imei || d.sim || d.id, was:d.market, status:d.status || '' }); d.marketBeforeClose = d.market; d.market = ''; d.updatedAt = now; devCount++; }); });
+    closed.forEach(function(m){ var i = MARKETS.indexOf(m); if(i >= 0){ MARKETS.splice(i, 1); log.markets.push({ id:m.id, name:m.name }); } });
+    if(!opt.dryRun){
+      for(var j = 0; j < log.markets.length; j++){ try{ await wmamRecordMarketDeleted(log.markets[j].id); }catch(e){} }
+      agentsChanged.forEach(function(a){ try{ saveAgentToSupabase(a); }catch(e){} });
+      if(devCount){ try{ saveInventory(); }catch(e){} }
+      _wmamAliasMap = null; wmamMarketsChanged();
+      var ok = await wmamSaveMarketsNow('close-old-markets');
+      log.backup = backupM; log.phonesChanged = devCount;
+      try{ await _mkaLog(log); }catch(e){}
+      try{ await supaClient.from('app_settings').upsert({ key:'markets_closed_20261015', value:JSON.stringify({ at:now, by:u.name, markets:log.markets.length, people:log.people.length, phones:devCount }), updated_at:now }, { onConflict:'key' }); }catch(e){}
+      MKC_CLOSE.result = { ok:!!ok, markets:log.markets.length, people:log.people.length, phones:devCount };
+    } else {
+      MKC_CLOSE.result = { ok:true, dryRun:true, markets:log.markets.length, people:log.people.length, phones:devCount };
+    }
+    MKC_CLOSE.ran = true;
+    return MKC_CLOSE.result;
+  }catch(e){
+    for(var k = undo.length - 1; k >= 0; k--){ try{ undo[k][0][undo[k][1]] = undo[k][2]; }catch(_){} }
+    MARKETS.length = 0; backupM.forEach(function(m){ MARKETS.push(m); }); _wmamAliasMap = null; try{ wmamMarketsChanged(); }catch(_){}
+    return { ok:false, why:'stopped and put back exactly as it was — ' + (e && e.message || e) };
+  }finally{ MKC_CLOSE.running = false; }
+}
+// runs once by itself the first time the owner or office opens the back office after this build (when the 11 markets exist)
+async function mkcCloseAuto(){
+  try{ var u = DB.current; if(!u || !canManageMarkets(u) || !_mkcPlanReady()) return;
+    var r = await supaClient.from('app_settings').select('value').eq('key', 'markets_closed_20261015').maybeSingle();
+    if(r && r.data && r.data.value){ MKC_CLOSE.ran = true; try{ MKC_CLOSE.result = JSON.parse(r.data.value); }catch(e){} return; }
+    if(r && r.error) return;   // can't tell — never run blind
+    var res = await mkcCloseOldMarkets();
+    if(res && res.ok){ try{ if(typeof gotoPanel === 'function' && (window._currentPanelId === 'bo' || window._currentPanelId === 'owner' || !window._currentPanelId)) gotoPanel(window._currentPanelId || 'bo'); }catch(e){} }
+  }catch(e){ console.warn('[close markets]', e); }
+}
+// everyone else (agents, managers) also sees only open markets once the office has closed them
+async function mkcCloseFlagLoad(){ try{ var r = await supaClient.from('app_settings').select('value').eq('key', 'markets_closed_20261015').maybeSingle(); if(r && r.data && r.data.value){ MKC_CLOSE.ran = true; try{ MKC_CLOSE.result = JSON.parse(r.data.value); }catch(e){} } }catch(e){} }
+setTimeout(function(){ mkcCloseFlagLoad().then(function(){ return mkcCloseAuto(); }); }, 6000);
+// the Market Cleanup page shows what was closed
+var _mkcBodyClose = _mkcBody;
+_mkcBody = function(){ var h = _mkcBodyClose.apply(this, arguments), R = MKC_CLOSE.result;
+  var box = '<div style="background:#fff;border:2px solid ' + (R ? '#86efac' : '#cbd5e1') + ';border-radius:12px;padding:14px 16px;margin-bottom:14px"><div style="font-weight:900;color:#003594">Closed markets</div>'
+    + (R ? '<div style="font-size:.9rem;margin-top:4px">✔ ' + (R.markets || 0) + ' old market' + (R.markets === 1 ? '' : 's') + ' closed and removed everywhere · ' + (R.people || 0) + ' people moved to no market · ' + (R.phones || 0) + ' phones moved to UNASSIGNED. Nothing was deleted — the old names are kept on each record.</div>'
+         : '<div style="font-size:.9rem;margin-top:4px">Every market that is not one of the 11 above is closed automatically the first time the office opens the back office. People in a closed market go to no market; their phones go to UNASSIGNED for the Inventory Dept.</div><button onclick="mkcCloseOldMarkets().then(function(r){ alert(r && r.ok ? \'Closed \' + r.markets + \' old markets · \' + r.people + \' people · \' + r.phones + \' phones\' : \'Not done: \' + (r && r.why)); gotoPanel(\'market-cleanup\'); })" style="margin-top:8px;padding:9px 14px;border:none;border-radius:8px;background:#b91c1c;color:#fff;font-weight:800;cursor:pointer">Close old markets now</button>')
+    + '</div>';
+  return h.replace('<div id="mkcRoot">', '<div id="mkcRoot">' + box); };
+var _bizMarketBase = _bizMarket;
+_bizMarket = function(raw){ if(MKC_CLOSE.ran){ var r = String(raw || '').trim(); return (r && _mkcOpenName(r)) || '(no market)'; } return _bizMarketBase.apply(this, arguments); };
+Object.assign(window, { mkcCloseOldMarkets:mkcCloseOldMarkets, mkcClosePreview:mkcClosePreview, MKC_CLOSE:MKC_CLOSE });
+
+// ══════════════════════════════════════════════════════════════════════
+//  INVENTORY IN SYNC FOR EVERY LIFELINE CAMPAIGN (Calvin 2026-10-15)
+//  • "Assurance" and "Assurance Wireless" (and "Excess"/"Excess Telecom") are the same campaign everywhere:
+//    agents and managers coded "Assurance Wireless" now see their team's Assurance phones (before, a
+//    Market Manager only saw the Assurance phones they held themselves).
+//  • Phones not given to anyone yet (warehouse) are seen only by the Inventory Dept / owner and by the
+//    manager(s) of THAT phone's market (Campaign Manager, Market Manager or IBO set on the market).
+//    A phone with no market goes only to the Inventory Dept (locked rule: no guessing).
+//  • Sold and deleted phones never count as inventory anyone holds.
+// ══════════════════════════════════════════════════════════════════════
+var _CAMP_ALIASES = { 'assurance':['Assurance','Assurance Wireless'], 'assurance wireless':['Assurance','Assurance Wireless'], 'excess':['Excess','Excess Telecom'], 'excess telecom':['Excess','Excess Telecom'] };
+function _campNames(c){ var k = String(c || '').trim().toLowerCase(); return _CAMP_ALIASES[k] || [c]; }
+var _agentCodedOnBase = agentCodedOn;
+agentCodedOn = function(agent, campaign){ if(_agentCodedOnBase.apply(this, arguments)) return true; var names = _campNames(campaign); for(var i = 0; i < names.length; i++){ if(names[i] !== campaign && _agentCodedOnBase(agent, names[i])) return true; } return false; };
+window.agentCodedOn = agentCodedOn;
+// the markets a person manages (any program section where they are CM, MM or IBO)
+function _invMyMarketNames(u){ var out = {}; if(!u) return out;
+  (MARKETS || []).forEach(function(m){ if(!m || m.active === false) return; var pr = m.programs || {};
+    Object.keys(pr).forEach(function(k){ var x = pr[k] || {}; if([x.cmId, x.mmId, x.iboId].map(String).indexOf(String(u.id)) >= 0) out[m.name] = 1; }); });
+  return out; }
+function _invPoolFor(campaign){
+  var names = _campNames(campaign), pool = [];
+  if(names.indexOf('Gen Mobile') >= 0 && Array.isArray(GM_INVENTORY)) pool = GM_INVENTORY;
+  else if(names.indexOf('TruConnect') >= 0 && Array.isArray(TC_INVENTORY)) pool = TC_INVENTORY;
+  else if(names.indexOf('Assurance') >= 0 && Array.isArray(AW_INVENTORY)) pool = AW_INVENTORY;
+  else if(names.indexOf('Excess') >= 0 && Array.isArray(EX_INVENTORY)) pool = EX_INVENTORY;
+  else { var cfg = campaignCfg(campaign); try{ pool = (cfg && cfg.inventory && cfg.inventory()) || []; }catch(e){ pool = []; } }
+  var out = pool.slice();
+  (INVENTORY_DEVICES || []).forEach(function(d){ if(d && names.indexOf(d.campaign) >= 0 && out.indexOf(d) < 0) out.push(d); });
+  return out;
+}
+var _inventoryVisibleToBase = inventoryVisibleTo;
+inventoryVisibleTo = function(user, campaign){
+  // "Assurance Wireless" → the registry key "Assurance" (same for Excess) so the right pool is read
+  if(campaign && !CAMPAIGN_REGISTRY[campaign]){ var nm = _campNames(campaign).filter(function(n){ return CAMPAIGN_REGISTRY[n]; })[0]; if(nm) campaign = nm; }
+  var res = _inventoryVisibleToBase.call(this, user, campaign);
+  try{
+    if(!user || !campaign) return res;
+    if(isOwner(user) || user.role === 'admin' || (typeof isInventory === 'function' && isInventory(user)) || (typeof agentHasDeptAccess === 'function' && agentHasDeptAccess(user, 'inv-dashboard'))) return res;
+    var mine = _invMyMarketNames(user), inMine = function(d){ var n = _wmamMarketNameForBase ? _wmamMarketNameForBase(d.market || '') : wmamMarketNameFor(d.market || ''); return !!(d.market && mine[n]); };
+    // warehouse phones: only the ones in a market this person manages
+    res = res.filter(function(d){ return deviceHolderId(d) !== null || inMine(d); });
+    if(user.role === 'Market Manager' || user.role === 'Campaign Manager' || user.role === 'IBO'){
+      var have = {}; res.forEach(function(d){ have[d.id || d.imei] = 1; });
+      _invPoolFor(campaign).forEach(function(d){ if(d && deviceHolderId(d) === null && !_invxGone(d) && inMine(d) && !have[d.id || d.imei]){ res.push(d); have[d.id || d.imei] = 1; } });
+    }
+  }catch(e){ console.warn('[inv scope]', e); }
+  return res;
+};
+window.inventoryVisibleTo = inventoryVisibleTo;
+// a person holding phones in a campaign always sees that campaign's view, whatever the campaign is called
+var _invScopedDevicesBase = invScopedDevices;
+invScopedDevices = function(user, campaign){
+  var res = _invScopedDevicesBase.apply(this, arguments);
+  if(res.length || !user) return res;
+  try{ var names = _campNames(campaign); var held = (devicesHeldBy(user.id, null) || []).some(function(d){ return names.indexOf(d.campaign || d.carrier) >= 0; }); if(held) return inventoryVisibleTo(user, campaign); }catch(e){}
+  return res;
+};
+window.invScopedDevices = invScopedDevices;
 
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
@@ -28431,7 +29070,7 @@ function inventoryPipelineBreakdown(user){
   if(!user) return out;
 
   var sum = inventorySummary(user);
-  var devices = (sum.all||[]).concat(sum.legacy||[]);
+  var devices = (sum.all||[]).concat(sum.legacy||[]).filter(function(d){ return d && !_invxSold(d) && !_invxGone(d); });   // v2026.10.15: only phones still in play (sold / deleted never count as held)
   out.total = devices.length;
 
   // Map agentId -> agent for fast lookup
@@ -49705,7 +50344,7 @@ function gotoPanel(id, params){
     'multi-team-cleanup':'Multi-Team Cleanup',
     'backup-restore':'Backup Restore',
     'payroll-process':'Payroll Processing',
-    'payroll-rollup':'Weekly Rollup',
+    'payroll-rollup':'Pay Stubs',
     'payroll-debt':'Debt Ledger',
     'inv-dept-approvals':'Inv Dept Approvals',
     'inv-dashboard':'Uploads & Deletions','inv-upload':'Upload Devices',
@@ -51866,7 +52505,7 @@ function panelBO(){
       if(!pool || !Array.isArray(pool)) return;
       pool.forEach(function(d){
         if(!d) return;
-        if(d.holderId === u.id || d.assignedTo === u.id){
+        if((d.holderId === u.id || d.assignedTo === u.id) && !_invxGone(d) && !_invxSold(d)){
           bulletproofDevices.push(d);
         }
       });
@@ -53905,7 +54544,9 @@ function ppComputeAgentCommissions(parsed, carrier){
       // Otherwise, fall back to grossCents (carrier rate) for AW agents.
       var awTotal = act.Total || 0;
       // AW activations all NLAD-equivalent for now (no Tribal split column in AW)
-      for(var n=0;n<awTotal;n++){ events.push({ agentId:aid, isTribal:false }); }
+      var awN = (typeof _aw26Counts === 'function') ? _aw26Counts(awTotal, (act['CA SIM']||0)+(act['NLAD SIM']||0), (act['CA PHONE']||0)+(act['NLAD PHONE']||0), ('CA PHONE' in act || 'NLAD PHONE' in act), 'Assurance code '+((m.row&&m.row.agentCode)||''), out.warnings = out.warnings || []) : { sim:awTotal, phone:0 };
+      for(var n=0;n<awN.sim;n++){ events.push({ agentId:aid, isTribal:false }); }
+      for(var n2=0;n2<awN.phone;n2++){ events.push({ agentId:aid, isTribal:false, isPhone:true }); }
       if(m.row.chargebackTotal){
         events.push({ agentId:aid, isTribal:false, chargebackCents: m.row.chargebackTotal, _chargebackOnly: true });
       }
@@ -55261,6 +55902,7 @@ function ppCommitStaged(){
             row.creditsApplied       = net.creditsCents;
             row.priorDebtPaid        = net.debtPaidCents;
             row.carryoverDebtAdded   = net.carryoverCents;
+            row.deductionLines       = (net.cascade || []).map(function(x){ return { type:x.type, orderNum:x.orderNum, amountCents:x.amountCents, fromName:x.fromName, paidByRole:x.paidByRole, paidByAid:x.paidByAid }; });   // v2026.10.15: itemized on the pay stub
           }
         });
         // Store full cascade audit on the week so future Aging Phone Credits
@@ -60569,6 +61211,7 @@ function panelInvDashboard(){
       }
     });
   }
+  devices = devices.filter(function(d){ return d && !_invxGone(d) && !_invxSold(d); });   // v2026.10.15: live inventory only — matches the dashboard (sold phones are on Sold Reports)
   var today   = new Date(); today.setHours(0,0,0,0);
 
   var total    = devices.length;
@@ -60641,7 +61284,7 @@ function panelInvDashboard(){
     // Primary: count from the unioned `devices` array. This is the
     // canonical source in production where all campaigns are active.
     devices.forEach(function(d){
-      if(d && d.campaign && String(d.campaign).toUpperCase() === up && d.id != null){
+      if(d && d.campaign && String(d.campaign).toUpperCase() === up && d.id != null && !_invxGone(d) && !_invxSold(d)){
         seen[d.id] = true;
       }
     });
@@ -60660,7 +61303,7 @@ function panelInvDashboard(){
       var pool = window[poolName];
       if(Array.isArray(pool)){
         pool.forEach(function(d){
-          if(d && d.id != null) seen[d.id] = true;
+          if(d && d.id != null && !_invxGone(d) && !_invxSold(d)) seen[d.id] = true;
         });
       }
     }
@@ -74281,7 +74924,7 @@ function panelDartInventory(){
 
   // ── Sort hint ──
   h += _carrierInvReconcileBanner(all);
-  h += _carrierInvGroupedHTML(all);
+  h += _carrierInvGroupedHTML(all.filter(function(d){ return !_invxSold(d); }));
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-bottom:6px">Showing '+filtered.length+' of '+all.length+' &middot; sorted soonest-to-expire first (expiring inventory at top)</div>';
 
   // ── Table ──
@@ -74429,7 +75072,7 @@ function _carrierInvDevices(campaign){
   var results = [];
   if(typeof INVENTORY_DEVICES !== 'undefined' && Array.isArray(INVENTORY_DEVICES)){
     INVENTORY_DEVICES.forEach(function(d){
-      if(d && d.campaign && String(d.campaign).toUpperCase() === up && d.id != null){
+      if(d && d.campaign && String(d.campaign).toUpperCase() === up && d.id != null && !_invxGone(d)){
         if(!seen[d.id]){ seen[d.id] = true; results.push(d); }
       }
     });
@@ -74437,7 +75080,7 @@ function _carrierInvDevices(campaign){
   var poolName = _carrierInvPoolName(campaign);
   if(poolName && typeof window !== 'undefined' && Array.isArray(window[poolName])){
     window[poolName].forEach(function(d){
-      if(d && d.id != null && !seen[d.id]){
+      if(d && d.id != null && !seen[d.id] && !_invxGone(d)){   // v2026.10.15: deleted copies never count
         seen[d.id] = true;
         results.push(d);
       }
@@ -75065,7 +75708,7 @@ function panelCarrierInventory(campaign){
   h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;padding:10px 14px;background:rgba(0,53,148,.04);border:1px solid rgba(0,53,148,.18);border-radius:6px;flex-wrap:wrap;gap:10px">';
   h += '<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
   h += '<button onclick="gotoPanel(\'inv-dashboard\')" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;padding:7px 12px;border-radius:4px;cursor:pointer">← All Inventory</button>';
-  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+all.length+' total ' + escHtml(campaign) + ' devices</div>';
+  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown)">'+all.filter(function(d){ return !_invxSold(d); }).length+' ' + escHtml(campaign) + ' devices in stock or with agents' + (all.some(_invxSold) ? ' · ' + all.filter(_invxSold).length + ' sold (history)' : '') + '</div>';
   h += '</div>';
   if(isInv){
     var campKey = campaign.replace(/'/g, "\\'");
@@ -75144,7 +75787,7 @@ function panelCarrierInventory(campaign){
   h += '</div>';
 
   h += _carrierInvReconcileBanner(all);
-  h += _carrierInvGroupedHTML(all);
+  h += _carrierInvGroupedHTML(all.filter(function(d){ return !_invxSold(d); }));
   h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted);margin-bottom:6px">Showing '+filtered.length+' of '+all.length+' &middot; sorted soonest-to-expire first (expiring inventory at top)</div>';
 
   // Table
