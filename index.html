@@ -3795,7 +3795,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.15.1700';
+var BUILD_VERSION = '2026.10.15.1800';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -23546,6 +23546,7 @@ function _panelBOScoped(){ var u = DB.current, _iboView = !!(u && u.role === 'Ca
       inventory:function(){ return (cfg.inventory() || []).filter(function(d){ if(!d) return false; if(!scope) return true; return !!scope.markets[_cmCanon(d.market)] || !!scope.people[_cmHolder(d)]; }).map(function(d){ var cm = _cmCanon(d.market); return cm === d.market ? d : Object.assign({}, d, { market:cm }); }); },
       activations:function(){ var L = (typeof cfg.activations === 'function' ? cfg.activations() : []) || []; if(!scope) return L; return L.filter(function(a){ return a && scope.people[String(a.agentId)]; }); } }); };
   var h; try{ h = _panelBOCmScope.apply(this, arguments); } finally { campaignCfg = saved; }
+  try{ if(scope && typeof h === 'string') h = _cmReplaceOverview(h, u, scope); }catch(e){}
   try{ if(scope && typeof h === 'string'){
     h = h.replace(/All Markets — Detail/g, 'My Markets — Detail');
     h = h.replace('>FULL CAMPAIGN VISIBILITY<', '>YOUR MARKETS ONLY<');
@@ -23633,6 +23634,62 @@ showImpersonateModal = function(){ var r = _showImpersonateModalAll.apply(this, 
         list.appendChild(row); }); }); }catch(e){ console.warn('[view as all roles]', e); }
   return r; };
 window.showImpersonateModal = showImpersonateModal;
+
+// ══════════════════════════════════════════════════════════════════════
+//  MANAGER / IBO OVERVIEW — EVERY CAMPAIGN, REAL SALES (Calvin 2026-10-15, v2026.10.15.1800)
+//  The old overview showed ONE campaign and counted "sold" only from activation-file rows, so an IBO with Gen Mobile +
+//  TruConnect + Assurance saw just Gen Mobile with "0 sold". Now (for Campaign Managers and IBOs, own markets only):
+//  one block per campaign they work, with inventory (their markets + their people), sales this week / this month from
+//  the same sales records the scoreboard and rankings use, top agents, agents with zero sales, and each market.
+//  The scoreboard's per-campaign stock also counts TruConnect phones (stored as "TC (TruConnect)").
+// ══════════════════════════════════════════════════════════════════════
+function _wmamCampKey(c){ var s = String(c || '').trim().replace(/^TC \((.*)\)$/, '$1'); try{ s = canonicalCampaign(s); }catch(e){} return s; }
+var _scoreboardInventoryCK = scoreboardInventory;
+scoreboardInventory = function(user){ var out = _scoreboardInventoryCK.apply(this, arguments);
+  try{ var by = {}; Object.keys(out.byCampaign || {}).forEach(function(k){ var c = _wmamCampKey(k); by[c] = (by[c] || 0) + out.byCampaign[k]; }); out.byCampaign = by; }catch(e){} return out; };
+window.scoreboardInventory = scoreboardInventory;
+function _ovCfgFor(c){ var R = CAMPAIGN_REGISTRY || {}; return R[c] || R[{ 'Assurance Wireless':'Assurance', 'Excess Telecom':'Excess' }[c]] || null; }
+function _ovDaysLeft(d){ try{ var v = (typeof wmamDaysUntil === 'function') ? wmamDaysUntil(d.chargeDate || d.expiryDate) : null; return v; }catch(e){ return null; } }
+function _ovSold(d){ return d && (d.status === 'sold' || d.status === 'activated' || !!d.soldAt); }
+function cmOverviewHtml(u, scope){
+  var esc = _escapeHtml, camps = []; try{ camps = assignedCampaigns(u) || []; }catch(e){}
+  var people = (DB.agents || []).filter(function(a){ return a && a.active !== false && !a.deletedAt && scope.people[String(a.id)]; });
+  var personMarket = function(a){ var n = ''; try{ n = wmamAssignedMarketOf(a); }catch(e){} return n || '(no market)'; };
+  var blocks = camps.map(function(c){
+    var cfg = _ovCfgFor(c), devs = [];
+    try{ devs = ((cfg && cfg.inventory && cfg.inventory()) || []).filter(function(d){ if(!d || d.deletedAt || d.status === 'deleted') return false; return !!scope.markets[_cmCanon(d.market)] || !!scope.people[_cmHolder(d)]; }); }catch(e){}
+    var mk = {}, M = function(n){ return mk[n] = mk[n] || { name:n, inv:0, held:0, exp:0, week:0, month:0 }; };
+    devs.forEach(function(d){ if(_ovSold(d)) return; var h = _cmHolder(d), a = h ? people.find(function(x){ return String(x.id) === h; }) : null; var n = _cmCanon(d.market); if(n === '(no market)' && a) n = personMarket(a);
+      var r = M(n); r.inv++; if(h) r.held++; var dl = _ovDaysLeft(d); if(dl != null && dl >= 0 && dl <= 10) r.exp++; });
+    var sellers = people.map(function(a){ var w = 0, m = 0; try{ w = agentSalesCount(a, { campaign:c, period:'week' }) || 0; m = agentSalesCount(a, { campaign:c, period:'month' }) || 0; }catch(e){} return { a:a, week:w, month:m }; });
+    sellers.forEach(function(s){ if(!s.week && !s.month) return; var r = M(personMarket(s.a)); r.week += s.week; r.month += s.month; });
+    var coded = sellers.filter(function(s){ var k = s.a.agentCodes || {}; return Object.keys(k).some(function(x){ return k[x] && _wmamCampKey(x) === c; }) || s.month > 0; });
+    var tot = { inv:0, held:0, exp:0, week:0, month:0 }; Object.keys(mk).forEach(function(k){ var r = mk[k]; tot.inv += r.inv; tot.held += r.held; tot.exp += r.exp; tot.week += r.week; tot.month += r.month; });
+    if(!tot.inv && !tot.month && !tot.week && !coded.length) return '';
+    var top = coded.filter(function(s){ return s.month > 0; }).sort(function(x, y){ return y.month - x.month || y.week - x.week; }).slice(0, 5);
+    var zero = coded.filter(function(s){ return !s.month; }).slice(0, 8);
+    var stat = function(l, v, col){ return '<div style="flex:1 1 110px"><div style="font-size:.6rem;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase;font-weight:800">' + l + '</div><div style="font-size:1.35rem;font-weight:900;color:' + (col || '#003594') + '">' + v + '</div></div>'; };
+    var rows = Object.keys(mk).map(function(k){ return mk[k]; }).sort(function(x, y){ return (x.name === '(no market)' ? 1 : 0) - (y.name === '(no market)' ? 1 : 0) || y.month - x.month || y.inv - x.inv; });
+    var td = function(v, o){ o = o || {}; return '<td style="padding:6px 8px;text-align:' + (o.l ? 'left' : 'right') + ';' + (o.b ? 'font-weight:800;' : '') + (o.c ? 'color:' + o.c + ';' : '') + '">' + v + '</td>'; };
+    var TH = 'color:#fff !important;letter-spacing:0;font-size:.72rem;font-weight:800;padding:6px 8px;';
+    return '<div style="border:1px solid #e5e7eb;border-radius:12px;margin-bottom:14px;background:#fff;overflow:hidden">'
+      + '<div style="padding:10px 14px;background:#f8fafc;border-bottom:1px solid #e5e7eb;font-weight:900;color:#003594;font-size:1.02rem">' + esc(c) + '</div>'
+      + '<div style="display:flex;gap:10px;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid #f1f5f9">' + stat('Inventory', tot.inv) + stat('With people', tot.held) + stat('Expiring ≤10d', tot.exp, tot.exp ? '#b91c1c' : '#003594') + stat('Sold this week', tot.week, '#059669') + stat('Sold this month', tot.month, '#059669') + stat('People', coded.length, '#7c3aed') + '</div>'
+      + '<div style="display:flex;flex-wrap:wrap">'
+      + '<div style="flex:1 1 260px;padding:10px 14px"><div style="font-size:.62rem;letter-spacing:2px;color:#059669;font-weight:800;margin-bottom:6px">🏆 TOP SELLERS THIS MONTH</div>' + (top.length ? top.map(function(s, i){ return '<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #f1f5f9"><span>' + (['🥇','🥈','🥉','4.','5.'][i]) + ' ' + esc(s.a.name) + (String(s.a.id) === String(u.id) ? ' (you)' : '') + '</span><b>' + s.month + ' <span style="font-weight:400;color:#6b7280;font-size:.78rem">(' + s.week + ' this week)</span></b></div>'; }).join('') : '<div style="color:#6b7280;font-size:.84rem">No sales yet this month.</div>') + '</div>'
+      + '<div style="flex:1 1 220px;padding:10px 14px"><div style="font-size:.62rem;letter-spacing:2px;color:#d97706;font-weight:800;margin-bottom:6px">⚠ NO SALES THIS MONTH</div>' + (zero.length ? zero.map(function(s){ return '<div style="padding:4px 0;border-bottom:1px solid #f1f5f9">' + esc(s.a.name) + (String(s.a.id) === String(u.id) ? ' (you)' : '') + '</div>'; }).join('') : '<div style="color:#6b7280;font-size:.84rem">Everyone has sold. ✔</div>') + '</div></div>'
+      + (rows.length ? '<div style="overflow-x:auto;padding:0 14px 12px"><table style="width:100%;border-collapse:collapse;font-size:.84rem"><tr style="background:#003594"><th style="' + TH + 'text-align:left">Market</th><th style="' + TH + 'text-align:right">Inventory</th><th style="' + TH + 'text-align:right">With people</th><th style="' + TH + 'text-align:right">Expiring ≤10d</th><th style="' + TH + 'text-align:right">Sold this week</th><th style="' + TH + 'text-align:right">Sold this month</th></tr>'
+        + rows.map(function(r){ return '<tr style="border-top:1px solid #eef0f4">' + td(esc(r.name), { l:1, b:1 }) + td(r.inv) + td(r.held) + td(r.exp || '—', { c:r.exp ? '#b91c1c' : '' }) + td(r.week, { c:'#059669' }) + td(r.month, { c:'#059669', b:1 }) + '</tr>'; }).join('') + '</table></div>' : '')
+      + '</div>'; }).filter(Boolean);
+  var role = u.__iboView ? 'IBO' : 'Campaign Manager';
+  return '<div class="bo-card" style="margin-bottom:20px;border:2px solid #7c3aed55"><div class="bo-card-head" style="border-left:4px solid #7c3aed;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><div class="bo-card-title" style="color:#7c3aed">🎯 ' + role + ' Overview — ' + esc(camps.join(' · ') || 'no campaign') + '</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.62rem;letter-spacing:2px;color:var(--muted)">YOUR MARKETS ONLY</div></div>'
+    + '<div style="padding:12px 14px">' + (blocks.length ? blocks.join('') : '<div style="color:#6b7280">No inventory or sales yet in your markets.</div>') + '</div></div>'; }
+function _cmReplaceOverview(h, u, scope){ try{
+    var t = h.indexOf('— Campaign Manager Overview'); if(t < 0) t = h.indexOf('— Campaign Manager Overview'); if(t < 0) return h;
+    var s = h.lastIndexOf('<div class="bo-card" style="margin-bottom:20px;border:2px solid', t); if(s < 0) return h;
+    var endMark = '</tbody></table></div></div></div>', e = h.indexOf(endMark, t); if(e < 0) return h; e += endMark.length;
+    return h.slice(0, s) + cmOverviewHtml(u, scope) + h.slice(e); }catch(err){ console.warn('[cm overview]', err); return h; } }
+Object.assign(window, { cmOverviewHtml:cmOverviewHtml });
 
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
