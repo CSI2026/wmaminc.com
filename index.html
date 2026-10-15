@@ -3795,7 +3795,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.15.1000';
+var BUILD_VERSION = '2026.10.15.1100';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -22744,6 +22744,441 @@ invScopedDevices = function(user, campaign){
   return res;
 };
 window.invScopedDevices = invScopedDevices;
+
+// ══════════════════════════════════════════════════════════════════════
+//  YOUR AI TEAM — Calvin 2026-10-15 (v2026.10.15.1100)  Admin → Owner Control → AI Employees
+//  Director = Calvin's own assistant (the master brain). Inventory bot = Makenzie's assistant.
+//  Onboarding & Payroll bot = K-Anna's assistant. Room for up to 6 more employee bots.
+//  MANAGER ASSISTANT is OFF until Calvin turns it on (CMs, MMs, TLs, IBO). When on, a manager's
+//  assistant only sees: their own pay + their downline's pay rates (saved comp plan), their team's
+//  sales and phones (charge dates only), the company policies Calvin writes here, and manager tasks
+//  (send phones to their own people, request devices, message their team) — every task waits for the
+//  manager to tap Approve. Never Calvin's pay or contracts, never another manager's people.
+//  Only Calvin can turn any AI feature on/off or change a bot. Banking / direct deposit: off-limits to AI.
+//  AI never appears outside the back office; nothing here touches public pages.
+// ══════════════════════════════════════════════════════════════════════
+var AITEAM = { cfg:null, loaded:false };
+var AITEAM_SLOTS = 6;
+function _aitDefault(){ return { managerAssistant:{ on:false, roles:{ 'Campaign Manager':true, 'Market Manager':true, 'Team Leader':true, 'IBO':true }, policies:'' }, employees:[], titles:{}, by:'', at:'' }; }
+async function aiTeamLoad(){
+  try{ var r = await supaClient.from('app_settings').select('value').eq('key', 'ai_team').maybeSingle(); AITEAM.cfg = (r && r.data && r.data.value) ? (JSON.parse(r.data.value) || null) : null; }catch(e){}
+  var d = _aitDefault(); AITEAM.cfg = Object.assign(d, AITEAM.cfg || {}); AITEAM.cfg.managerAssistant = Object.assign(d.managerAssistant, (AITEAM.cfg || {}).managerAssistant || {});
+  if(!Array.isArray(AITEAM.cfg.employees)) AITEAM.cfg.employees = [];
+  AITEAM.loaded = true; return AITEAM.cfg;
+}
+async function _aitSave(){
+  if(!isOwner(DB.current)){ alert('Only Calvin can change the AI team.'); return false; }
+  AITEAM.cfg.by = DB.current.name; AITEAM.cfg.at = new Date().toISOString();
+  var r = await supaClient.from('app_settings').upsert({ key:'ai_team', value:JSON.stringify(AITEAM.cfg), updated_at:new Date().toISOString() }, { onConflict:'key' });
+  if(r && r.error){ alert('Not saved — check the connection.'); return false; } return true;
+}
+function _aitActive(a){ return !!(a && a.active !== false && !a.deletedAt); }
+function _aitFind(re){ return (DB.agents || []).find(function(a){ return _aitActive(a) && re.test(String(a.name || '')); }) || null; }
+function _aitHasAccess(a){ return !!(a && (WMAI.ids || []).indexOf(String(a.id)) >= 0); }
+// managers = CM / MM / TL / IBO who are not office staff and not Calvin
+function _aitIsOfficeStaff(u){ try{ return !!(u && (isOwner(u) || u.fullOfficeAccess === true || (typeof isOfficeRole === 'function' && isOfficeRole(u)))); }catch(e){ return false; } }
+function aiTeamIsManager(u){ if(!u || isOwner(u)) return false; if(_aitIsOfficeStaff(u)) return false;
+  var roles = ((AITEAM.cfg && AITEAM.cfg.managerAssistant && AITEAM.cfg.managerAssistant.roles) || _aitDefault().managerAssistant.roles);
+  if(roles[u.role]) return true; try{ if(roles['IBO'] && typeof isIBOCategory === 'function' && isIBOCategory(u)) return true; }catch(e){} return false; }
+function aiTeamManagerOn(){ return !!(AITEAM.cfg && AITEAM.cfg.managerAssistant && AITEAM.cfg.managerAssistant.on); }
+// a manager's own people: everyone who reports to them on any campaign (down the line), plus their markets (MM / TL / CM)
+function aiTeamDownline(mgr){
+  if(!mgr) return []; var ids = {}, add = function(id){ id = String(id); if(id === String(mgr.id) || ids[id]) return false; ids[id] = true; return true; };
+  var all = (DB.agents || []).filter(_aitActive), frontier = [String(mgr.id)];
+  for(var depth = 0; depth < 8 && frontier.length; depth++){ var next = [];
+    all.forEach(function(a){ var rt = a.reportsTo || {}; if(Object.keys(rt).some(function(k){ return frontier.indexOf(String(rt[k])) >= 0; }) && add(a.id)) next.push(String(a.id)); });
+    frontier = next; }
+  try{ marketActiveList().forEach(function(m){ var mine = String(m.mmId) === String(mgr.id) || String(m.cmId) === String(mgr.id) || (m.tlIds || []).map(String).indexOf(String(mgr.id)) >= 0; if(!mine) return;
+    all.forEach(function(a){ if(_waMarket(a) === m.name && !isOwner(a)) add(a.id); }); }); }catch(e){}
+  return all.filter(function(a){ return ids[String(a.id)] && !isOwner(a); });
+}
+
+// ── The owner page ──
+function _aitBotCard(icon, title, who, desc, color, extra){
+  var esc = _escapeHtml, on = who ? (isOwner(who) || _aitHasAccess(who)) : false;
+  return '<div style="border:2px solid ' + (on ? color : '#e5e7eb') + ';border-radius:14px;padding:12px;background:#fff;flex:1 1 230px;min-width:220px">'
+    + '<div style="display:flex;justify-content:space-between;gap:6px;align-items:flex-start"><div style="font-size:1.6rem">' + icon + '</div><span style="font-size:.72rem;font-weight:900;padding:3px 8px;border-radius:999px;background:' + (on ? '#dcfce7' : '#f1f5f9') + ';color:' + (on ? '#166534' : '#64748b') + '">' + (on ? 'ON' : (who ? 'OFF' : 'EMPTY')) + '</span></div>'
+    + '<div style="font-weight:900;color:#0f172a;margin-top:4px">' + esc(title) + '</div>'
+    + '<div style="font-size:.8rem;color:#475569">' + (who ? esc(who.name) + (who.aiName ? ' · named “' + esc(who.aiName) + '”' : '') : 'No one assigned') + '</div>'
+    + '<div style="font-size:.78rem;color:#6b7280;margin-top:6px">' + esc(desc) + '</div>' + (extra || '') + '</div>';
+}
+function _aiTeamHtml(){
+  var esc = _escapeHtml, c = AITEAM.cfg || _aitDefault(), owner = DB.current;
+  var mk = _aitFind(/makenzie/i), ka = _aitFind(/k-?\s?anna/i);
+  var office = (DB.agents || []).filter(function(a){ return _aitActive(a) && !isOwner(a) && _aitIsOfficeStaff(a) && a !== mk && a !== ka; });
+  var toggle = function(a){ if(!a || isOwner(a)) return ''; var on = _aitHasAccess(a); return '<button onclick="aiTeamBotAccess(' + a.id + ',' + (on ? 'false' : 'true') + ')" style="margin-top:8px;padding:6px 10px;border-radius:8px;border:1px solid ' + (on ? '#dc2626' : '#16a34a') + ';background:#fff;color:' + (on ? '#dc2626' : '#16a34a') + ';font-weight:800;cursor:pointer;font-size:.78rem">' + (on ? 'Turn off' : 'Turn on') + '</button>'; };
+  var h = '<div style="border:2px solid #003594;border-radius:16px;padding:14px;margin:6px 0 16px;background:#f8fbff">'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.5rem;font-weight:800;color:#003594">👥 YOUR AI TEAM</div>'
+    + '<div style="font-size:.82rem;color:#374151;margin-bottom:10px">Only you can turn a bot on or off or change what it does. No bot can see or touch banking or direct deposit. AI only shows inside the back office.</div>'
+    + '<div style="display:flex;gap:10px;flex-wrap:wrap">'
+    + _aitBotCard('👑', 'Director', owner, 'Your own AI. The master brain — every other bot reports to it and your rules always win.', '#7c3aed')
+    + _aitBotCard('📦', 'Inventory bot', mk, 'Works with Makenzie: transfers, audits, SIM follow-ups, expired phones.', '#0891b2', toggle(mk))
+    + _aitBotCard('📝', 'Onboarding & Payroll bot', ka, 'Works with K-Anna: onboarding, pay files, pay statements, prior debt.', '#16a34a', toggle(ka))
+    + '</div>';
+  // 6 employee slots
+  h += '<div style="font-weight:900;color:#003594;margin:14px 0 6px">Employee bots (' + c.employees.filter(Boolean).length + ' of ' + AITEAM_SLOTS + ' used)</div><div style="display:flex;gap:10px;flex-wrap:wrap">';
+  for(var i = 0; i < AITEAM_SLOTS; i++){ var e = c.employees[i] || null, who = e ? (DB.agents || []).find(function(a){ return a && String(a.id) === String(e.personId); }) : null;
+    var pick = '<select onchange="aiTeamSlotSet(' + i + ',this.value)" class="f-input" style="margin-top:8px;font-size:.8rem"><option value="">— assign an office person —</option>' + office.map(function(a){ return '<option value="' + a.id + '"' + (who && who.id === a.id ? ' selected' : '') + '>' + esc(a.name) + '</option>'; }).join('') + '</select>'
+      + '<input class="f-input" style="margin-top:6px;font-size:.8rem" placeholder="Job title (e.g. Sales Reports bot)" value="' + esc((e && e.title) || '') + '" onchange="aiTeamSlotTitle(' + i + ',this.value)">';
+    h += _aitBotCard('🤖', (e && e.title) || ('Employee bot ' + (i + 1)), who, who ? 'Learns ' + String(who.name).split(' ')[0] + '’s job from their activity.' : 'Open slot.', '#475569', pick + toggle(who)); }
+  h += '</div>';
+  // Manager Assistant
+  var M = c.managerAssistant, mgrs = (DB.agents || []).filter(function(a){ return _aitActive(a) && aiTeamIsManager(a); });
+  h += '<div style="border:2px solid ' + (M.on ? '#16a34a' : '#f59e0b') + ';border-radius:14px;padding:14px;margin-top:14px;background:#fff">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><b style="color:#003594;font-size:1.05rem">🧭 Manager Assistant</b>'
+    + '<span style="font-weight:900;padding:4px 10px;border-radius:999px;background:' + (M.on ? '#dcfce7' : '#fef3c7') + ';color:' + (M.on ? '#166534' : '#92400e') + '">' + (M.on ? 'ON' : 'OFF') + '</span></div>'
+    + '<div style="font-size:.8rem;color:#374151;margin:6px 0">For your managers. While it is OFF, no manager sees an assistant at all.</div>'
+    + '<div style="font-size:.8rem;background:#f8fafc;border-radius:10px;padding:8px 10px;color:#334155"><b>It can:</b> show the manager their own pay and their downline’s pay rates (from your saved comp plan) · their team’s sales and phones (charge dates only) · the company policies you write below · draft manager tasks (send phones to their own people, request devices, message their team) — each one waits for the manager to tap Approve.<br><b>It can never:</b> show your pay or contracts, another manager’s people, banking or direct deposit.</div>'
+    + '<div style="margin-top:8px;font-size:.84rem"><b>Who gets it when on:</b> ' + ['Campaign Manager','Market Manager','Team Leader','IBO'].map(function(r){ return '<label style="margin-right:12px;white-space:nowrap"><input type="checkbox" ' + (M.roles[r] ? 'checked' : '') + ' onchange="aiTeamMgrRole(\'' + r + '\',this.checked)"> ' + r + (r === 'IBO' ? '' : 's') + '</label>'; }).join('') + '</div>'
+    + '<div style="font-size:.78rem;color:#6b7280;margin-top:4px">' + mgrs.length + ' manager' + (mgrs.length === 1 ? '' : 's') + ' match: ' + esc(mgrs.slice(0, 20).map(function(a){ return a.name; }).join(', ')) + (mgrs.length > 20 ? '…' : '') + '</div>'
+    + '<div class="f-label" style="margin-top:10px">Company policies the Manager Assistant follows (you can edit anytime)</div><textarea id="aitPolicies" rows="5" class="f-input" placeholder="e.g. Phones must be sold within 7 days of transfer. No phone goes to an agent without a signed transfer.">' + esc(M.policies || '') + '</textarea>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button onclick="aiTeamSavePolicies()" style="padding:10px 14px;border:1px solid #003594;border-radius:10px;background:#fff;color:#003594;font-weight:800;cursor:pointer">Save policies</button>'
+    + '<button onclick="aiTeamMgrToggle(' + (M.on ? 'false' : 'true') + ')" style="padding:10px 16px;border:none;border-radius:10px;background:' + (M.on ? '#dc2626' : '#16a34a') + ';color:#fff;font-weight:900;cursor:pointer">' + (M.on ? 'Turn Manager Assistant OFF' : 'Turn Manager Assistant ON') + '</button></div>'
+    + (c.at ? '<div style="font-size:.72rem;color:#94a3b8;margin-top:6px">Last changed by ' + esc(c.by || '') + ' · ' + esc(String(c.at).slice(0, 16).replace('T', ' ')) + '</div>' : '')
+    + '</div></div>';
+  return h;
+}
+function aiTeamRenderBox(){ var b = document.getElementById('aiTeamBox'); if(b) b.innerHTML = _aiTeamHtml(); }
+async function aiTeamBotAccess(id, on){
+  if(!isOwner(DB.current)){ alert('Only Calvin can turn a bot on or off.'); return; }
+  var a = (DB.agents || []).find(function(x){ return x && String(x.id) === String(id); }); if(!a) return;
+  if(!on && !confirm('Turn off ' + a.name + '’s assistant? They stop seeing it until you turn it back on. Nothing it learned is deleted.')) return;
+  var r = on ? await supaClient.from('ai_access').insert({ agent_id:a.id, agent_name:a.name, granted_by:DB.current.name }) : await supaClient.from('ai_access').delete().eq('agent_id', a.id);
+  if(r && r.error){ alert('Not saved: ' + r.error.message); return; }
+  await wmaiLoadAccess(); try{ showToast(on ? a.name + '’s bot is on' : a.name + '’s bot is off'); }catch(e){} aiTeamRenderBox();
+}
+async function aiTeamSlotSet(i, personId){ if(!isOwner(DB.current)) return; var e = AITEAM.cfg.employees[i] || {}; AITEAM.cfg.employees[i] = personId ? Object.assign(e, { personId:+personId }) : null; if(await _aitSave()){ try{ showToast('Saved'); }catch(x){} } aiTeamRenderBox(); }
+async function aiTeamSlotTitle(i, t){ if(!isOwner(DB.current)) return; var e = AITEAM.cfg.employees[i]; if(!e){ alert('Assign a person to this slot first.'); aiTeamRenderBox(); return; } e.title = String(t || '').slice(0, 60); if(await _aitSave()){ try{ showToast('Saved'); }catch(x){} } aiTeamRenderBox(); }
+async function aiTeamMgrRole(role, on){ if(!isOwner(DB.current)) return; AITEAM.cfg.managerAssistant.roles[role] = !!on; await _aitSave(); aiTeamRenderBox(); }
+async function aiTeamSavePolicies(){ if(!isOwner(DB.current)) return; AITEAM.cfg.managerAssistant.policies = String((document.getElementById('aitPolicies') || {}).value || '').slice(0, 8000); if(await _aitSave()){ try{ showToast('Policies saved'); }catch(e){} } aiTeamRenderBox(); }
+async function aiTeamMgrToggle(on){
+  if(!isOwner(DB.current)){ alert('Only Calvin can turn the Manager Assistant on or off.'); return; }
+  if(on && !confirm('Turn the Manager Assistant ON for your managers?\n\nThey will only see their own pay, their downline’s rates, their team’s sales and phones, and your policies. Every task waits for their Approve.')) return;
+  var pol = document.getElementById('aitPolicies'); if(pol) AITEAM.cfg.managerAssistant.policies = String(pol.value || '').slice(0, 8000);
+  AITEAM.cfg.managerAssistant.on = !!on; if(await _aitSave()){ try{ showToast('Manager Assistant ' + (on ? 'ON' : 'OFF')); }catch(e){} } aiTeamRenderBox(); try{ wmaiButton(); }catch(e){}
+}
+// put "Your AI team" at the top of the AI Employees page (owner only — the page itself is owner-only)
+var _panelAISettingsTeam = panelAISettings;
+panelAISettings = function(){ var h = _panelAISettingsTeam.apply(this, arguments); if(!isOwner(DB.current)) return h;
+  setTimeout(function(){ aiTeamLoad().then(function(){ return wmaiLoadAccess(); }).then(aiTeamRenderBox).catch(aiTeamRenderBox); }, 0);
+  var marker = '<div id="aiSetBox">', i = h.indexOf(marker); var box = '<div id="aiTeamBox"><div style="padding:16px;color:#888">Loading your AI team…</div></div>';
+  return i > 0 ? h.slice(0, i) + box + h.slice(i) : box + h; };
+window.panelAISettings = panelAISettings;
+
+// ── Enforcement: Manager Assistant OFF = managers never see an assistant; ON = manager-only tools ──
+var _wmaiButtonTeam = wmaiButton;
+wmaiButton = function(){ var u = DB.current;
+  if(u && aiTeamIsManager(u) && WMAI.allowed){ if(!AITEAM.loaded){ aiTeamLoad().then(function(){ wmaiButton(); }); var b0 = document.getElementById('wmaiBtn'); if(b0) b0.remove(); return; }
+    if(!aiTeamManagerOn()){ var b = document.getElementById('wmaiBtn'); if(b) b.remove(); var p = document.getElementById('wmaiPanel'); if(p) p.remove(); return; } }
+  return _wmaiButtonTeam.apply(this, arguments); };
+window.wmaiButton = wmaiButton;
+var AITEAM_MGR_TOOLS = ['my_pay_and_team_rates', 'team_sales_phones', 'company_policies', 'propose_message', 'propose_phone_send', 'propose_device_request', 'remember'];
+WAGENT_TOOLS.push({ name:'my_pay_and_team_rates', description:'MANAGER ASSISTANT: the manager’s own pay lines for a pay period and the pay rates (from the saved comp plan) for the manager and their own downline. Never anyone else.', parameters:{ type:'object', properties:{ period_end:{ type:'string', description:'YYYY-MM-DD; omit for the latest' } } } });
+WAGENT_TOOLS.push({ name:'team_sales_phones', description:'MANAGER ASSISTANT: the manager’s own team — sales per person for a date range and phones each person holds with the charge date only.', parameters:{ type:'object', properties:{ from:{ type:'string' }, to:{ type:'string' } } } });
+WAGENT_TOOLS.push({ name:'company_policies', description:'MANAGER ASSISTANT: the company policies Calvin wrote for managers. Quote them exactly.', parameters:{ type:'object', properties:{} } });
+WAGENT_TOOLS.push({ name:'propose_phone_send', description:'MANAGER ASSISTANT: prepare a request to send phones/SIMs from the manager to one of their own people. Waits for the manager to tap Approve; then the Inventory office gets the request.', parameters:{ type:'object', properties:{ to:{ type:'string', description:'person in the manager’s own team' }, count:{ type:'number' }, campaign:{ type:'string' }, imeis:{ type:'array', items:{ type:'string' } }, note:{ type:'string' } }, required:['to'] } });
+WAGENT_TOOLS.push({ name:'propose_device_request', description:'MANAGER ASSISTANT: prepare a request for more phones/SIMs from the Inventory office. Waits for the manager to tap Approve.', parameters:{ type:'object', properties:{ campaign:{ type:'string' }, phones:{ type:'number' }, sims:{ type:'number' }, note:{ type:'string' } } } });
+var AITEAM_BLOCKED = /bank|routing|account.?number|direct.?deposit|ach\b|payout_record|set_bank/i;
+var _waAgentCallTeam = _waAgentCall;
+_waAgentCall = function(tools, S){ var u = DB.current;
+  if(u && aiTeamIsManager(u)){ if(!aiTeamManagerOn()) return Promise.resolve({ data:{ error:'not_allowed' } });
+    tools = (tools || []).filter(function(t){ var n = t && t.function && t.function.name; return AITEAM_MGR_TOOLS.indexOf(n) >= 0; }); }
+  else if(u && !isOwner(u)) tools = (tools || []).filter(function(t){ var n = t && t.function && t.function.name; return ['my_pay_and_team_rates','team_sales_phones','company_policies','propose_phone_send','propose_device_request'].indexOf(n) < 0; });
+  else tools = (tools || []).filter(function(t){ var n = t && t.function && t.function.name; return ['my_pay_and_team_rates','team_sales_phones','company_policies','propose_phone_send','propose_device_request'].indexOf(n) < 0; });
+  return _waAgentCallTeam(tools, S); };
+window._waAgentCall = _waAgentCall;
+var _waPersonaTeam = _waPersona;
+_waPersona = function(){ var p = _waPersonaTeam.apply(this, arguments), u = DB.current;
+  if(u && aiTeamIsManager(u)) p.memory = (p.memory || '') + '\n- YOU ARE THE MANAGER ASSISTANT for ' + u.name + ' (' + (u.role || 'manager') + '). Only talk about ' + u.name + '’s own pay, their own downline’s pay rates, their own team’s sales and phones (charge dates only), and the company policies. Never Calvin’s pay or contracts, never any other manager’s people, never banking or direct deposit. Every task you prepare waits for the manager to tap Approve.';
+  else if(u && isOwner(u)) p.memory = (p.memory || '') + '\n- Your title on the AI team is DIRECTOR.';
+  return p; };
+window._waPersona = _waPersona;
+function _aitPayRates(u){ var rows = (typeof COMP_RULES !== 'undefined' && COMP_RULES.rows) ? COMP_RULES.rows : [];
+  return rows.filter(function(r){ return !/owner|calvin/i.test(String(r.applies_to || '') + ' ' + String(r.rule_key || '')); }).map(function(r){ return { campaign:r.campaign, applies_to:r.applies_to, rule:r.rule_text, amount:r.amount, from:r.effective_from || '' }; }); }
+var _wagentRunTeam = wagentRun;
+wagentRun = function(name, args){ var u = DB.current; args = args || {};
+  if(AITEAM_BLOCKED.test(String(name))) return { error:'Banking and direct deposit are off-limits to the assistant.' };
+  if(u && aiTeamIsManager(u)){
+    if(!aiTeamManagerOn()) return { error:'The Manager Assistant is off.' };
+    if(AITEAM_MGR_TOOLS.indexOf(name) < 0) return { error:'Managers can only use their own pay, their own team, policies and manager tasks.' };
+    var team = aiTeamDownline(u), inTeam = function(p){ return p && team.some(function(a){ return String(a.id) === String(p.id); }); };
+    if(name === 'company_policies') return { policies:(AITEAM.cfg && AITEAM.cfg.managerAssistant.policies) || '(Calvin has not written policies yet)' };
+    if(name === 'my_pay_and_team_rates'){ var out = { manager:u.name, team:team.map(function(a){ return { name:a.name, role:a.role || '', market:_waMarket(a) }; }), pay_rates_saved_comp_plan:_aitPayRates(u) };
+      try{ var ends = _payPeriodEnds(), pe = args.period_end || ends[0]; if(pe){ var roll = payrollBuildWeeklyRollup(pe), me = roll.agents[u.id]; out.my_pay = me ? { period_end:pe, net:(me.netCents || 0) / 100, lines:(me.lines || []).map(function(l){ return { line:l.carrier, amount:((l.grossCents || 0) - (l.chargebackCents || 0)) / 100 }; }) } : { period_end:pe, note:'no pay this period' }; } }catch(e){ out.my_pay = { note:'pay not available' }; }
+      return out; }
+    if(name === 'team_sales_phones'){ var to = args.to || _waToday(), from = args.from || _ntcAdd(to, -6), pool = [];
+      try{ pool = wmamUniqPool(); }catch(e){}
+      return { from:from, to:to, team:team.map(function(a){ var s = _waEntries(a, from, to).reduce(function(t, e){ return t + e.count; }, 0);
+        var ph = pool.filter(function(d){ return d && String(_wmamHolderOf(d)) === String(a.id); }).map(function(d){ return { imei:String(d.imei || d.sim || ''), type:d.type === 'sim' ? 'SIM' : 'phone', campaign:d.campaign || '', charge_date:String(d.chargeDate || '').slice(0, 10) }; });
+        return { name:a.name, sales:s, phones:ph }; }) }; }
+    if(name === 'propose_message'){ var rec = (args.recipients || []).map(_waFindPerson).filter(Boolean); var bad = rec.filter(function(p){ return !inTeam(p); }); if(bad.length) return { error:'You can only message your own team. Not on your team: ' + bad.map(function(p){ return p.name; }).join(', ') }; return _wagentRunTeam(name, args); }
+    if(name === 'propose_phone_send'){ var p = _waFindPerson(args.to); if(!p) return { error:'person not found' }; if(!inTeam(p)) return { error:p.name + ' is not on your team.' };
+      return { _draft:{ kind:'phone_send', to:{ id:p.id, name:p.name }, count:Number(args.count) || (args.imeis || []).length || 0, campaign:args.campaign || '', imeis:(args.imeis || []).slice(0, 50), note:String(args.note || '').slice(0, 400) }, status:'waiting for the manager to approve' }; }
+    if(name === 'propose_device_request') return { _draft:{ kind:'device_request', campaign:args.campaign || '', phones:Number(args.phones) || 0, sims:Number(args.sims) || 0, note:String(args.note || '').slice(0, 400) }, status:'waiting for the manager to approve' };
+  }
+  if(['my_pay_and_team_rates','team_sales_phones','company_policies','propose_phone_send','propose_device_request'].indexOf(name) >= 0) return { error:'Manager Assistant tool — managers only.' };
+  return _wagentRunTeam(name, args); };
+window.wagentRun = wagentRun;
+// the two manager task cards + what Approve does (the Inventory office gets the request)
+var _wagentDraftHtmlTeam = wagentDraftHtml;
+wagentDraftHtml = function(d, i, j){ if(!d || (d.kind !== 'phone_send' && d.kind !== 'device_request')) return _wagentDraftHtmlTeam.apply(this, arguments);
+  var esc = _escapeHtml, st = d._status, txt = d.kind === 'phone_send' ? '📱 Send ' + (d.count || '') + ' ' + esc(d.campaign) + ' phone(s) to ' + esc(d.to.name) + (d.imeis.length ? '<div style="font-size:.76rem;color:#475569;margin-top:4px">' + d.imeis.map(esc).join(', ') + '</div>' : '') : '📥 Request ' + (d.phones || 0) + ' phone(s) and ' + (d.sims || 0) + ' SIM(s)' + (d.campaign ? ' — ' + esc(d.campaign) : '');
+  return '<div style="margin:4px 0 8px;background:#fff;border:2px solid #0891b2;border-radius:12px;padding:10px;font-size:.85rem"><div style="font-weight:900;color:#0e7490">' + txt + '</div>' + (d.note ? '<div style="margin-top:4px">' + esc(d.note) + '</div>' : '')
+    + (st ? '<div style="margin-top:6px;font-weight:800;color:' + (st === 'sent' ? '#166534' : '#6b7280') + '">' + esc(st === 'sent' ? '✔ ' + (d._done || 'Sent') : 'Discarded') + '</div>' : '<div style="display:flex;gap:6px;margin-top:8px"><button onclick="wagentSend(' + i + ',' + j + ')" style="padding:7px 12px;border:none;border-radius:8px;background:#16a34a;color:#fff;font-weight:900;cursor:pointer">✔ Approve</button><button onclick="(function(){var m=WMAI.msgs[' + i + '];if(m&&m.drafts&&m.drafts[' + j + ']){m.drafts[' + j + ']._status=\'discarded\';wmaiRender();}})()" style="padding:7px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;cursor:pointer">Discard</button></div>') + '</div>'; };
+window.wagentDraftHtml = wagentDraftHtml;
+var _wagentSendTeam = wagentSend;
+wagentSend = async function(i, j){ var m = WMAI.msgs[i], d = m && m.drafts && m.drafts[j], u = DB.current;
+  if(!d || d._status || (d.kind !== 'phone_send' && d.kind !== 'device_request')) return _wagentSendTeam.apply(this, arguments);
+  var invIds = (DB.agents || []).filter(function(a){ return _aitActive(a) && !isOwner(a) && (/inventory/i.test(a.role || '') || (typeof isInventory === 'function' && isInventory(a))); }).map(function(a){ return a.id; });
+  var title = d.kind === 'phone_send' ? u.name + ' asks to send ' + (d.count || '') + ' ' + d.campaign + ' phone(s) to ' + d.to.name : u.name + ' requests ' + d.phones + ' phone(s) and ' + d.sims + ' SIM(s)' + (d.campaign ? ' (' + d.campaign + ')' : '');
+  try{ pushNotification({ type:'info', title:title, body:(d.imeis && d.imeis.length ? 'IMEIs: ' + d.imeis.join(', ') + '. ' : '') + (d.note || '') + ' — approved by ' + u.name + ' through the Manager Assistant.', toIds:invIds, toRoles:invIds.length ? [] : ['Inventory'], icon:'📦', data:{ panel:'inv-transfers' } }); }catch(e){}
+  try{ var r = await supaClient.from('app_settings').select('value').eq('key', 'mgr_assistant_tasks').maybeSingle(); var L = (r && r.data && r.data.value) ? (JSON.parse(r.data.value) || []) : []; L.push(Object.assign({ by:u.name, byId:u.id, at:new Date().toISOString() }, d, { _status:undefined })); await supaClient.from('app_settings').upsert({ key:'mgr_assistant_tasks', value:JSON.stringify(L.slice(-500)), updated_at:new Date().toISOString() }, { onConflict:'key' }); }catch(e){}
+  d._status = 'sent'; d._done = 'Sent to the Inventory office'; WAGENT.hist.push({ role:'user', content:'[system note: the manager approved; the Inventory office got the request]' }); wmaiRender(); };
+window.wagentSend = wagentSend;
+setTimeout(function(){ try{ if(DB.current && aiTeamIsManager(DB.current)) aiTeamLoad().then(function(){ wmaiButton(); }); }catch(e){} }, 5000);
+if(typeof window !== 'undefined'){ Object.assign(window, { AITEAM:AITEAM, aiTeamLoad:aiTeamLoad, aiTeamRenderBox:aiTeamRenderBox, aiTeamBotAccess:aiTeamBotAccess, aiTeamSlotSet:aiTeamSlotSet, aiTeamSlotTitle:aiTeamSlotTitle, aiTeamMgrRole:aiTeamMgrRole, aiTeamSavePolicies:aiTeamSavePolicies, aiTeamMgrToggle:aiTeamMgrToggle, aiTeamIsManager:aiTeamIsManager, aiTeamDownline:aiTeamDownline }); }
+// ══════════════════════════════════════════════════════════════════════
+//  GEN MOBILE PAYROLL FIXES + OCT 1 UPSELL CUTOFF + PAY LINK IMEI CHECK — Calvin 2026-10-15 (v2026.10.15.1100)
+//  1. The 2026-10 Gen Mobile plan applies from the 9/27–10/3 pay week on ("that's the now and ongoing plan").
+//  2. The Gen Mobile pay email is read by COLUMN NAME (Gen Mobile added "BYOD CA" before "Email").
+//     The Breakeven/Upsell section stops at the ASSURANCE section. Device credits are never charged —
+//     they are flagged so the office adds them as a Credit.
+//  3. Direct manager $1/$2 comes from the Markets page (Team Leader, else Market Manager) when the profile
+//     doesn't name one. Juan's routing also works when he is the Market Manager of the market, or when the
+//     person is in no market (walks the upline).
+//  4. OCT 1 CUTOFF — judged on EACH ORDER'S OWN DATE, so one file can mix both:
+//     • Orders dated BEFORE 10/1/2026: every upsell / device fee on the file is deducted from the enroller
+//       (they collected that cash in the field and the fee must be paid).
+//     • Orders dated 10/1/2026 and after: the charge is read and recorded, but the agent is NOT charged when the
+//       Pay Link shows that exact IMEI PAID (the customer paid at point of sale). If the IMEI is NOT paid on the
+//       Pay Link, the line is FLAGGED and the cost is deducted from the enroller.
+//     • SIM-only lines cost nothing and are never flagged. A data plan on a SIM order must be paid on the Pay
+//       Link (sale carries a data plan) or the agent is charged for it.
+//     • Triple check on every IMEI: (1) the IMEI matches a Pay Link sale, (2) the sale is PAID (paid status,
+//       paid date, money received), (3) the payment was not disputed / refunded / canceled.
+//     The same check (plvVerify) is used for any phone carrier whose pay file lists IMEIs.
+//  5. Data plan commissions to the enroller (NLAD): low $2 / middle $5 / high $10 ($10 / $20 / $30 plans).
+//     Bundles pay $5 / $10 / $20 once Calvin confirms which bundle pays which (until then: flagged, not paid).
+//  Never charges a manager or Tanita for a device line — device charges belong to the enroller only.
+// ══════════════════════════════════════════════════════════════════════
+var GM_UPSELL_CUTOFF = '2026-10-01';
+var GM_PLAN_START_2610 = '2026-09-27';
+
+// ── 1. plan start: the 9/27–10/3 week and every week after ──
+if(!GM_PLAN_2026_10.effectiveFrom || GM_PLAN_2026_10.effectiveFrom > GM_PLAN_START_2610) GM_PLAN_2026_10.effectiveFrom = GM_PLAN_START_2610;
+var _gmPlan2610LoadStart = gmPlan2610Load;
+gmPlan2610Load = async function(){ var P = await _gmPlan2610LoadStart.apply(this, arguments);
+  if(!GM_PLAN_2026_10.effectiveFrom || GM_PLAN_2026_10.effectiveFrom === '2026-10-04'){
+    GM_PLAN_2026_10.effectiveFrom = GM_PLAN_START_2610;
+    // Calvin's own login saves the corrected start once, so every device agrees
+    if(DB.current && isOwner(DB.current)){ try{ await supaClient.from('app_settings').upsert({ key:'gm_plan_2026_10', value:JSON.stringify({ effectiveFrom:GM_PLAN_START_2610, bundles:GM_PLAN_2026_10.bundles }), updated_at:new Date().toISOString() }, { onConflict:'key' }); }catch(e){} }
+  }
+  return P; };
+window.gmPlan2610Load = gmPlan2610Load;
+if(typeof COMP_RULE_ENGINE !== 'undefined') COMP_RULE_ENGINE['gm.payweek'] = function(){ return undefined; };   // a date, not a dollar amount — checked by the text below
+
+// ── 2. Pay Link records: every PAID sale, by IMEI / SIM number ──
+var PLV = { loaded:false, loading:null, at:0, byId:{}, err:'' };
+function _plvKey(v){ return String(v == null ? '' : v).replace(/\D/g, ''); }
+async function plvLoad(force){
+  if(PLV.loading && !force) return PLV.loading;
+  if(PLV.loaded && !force && Date.now() - PLV.at < 5 * 60000) return PLV;
+  PLV.loading = (async function(){ var map = {}, errs = [];
+    try{ var r = await supaClient.from('gm_sales').select('id,agent_id,agent_name,imei,model,status,order_type,plan_name,amount_charged,amount_paid,paid_at,created_at,dispute_state').eq('status', 'paid').limit(20000);
+      if(r && r.error) errs.push('Gen Mobile Pay Link: ' + r.error.message); else ((r && r.data) || []).forEach(function(s){ var k = _plvKey(s.imei); if(k) (map[k] = map[k] || []).push(Object.assign({ campaign:'Gen Mobile' }, s)); }); }catch(e){ errs.push('Gen Mobile Pay Link: ' + (e.message || e)); }
+    try{ var q = await supaClient.from('aw_phone_sales').select('*').eq('status', 'paid').limit(20000);
+      if(q && !q.error) ((q && q.data) || []).forEach(function(s){ var k = _plvKey(s.imei); if(k) (map[k] = map[k] || []).push(Object.assign({ campaign:'Assurance' }, s)); }); }catch(e){}
+    PLV.byId = map; PLV.err = errs.join(' · '); PLV.loaded = !errs.length; PLV.at = Date.now(); PLV.loading = null; return PLV; })();
+  return PLV.loading;
+}
+// the triple check — returns { paid, checks[], sale, why }
+function plvVerify(id, opts){ opts = opts || {}; var k = _plvKey(id), out = { paid:false, checks:[], sale:null, why:'' };
+  if(!k){ out.why = 'no IMEI / SIM number on the pay file line'; return out; }
+  if(!PLV.loaded){ out.why = 'Pay Link records did not load' + (PLV.err ? ' (' + PLV.err + ')' : ''); out.unverified = true; return out; }
+  var L = PLV.byId[k] || []; if(!L.length && k.length > 15) L = PLV.byId[k.slice(0, 15)] || [];   // IMEI with a check digit / SV
+  out.checks.push({ test:'IMEI on a Pay Link sale', ok:L.length > 0 });
+  if(!L.length){ out.why = 'IMEI ' + k + ' is not on any Pay Link sale'; return out; }
+  var paid = L.filter(function(s){ return s.status === 'paid' && (s.paid_at || s.created_at) && (Number(s.amount_paid) > 0 || Number(s.amount_charged) > 0 || s.amount_paid == null); });
+  out.checks.push({ test:'Sale is PAID', ok:paid.length > 0 });
+  if(!paid.length){ out.why = 'Pay Link sale on IMEI ' + k + ' is not paid'; return out; }
+  var clean = paid.filter(function(s){ var d = String(s.dispute_state || '').toUpperCase(); return !d || d === 'WON'; });
+  out.checks.push({ test:'Payment not disputed / refunded', ok:clean.length > 0 });
+  if(!clean.length){ out.why = 'Pay Link payment on IMEI ' + k + ' was disputed (' + paid[0].dispute_state + ')'; return out; }
+  var s = clean[0];
+  if(opts.needsPlan){ var hasPlan = !!(s.plan_name && !/^(none|no plan|-)$/i.test(String(s.plan_name).trim()));
+    out.checks.push({ test:'Pay Link sale includes the data plan', ok:hasPlan }); if(!hasPlan){ out.why = 'Pay Link sale on ' + k + ' did not include a data plan'; return out; } }
+  out.paid = true; out.sale = s; return out; }
+
+// ── 3. read the Gen Mobile pay email by column name ──
+function _gmSplit(line){ var c = line.split('\t'); if(c.length < 3) c = line.split(/\s{2,}/); return c; }
+function _gmHead(c){ return c.map(function(h){ return String(h || '').trim().toLowerCase().replace(/\s+/g, ' '); }); }
+function _gmFind(hd, names){ for(var i = 0; i < names.length; i++){ var j = hd.indexOf(names[i]); if(j >= 0) return j; } return -1; }
+function _gmMoneyCents(raw){ var s = String(raw || '').trim(); if(!s) return null; var neg = /\(|^-|-\$|−/.test(s); var v = parseFloat(s.replace(/[^\d.]/g, '')); if(isNaN(v)) return null; return Math.round((neg ? -v : v) * 100); }
+function _gmLineDate(raw, period){ var s = String(raw || '').trim(); if(!s) return ''; var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/); if(m) return m[0];
+  m = s.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/); if(!m) return '';
+  var y = m[3] ? (m[3].length === 2 ? '20' + m[3] : m[3]) : String((period && (period.end || period.start) || _ctToday()).slice(0, 4));
+  var d = y + '-' + ('0' + m[1]).slice(-2) + '-' + ('0' + m[2]).slice(-2);
+  if(!m[3] && period && period.end && d > period.end && /-0?1-/.test(period.end.slice(4, 8))) d = (Number(y) - 1) + d.slice(4);   // December orders on a January file
+  return d; }
+function _gmIsCredit(type, raw){ return /credit|refund|return(ed)?\b/i.test(String(type || '')) || /^\s*\+/.test(String(raw || '')); }
+function _gmIsSimOnly(type, model){ var t = String(type || '') + ' ' + String(model || ''); return /\b(sim|byod)\b/i.test(t) && !/data|plan|bundle/i.test(t) && !/upsell|phone|device/i.test(String(type || '')); }
+function _gmIsDataLine(type, model){ return /data|plan|bundle/i.test(String(type || '') + ' ' + String(model || '')); }
+function parseGenMobilePayEmail2610(text){
+  if(!text || typeof text !== 'string') return null;
+  var result = { periodStart:'', periodEnd:'', rows:{}, errors:[], deviceLines:[], credits:[], readBy:'column-name' };
+  var pm = text.match(/GEN\s*MOBILE\s*\(([\d\/]+)\s*-\s*([\d\/]+)\)/i);
+  if(pm){ result.periodStart = ppNormalizeDate(pm[1]); result.periodEnd = ppNormalizeDate(pm[2]); } else result.errors.push('Could not find "GENMOBILE (M/D - M/D)" header. Dates left blank.');
+  var period = { start:result.periodStart, end:result.periodEnd };
+  var lines = text.replace(/\r/g, '').split('\n'), mode = '', A = null, C = null;
+  var blank = function(){ return { NLAD:0, 'NLAD+':0, CA:0, 'CA+NLAD':0, TRB:0, Total:0, Data:0, BYOD_SIM:0, BYOD_CA:0, Email:0 }; };
+  var rowFor = function(code, market){ return result.rows[code] = result.rows[code] || { agentCode:code, market:String(market || '').trim().replace(/^MMG\s+CIR\s+/i, ''), activations:blank(), chargebacks:[], chargebackTotal:0 }; };
+  for(var i = 0; i < lines.length; i++){ var line = lines[i]; if(!line.trim()) continue;
+    if(/^\s*ASSURANCE\b/i.test(line) || /^\s*ASSURANCE\s*\(/i.test(line)){ mode = 'done'; continue; }   // the Gen Mobile part ends here
+    if(mode === 'done') continue;
+    if(/Team\s+Name/i.test(line) && /Agent/i.test(line) && /NLAD/i.test(line)){ var hd = _gmHead(_gmSplit(line));
+      A = { market:0, agent:_gmFind(hd, ['agent']), nlad:_gmFind(hd, ['nlad']), nladPlus:_gmFind(hd, ['nlad+','nlad +']), ca:_gmFind(hd, ['ca']), caNlad:_gmFind(hd, ['ca+nlad','ca + nlad']), trb:_gmFind(hd, ['trb','tribal']), total:_gmFind(hd, ['total']), data:_gmFind(hd, ['data']), byod:_gmFind(hd, ['byod sim','byod','sim only','sim-only']), byodCa:_gmFind(hd, ['byod ca']), email:_gmFind(hd, ['email','e-mail']) };
+      if(A.agent < 0) A.agent = 1; mode = 'act'; continue; }
+    if(/BREAKEVEN|UPSELL/i.test(line) && !/\t.*\d/.test(line)){ mode = 'cbwait'; continue; }
+    if(/\bAgent\b/i.test(line) && /\bIMEI\b/i.test(line)){ var h2 = _gmHead(_gmSplit(line));
+      C = { market:0, agent:_gmFind(h2, ['agent']), date:_gmFind(h2, ['date','order date','activation date']), order:_gmFind(h2, ['order','order #','order id']), model:_gmFind(h2, ['model','device']), imei:_gmFind(h2, ['imei','imei/sim','sim']), type:_gmFind(h2, ['type']), amount:_gmFind(h2, ['b/e','be','amount','charge','cost']) };
+      if(C.agent < 0) C.agent = 1; if(C.amount < 0) C.amount = h2.length - 1; mode = 'cb'; continue; }
+    if(mode === 'act' && A){ var c = _gmSplit(line); var code = String(c[A.agent] || '').trim(); if(!code || /^total$/i.test(code)) continue; if(c.length < 4) continue;
+      var n = function(ix){ if(ix < 0) return 0; var v = parseInt(String(c[ix] || '').replace(/[^0-9-]/g, ''), 10); return isNaN(v) ? 0 : v; };
+      var r = rowFor(code, c[A.market]); var act = r.activations;
+      act.NLAD += n(A.nlad); act['NLAD+'] += n(A.nladPlus); act.CA += n(A.ca); act['CA+NLAD'] += n(A.caNlad); act.TRB += n(A.trb); act.Total += n(A.total); act.Data += n(A.data); act.BYOD_SIM += n(A.byod); act.BYOD_CA += n(A.byodCa); act.Email += n(A.email); continue; }
+    if(mode === 'cb' && C){ var d = _gmSplit(line); var cbCode = String(d[C.agent] || '').trim(); if(!cbCode || /^total$/i.test(cbCode) || d.length < 4) continue;
+      var cents = _gmMoneyCents(d[C.amount]); var type = String(C.type >= 0 ? d[C.type] || '' : '').trim(), model = String(C.model >= 0 ? d[C.model] || '' : '').trim();
+      var e = { date:_gmLineDate(C.date >= 0 ? d[C.date] : '', period), rawDate:String(C.date >= 0 ? d[C.date] || '' : '').trim(), order:String(C.order >= 0 ? d[C.order] || '' : '').trim(), model:model, imei:String(C.imei >= 0 ? d[C.imei] || '' : '').trim(), type:type, amountRaw:String(d[C.amount] || '').trim(), cents:cents, agentCode:cbCode, market:String(d[C.market] || '').trim() };
+      result.deviceLines.push(e); rowFor(cbCode, d[C.market]).chargebacks.push(e); }
+  }
+  if(!A) result.errors.push('Could not find the Gen Mobile activations header (Team Name / Agent / NLAD …).');
+  var bca = Object.keys(result.rows).filter(function(k){ return result.rows[k].activations.BYOD_CA; });
+  if(bca.length) result.errors.push('BYOD CA column: ' + bca.map(function(k){ return k + ' ' + result.rows[k].activations.BYOD_CA; }).join(', ') + ' — read and recorded, NOT paid as SIM-only until Calvin confirms how BYOD CA pays.');
+  gmApplyDeviceRules(result);
+  return result;
+}
+// decide every device line: deduct, recorded (paid on the Pay Link), credit, SIM (no cost)
+function gmApplyDeviceRules(result){
+  var flags = [], credits = [];
+  Object.keys(result.rows).forEach(function(code){ var r = result.rows[code], tot = 0;
+    (r.chargebacks || []).forEach(function(e){ var cost = e.cents == null ? 0 : Math.abs(e.cents);
+      if(_gmIsCredit(e.type, e.amountRaw)){ e.decision = 'credit'; e.amount = 0; e.why = 'Device credit — never charged. Add it as a Credit.'; credits.push(e); return; }
+      if(_gmIsSimOnly(e.type, e.model)){ e.decision = 'sim'; e.amount = 0; e.why = 'SIM card — no cost to the agent.'; return; }
+      if(!cost){ e.decision = 'zero'; e.amount = 0; e.why = 'No amount on this line.'; return; }
+      var day = e.date || '';
+      var pre = day ? day < GM_UPSELL_CUTOFF : ((result.periodEnd || '') !== '' && result.periodEnd < GM_UPSELL_CUTOFF);
+      if(pre){ e.decision = 'deduct'; e.amount = -cost; e.why = 'Order dated ' + (day || 'before 10/1') + ' (before Oct 1): agent collected this in the field — deducted.'; tot += e.amount; return; }
+      var v = plvVerify(e.imei, { needsPlan:_gmIsDataLine(e.type, e.model) }); e.verify = v;
+      if(v.paid){ e.decision = 'paid'; e.amount = 0; e.why = 'Order dated ' + (day || '?') + ': paid on the Pay Link' + (v.sale && v.sale.paid_at ? ' ' + String(v.sale.paid_at).slice(0, 10) : '') + (v.sale && v.sale.agent_name ? ' by ' + v.sale.agent_name : '') + ' — recorded, NOT deducted.'; return; }
+      e.decision = 'flag'; e.amount = -cost; e.why = 'Order dated ' + (day || '(no date)') + ': ' + v.why + ' — FLAGGED and deducted from the agent.'; tot += e.amount;
+      flags.push(e); });
+    r.chargebackTotal = tot; });
+  result.flags = flags; result.credits = credits;
+  if(!PLV.loaded && (result.deviceLines || []).some(function(e){ return e.decision === 'flag'; })) result.errors.push('Pay Link records did not load, so device charges dated 10/1 or later could not be checked and were DEDUCTED. Reopen this pay file once the connection is back before you save it.');
+  if(flags.length) result.errors.push(flags.length + ' device charge' + (flags.length === 1 ? '' : 's') + ' dated 10/1 or later ' + (flags.length === 1 ? 'is' : 'are') + ' NOT paid on the Pay Link and ' + (flags.length === 1 ? 'was' : 'were') + ' deducted from the agent: ' + flags.map(function(e){ return e.agentCode + ' IMEI ' + (e.imei || '?') + ' $' + (Math.abs(e.amount) / 100).toFixed(2); }).join('; '));
+  if(credits.length) result.errors.push(credits.length + ' Gen Mobile device credit' + (credits.length === 1 ? '' : 's') + ' (never charged) — add as a Credit: ' + credits.map(function(e){ return e.agentCode + ' ' + (e.model || '') + ' ' + (e.amountRaw || ''); }).join('; '));
+  return result;
+}
+var _parseGenMobilePayEmailOld = parseGenMobilePayEmail;
+parseGenMobilePayEmail = function(text){ var r = null; try{ r = parseGenMobilePayEmail2610(text); }catch(e){ console.warn('[gm reader 2610]', e); }
+  if(r && Object.keys(r.rows).length) return r; return _parseGenMobilePayEmailOld.apply(this, arguments); };
+window.parseGenMobilePayEmail = parseGenMobilePayEmail;
+// hand the device lines to the engine for the pay statement
+var _ppComputeGM2610 = ppComputeAgentCommissions;
+ppComputeAgentCommissions = function(parsed, carrier){
+  if(carrier === 'Gen Mobile' && parsed && parsed.rows){ window._gmDeviceLines = parsed.deviceLines || null; }
+  try{ return _ppComputeGM2610.apply(this, arguments); } finally { if(carrier === 'Gen Mobile') window._gmDeviceLines = null; } };
+window.ppComputeAgentCommissions = ppComputeAgentCommissions;
+
+// ── 4. direct manager from the Markets page; Juan routing ──
+var _gm26DirectMgrOld = _gm26DirectMgr;
+_gm26DirectMgr = function(a){ var m = _gm26DirectMgrOld.apply(this, arguments); if(m || !a) return m;
+  var team = (typeof gmAgentTeam === 'function') ? gmAgentTeam(a.id) : null; if(!team) return null;
+  var ids = [team.leader, team.marketManager];
+  for(var i = 0; i < ids.length; i++){ var p = ids[i] != null && ids[i] !== '' ? _gm26Person(ids[i]) : null; if(p && p.id !== a.id && p.active !== false && !p.deletedAt && !isOwner(p)) return p; }
+  return null; };
+window._gm26DirectMgr = _gm26DirectMgr;
+var _gm26IboOld = _gm26Ibo;
+_gm26Ibo = function(agentId){ var r = null; try{ r = _gm26IboOld.apply(this, arguments); }catch(e){} if(r) return r;
+  var a = _gm26Person(agentId); if(!a) return null; if(a.role === 'IBO') return a;
+  var team = (typeof gmAgentTeam === 'function') ? gmAgentTeam(agentId) : null;
+  if(team){ var mm = team.marketManager != null ? _gm26Person(team.marketManager) : null; if(mm && (mm.role === 'IBO' || (typeof gmCmModelOf === 'function' && gmCmModelOf(mm) === 'ibo-consolidated'))) return mm; return null; }
+  // no market: walk the Gen Mobile upline
+  var seen = {}, cur = a;
+  for(var d = 0; d < 10 && cur && !seen[cur.id]; d++){ seen[cur.id] = 1; if(cur !== a && cur.role === 'IBO') return cur;
+    var nx = (cur.reportsTo && cur.reportsTo['Gen Mobile']) || cur.teamLeaderId || cur.marketManagerId || cur.campaignManagerId; cur = nx != null ? _gm26Person(nx) : null; }
+  try{ return (typeof agentIsUnderIBO === 'function') ? agentIsUnderIBO(agentId) : null; }catch(e){ return null; } };
+window._gm26Ibo = _gm26Ibo;
+
+// ── 5. device lines on the pay statement; bundles ──
+var _gmCalculateWeek2610Dev = gmCalculateWeek2610;
+gmCalculateWeek2610 = function(rows){ var res = _gmCalculateWeek2610Dev.apply(this, arguments), L = window._gmDeviceLines;
+  try{ if(res && res.perAgent && Array.isArray(L) && L.length){
+    var byCode = {}; L.forEach(function(e){ (byCode[e.agentCode] = byCode[e.agentCode] || []).push(e); });
+    var codeOwner = function(code){ return (DB.agents || []).find(function(a){ var ac = a && a.agentCodes || {}; return ac['Gen Mobile'] && String(ac['Gen Mobile']).trim().toLowerCase() === String(code).trim().toLowerCase(); }) || (DB.agents || []).find(function(a){ return a && a.active && String(a.name || '').trim().toLowerCase() === String(code).trim().toLowerCase(); }); };
+    Object.keys(byCode).forEach(function(code){ var a = codeOwner(code); if(!a) return; var ibo = _gm26Ibo(a.id), payeeId = ibo ? ibo.id : a.id, e = res.perAgent[payeeId]; if(!e) e = res.perAgent[payeeId] = { amount:0, breakdown:[], rows:0 };
+      var lines = byCode[code], ded = lines.filter(function(x){ return x.decision === 'deduct' || x.decision === 'flag'; }), paid = lines.filter(function(x){ return x.decision === 'paid'; }), cr = lines.filter(function(x){ return x.decision === 'credit'; });
+      var tag = (ibo && ibo.id !== a.id) ? ' (' + a.name + ')' : '';
+      e.breakdown = e.breakdown.map(function(b){ if(b.label === 'Chargebacks' + (tag ? ' (' + a.name + ', paid to ' + ibo.name + ')' : '') || (b.label === 'Chargebacks' && !tag)){ var pre = ded.filter(function(x){ return x.decision === 'deduct'; }).length, fl = ded.length - pre;
+        return Object.assign({}, b, { label:'Phone deductions' + tag + ' — ' + ded.length + ' device charge' + (ded.length === 1 ? '' : 's') + (pre ? ' (' + pre + ' before 10/1)' : '') + (fl ? ' (' + fl + ' not paid on Pay Link)' : ''), count:ded.length, deviceLines:ded.map(function(x){ return { date:x.date, imei:x.imei, model:x.model, type:x.type, amount:x.amount / 100, why:x.why }; }) }); } return b; });
+      if(paid.length) e.breakdown.push({ label:'Device charges paid on the Pay Link' + tag + ' — recorded, not deducted', count:paid.length, rate:0, amount:0, deviceLines:paid.map(function(x){ return { date:x.date, imei:x.imei, model:x.model, type:x.type, amount:0, gm_charge:(x.cents == null ? 0 : -Math.abs(x.cents)) / 100, why:x.why }; }) });
+      if(cr.length) e.breakdown.push({ label:'Device credits from Gen Mobile' + tag + ' — not charged (office: add as a Credit)', count:cr.length, rate:0, amount:0 }); });
+  } }catch(err){ console.warn('[gm device lines]', err); }
+  // bundles: pay only when Calvin has set the bundle rates
+  try{ var B = GM_PLAN_2026_10.bundles || {}; if(res && res.warnings && (B.b10 == null || B.b20 == null || B.b30 == null)){ res.warnings = res.warnings.map(function(w){ return /3-month bundle/.test(w) ? w.replace('Calvin has not set the bundle rate', 'Calvin set bundles at $5 / $10 / $20 but has not said which bundle pays which yet') : w; }); } }catch(e){}
+  return res; };
+window.gmCalculateWeek2610 = gmCalculateWeek2610;
+// keep the plain-wording pay statements readable
+var _ppPlainLabelDev = _ppPlainLabel;
+_ppPlainLabel = function(l){ var s = String(l || ''); if(/^Phone deductions|^Device charges paid on the Pay Link|^Device credits from Gen Mobile/.test(s)) return s; return _ppPlainLabelDev.apply(this, arguments); };
+window._ppPlainLabel = _ppPlainLabel;
+
+// the deductions list on the preview only carries lines the agent actually pays (paid-on-Pay-Link, SIM and credit lines stay recorded on the row)
+var _ppInjectGMCbDev = ppInjectGMChargebacksAsCascadeDeductions;
+ppInjectGMChargebacksAsCascadeDeductions = function(match, commissions, allDeductions){ var saved = [];
+  try{ ((match && match.matched) || []).forEach(function(m){ var r = m && m.row; if(!r || !Array.isArray(r.chargebacks) || !r.chargebacks.some(function(e){ return e && e.decision; })) return; saved.push([r, r.chargebacks]); r.chargebacks = r.chargebacks.filter(function(e){ return !e.decision || e.decision === 'deduct' || e.decision === 'flag'; }); }); }catch(e){}
+  try{ return _ppInjectGMCbDev.apply(this, arguments); } finally { saved.forEach(function(x){ x[0].chargebacks = x[1]; }); } };
+window.ppInjectGMChargebacksAsCascadeDeductions = ppInjectGMChargebacksAsCascadeDeductions;
+// ── load the Pay Link records whenever payroll is open ──
+var _ppPreviewPLV = panelPayrollUploadPreview;
+panelPayrollUploadPreview = function(){ if(!PLV.loaded && !PLV.loading){ plvLoad().then(function(){ /* records ready for the next read */ }); } return _ppPreviewPLV.apply(this, arguments); };
+window.panelPayrollUploadPreview = panelPayrollUploadPreview;
+setTimeout(function(){ try{ if(DB.current && (isOwner(DB.current) || (typeof wmamIsPayrollStaff === 'function' && wmamIsPayrollStaff(DB.current) && _aitIsOfficeStaff(DB.current)))) plvLoad(); }catch(e){} }, 6000);
+// pasting a Gen Mobile email: make sure Pay Link records are in before reading it
+var _ppDetectCarriersPLV = ppDetectCarriers;
+ppDetectCarriers = function(input){ if(input && /GEN\s*MOBILE\s*\(/i.test(input.text || '') && !PLV.loaded && !PLV.loading) plvLoad(); return _ppDetectCarriersPLV.apply(this, arguments); };
+window.ppDetectCarriers = ppDetectCarriers;
+
+// the Pay Link check box on the pay-file preview (Gen Mobile): every device line and what happened to it
+function gmDeviceCheckHtml(parsed){ var L = (parsed && parsed.deviceLines) || []; if(!L.length) return '';
+  var esc = _escapeHtml, money = function(c){ return '$' + (Math.abs(c || 0) / 100).toFixed(2); };
+  var cnt = function(d){ return L.filter(function(e){ return e.decision === d; }); }, pre = cnt('deduct'), paid = cnt('paid'), flag = cnt('flag'), cr = cnt('credit'), sim = cnt('sim');
+  var sum = function(a){ return a.reduce(function(t, e){ return t + Math.abs(e.cents || 0); }, 0); };
+  var chip = function(bg, fg, t){ return '<span style="display:inline-block;padding:3px 9px;border-radius:999px;background:' + bg + ';color:' + fg + ';font-weight:800;font-size:.78rem;margin:0 6px 6px 0">' + t + '</span>'; };
+  var rowsOf = function(list, color, label){ return list.map(function(e){ return '<tr style="border-top:1px solid #f1f5f9"><td style="padding:5px 8px;font-weight:800;color:' + color + '">' + label + '</td><td style="padding:5px 8px">' + esc(e.agentCode) + '</td><td style="padding:5px 8px">' + esc(e.date || e.rawDate || '') + '</td><td style="padding:5px 8px;font-family:monospace">' + esc(e.imei || '') + '</td><td style="padding:5px 8px">' + esc((e.type || '') + (e.model ? ' \u00b7 ' + e.model : '')) + '</td><td style="padding:5px 8px;text-align:right">' + esc(e.amountRaw || '') + '</td><td style="padding:5px 8px;font-size:.78rem;color:#475569">' + esc(e.why || '') + '</td></tr>'; }).join(''); };
+  return '<div class="bo-card" style="margin-bottom:16px;border:2px solid ' + (flag.length ? '#dc2626' : '#16a34a') + '"><div style="padding:14px 16px">'
+    + '<div style="font-family:Barlow Condensed,sans-serif;font-size:1.2rem;font-weight:800;color:#003594">\uD83D\uDD0E Gen Mobile device charges \u2014 Oct 1 rule + Pay Link check</div>'
+    + '<div style="font-size:.8rem;color:#374151;margin:4px 0 8px">Before 10/1: deducted from the agent. 10/1 and after: only deducted when that IMEI is NOT paid on the Pay Link (IMEI match \u00b7 paid \u00b7 not disputed). ' + (PLV.loaded ? 'Pay Link records loaded ' + new Date(PLV.at).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' }) + '.' : '<b style="color:#b91c1c">Pay Link records did NOT load \u2014 reopen before saving.</b>') + '</div>'
+    + chip('#fee2e2', '#991b1b', pre.length + ' before 10/1 \u00b7 deducted ' + money(sum(pre))) + chip('#dcfce7', '#166534', paid.length + ' paid on Pay Link \u00b7 not deducted ' + money(sum(paid))) + chip(flag.length ? '#dc2626' : '#f1f5f9', flag.length ? '#fff' : '#64748b', flag.length + ' NOT paid on Pay Link \u00b7 flagged & deducted ' + money(sum(flag))) + (cr.length ? chip('#dbeafe', '#1e40af', cr.length + ' credit' + (cr.length === 1 ? '' : 's') + ' \u00b7 add as Credit') : '') + (sim.length ? chip('#f1f5f9', '#475569', sim.length + ' SIM \u00b7 no cost') : '')
+    + ((flag.length || paid.length || cr.length) ? '<div style="overflow-x:auto;margin-top:6px"><table style="width:100%;border-collapse:collapse;font-size:.82rem"><tr style="background:#003594;color:#fff"><th style="padding:6px 8px;text-align:left">Result</th><th style="padding:6px 8px;text-align:left">Agent code</th><th style="padding:6px 8px;text-align:left">Order date</th><th style="padding:6px 8px;text-align:left">IMEI / SIM</th><th style="padding:6px 8px;text-align:left">Type</th><th style="padding:6px 8px;text-align:right">Gen Mobile</th><th style="padding:6px 8px;text-align:left">Why</th></tr>'
+      + rowsOf(flag, '#dc2626', 'FLAGGED') + rowsOf(paid, '#16a34a', 'PAID') + rowsOf(cr, '#1d4ed8', 'CREDIT') + '</table></div>' : '')
+    + '</div></div>'; }
+var _ppPreviewDevBox = panelPayrollUploadPreview;
+panelPayrollUploadPreview = function(){ var h = _ppPreviewDevBox.apply(this, arguments);
+  try{ var st = window._ppStaged, gm = st && (st.detections || []).find(function(d){ return d && d.carrier === 'Gen Mobile'; }); if(!gm || !gm.parsed) return h;
+    var box = gmDeviceCheckHtml(gm.parsed); if(!box) return h; var i = h.indexOf('<div id="compRulesBanner">'); if(i < 0) return box + h; var j = h.indexOf('</div>', h.indexOf('</div>', i) + 1);
+    var k = h.indexOf('<div style="display:flex;gap:10px;margin-bottom:20px'); return k > 0 ? h.slice(0, k) + box + h.slice(k) : h + box; }catch(e){ return h; } };
+window.panelPayrollUploadPreview = panelPayrollUploadPreview;
+// ── the AI quotes these rules exactly ──
+var _wmamPayRulesDev = wmamPayRules;
+wmamPayRules = function(args){ var out = _wmamPayRulesDev.apply(this, arguments);
+  if(out.gen_mobile_2026_10_plan){ var g = out.gen_mobile_2026_10_plan; g.starts_with_pay_week_of = '2026-09-27 (the 9/27–10/3 pay week and every week after)';
+    g.device_charges = 'Judged on each order’s own date. Orders dated BEFORE 10/1/2026: every upsell / device fee on the Gen Mobile file is deducted from the enroller (they collected the cash in the field). Orders dated 10/1/2026 or later: recorded but NOT deducted when that exact IMEI is PAID on the Pay Link; if it is not paid on the Pay Link it is flagged and deducted from the enroller. SIM-only lines cost nothing. A data plan on a SIM order must be paid on the Pay Link or the agent is charged for it. Device credits are never charged. No override is ever taken back for a device charge.';
+    g.add_ons_to_enroller.data_plans_nlad_only = 'low $2 ($10 plan) / middle $5 ($20 plan) / high $10 ($30 plan)'; g.add_ons_to_enroller.bundles = '$5 / $10 / $20 — Calvin still has to say which bundle pays which'; }
+  return out; };
+window.wmamPayRules = wmamPayRules;
+WBRAIN_SEED.push({ id:'seed-gm-oct1-cutoff', f:'Gen Mobile device / upsell charges: orders dated before 10/1/2026 are deducted from the enroller; orders dated 10/1/2026 or later are only deducted when that IMEI is NOT paid on the Pay Link (then flagged). SIM-only lines cost nothing. Data plan on a SIM order must be paid on the Pay Link.', at:'2026-10-15', from:'Calvin Williams', fromId:'owner', locked:true });
+Object.assign(window, { gmDeviceCheckHtml:gmDeviceCheckHtml, PLV:PLV, plvLoad:plvLoad, plvVerify:plvVerify, parseGenMobilePayEmail2610:parseGenMobilePayEmail2610, gmApplyDeviceRules:gmApplyDeviceRules, GM_UPSELL_CUTOFF:GM_UPSELL_CUTOFF });
 
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
