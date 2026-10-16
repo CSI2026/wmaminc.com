@@ -3833,7 +3833,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.16.1530';
+var BUILD_VERSION = '2026.10.16.1600';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -25413,6 +25413,237 @@ if(typeof isAgentPendingBgReview === 'function'){
     return true; };
   window.isAgentPendingBgReview = isAgentPendingBgReview;
 }
+// ══════════════════════════════════════════════════════════════════════
+//  NEW AGENT TRACKER (Calvin 2026-10-16 — picked "B and C together")
+//  B · People → Hiring & Onboarding → New Agent Tracker: one row per new agent, the 8 steps as dots, who it's
+//      waiting on (office / agent / manager) and for how long. Office sees everyone; Team Leaders, Market
+//      Managers, Campaign Managers and IBOs see only their own people.
+//  C · Agent dashboard: "Getting you started" checklist with the one thing to do next.
+//      Manager dashboard: "My new hires" card. Office: a stuck-agents line on the dashboard and one email
+//      a day (sent the first time someone from the office opens the back office after 8 AM Central).
+//  Yellow = waiting 2–3 days, red = stuck 4+ days. An agent leaves the tracker after their first sale,
+//  or when Suspended / Terminated. Nothing here changes any data — it only reads what the system records.
+// ══════════════════════════════════════════════════════════════════════
+var TRK = { warn:2, bad:4, filter:'all', q:'' };
+var TRK_STEPS = [
+  { key:'added',     label:'Added',               who:'office', todo:'Add the agent' },
+  { key:'bgforms',   label:'Background forms',    who:'agent',  todo:'Sign the 2 background forms' },
+  { key:'bgpass',    label:'Background check',    who:'office', todo:'Run the background check' },
+  { key:'contracts', label:'Contracts',           who:'agent',  todo:'Sign contracts' },
+  { key:'coded',     label:'Coded',               who:'office', todo:'Enter the code' },
+  { key:'agree',     label:'Pay Link agreement',  who:'agent',  todo:'Sign the Pay Link agreement' },
+  { key:'phones',    label:'Phones',              who:'manager',todo:'Send phones' },
+  { key:'sale',      label:'First sale',          who:'agent',  todo:'Make the first sale' }
+];
+var TRK_SALES_ROLES = /^(Field Agent|Team Leader|Market Manager)$/;
+function _trkDay(v){ if(!v) return ''; try{ var s = String(v); if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10); var d = new Date(s); return isNaN(d) ? '' : d.toISOString().slice(0, 10); }catch(e){ return ''; } }
+function _trkDaysSince(ymd){ if(!ymd) return 0; var a = new Date(String(ymd).slice(0, 10) + 'T12:00:00'), b = new Date(_catToday() + 'T12:00:00'); return Math.max(0, Math.round((b - a) / 86400000)); }
+function _trkMax(list){ return list.filter(Boolean).sort().slice(-1)[0] || ''; }
+function _trkMin(list){ return list.filter(Boolean).sort()[0] || ''; }
+function _trkCamps(a){ var l = []; try{ l = (typeof wmamCampaignsOf === 'function' ? wmamCampaignsOf(a) : []).map(_onbCampName); }catch(e){} return _onbDedupe(l).filter(function(c){ return !wmamCampEnded(c) && !(typeof wmamAgentCampOff === 'function' && wmamAgentCampOff(a, c)); }); }
+function _trkMgr(a){
+  try{ var id = Number(a.id), hit = null;
+    (MARKETS || []).forEach(function(m){ if(hit || !m || m.active === false) return; ensureMarketSections(m); Object.keys(m.programs || {}).forEach(function(p){ var s = m.programs[p]; if(hit || !s) return;
+      if((s.faIds || []).map(Number).indexOf(id) >= 0 || (s.tlIds || []).map(Number).indexOf(id) >= 0){ var mid = (a.role === 'Field Agent' && (s.tlIds || [])[0]) || s.mmId || s.cmId || s.iboId; hit = { market:m.name, mgr:mid != null ? _agstFind(mid) : null }; } }); });
+    var mgr = hit && hit.mgr; if(!mgr && a.teamLeaderId) mgr = _agstFind(a.teamLeaderId); if(!mgr && a.reportsTo){ var k = Object.keys(a.reportsTo)[0]; if(k) mgr = _agstFind(a.reportsTo[k]); }
+    return { market:(hit && hit.market) || (typeof wmamMarketNameFor === 'function' ? wmamMarketNameFor(a.team) : a.team) || '', mgr:mgr && mgr.id !== a.id ? mgr : null };
+  }catch(e){ return { market:a.team || '', mgr:null }; }
+}
+var _trkHeld = { t:0, by:{} };
+function _trkPhones(){ if(Date.now() - _trkHeld.t < 15000) return _trkHeld.by; var by = {};
+  try{ wmamUniqPool().forEach(function(d){ var h = _wmamHolderOf(d), seller = d.activatedById || d.soldById; var day = _trkDay(d.receivedAt || d.assignedDate || d.transferredAt || d.uploadedAt);
+    [h, seller].forEach(function(x){ if(x == null) return; var e = by[String(x)] = by[String(x)] || { n:0, first:'' }; e.n++; if(day && (!e.first || day < e.first)) e.first = day; }); }); }catch(e){}
+  _trkHeld = { t:Date.now(), by:by }; return by; }
+function _trkFirstSale(a){ var first = ''; (Array.isArray(a.monthlySales) ? a.monthlySales : []).forEach(function(b){ (b && b.entries || []).forEach(function(x){ if(x && x.date && (!first || x.date < first)) first = String(x.date).slice(0, 10); }); }); if(!first && (a.sales || 0) > 0) first = 'earlier'; return first; }
+
+// the 8 steps for one agent
+function wmamOnbProgress(a){
+  var camps = _trkCamps(a), steps = TRK_STEPS.map(function(s){ return { key:s.key, label:s.label, who:s.who, done:false, at:'', skip:false, note:'' }; });
+  var S = function(k){ return steps.find(function(x){ return x.key === k; }); };
+  var bgView = _onbBgView(a), bg = bgView.bgChecks || {}, ob = (typeof AGENT_ONBOARDING_STATUS !== 'undefined' && AGENT_ONBOARDING_STATUS[a.id]) || {};
+  var tl = Array.isArray(a.onboardingTimeline) ? a.onboardingTimeline : [];
+  // 1 added
+  S('added').done = true; S('added').at = _trkDay(a.start) || _trkDay(a.createdAt) || _trkDay(a.loginGrantedAt) || '';
+  // 2 + 3 background check (only campaigns that need one)
+  var needBg = camps.filter(function(c){ var r = wmamCampRec(c); return r && r.requiresBgCheck; });
+  if(!needBg.length || a.bgManualOverrideAt || (typeof isApplicantGrandfathered === 'function' && isApplicantGrandfathered(a))){ S('bgforms').done = S('bgpass').done = true; S('bgforms').skip = S('bgpass').skip = true; }
+  else {
+    var entries = needBg.map(function(c){ return bg[c] || bg[_cc(c)] || null; });
+    var submitted = entries.filter(function(e){ return e && e.status; });
+    if(a.bgAuthSignedFiredAt || submitted.length || a.bgApprovedAt){ S('bgforms').done = true; S('bgforms').at = _trkDay(a.bgAuthSignedFiredAt) || _trkMin(submitted.map(function(e){ return _trkDay(e.submittedAt); })) || _trkDay(a.bgApprovedAt); }
+    var passed = entries.filter(function(e){ return e && e.status === 'passed'; }), failed = entries.filter(function(e){ return e && e.status === 'failed'; });
+    if(a.bgApprovedAt || (passed.length && passed.length === needBg.length)){ S('bgpass').done = true; S('bgpass').at = _trkMax(passed.map(function(e){ return _trkDay(e.decidedAt); })) || _trkDay(a.bgApprovedAt); }
+    else if(failed.length){ S('bgpass').note = 'failed'; }
+    else if(passed.length){ S('bgpass').note = passed.length + ' of ' + needBg.length + ' passed'; }
+  }
+  // 4 contracts
+  var packs = camps.map(function(c){ return ob[c] || ob[_cc(c)] || null; }).filter(Boolean);
+  if(packs.length && packs.every(function(p){ return p.allComplete; })){ S('contracts').done = true;
+    var ts = []; packs.forEach(function(p){ Object.keys(p.steps || {}).forEach(function(k){ var x = p.steps[k]; if(x) ts.push(_trkDay(x.signedAt || x.submittedAt)); }); }); S('contracts').at = _trkMax(ts); }
+  else if(packs.length){ var signed = 0, total = 0; packs.forEach(function(p){ Object.keys(p.steps || {}).forEach(function(k){ total++; var x = p.steps[k]; if(x && (x.signed || x.submitted)) signed++; }); }); S('contracts').note = signed + ' of ' + total + ' signed'; }
+  else { S('contracts').note = 'not sent'; }
+  // 5 coded
+  var coded = camps.filter(function(c){ return !!wmamCodeFor(a, c); }), missing = camps.filter(function(c){ return !wmamCodeFor(a, c); });
+  if(camps.length && !missing.length){ S('coded').done = true; S('coded').at = _trkMax(tl.filter(function(e){ return e && e.milestone === 'coded'; }).map(function(e){ return _trkDay(e.at); })); }
+  S('coded').note = missing.join(', '); S('coded').coded = coded;
+  // 6 Gen Mobile Pay Link agreement
+  var gm = coded.some(function(c){ return _catCanon(c) === _catCanon('Gen Mobile'); }) || camps.some(function(c){ return _catCanon(c) === _catCanon('Gen Mobile'); });
+  if(!gm){ S('agree').done = true; S('agree').skip = true; }
+  else if(typeof WMAM_AGREE_SET !== 'undefined' && WMAM_AGREE_SET[String(a.id)]){ S('agree').done = true; }
+  // 7 phones (only campaigns with inventory)
+  var invCamps = camps.filter(function(c){ return typeof CAMPAIGN_REGISTRY !== 'undefined' && Object.keys(CAMPAIGN_REGISTRY).some(function(k){ return _catCanon(k) === _catCanon(c) && CAMPAIGN_REGISTRY[k] && CAMPAIGN_REGISTRY[k].active; }); });
+  var ph = _trkPhones()[String(a.id)];
+  if(!invCamps.length){ S('phones').done = true; S('phones').skip = true; }
+  else if(ph && ph.n){ S('phones').done = true; S('phones').at = ph.first; }
+  // 8 first sale
+  var fs = _trkFirstSale(a); if(fs){ S('sale').done = true; S('sale').at = fs === 'earlier' ? '' : fs; }
+  // where they are now: the first step not done (a later step can be done early, e.g. coded before contracts)
+  var cur = steps.findIndex(function(x){ return !x.done; });
+  var since = '';
+  if(cur > 0){ for(var i = cur - 1; i >= 0; i--){ if(steps[i].at){ since = steps[i].at; break; } } }
+  since = since || S('added').at || '';
+  var days = cur < 0 ? 0 : _trkDaysSince(since);
+  var m = _trkMgr(a), wait = '', who = cur < 0 ? '' : steps[cur].who, sub = '';
+  if(cur >= 0){ var k = steps[cur].key;
+    if(k === 'bgforms') wait = 'Agent: sign the 2 background forms';
+    else if(k === 'bgpass'){ if(S('bgpass').note === 'failed'){ wait = 'Office: background check FAILED — decide next step'; } else wait = 'Office: run the background check'; sub = S('bgpass').note && S('bgpass').note !== 'failed' ? S('bgpass').note : (S('bgforms').at ? 'Forms signed ' + _catNice(S('bgforms').at) : ''); }
+    else if(k === 'contracts'){ if(S('contracts').note === 'not sent'){ wait = 'Office: send contracts'; who = 'office'; } else { wait = 'Agent: sign contracts'; sub = S('contracts').note; } }
+    else if(k === 'coded'){ wait = 'Office: enter ' + (missing.length ? missing.join(' + ') : '') + ' code' + (missing.length === 1 ? '' : 's'); if(!camps.length){ wait = 'Office: add a campaign'; } }
+    else if(k === 'agree'){ wait = a.lastLoginAt || a.lastSeen ? 'Agent: sign the Pay Link agreement' : 'Agent: log in and sign the Pay Link agreement'; }
+    else if(k === 'phones'){ wait = 'Manager: send phones' + (m.mgr ? ' (' + m.mgr.name + ')' : ''); if(!m.market){ wait = 'Office: place in a market, then manager sends phones'; who = 'office'; } }
+    else if(k === 'sale'){ wait = 'Agent: first sale'; var hp = _trkPhones()[String(a.id)]; sub = hp && hp.n ? 'Has ' + hp.n + ' phone' + (hp.n === 1 ? '' : 's') + ' / SIM' + (hp.n === 1 ? '' : 's') : ''; }
+  }
+  return { agent:a, steps:steps, cur:cur, done:cur < 0, who:who, wait:wait, sub:sub, days:days, since:since, camps:camps, market:m.market, mgr:m.mgr,
+    level: cur < 0 ? 'ok' : (days >= TRK.bad ? 'bad' : (days >= TRK.warn ? 'warn' : 'ok')) };
+}
+// who is "new": sales role, active, no first sale yet, and added in the last 120 days or still in onboarding
+function wmamTrackedAgents(scope){
+  var cut = (function(){ var d = new Date(_catToday() + 'T12:00:00'); d.setDate(d.getDate() - 120); return d.toISOString().slice(0, 10); })();
+  var list = (scope || DB.agents || []).filter(function(a){
+    if(!a || a.active === false || isOwner(a) || !TRK_SALES_ROLES.test(a.role || '')) return false;
+    if(typeof wmamAgentStatus === 'function' && wmamAgentStatus(a) !== 'active') return false;
+    if(_trkFirstSale(a)) return false;
+    var recent = (_trkDay(a.start) && _trkDay(a.start) >= cut) || a.pendingAgent === true || (typeof _isAgentPendingOnboarding === 'function' && _isAgentPendingOnboarding(a));
+    return !!recent; });
+  return list.map(wmamOnbProgress).filter(function(p){ return !p.done; }).sort(function(x, y){ return (y.days - x.days) || (x.cur - y.cur) || String(x.agent.name).localeCompare(String(y.agent.name)); });
+}
+function _trkIsOffice(u){ return _onbIsOffice(u); }
+function _trkIsMgr(u){ return !!u && /^(Team Leader|Market Manager|Campaign Manager|IBO)$/.test(u.role || ''); }
+function _trkScopeFor(u){ if(_trkIsOffice(u)) return null; if(_trkIsMgr(u)){ try{ return aiTeamDownline(u); }catch(e){ return []; } } return []; }
+
+// ── B · the tracker page ──
+function _trkDots(p){ return '<div class="trk-dots" title="' + _escapeAttr(p.steps.map(function(s, i){ return (i + 1) + ' ' + s.label + (s.skip ? ' (not needed)' : (s.done ? ' ✔' : '')); }).join(' · ')) + '">' + p.steps.map(function(s, i){
+    var cls = s.done ? (s.skip ? 'skip' : 'd') : (i === p.cur ? (p.level === 'bad' ? 'stuck' : 'now') : '');
+    return '<i class="trk-dot ' + cls + '"></i>'; }).join('') + '</div>'; }
+function _trkPill(p){ return '<span class="trk-pill ' + p.level + '">' + p.days + (p.days === 1 ? ' day' : ' days') + '</span>'; }
+var TRK_CSS = '<style id="trkCss">.trk-dots{display:flex;gap:4px;align-items:center}.trk-dot{width:14px;height:14px;border-radius:50%;background:#cbd5e1;flex:0 0 14px}.trk-dot.d{background:#16a34a}.trk-dot.skip{background:#bbf7d0}.trk-dot.now{background:#d97706;box-shadow:0 0 0 3px #fef3c7}.trk-dot.stuck{background:#dc2626;box-shadow:0 0 0 3px #fee2e2}'
+  + '.trk-pill{font-size:.76rem;font-weight:800;border-radius:6px;padding:2px 8px;white-space:nowrap;font-variant-numeric:tabular-nums}.trk-pill.ok{background:#dcfce7;color:#166534}.trk-pill.warn{background:#fef3c7;color:#92400e}.trk-pill.bad{background:#fee2e2;color:#991b1b}'
+  + '.trk-chip{font-size:.84rem;font-weight:700;border:1px solid #cbd5e1;border-radius:999px;padding:6px 12px;background:#fff;color:#334155;cursor:pointer}.trk-chip.on{background:#003594;border-color:#003594;color:#fff}'
+  + '.trk-row{display:grid;grid-template-columns:minmax(150px,1.3fr) minmax(130px,1fr) auto minmax(190px,1.6fr) auto;gap:12px;align-items:center;padding:10px 12px;border-top:1px solid #eef2f7;cursor:pointer}.trk-row:hover{background:#f8fafc}'
+  + '.trk-who{font-size:.68rem;font-weight:900;letter-spacing:.06em;text-transform:uppercase;border-radius:5px;padding:1px 6px;margin-right:4px}.trk-who.office{background:#dbeafe;color:#1e40af}.trk-who.agent{background:#dcfce7;color:#166534}.trk-who.manager{background:#fef3c7;color:#92400e}'
+  + '@media(max-width:760px){.trk-head{display:none!important}.trk-row{grid-template-columns:1fr auto;gap:6px}.trk-row .trk-mk{display:none}.trk-row .trk-dots{grid-column:1/-1}.trk-row .trk-wait{grid-column:1/2}}</style>';
+function panelOnbTracker(){
+  var u = DB.current, scope = _trkScopeFor(u);
+  if(!_trkIsOffice(u) && !_trkIsMgr(u)) return '<div style="padding:40px;text-align:center;color:#888">This page is for the office and managers.</div>';
+  setTimeout(trkRender, 0);
+  try{ if(typeof wmamLoadAgreements === 'function') wmamLoadAgreements().then(function(){ if(document.getElementById('trkList')) trkRender(); }); }catch(e){}
+  return TRK_CSS + panelHeader('🧭 New Agent Tracker') + '<div style="max-width:1150px;margin:0 auto;padding:0 6px">'
+    + '<div style="font-size:.88rem;color:#475569;margin-bottom:10px">' + (scope ? 'Your new agents' : 'Every new agent') + ' and the step they’re on. <span class="trk-pill warn">' + TRK.warn + '–' + (TRK.bad - 1) + ' days</span> waiting · <span class="trk-pill bad">' + TRK.bad + '+ days</span> stuck. They leave this list after their first sale.</div>'
+    + '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px" id="trkChips"></div>'
+    + '<input id="trkQ" placeholder="Search name or market…" value="' + _escapeAttr(TRK.q) + '" oninput="TRK.q=this.value;trkRender()" style="width:100%;max-width:360px;padding:9px 11px;border:1px solid #cbd5e1;border-radius:8px;font-size:15px;margin-bottom:10px">'
+    + '<div id="trkList" style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden"><div style="padding:30px;text-align:center;color:#888">Loading…</div></div>'
+    + '<div style="font-size:.8rem;color:#64748b;margin-top:8px">Steps: 1 Added · 2 Background forms · 3 Background check · 4 Contracts · 5 Coded · 6 Pay Link agreement · 7 Phones · 8 First sale. A light-green dot means the step isn’t needed for their campaigns.</div></div>';
+}
+function trkRender(){
+  var el = document.getElementById('trkList'); if(!el) return; var esc = _escapeHtml, u = DB.current;
+  var all = wmamTrackedAgents(_trkScopeFor(u));
+  var cnt = function(f){ return all.filter(f).length; };
+  var chips = [['all', 'All', all.length], ['office', 'Waiting on office', cnt(function(p){ return p.who === 'office'; })], ['agent', 'Waiting on agent', cnt(function(p){ return p.who === 'agent'; })], ['manager', 'Waiting on manager', cnt(function(p){ return p.who === 'manager'; })], ['stuck', 'Stuck ' + TRK.bad + '+ days', cnt(function(p){ return p.level === 'bad'; })]];
+  var ce = document.getElementById('trkChips'); if(ce) ce.innerHTML = chips.map(function(c){ return '<button class="trk-chip' + (TRK.filter === c[0] ? ' on' : '') + '" onclick="TRK.filter=\'' + c[0] + '\';trkRender()">' + c[1] + ' (' + c[2] + ')</button>'; }).join('');
+  var q = TRK.q.trim().toLowerCase();
+  var list = all.filter(function(p){ if(TRK.filter === 'stuck' && p.level !== 'bad') return false; if(/^(office|agent|manager)$/.test(TRK.filter) && p.who !== TRK.filter) return false;
+    if(q && ((p.agent.name || '') + ' ' + (p.market || '') + ' ' + (p.mgr ? p.mgr.name : '')).toLowerCase().indexOf(q) < 0) return false; return true; });
+  var office = _trkIsOffice(u);
+  el.innerHTML = list.length ? '<div class="trk-row trk-head" style="cursor:default;background:#f8fafc;font-size:.72rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase;color:#64748b"><div>Agent</div><div class="trk-mk">Market · manager</div><div>Steps 1–8</div><div class="trk-wait">Waiting on</div><div>Days</div></div>' + list.map(function(p){
+      return '<div class="trk-row" onclick="' + (office ? 'ahubOpen(' + p.agent.id + ')' : 'trkMgrOpen(' + p.agent.id + ')') + '"><div style="min-width:0"><b>' + esc(p.agent.name) + '</b><div style="font-size:.78rem;color:#64748b">' + esc(p.camps.join(', ') || 'no campaign yet') + '</div></div>'
+        + '<div class="trk-mk" style="font-size:.86rem;min-width:0">' + esc(p.market || 'No market') + (p.mgr ? ' · ' + esc(p.mgr.name) : '') + '</div>'
+        + _trkDots(p)
+        + '<div class="trk-wait" style="min-width:0"><div style="font-weight:800;font-size:.88rem"><span class="trk-who ' + p.who + '">' + p.who + '</span>' + esc(p.wait.replace(/^(Office|Agent|Manager):\s*/, '')) + '</div>' + (p.sub ? '<div style="font-size:.78rem;color:#64748b">' + esc(p.sub) + '</div>' : '') + '</div>'
+        + '<div>' + _trkPill(p) + '</div></div>'; }).join('')
+    : '<div style="padding:30px;text-align:center;color:#64748b">' + (all.length ? 'No one matches.' : 'No new agents in progress right now.') + '</div>';
+}
+function trkMgrOpen(id){ var p = wmamOnbProgress(_agstFind(id)); if(!p) return; var esc = _escapeHtml;
+  var ov = document.createElement('div'); ov.id = 'trkOv'; ov.style.cssText = 'position:fixed;inset:0;z-index:100700;background:rgba(0,0,0,.55);overflow-y:auto;padding:16px'; ov.onclick = function(e){ if(e.target === ov) ov.remove(); };
+  ov.innerHTML = '<div style="max-width:520px;margin:30px auto;background:#fff;border-radius:14px;padding:16px;font-family:Arial,sans-serif">' + _trkChecklistHtml(p, true) + '<div style="text-align:right;margin-top:10px"><button onclick="document.getElementById(\'trkOv\').remove()" style="padding:9px 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;font-weight:800;cursor:pointer">Close</button></div></div>';
+  document.body.appendChild(ov); }
+
+// ── C · checklists and dashboard cards ──
+var TRK_AGENT_TEXT = {
+  added:'Your login is ready', bgforms:'Sign your 2 background forms (My Documents)', bgpass:'Background check: the office is running it', contracts:'Sign your contracts (My Documents)',
+  coded:'Get your agent code (the office enters it)', agree:'Sign the Gen Mobile Pay Link agreement', phones:'Receive your phones (your manager sends them, you e-sign)', sale:'Make your first sale' };
+function _trkChecklistHtml(p, forManager){
+  var esc = _escapeHtml, doneN = p.steps.filter(function(s){ return s.done; }).length;
+  var help = { bgforms:'Open My Documents and sign both forms.', bgpass:'Nothing for you to do. Usually 1–3 days.', contracts:'Open My Documents and sign each contract.', coded:'Nothing for you to do — the office gets it from the carrier.', agree:'It opens when you log in. Sign with your finger.', phones:'Your manager sends them in Transfers; you sign for them in Sign & Invoices.', sale:'Your sales show up after the next sales report.' };
+  var btn = { bgforms:"gotoPanel('my-documents')", contracts:"gotoPanel('my-documents')", phones:"gotoPanel('inv-sign')" };
+  return '<div style="display:grid;gap:8px"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline"><div style="font-weight:900;color:#003594;letter-spacing:.06em;text-transform:uppercase;font-size:.9rem">' + (forManager ? esc(p.agent.name) + ' · ' : '') + 'Getting started · ' + doneN + ' of 8 done</div>' + (p.cur >= 0 ? _trkPill(p) : '') + '</div>'
+    + '<div style="height:7px;border-radius:99px;background:#e5e7eb;overflow:hidden"><i style="display:block;height:100%;width:' + Math.round(doneN / 8 * 100) + '%;background:#16a34a"></i></div>'
+    + p.steps.map(function(s, i){ var now = i === p.cur;
+        var box = s.done ? '<span style="width:20px;height:20px;border-radius:6px;background:' + (s.skip ? '#bbf7d0' : '#16a34a') + ';color:#fff;display:grid;place-items:center;font-size:.75rem;font-weight:900;flex:0 0 20px">✓</span>' : '<span style="width:20px;height:20px;border-radius:6px;border:2px solid ' + (now ? '#d97706' : '#cbd5e1') + ';flex:0 0 20px"></span>';
+        var t = forManager ? (s.label + (s.skip ? ' (not needed)' : '')) : (TRK_AGENT_TEXT[s.key] + (s.skip ? ' — not needed' : ''));
+        return '<div style="display:flex;gap:9px;align-items:flex-start;' + (s.done && !now ? 'color:#64748b' : '') + '">' + box + '<div style="min-width:0"><div style="' + (now ? 'font-weight:800;color:#0f172a' : '') + '">' + esc(t) + '</div>'
+          + (now ? '<div style="font-size:.82rem;color:#475569">' + esc(forManager ? p.wait + (p.sub ? ' · ' + p.sub : '') : (help[s.key] || '')) + '</div>' + (!forManager && btn[s.key] ? '<button onclick="' + btn[s.key] + '" style="margin-top:5px;padding:7px 12px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Do it now →</button>' : '') : '') + '</div></div>'; }).join('')
+    + '</div>';
+}
+function wmamTrkAgentCard(u){ if(!u || !TRK_SALES_ROLES.test(u.role || '')) return ''; var l = wmamTrackedAgents([u]); if(!l.length) return '';
+  return TRK_CSS + '<div class="bo-card" id="trkAgentCard" style="margin-bottom:16px"><div style="padding:14px 16px">' + _trkChecklistHtml(l[0], false) + '</div></div>'; }
+function wmamTrkMgrCard(u){ if(!_trkIsMgr(u)) return ''; var l = wmamTrackedAgents(_trkScopeFor(u)); if(!l.length) return ''; var esc = _escapeHtml;
+  return TRK_CSS + '<div class="bo-card" id="trkMgrCard" style="margin-bottom:16px"><div style="padding:14px 16px;display:grid;gap:8px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;flex-wrap:wrap"><div style="font-weight:900;color:#003594;letter-spacing:.06em;text-transform:uppercase;font-size:.9rem">My new hires (' + l.length + ')</div><button onclick="gotoPanel(\'onb-tracker\')" style="border:none;background:none;color:#003594;font-weight:800;cursor:pointer">See all →</button></div>'
+    + l.slice(0, 5).map(function(p){ var doneN = p.steps.filter(function(s){ return s.done; }).length;
+        return '<div onclick="trkMgrOpen(' + p.agent.id + ')" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;border-top:1px solid #eef2f7;padding-top:8px;cursor:pointer"><div style="min-width:0"><b>' + esc(p.agent.name) + '</b><div style="font-size:.8rem;color:#475569">Step ' + (p.cur + 1) + ' of 8 · ' + esc(p.wait) + '</div><div style="height:6px;border-radius:99px;background:#e5e7eb;overflow:hidden;margin-top:4px"><i style="display:block;height:100%;width:' + Math.round(doneN / 8 * 100) + '%;background:#16a34a"></i></div></div>' + _trkPill(p) + '</div>'; }).join('')
+    + '</div></div>'; }
+function wmamTrkOfficeLine(u){ if(!_trkIsOffice(u)) return ''; var l = wmamTrackedAgents(null); if(!l.length) return ''; var bad = l.filter(function(p){ return p.level === 'bad'; }), mine = l.filter(function(p){ return p.who === 'office'; });
+  return '<div onclick="gotoPanel(\'onb-tracker\')" style="cursor:pointer;display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:' + (bad.length ? '#fef2f2' : '#f0fdf4') + ';border:1px solid ' + (bad.length ? '#fecaca' : '#bbf7d0') + ';border-radius:12px;padding:10px 14px;margin:0 0 14px;font-size:.92rem"><b style="color:#003594">🧭 New agents: ' + l.length + ' in progress</b>'
+    + (bad.length ? '<span class="trk-pill bad" style="font-size:.8rem;font-weight:800;border-radius:6px;padding:2px 8px;background:#fee2e2;color:#991b1b">' + bad.length + ' stuck ' + TRK.bad + '+ days</span>' : '') + (mine.length ? '<span style="font-size:.84rem;color:#1e40af;font-weight:700">' + mine.length + ' waiting on the office</span>' : '') + '<span style="margin-left:auto;color:#003594;font-weight:800">Open tracker →</span></div>'; }
+
+// menu + routing + dashboards
+try{ (WMAM_NAV || []).forEach(function(sec){ (sec.cards || []).forEach(function(card){ if(card.title === 'Hiring & Onboarding' && Array.isArray(card.tabs) && !card.tabs.some(function(t){ return t[0] === 'onb-tracker'; })) card.tabs.unshift(['onb-tracker', 'New Agent Tracker']); }); }); }catch(e){}
+if(typeof _wmamIdAllowed === 'function'){ var _trkIdAllowed = _wmamIdAllowed; _wmamIdAllowed = function(id){ if(id === 'onb-tracker') return _trkIsOffice(DB.current) || _trkIsMgr(DB.current); return _trkIdAllowed.apply(this, arguments); }; }
+if(typeof _wmamTabAllowed === 'function'){ var _trkTabAllowed = _wmamTabAllowed; _wmamTabAllowed = function(u, id){ if(id === 'onb-tracker') return _trkIsOffice(u) || _trkIsMgr(u); return _trkTabAllowed.apply(this, arguments); }; }
+if(typeof canAccess === 'function'){ var _trkCanAccess = canAccess; canAccess = function(u, area){ if(area === 'onb-tracker') return _trkIsOffice(u) || _trkIsMgr(u); return _trkCanAccess.apply(this, arguments); }; }
+function _trkInsertTop(h, card){ if(!card || typeof h !== 'string') return h; var i = h.indexOf('<div class="bo-card"'); return i >= 0 ? h.slice(0, i) + card + h.slice(i) : h + card; }
+if(typeof panelBO === 'function'){
+  var _trkPanelBO = panelBO;
+  panelBO = function(){ var pid = window._currentPanelId, u = DB.current;
+    if(pid === 'onb-tracker') return panelOnbTracker();
+    var h = _trkPanelBO.apply(this, arguments);
+    try{ if(pid === 'bo' || !pid){ h = _trkInsertTop(h, wmamTrkAgentCard(u) + wmamTrkMgrCard(u) + wmamTrkOfficeLine(u)); } }catch(e){ console.warn('[tracker card]', e); }
+    return h; };
+}
+if(typeof panelOwner === 'function'){
+  var _trkPanelOwner = panelOwner;
+  panelOwner = function(){ var h = _trkPanelOwner.apply(this, arguments); try{ var line = wmamTrkOfficeLine(DB.current); if(line && typeof h === 'string') h = TRK_CSS + '<div style="max-width:1150px;margin:0 auto">' + line + '</div>' + h; }catch(e){} return h; };
+}
+
+// office email once a day (first office login after 8 AM Central)
+async function trkDailyDigest(){
+  try{
+    var u = DB.current; if(!_trkIsOffice(u)) return;
+    var now = new Date(), ct = new Date(now.toLocaleString('en-US', { timeZone:'America/Chicago' })); if(ct.getHours() < 8) return;
+    var today = _catToday(), key = 'onb_digest_sent';
+    var r = await supaClient.from('app_settings').select('value').eq('key', key).maybeSingle(); if(r && r.data && r.data.value === today) return;
+    await supaClient.from('app_settings').upsert({ key:key, value:today, updated_at:new Date().toISOString() }, { onConflict:'key' });
+    var l = wmamTrackedAgents(null), stuck = l.filter(function(p){ return p.level === 'bad'; }); if(!stuck.length) return;
+    var esc = _escapeHtml, line = function(p){ return '<li><b>' + esc(p.agent.name) + '</b> (' + esc(p.market || 'no market') + ') — ' + esc(p.wait) + ', ' + p.days + ' days</li>'; };
+    var html = '<div style="font-family:Arial,sans-serif;max-width:620px"><h2 style="color:#003594;margin:0 0 8px">New agents stuck ' + TRK.bad + '+ days: ' + stuck.length + '</h2>'
+      + ['office', 'agent', 'manager'].map(function(w){ var g = stuck.filter(function(p){ return p.who === w; }); return g.length ? '<p style="margin:10px 0 4px;font-weight:700">Waiting on ' + (w === 'office' ? 'the office' : (w === 'agent' ? 'the agent' : 'the manager')) + ' (' + g.length + ')</p><ul style="margin:0;padding-left:18px">' + g.map(line).join('') + '</ul>' : ''; }).join('')
+      + '<p style="margin-top:14px"><a href="https://wmaminc.com/#onb-tracker">Open the New Agent Tracker</a> — ' + l.length + ' new agents in progress in total.</p></div>';
+    var to = (DB.agents || []).filter(function(a){ return a && a.active !== false && a.email && (isOwner(a) || _trkIsOffice(a)) && !TRK_SALES_ROLES.test(a.role || ''); }).map(function(a){ return { email:a.email, name:a.name }; });
+    if(to.length && typeof brevoSend === 'function') brevoSend({ to:to, subject:'New agents stuck: ' + stuck.length + ' (' + _catNice(today) + ')', htmlContent:html });
+    try{ pushNotification({ toIds:(DB.agents || []).filter(function(a){ return a && a.active !== false && (isOwner(a) || _trkIsOffice(a)) && !TRK_SALES_ROLES.test(a.role || ''); }).map(function(a){ return a.id; }), icon:'🧭', title:stuck.length + ' new agent' + (stuck.length === 1 ? '' : 's') + ' stuck ' + TRK.bad + '+ days', body:stuck.slice(0, 4).map(function(p){ return p.agent.name + ': ' + p.wait; }).join(' · '), panel:'onb-tracker', priority:'normal', skipEmail:true }); }catch(e){}
+  }catch(e){ console.warn('[tracker digest]', e); }
+}
+setTimeout(trkDailyDigest, 20000);
+Object.assign(window, { TRK:TRK, wmamOnbProgress:wmamOnbProgress, wmamTrackedAgents:wmamTrackedAgents, panelOnbTracker:panelOnbTracker, trkRender:trkRender, trkMgrOpen:trkMgrOpen, trkDailyDigest:trkDailyDigest, wmamTrkAgentCard:wmamTrkAgentCard, wmamTrkMgrCard:wmamTrkMgrCard });
 
 // ══════════════════════════════════════════════════════════════════════
 //  LIVE VOICE — Calvin 2026-10-11: talk naturally, interrupt, hear a human
