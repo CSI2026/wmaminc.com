@@ -3833,7 +3833,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.16.1400';
+var BUILD_VERSION = '2026.10.16.1530';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -14599,7 +14599,7 @@ function gmAgentPLHtml(rows){
   var h = '<div style="font-weight:900;font-size:1.1rem;color:#0b1b3f;margin:4px 0 8px">My Pay Link</div>'
     + '<div style="display:flex;gap:6px;align-items:center;margin-bottom:10px"><input id="gmPlQ" type="search" value="'+esc(_q)+'" oninput="gmPlSearch(this.value)" placeholder="\uD83D\uDD0D '+(_office ? 'Find any order \u2014 agent name, IMEI, phone, customer, order #' : 'Find an order \u2014 IMEI, phone, customer, order #')+'" style="flex:1;padding:10px 12px;border:2px solid #cbd5e1;border-radius:10px;font-size:.92rem">'+(_q ? '<button onclick="gmPlSearch(\'\')" style="border:none;background:none;color:#003594;font-weight:800;cursor:pointer">Clear</button>' : '')+'</div>';
   if(_q.trim()){ return h + gmPlResultsHtml(_q, _office); }
-
+  h = h
     + '<div style="display:flex;gap:4px;background:#e5e7eb;border-radius:12px;padding:4px;margin-bottom:12px">'+tabBtn('week','This Week')+tabBtn('disp','Disputes'+(disputes.length ? ' <span style="background:#fee2e2;color:#991b1b;border-radius:99px;padding:1px 7px;font-size:.72rem">'+disputes.length+'</span>' : ''))+tabBtn('past','Past Weeks')+'</div>';
   if(tab === 'week'){
     var mine = rows.filter(function(s){ return !_gmDisp(s) && (inWeek(s, wk) || (s.status === 'link_created' && _gmPayWeekStart(String(s.created_at||'').slice(0,10)) === wk)); });
@@ -25091,6 +25091,327 @@ if(typeof window !== 'undefined'){
     pmEndCampaign:pmEndCampaign, pmRestartCampaign:pmRestartCampaign, pmEndProgram:pmEndProgram, pmRestartProgram:pmRestartProgram,
     AGST:AGST, agstLoad:agstLoad, agstSave:agstSave, agstOpen:agstOpen, agstApply:agstApply, agstToggleProgram:agstToggleProgram, wmamAgentStatus:wmamAgentStatus, wmamTermStage:wmamTermStage, wmamAgentHold:wmamAgentHold, wmamAgentHidden:wmamAgentHidden,
     wmamAgentCampOff:wmamAgentCampOff, wmamAgentProgOff:wmamAgentProgOff, wmamSuspendAgent:wmamSuspendAgent, wmamTerminateAgent:wmamTerminateAgent, wmamReactivateAgent:wmamReactivateAgent, wmamSaleBlock:wmamSaleBlock, AGST_NOT_CREDITED:AGST_NOT_CREDITED });
+}
+// ══════════════════════════════════════════════════════════════════════
+//  AGENT ONBOARDING — ONE CLEAN PATH (Calvin 2026-10-16)
+//  Main way in: People → Agents → "+ Add Agent" (login right away). "Invite by email" still works.
+//  Fixes:
+//   • New Hires (Agents Pending) is in the menu and no longer throws you back to Agents every 20 seconds.
+//   • Applications page lists every application from the public site, with "Add as agent" / "Not hired".
+//   • Agent Cleanup "clear pending" never deletes signed contracts again.
+//   • Assurance is ONE campaign: codes are saved as "Assurance" (what payroll reads), one background check,
+//     one contract packet; payroll also matches a code saved under any spelling.
+//   • Background-check queue only queues the campaigns the agent is on that need a check.
+//   • Every place a code is entered sends the "You're coded" notice + email to the agent and their managers,
+//     and closes the "enter code" task.
+//   • Contracts go only for the agent's own campaigns (Tribal contract when placed in Oklahoma), never for
+//     ended campaigns, and the screen doesn't jump to an old page afterwards.
+//   • A background-check pass no longer overwrites the password the office typed in "+ Add Agent".
+//   • Approved applicants keep their campaigns and are placed in their manager's market.
+//   • Approval waits while a personal-info field is sent back to the applicant to fix.
+//   • Pickup form lists every campaign with inventory; transfer notices open the right page.
+// ══════════════════════════════════════════════════════════════════════
+function _onbCampName(c){ try{ var r = wmamCampRec(c); return r ? r.name : String(c || '').trim(); }catch(e){ return String(c || '').trim(); } }
+function _onbIsOffice(u){ u = u || DB.current; try{ return !!u && (isOwner(u) || u.fullOfficeAccess === true || (typeof canEditAgentProfiles === 'function' && canEditAgentProfiles(u)) || (typeof isOfficeRole === 'function' && isOfficeRole(u))); }catch(e){ return false; } }
+function _onbDedupe(list){ var seen = {}, out = []; (list || []).forEach(function(c){ var n = _onbCampName(c), k = _catCanon(n); if(!n || seen[k]) return; seen[k] = 1; out.push(n); }); return out; }
+
+// ── 1. menu: New Hires next to Applications ──
+try{ (WMAM_NAV || []).forEach(function(sec){ (sec.cards || []).forEach(function(card){ if(card.title === 'Hiring & Onboarding' && Array.isArray(card.tabs) && !card.tabs.some(function(t){ return t[0] === 'agents-pending'; })) card.tabs.unshift(['agents-pending', 'New Hires']); }); }); }catch(e){}
+if(typeof _wmamIdAllowed === 'function'){
+  var _onbIdAllowed = _wmamIdAllowed;
+  _wmamIdAllowed = function(id){ if(id === 'agents-pending' || id === 'applications') return !!DB.current && (canAccess(DB.current, id) || _onbIsOffice(DB.current)); return _onbIdAllowed.apply(this, arguments); };
+}
+
+// ── 2. Applications from the public site ──
+var ONB_APPS = { rows:[], loaded:false, handled:{}, show:'open' };
+async function onbAppsLoad(){
+  try{ var r = await supaClient.from('applicants').select('*').order('submitted_at', { ascending:false }).limit(300); ONB_APPS.rows = (r && !r.error && Array.isArray(r.data)) ? r.data : []; }catch(e){ ONB_APPS.rows = []; }
+  try{ var h = await supaClient.from('app_settings').select('value').eq('key', 'applications_handled').maybeSingle(); ONB_APPS.handled = (h && h.data && h.data.value) ? (JSON.parse(h.data.value) || {}) : {}; }catch(e){}
+  ONB_APPS.loaded = true; return ONB_APPS.rows;
+}
+async function onbAppsSaveHandled(){ try{ await supaClient.from('app_settings').upsert({ key:'applications_handled', value:JSON.stringify(ONB_APPS.handled), updated_at:new Date().toISOString() }, { onConflict:'key' }); }catch(e){} }
+function _onbAppKey(r){ return String(r.id || r.email || r.phone || r.submitted_at || ''); }
+function _onbAppName(r){ var raw = r.raw || {}; return r.legal_name || raw.legalName || ((raw.fn || r.first_name || '') + ' ' + (raw.ln || r.last_name || '')).trim() || r.name || r.email || 'Applicant'; }
+function onbAppsRender(){
+  var box = document.getElementById('onbAppsBox'); if(!box) return; var esc = _escapeHtml;
+  var rows = ONB_APPS.rows.filter(function(r){ var h = ONB_APPS.handled[_onbAppKey(r)]; return ONB_APPS.show === 'all' ? true : (ONB_APPS.show === 'open' ? !h : !!h); });
+  var nOpen = ONB_APPS.rows.filter(function(r){ return !ONB_APPS.handled[_onbAppKey(r)]; }).length;
+  var tab = function(k, l){ var on = ONB_APPS.show === k; return '<button onclick="ONB_APPS.show=\'' + k + '\';onbAppsRender()" style="padding:8px 14px;border-radius:999px;border:1px solid #003594;background:' + (on ? '#003594' : '#fff') + ';color:' + (on ? '#fff' : '#003594') + ';font-weight:700;cursor:pointer">' + l + '</button>'; };
+  box.innerHTML = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">' + tab('open', 'New (' + nOpen + ')') + tab('done', 'Handled') + tab('all', 'All') + '<button onclick="onbAppsLoad().then(onbAppsRender)" style="margin-left:auto;padding:8px 14px;border-radius:8px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;font-weight:700">↻ Refresh</button></div>'
+    + (rows.length ? rows.map(function(r){ var raw = r.raw || {}, a = raw.answers || {}, h = ONB_APPS.handled[_onbAppKey(r)], k = _escapeAttr(_onbAppKey(r));
+        var act = (raw.priorCompanies || []).filter(function(x){ return x && x.stillActive; });
+        return '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:8px">'
+          + '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:flex-start"><div style="min-width:0"><div style="font-weight:900;color:#0b1b3f;font-size:1.02rem">' + esc(_onbAppName(r)) + '</div>'
+          + '<div style="font-size:.84rem;color:#4b5563">' + esc([r.position, r.market_name, r.selected_tl_name ? 'manager: ' + r.selected_tl_name : ''].filter(Boolean).join(' · ')) + '</div>'
+          + '<div style="font-size:.84rem;color:#4b5563">' + esc([r.phone, r.email].filter(Boolean).join(' · ')) + '</div>'
+          + '<div style="font-size:.8rem;color:#6b7280">Applied ' + (r.submitted_at ? new Date(r.submitted_at).toLocaleString() : '') + ((r.programs || raw.programs || []).length ? ' · ' + esc((r.programs || raw.programs).join(', ')) : '') + ((raw.campaigns || []).length ? ' · ' + esc(raw.campaigns.join(', ')) : '') + '</div>'
+          + (act.length ? '<div style="font-size:.82rem;color:#b91c1c;font-weight:800;margin-top:3px">🚩 Still active with ' + esc(act.map(function(x){ return x.company; }).join(', ')) + '</div>' : '')
+          + (a.bg ? '<div style="font-size:.8rem;color:#374151">Can pass background check: ' + esc(a.bg) + '</div>' : '') + '</div>'
+          + '<div style="display:flex;gap:6px;flex-wrap:wrap">' + (h ? '<span style="font-size:.8rem;font-weight:800;color:' + (h.status === 'hired' ? '#166534' : '#6b7280') + '">' + (h.status === 'hired' ? '✔ Added as agent' : 'Not hired') + ' · ' + esc(h.by || '') + '</span>' :
+              '<button onclick="onbAppConvert(\'' + k + '\')" style="padding:8px 12px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">+ Add as agent</button><button onclick="onbAppMark(\'' + k + '\',\'declined\')" style="padding:8px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#6b7280;font-weight:800;cursor:pointer">Not hired</button>')
+          + '</div></div></div>'; }).join('') : '<div style="padding:30px;text-align:center;color:#888;background:#fff;border-radius:12px">' + (ONB_APPS.show === 'open' ? 'No new applications.' : 'Nothing here.') + '</div>');
+}
+function onbAppMark(key, status){ ONB_APPS.handled[key] = { status:status, by:(DB.current && DB.current.name) || '', at:new Date().toISOString() }; onbAppsSaveHandled(); onbAppsRender(); }
+function onbAppConvert(key){
+  var r = ONB_APPS.rows.find(function(x){ return _onbAppKey(x) === key; }); if(!r) return; var raw = r.raw || {};
+  var nm = _onbAppName(r).split(' '), mk = (MARKETS || []).find(function(m){ return m && r.market_name && _wmamMktKey(m.name) === _wmamMktKey(r.market_name); });
+  var n = { id:'app-' + Date.now(), data:{ kind:'application', fn:nm[0] || '', ln:nm.slice(1).join(' '), email:r.email || '', phone:r.phone || '', position:r.position || '', marketName:r.market_name || '', marketId:mk ? mk.id : (raw.marketId || null), tlId:raw.tlId || r.selected_tl_id || null } };
+  if(typeof WMAM_NOTIFICATIONS !== 'undefined' && Array.isArray(WMAM_NOTIFICATIONS)) WMAM_NOTIFICATIONS.push(n);
+  window._onbConvertingApp = { key:key, campaigns:raw.campaigns || [], programs:r.programs || raw.programs || [] };
+  convertApplicationToAgent(n.id);
+  // tick the programs / campaigns the applicant asked for on the Add Agent form
+  var tick = function(){ try{ var c = window._onbConvertingApp; if(!c) return; var want = (c.programs || []).concat(c.campaigns || []).map(function(x){ return _catCanon(x); });
+    [].slice.call(document.querySelectorAll('input[type=checkbox]')).forEach(function(cb){ var v = _catCanon(cb.value || ''); if(v && want.indexOf(v) >= 0 && !cb.checked && cb.offsetParent){ cb.click(); } }); }catch(e){} };
+  [700, 1400, 2200, 3200].forEach(function(ms){ setTimeout(tick, ms); });
+}
+if(typeof apSavePerson === 'function'){
+  var _onbApSave = apSavePerson;
+  apSavePerson = async function(){ var before = (DB.agents || []).length, r; window._onbCreating = true; try{ r = await _onbApSave.apply(this, arguments); } finally { window._onbCreating = false; }
+    try{ var c = window._onbConvertingApp; if(c && (DB.agents || []).length > before){ onbAppMark(c.key, 'hired'); window._onbConvertingApp = null; } }catch(e){}
+    return r; };
+}
+panelApplications = function(){
+  setTimeout(function(){ (ONB_APPS.loaded ? Promise.resolve() : onbAppsLoad()).then(onbAppsRender); }, 0);
+  return panelHeader('📝 Applications') + '<div style="max-width:1000px;margin:0 auto;padding:0 6px"><div style="font-size:.86rem;color:#4b5563;margin:0 0 10px">Every application sent from the website. <b>+ Add as agent</b> opens the Add Agent form filled in with their details. Invited people waiting on their background forms are under <a href="#" onclick="gotoPanel(\'agents-pending\');return false">New Hires</a>.</div><div id="onbAppsBox"><div style="padding:30px;text-align:center;color:#888">Loading…</div></div></div>';
+};
+
+// ── 3. Agent Cleanup: signed contracts are a list of signed records — never deleted ──
+_aclPending = function(agentId){
+  var docs = 0, packs = 0, keptPartial = 0;
+  var ad = (typeof ASSIGNED_DOC_STATUS !== 'undefined' && ASSIGNED_DOC_STATUS[agentId]) || {};
+  Object.keys(ad).forEach(function(k){ if(ad[k] && !ad[k].signed) docs++; });
+  var st = (typeof AGENT_ONBOARDING_STATUS !== 'undefined' && AGENT_ONBOARDING_STATUS[agentId]) || {};
+  Object.keys(st).forEach(function(c){ var p = st[c]; if(!p || p.allComplete) return;
+    var any = p.steps && Object.keys(p.steps).some(function(s){ var x = p.steps[s]; return x && (x.signed || x.submitted); });
+    if(any) keptPartial++; else packs++; });
+  return { docs:docs, packs:packs, partial:keptPartial, total:docs + packs };
+};
+aclClearPending = function(){
+  var list = _aclSelected(); if(!list.length) return;
+  var tot = 0; list.forEach(function(a){ tot += _aclPending(a.id).total; });
+  if(!confirm('Clear ' + tot + ' pending (unsigned) document(s) for ' + list.length + ' agent(s)?\n\nSigned documents are NOT touched. Partly signed packets are kept.')) return;
+  var cleared = 0;
+  list.forEach(function(a){
+    var ad = ASSIGNED_DOC_STATUS[a.id]; if(ad) Object.keys(ad).forEach(function(k){ if(ad[k] && !ad[k].signed){ delete ad[k]; cleared++; } });
+    var st = AGENT_ONBOARDING_STATUS[a.id]; if(st) Object.keys(st).forEach(function(c){ var p = st[c]; if(!p || p.allComplete) return;
+      var any = p.steps && Object.keys(p.steps).some(function(s){ var x = p.steps[s]; return x && (x.signed || x.submitted); });
+      if(!any){ delete st[c]; cleared++; } });
+    try{ saveAssignedDocs(a.id); }catch(e){}
+  });
+  try{ saveAgentContracts(); }catch(e){} try{ saveToStorage(); }catch(e){}
+  try{ showToast('Cleared ' + cleared + ' unsigned document' + (cleared === 1 ? '' : 's') + ' — signed contracts kept'); }catch(e){}
+  try{ gotoPanel('agent-cleanup'); }catch(e){}
+};
+window._aclPending = _aclPending; window.aclClearPending = aclClearPending;
+
+// ── 4. Assurance is one campaign ──
+if(typeof ahubSaveCode === 'function'){
+  var _onbAhubSaveCode = ahubSaveCode;
+  ahubSaveCode = function(id, c){
+    var r = _onbAhubSaveCode.apply(this, arguments);
+    try{ var a = _agstFind(id), name = _onbCampName(c); if(a && name && name !== c){ var codes = Object.assign({}, _wmamCodes(a)), v = codes[c];
+      if(v){ Object.keys(codes).forEach(function(k){ if(_catCanon(k) === _catCanon(name)) delete codes[k]; }); codes[name] = v; a.agentCodes = codes; _ahubSave(a); } } }catch(e){}
+    return r; };
+}
+if(typeof ppMatchRowsToAgents === 'function'){
+  var _onbMatch = ppMatchRowsToAgents;
+  ppMatchRowsToAgents = function(parsed, carrier){
+    var res = _onbMatch.apply(this, arguments);
+    try{ if(res && Array.isArray(res.unmatched) && res.unmatched.length){ var still = [];
+      res.unmatched.forEach(function(row){ var code = String((row && (row.agentCode || row.code)) || '').trim().toLowerCase();
+        var a = code ? (DB.agents || []).find(function(x){ if(!x) return false; var v = wmamCodeFor(x, carrier); return v && String(v).trim().toLowerCase() === code; }) : null;
+        if(a) res.matched.push({ row:row, agent:a }); else still.push(row); });
+      res.unmatched = still; } }catch(e){}
+    return res; };
+}
+function _onbBgView(a){ if(!a || !a.bgChecks) return a; var o = Object.create(a), bg = {}; Object.keys(a.bgChecks).forEach(function(k){ bg[k] = a.bgChecks[k]; var n = _onbCampName(k); [n, _cc(n), _cc(k)].forEach(function(x){ if(x && !bg[x]) bg[x] = a.bgChecks[k]; }); }); o.bgChecks = bg; return o; }
+if(typeof wmamAgentCampStatus === 'function'){
+  var _onbCampStatus = wmamAgentCampStatus;
+  wmamAgentCampStatus = function(a, c){
+    // contracts signed under "Assurance" count for "Assurance Wireless" (same campaign)
+    var S = a && typeof AGENT_ONBOARDING_STATUS !== 'undefined' ? AGENT_ONBOARDING_STATUS[a.id] : null, added = [];
+    if(S) Object.keys(S).forEach(function(k){ [_cc(k), _onbCampName(k)].forEach(function(x){ if(x && !S[x]){ S[x] = S[k]; added.push(x); } }); });
+    try{ return _onbCampStatus.call(this, _onbBgView(a), c); } finally { added.forEach(function(x){ delete S[x]; }); } };
+}
+function _onbDedupeBoxes(root){
+  try{ var seen = {}; [].slice.call((root || document).querySelectorAll('input[type=checkbox]')).forEach(function(cb){ var v = cb.value; if(!v || !wmamCampRec(v)) return; var k = _catCanon(_onbCampName(v)) + '|' + (cb.name || '');
+    if(seen[k]){ var l = cb.closest('label'); if(l) l.remove(); else cb.remove(); } else { seen[k] = 1; cb.value = _onbCampName(v); var lab = cb.closest('label'); if(lab && /Assurance Wireless/.test(lab.textContent) && cb.value === 'Assurance'){} } }); }catch(e){}
+}
+['_openInviteApplicantModal', '_uiShowAddPendingAgentModal', '_invToggleCampaigns'].forEach(function(fn){
+  if(typeof window[fn] !== 'function') return; var orig = window[fn];
+  window[fn] = function(){ var r = orig.apply(this, arguments); setTimeout(function(){ _onbDedupeBoxes(document); }, 40); return r; };
+});
+if(typeof approveApplicant === 'function'){
+  var _onbApprove = approveApplicant;
+  approveApplicant = function(applicantId){
+    var app = (APPLICANTS_PRE_BG || []).find(function(a){ return a && a.id === applicantId; });
+    if(app){
+      if(Array.isArray(app.rejectedFields) && app.rejectedFields.length && !(app.forms && app.forms.pii && app.forms.pii.signed)){ alert('⏳ ' + app.name + ' still has to fix: ' + app.rejectedFields.join(', ') + '.\n\nApproval opens as soon as they resubmit.'); return null; }
+      app.campaigns = _onbDedupe(app.campaigns);
+      if(app.codes){ var cc = {}; Object.keys(app.codes).forEach(function(k){ if(app.codes[k]) cc[_onbCampName(k)] = app.codes[k]; }); app.codes = cc; }
+    }
+    window._onbCreating = true; try{ return _onbApprove.apply(this, arguments); } finally { window._onbCreating = false; }
+  };
+}
+// approved applicant: keep their campaigns + program and place them in their manager's market (before contracts go out)
+function _onbAfterApprove(a, app){
+  if(!a || !app) return;
+  a.campaigns = _onbDedupe((Array.isArray(a.campaigns) ? a.campaigns : []).concat(app.campaigns || []));
+  if(app.program){ a.programs = (Array.isArray(a.programs) ? a.programs : []).concat([app.program]).filter(function(x, i, l){ return x && l.indexOf(x) === i; }); a.program = a.program || app.program; }
+  if(!a.team){
+    var mgrId = app.teamLeaderId || app.marketManagerId || app.campaignManagerId || app.iboId, mgr = mgrId != null ? _agstFind(mgrId) : null, mname = '';
+    try{ mname = mgr ? (wmamAssignedMarketOf(mgr) || wmamMarketNameFor(mgr.team) || '') : ''; }catch(e){}
+    if(!mname && app.market){ var m0 = (MARKETS || []).find(function(m){ return m && (String(m.id) === String(app.market).replace(/^market-/, '') || _wmamMktKey(m.name) === _wmamMktKey(app.market)); }); if(m0) mname = m0.name; }
+    var mk = mname ? (MARKETS || []).find(function(m){ return m && m.active !== false && _wmamMktKey(m.name) === _wmamMktKey(mname); }) : null;
+    if(mk){ a.team = mk.name; try{ wmamApplyProfilePlacement(a.id, { market:'market-' + mk.id }); }catch(e){} }
+  }
+}
+window._onbAfterApprove = _onbAfterApprove;
+
+// ── 5. background-check queue: only the agent's own campaigns that need a check ──
+var _onbBgAgent = null;
+try{ Object.defineProperty(window, 'CAMPAIGNS_REGISTRY', { configurable:true, get:function(){
+  var live = _catC().filter(function(c){ return c && c.requiresBgCheck && !wmamCampEnded(c.name); });
+  var a = _onbBgAgent, mine = a ? (typeof wmamCampaignsOf === 'function' ? wmamCampaignsOf(a) : []).map(function(x){ return _catCanon(x); }) : [];
+  var pick = mine.length ? live.filter(function(c){ return mine.indexOf(_catCanon(c.name)) >= 0; }) : live;
+  if(!pick.length) pick = live;
+  return pick.map(function(c){ return { name:c.name, active:true, requiresBgCheck:true }; }); } }); }catch(e){}
+if(typeof onBgAuthSigned === 'function'){
+  var _onbBgSigned = onBgAuthSigned;
+  onBgAuthSigned = function(agentId){
+    var a = _agstFind(agentId); _onbBgAgent = a;
+    // the original narrows by the agent's code keys — give it the same spelling as the campaign list
+    var saved = a && a.agentCodes; if(a && saved){ var cc = {}; Object.keys(saved).forEach(function(k){ cc[_onbCampName(k)] = saved[k]; }); a.agentCodes = cc; }
+    try{ return _onbBgSigned.apply(this, arguments); } finally { _onbBgAgent = null; if(a && saved) a.agentCodes = saved; }
+  };
+}
+
+// ── 6. contracts: the agent's own campaigns only, Tribal in Oklahoma, no jump to an old page ──
+sendOnboardingPacketAllForAgent = function(agentId){
+  var u = DB.current;
+  if(typeof isOfficeRole === 'function' && !isOfficeRole(u) && !_onbIsOffice(u)){ alert('Office staff only.'); return; }
+  var agent = (DB.agents || []).find(function(a){ return a && a.id === agentId; }); if(!agent){ alert('Agent not found.'); return; }
+  var camps = _onbDedupe((typeof wmamCampaignsOf === 'function' ? wmamCampaignsOf(agent) : []).concat(Object.keys(_wmamCodes(agent)).filter(function(k){ return wmamCodeFor(agent, k); })));
+  if(!camps.length){ var progs = Array.isArray(agent.programs) ? agent.programs : (agent.program ? [agent.program] : []); progs.forEach(function(p){ camps = camps.concat(wmamLiveCampaigns(p)); }); camps = _onbDedupe(camps); }
+  camps = camps.filter(function(c){ return !wmamCampEnded(c) && !(typeof wmamAgentCampOff === 'function' && wmamAgentCampOff(agent, c)); });
+  if(!camps.length){ alert('This agent has no campaigns yet. Add a campaign on their profile first.'); return; }
+  var bgView = _onbBgView(agent), blocked = [], ok = [];
+  camps.forEach(function(c){ var rec = wmamCampRec(c); if(rec && rec.requiresBgCheck){ var b = bgView.bgChecks && (bgView.bgChecks[c] || bgView.bgChecks[_cc(c)]); var s = (b && b.status) || 'none'; if(s !== 'passed'){ blocked.push({ campaign:c, status:s }); return; } } ok.push(c); });
+  if(blocked.length){ var msg = 'These campaigns need a passed background check before their contracts go out:\n\n' + blocked.map(function(b){ return '  • ' + b.campaign + ' (background check: ' + b.status + ')'; }).join('\n');
+    if(ok.length){ if(!confirm(msg + '\n\nSend the other ' + ok.length + ' now (' + ok.join(', ') + ')?')) return; } else { alert(msg + '\n\nThey go out automatically when the check passes.'); return; } }
+  if(!confirm('Send contracts to ' + agent.name + ' for:\n\n' + ok.map(function(c){ return '  • ' + c; }).join('\n') + '\n\nThey get an email + a notice right away.')) return;
+  var sent = 0, okla = (typeof agentIsOklahoma === 'function') && agentIsOklahoma(agent);
+  ok.forEach(function(c){ var ex = AGENT_ONBOARDING_STATUS[agentId] && AGENT_ONBOARDING_STATUS[agentId][c], rec = wmamCampRec(c);
+    var type = (ex && ex.contractType) || ((okla && rec && rec.settings && rec.settings.hasTribal) ? 'tribal' : 'standard');
+    try{ sendOnboardingPacket(agentId, c, type); sent++; }catch(e){ console.warn('[contracts] ' + c, e); } });
+  alert('✓ Contracts sent for ' + sent + ' campaign' + (sent === 1 ? '' : 's') + '.');
+};
+window.sendOnboardingPacketAllForAgent = sendOnboardingPacketAllForAgent;
+
+// ── 7. every code entry tells the agent + managers, and closes the "enter code" task ──
+var ONB_CODE_SNAP = null;
+function _onbSnap(){ if(ONB_CODE_SNAP) return; ONB_CODE_SNAP = {}; (DB.agents || []).forEach(function(a){ if(a) ONB_CODE_SNAP[a.id] = JSON.stringify(_wmamCodes(a)); }); }
+setTimeout(_onbSnap, 7000);
+var _onbNotifying = false;
+function _onbCodedCheck(a){
+  if(!a || !ONB_CODE_SNAP || _onbNotifying || !_onbIsOffice(DB.current) || a.active === false) return;
+  var before = {}; try{ before = JSON.parse(ONB_CODE_SNAP[a.id] || '{}') || {}; }catch(e){}
+  var known = Object.prototype.hasOwnProperty.call(ONB_CODE_SNAP, a.id), now = _wmamCodes(a);
+  ONB_CODE_SNAP[a.id] = JSON.stringify(now);
+  Object.keys(now).forEach(function(k){ var v = now[k]; if(!v || !String(v).trim() || String(v).trim() === '0') return;
+    var had = Object.keys(before).some(function(b){ return _catCanon(b) === _catCanon(k) && before[b] && String(before[b]).trim(); });
+    if(had) return; if(!known && !window._onbCreating) return;   // an agent this device never saw is only "new" while the office is creating them here
+    _onbNotifying = true;
+    try{ onboardingEnterAgentCode(a.id, k, String(v)); }catch(e){ console.warn('[coded notice]', e); }
+    try{ (ONBOARDING_TASKS || []).forEach(function(t){ if(t && t.status === 'pending' && t.type === 'enter-code' && t.agentId === a.id && _catCanon(t.campaignName) === _catCanon(k)) completeOBTask(t.id); }); }catch(e){}
+    _onbNotifying = false; });
+}
+if(typeof saveAgentToSupabase === 'function'){
+  var _onbSaveAgent = saveAgentToSupabase;
+  saveAgentToSupabase = function(agent){ try{ _onbCodedCheck(agent); }catch(e){} return _onbSaveAgent.apply(this, arguments); };
+}
+if(typeof onboardingEnterAgentCode === 'function'){
+  var _onbEnterCode = onboardingEnterAgentCode;
+  onboardingEnterAgentCode = function(agentId, campaignName, code){
+    var a = _agstFind(agentId), wasN = _onbNotifying; _onbNotifying = true;
+    try{ var r = _onbEnterCode.call(this, agentId, _onbCampName(campaignName), code); if(a && ONB_CODE_SNAP) ONB_CODE_SNAP[a.id] = JSON.stringify(_wmamCodes(a)); return r; } finally { _onbNotifying = wasN; }
+  };
+}
+
+// ── 8. logins: a background-check pass keeps the password the office set ──
+if(typeof wmamEnsureAccess === 'function'){
+  var _onbEnsureAccess = wmamEnsureAccess;
+  wmamEnsureAccess = function(a, why){
+    if(a && a.active !== false && !a.authUserId && a.pendingAgent !== true && a.password && !_wmamBadUsername(a)){
+      try{ saveAgentToSupabase(a); }catch(e){}
+      return { id:a.id, name:a.name, email:a.email || '', username:a.username, password:null, kept:true };
+    }
+    return _onbEnsureAccess.apply(this, arguments);
+  };
+}
+// the Agents profile button says what it really does
+if(typeof ahubProfRender === 'function'){
+  var _onbProfRender = ahubProfRender;
+  ahubProfRender = function(id){ var r = _onbProfRender.apply(this, arguments);
+    try{ var a = _agstFind(id), box = document.getElementById('ahubProfBox'); if(a && box && a.pendingAgent !== true && a.password){ [].slice.call(box.querySelectorAll('button')).forEach(function(b){ if(/wmamGrantLoginNow/.test(b.getAttribute('onclick') || '')){ b.textContent = '🔑 Send a new password'; b.title = 'Makes a new temporary password and emails it to ' + a.name; } }); } }catch(e){}
+    return r; };
+}
+
+// ── 9. Gen Mobile agreement on the Agents page uses the same version as the login screen ──
+if(typeof wmamLoadAgreements === 'function'){
+  wmamLoadAgreements = async function(force){
+    if(!force && Date.now() - WMAM_AGREE_LOADED < 60000) return;
+    try{ var r = await supaClient.from('agent_agreements').select('agent_id,doc_key,doc_version').eq('doc_key', 'gm_paylink_agreement'); WMAM_AGREE_SET = {};
+      ((r && r.data) || []).forEach(function(x){ if(!x.doc_version || typeof WMAM_GM_AGREEMENT_VERSION === 'undefined' || x.doc_version === WMAM_GM_AGREEMENT_VERSION) WMAM_AGREE_SET[String(x.agent_id)] = 1; }); WMAM_AGREE_LOADED = Date.now(); }catch(e){}
+  };
+}
+
+// ── 10. pickup form lists every campaign with inventory; notices open the right page ──
+if(typeof panelInventoryPickup === 'function'){
+  var _onbPickup = panelInventoryPickup;
+  panelInventoryPickup = function(){ var h = _onbPickup.apply(this, arguments);
+    try{ var have = {}; String(h).replace(/<option value="([^"]+)"/g, function(m, v){ have[_catCanon(v)] = 1; return m; });
+      var add = Object.keys(CAMPAIGN_REGISTRY || {}).filter(function(k){ return CAMPAIGN_REGISTRY[k] && CAMPAIGN_REGISTRY[k].active && !have[_catCanon(k)] && !wmamCampEnded(k); }).map(function(k){ return '<option value="' + _escapeAttr(k) + '">' + _escapeHtml(k) + '</option>'; }).join('');
+      if(add) h = h.replace(/(<select id="ipCampaign"[\s\S]*?)(<\/select>)/, '$1' + add + '$2'); }catch(e){}
+    return h; };
+}
+if(typeof pushNotification === 'function'){
+  var _onbPush = pushNotification;
+  pushNotification = function(opts){
+    try{ if(opts && typeof opts.panel === 'string'){
+      if(/^[a-z]+-transfers$/.test(opts.panel) && opts.panel !== 'inv-transfers' && opts.panel !== 'pending-transfers') opts = Object.assign({}, opts, { panel:/Approval Needed/i.test(opts.title || '') ? 'pending-transfers' : 'inv-sign' });
+      if(opts.panel === 'my-documents' && /^Documents to sign$/.test(opts.title || '')) opts = Object.assign({}, opts, { panel:'onboard-sign', body:String(opts.body || '').replace('open My Documents to sign', 'tap to open and sign') });
+    } }catch(e){}
+    return _onbPush.call(this, opts);
+  };
+}
+Object.assign(window, { onbAppsLoad:onbAppsLoad, onbAppsRender:onbAppsRender, onbAppMark:onbAppMark, onbAppConvert:onbAppConvert, ONB_APPS:ONB_APPS, panelApplications:panelApplications });
+
+// ── 11. a campaign checked on the Add Agent form (code not in yet) counts as one of the agent's campaigns ──
+if(typeof wmamCampaignsOf === 'function'){
+  var _onbCampaignsOf = wmamCampaignsOf;
+  wmamCampaignsOf = function(a){ var l = _onbCampaignsOf.apply(this, arguments) || []; if(!a) return l;
+    try{ var have = {}; l.forEach(function(c){ have[_catCanon(c)] = 1; });
+      Object.keys(_wmamCodes(a)).forEach(function(k){ var n = _cc(k), ck = _catCanon(k); if(!n || have[ck] || !wmamCampRec(k)) return; have[ck] = 1; l.push(n); });
+      l.sort(); }catch(e){}
+    return l; };
+}
+// ── 12. Oklahoma (Tribal contracts) is read from today's market list, not the old team list ──
+if(typeof agentIsOklahoma === 'function'){
+  var _onbIsOK = agentIsOklahoma;
+  agentIsOklahoma = function(agent){ if(_onbIsOK.apply(this, arguments)) return true; if(!agent) return false;
+    try{ var n = (typeof wmamAssignedMarketOf === 'function' && wmamAssignedMarketOf(agent)) || (typeof wmamMarketNameFor === 'function' && wmamMarketNameFor(agent.team)) || agent.team || '';
+      var m = (MARKETS || []).find(function(x){ return x && _wmamMktKey(x.name) === _wmamMktKey(n); });
+      return /\b(OK|Oklahoma)\b|Tulsa|Lawton|Anadarko|Muskogee/i.test(String(n)) || !!(m && /^(OK|Oklahoma)$/i.test(String(m.state || ''))); }catch(e){ return false; } };
+}
+// ── 13. an agent added with "+ Add Agent" is in the normal background-check flow, not "Legacy review" ──
+if(typeof isAgentPendingBgReview === 'function'){
+  var _onbLegacy = isAgentPendingBgReview;
+  isAgentPendingBgReview = function(agent){ if(!_onbLegacy.apply(this, arguments)) return false;
+    try{ if(agent.bgApprovedAt || (agent.bgChecks && Object.keys(agent.bgChecks).length)) return false;
+      if(agent.start && String(agent.start).slice(0, 10) >= '2026-10-16') return false; }catch(e){}   // added from this build on = normal background-check flow
+    return true; };
+  window.isAgentPendingBgReview = isAgentPendingBgReview;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -38704,9 +39025,12 @@ function approveApplicant(applicantId){
   }
 
   // Auto-fire campaign contract packets for each campaign the applicant was set up for
+  try{ if(typeof _onbAfterApprove === 'function') _onbAfterApprove(newAgent, app); }catch(e){ console.warn('[onb placement]', e); }
   (app.campaigns || []).forEach(function(campName){
     try{
-      if(typeof sendOnboardingPacket === 'function'){
+      if(typeof _autoFirePacketAfterBgPass === 'function'){
+        _autoFirePacketAfterBgPass(newAgent, campName);
+      } else if(typeof sendOnboardingPacket === 'function'){
         sendOnboardingPacket(newAgent.id, campName, 'standard');
       }
     }catch(e){ console.warn('[approveApplicant] sendOnboardingPacket('+campName+') failed:', e); }
@@ -67690,7 +68014,7 @@ function panelAgentsPending(){
   setTimeout(function(){
     refreshApplicantsFromSupabase().then(function(updated){
       if(updated){
-        try{ if(typeof gotoPanel === 'function') gotoPanel('agents'); }catch(e){}
+        try{ if(typeof gotoPanel === 'function') gotoPanel('agents-pending'); }catch(e){}
       }
     });
   }, 50);
@@ -67718,7 +68042,7 @@ function panelAgentsPending(){
         var after = JSON.stringify(APPLICANTS_PRE_BG||[]);
         if(after !== before){
           // Something changed — re-render
-          try{ if(typeof gotoPanel === 'function') gotoPanel('agents'); }catch(e){}
+          try{ if(typeof gotoPanel === 'function') gotoPanel('agents-pending'); }catch(e){}
         }
       });
     }, 20*1000);
@@ -68160,7 +68484,7 @@ function _uiApproveApplicant(applicantId){
   var agent = approveApplicant(applicantId);
   if(agent){
     alert('✅ Approved.\n\n'+agent.name+' has been added to the team. They were emailed their login (username: '+agent.username+') and will see their campaign contracts on first login.');
-    gotoPanel('agents');
+    gotoPanel('agents-pending');
   }
 }
 
@@ -68171,13 +68495,13 @@ function _uiRejectApplicant(applicantId){
   var reason = prompt('Internal reason / notes (optional, NOT shown to applicant):', '') || '';
   rejectApplicant(applicantId, reason);
   alert('Rejected.\n\nApplicant was sent the turn-down email.');
-  gotoPanel('agents');
+  gotoPanel('agents-pending');
 }
 
 function _cancelApplicant(applicantId){
   var app = (APPLICANTS_PRE_BG||[]).find(function(a){return a && a.id === applicantId;});
   if(!app) return;
-  app.stage = 'canceled';
+  app.stage = 'cancelled';
   app.decidedAt = new Date().toISOString();
   app.decidedByName = (DB.current && DB.current.name) || 'office';
   saveApplicants();
@@ -68194,7 +68518,7 @@ function _uiOverridePassLegacy(agentId){
   agent.bgManualOverrideByName = (DB.current && DB.current.name) || '';
   try{ if(typeof saveAgentToSupabase === 'function') saveAgentToSupabase(agent); }catch(e){}
   alert('✓ Cleared. '+agent.name+' is no longer in the Pending panel.');
-  gotoPanel('agents');
+  gotoPanel('agents-pending');
 }
 
 // ── Calvin 2026-06-10 v1630: Reject field & ask applicant to resubmit ──
@@ -68219,9 +68543,9 @@ function _uiRefreshApplicantsPanel(){
   var btn = document.getElementById('ap-refresh-btn');
   if(btn){ btn.disabled = true; btn.innerHTML = '⏳ Refreshing...'; }
   refreshApplicantsFromSupabase().then(function(updated){
-    try{ if(typeof gotoPanel === 'function') gotoPanel('agents'); }catch(e){}
+    try{ if(typeof gotoPanel === 'function') gotoPanel('agents-pending'); }catch(e){}
   }).catch(function(){
-    try{ if(typeof gotoPanel === 'function') gotoPanel('agents'); }catch(e){}
+    try{ if(typeof gotoPanel === 'function') gotoPanel('agents-pending'); }catch(e){}
   });
 }
 if(typeof window !== 'undefined') window._uiRefreshApplicantsPanel = _uiRefreshApplicantsPanel;
@@ -81139,7 +81463,8 @@ function gmInitiateTransfer(){
   // no longer honored here — that's what let Brandon's transfer skip Makenzie.
   var mmObj = DB.agents.find(function(a){return a.id===u.id;});
   var senderIsApprover = (typeof isInventory==='function' && isInventory(mmObj)) || (typeof isOwner==='function' && isOwner(mmObj));
-  var requiresApproval = (window.__wmamXferNeedsApproval != null) ? !!window.__wmamXferNeedsApproval : !senderIsApprover;   // v2026.10.10: market rule from the Transfers page
+  var _gmSoon = _gmAddDays(_ctToday(), 21), _gmShort = imeis.filter(function(im){ var d = (GM_INVENTORY||[]).find(function(x){ return x && (x.imei === im || (x.sim && x.sim === im)); }); if(!d) return false; var cd = null; try{ cd = (typeof wmamGMDates === 'function') ? wmamGMDates(d).companyExpiry : null; }catch(e){} cd = cd || _gmIso(d.vendorDueDate) || _gmIso(d.companyExpiry) || _gmIso(d.expiryDate); return !!(cd && cd < _gmSoon); });   // v2026.10.16: same short-date rule as every other campaign
+  var requiresApproval = (_gmShort.length > 0 && !senderIsApprover) || ((window.__wmamXferNeedsApproval != null) ? !!window.__wmamXferNeedsApproval : !(senderIsApprover || (mmObj && mmObj.canTransferWithoutApproval === true)));   // v2026.10.10: market rule from the Transfers page
   var req = gmCreateTransferRequest(u.id, toId, imeis, requiresApproval);
   if(req){
     cdFlash(requiresApproval?'Transfer request sent to Inventory Dept for approval':'Transfer sent to agent for signature');
@@ -86727,7 +87052,8 @@ function tcApprove(completionId){
       // We use a non-empty placeholder if no specific code was entered, since
       // agentIsCoded() considers an empty/whitespace string as NOT coded.
       var val = (codes[k] || '').trim();
-      agent.agentCodes[k] = val || ('TRAINED-'+(new Date().toISOString().slice(0,10)));
+      if(val) agent.agentCodes[k] = val;   // v2026.10.16: no made-up "TRAINED-date" codes — a campaign without a real code gets an "enter code" task instead
+      else { agent.campaigns = (Array.isArray(agent.campaigns) ? agent.campaigns : []).concat([k]).filter(function(x,i,a){ return a.indexOf(x) === i; }); try{ createOBTask(agent.id, agent.name, k, 'enter-code', 'Enter Agent Code — '+agent.name+' / '+k, agent.name+' finished training for '+k+'. Get the code from the carrier and enter it.'); }catch(e){} }
     });
     c.approvalStatus = 'approved';
     c.approvedById = u.id;
