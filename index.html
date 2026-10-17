@@ -3833,7 +3833,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.17.1830';
+var BUILD_VERSION = '2026.10.17.1900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -102805,7 +102805,7 @@ html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
 </script>
 <script>
 // ══════════════════════════════════════════════════════════════════════
-//  AI TEAM (v2026.10.17.1830) — your AI employees, each one its own person.
+//  AI TEAM (v2026.10.17.1900) — your AI employees, each one its own person.
 //  • The AI Team button opens your team: one card per employee with live status.
 //  • Each employee opens in their OWN window: move it, shrink it, minimize it
 //    (and keep talking from the small bar), several open at once.
@@ -103505,6 +103505,42 @@ async function aitRecUse(id, kind){
 // server employee (tool "do_work"), so answers come from real data, never guesses.
 async function aitVoiceToggle(id){ if(AIT.voice && AIT.voice.emp === id) return aitVoiceStop(); return aitVoiceStart(id); }
 function _aitVStatus(t){ if(!AIT.voice) return; AIT.voice.status = t; aitRenderWin(AIT.voice.emp); }
+// ── natural interrupting (like Grok / Muse): you can talk over the AI any time ──
+// While the AI talks, a little of its own voice leaks from the speakers back into the mic. That faint echo
+// is held back; your real voice (much louder at the mic) goes straight through, and the AI stops and listens.
+// When the AI is quiet, everything you say goes through untouched.
+function _aitGateStep(g, mic, out, now){
+  if(out > 0.012) g.lastOut = now;                                   // the AI's voice is playing
+  var aiTalking = now - (g.lastOut || 0) < 300;
+  if(!aiTalking){ g.open = true; g.loud = 0; return g; }
+  if(g.open && now - (g.openAt || 0) < 1200 && g.byUser) return g;   // you started talking: keep listening
+  g.floor = g.floor == null ? mic : (mic < g.floor ? g.floor * 0.9 + mic * 0.1 : g.floor * 0.995 + mic * 0.005);   // how loud the echo is
+  var need = Math.max(0.025, g.floor * 3);                           // your voice must be clearly louder than the echo
+  if(mic > need){ g.loud = (g.loud || 0) + 1; } else { g.loud = 0; }
+  if(g.loud >= 4){ g.open = true; g.byUser = true; g.openAt = now; } // ~80 ms of real speech
+  else { g.open = false; g.byUser = false; }
+  return g;
+}
+function _aitRms(an, buf){ an.getFloatTimeDomainData(buf); var s = 0; for(var i = 0; i < buf.length; i++) s += buf[i] * buf[i]; return Math.sqrt(s / buf.length); }
+function _aitGateStart(V, mic){
+  var AC = window.AudioContext || window.webkitAudioContext; if(!AC) return null;
+  var ctx = new AC(); try{ ctx.resume(); }catch(e){}
+  var src = ctx.createMediaStreamSource(mic), gain = ctx.createGain(), dest = ctx.createMediaStreamDestination(), an = ctx.createAnalyser();
+  an.fftSize = 512; src.connect(an); src.connect(gain); gain.connect(dest); gain.gain.value = 1;
+  var G = { ctx:ctx, gain:gain, an:an, buf:new Float32Array(512), obuf:new Float32Array(512), outAn:null, st:{ open:true } };
+  G.timer = setInterval(function(){
+    if(AIT.voice !== V){ clearInterval(G.timer); return; }
+    var m = _aitRms(an, G.buf), o = G.outAn ? _aitRms(G.outAn, G.obuf) : 0;
+    _aitGateStep(G.st, m, o, Date.now());
+    var want = V.muted ? 0 : (G.st.open ? 1 : 0);
+    if(G.want !== want){ G.want = want; try{ gain.gain.setTargetAtTime(want, ctx.currentTime, want ? 0.005 : 0.03); }catch(e){ gain.gain.value = want; } }
+  }, 20);
+  G.track = dest.stream.getAudioTracks()[0];
+  return G;
+}
+function _aitGateHearAi(V, stream){ var G = V.gate; if(!G || G.outAn) return;
+  try{ var s = G.ctx.createMediaStreamSource(stream), a = G.ctx.createAnalyser(); a.fftSize = 512; s.connect(a); G.outAn = a; }catch(e){} }
+
 // ── fast live voice: the key is fetched ahead of time, and the mic, the key and the connection all get ready at once ──
 function _aitVoiceKeyFetch(id){
   var p = (async function(){
@@ -103541,15 +103577,16 @@ async function aitVoiceStart(id){
   try{
     if(!navigator.mediaDevices || !window.RTCPeerConnection) throw new Error('this browser can’t do live voice');
     var keyP = _aitTakeVoiceKey(id);                                                                   // the voice key (usually ready already) comes in while the mic starts
-    var mic = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true } });
+    var mic = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1 } });
     if(AIT.voice !== V){ mic.getTracks().forEach(function(t){ t.stop(); }); return; } V.mic = mic;
     var pc = new RTCPeerConnection(); V.pc = pc;
     var audio = document.createElement('audio'); audio.autoplay = true; audio.setAttribute('playsinline', ''); V.audio = audio;
-    pc.ontrack = function(ev){ audio.srcObject = ev.streams[0]; };
-    mic.getTracks().forEach(function(t){ pc.addTrack(t, mic); });
+    var G = null; try{ G = _aitGateStart(V, mic); }catch(x){ G = null; } V.gate = G;
+    if(G && G.track) pc.addTrack(G.track, mic); else mic.getTracks().forEach(function(t){ pc.addTrack(t, mic); });
+    pc.ontrack = function(ev){ audio.srcObject = ev.streams[0]; _aitGateHearAi(V, ev.streams[0]); };
     var dc = pc.createDataChannel('oai-events'); V.dc = dc;
     dc.onmessage = function(ev){ try{ aitVoiceEvent(JSON.parse(ev.data)); }catch(x){} };
-    dc.onopen = function(){ if(AIT.voice !== V) return; V.ready = Date.now(); _aitVStatus('Live — go ahead and talk.'); };
+    dc.onopen = function(){ if(AIT.voice !== V) return; V.ready = Date.now(); _aitVStatus('Live — just talk. Interrupt anytime.'); };
     var offer = await pc.createOffer(); await pc.setLocalDescription(offer);
     var key = await keyP; if(AIT.voice !== V) return;
     var resp = await fetch(key.calls_url || 'https://api.openai.com/v1/realtime/calls', { method:'POST', body:offer.sdp, headers:{ 'Authorization':'Bearer ' + key.client_secret, 'Content-Type':'application/sdp' } });
@@ -103565,6 +103602,7 @@ function aitVoiceStop(){
   try{ if(v.cam) v.cam.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} var pv = document.getElementById('aitCamPrev'); if(pv) pv.remove();
   try{ if(v.dc) v.dc.close(); }catch(e){} try{ if(v.pc) v.pc.close(); }catch(e){}
   try{ if(v.mic) v.mic.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} try{ if(v.audio) v.audio.srcObject = null; }catch(e){}
+  try{ if(v.gate){ clearInterval(v.gate.timer); v.gate.ctx.close(); } }catch(e){}
   aitRenderWin(v.emp);
 }
 function aitVoiceMute(){ var v = AIT.voice; if(!v || !v.mic) return; v.muted = !v.muted; v.mic.getTracks().forEach(function(t){ t.enabled = !v.muted; }); _aitVStatus(v.muted ? 'Muted — tap Unmute to talk' : 'Live — just talk. Interrupt anytime.'); }
