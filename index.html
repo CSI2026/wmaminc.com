@@ -71,7 +71,8 @@
   }
   function isCloudKey(k){ return typeof k === 'string' && /^_?wmam_/.test(k) && !isDeviceKey(k); }
   // Never stored anywhere as a blob: these already live in their own Supabase tables
-  var TABLE_BACKED = /^wmam_(agents|gm_inventory|tc_inventory|aw_inventory|ex_inventory|inv_devices)$/;
+  // v2026.10.18 ONE SOURCE OF TRUTH: the shared inventory lists live only in the database (inv_records) — no private copy is read or written
+  var TABLE_BACKED = /^wmam_(agents|gm_inventory|tc_inventory|aw_inventory|ex_inventory|inv_devices|inv_batches|inv_transfers|inv_requests|inv_deletion_requests|gm_activations|gm_transfers|aw_activations|aw_transfers|tc_activations|tc_transfers|ex_activations|ex_transfers|dart_transfers|inv_pickups|inv_discrepancies|pending_xfers|sold_reports|sold_report_batches|inv_markets|inv_upsell_pct|supply_inv|inv_tombstones|gm_activation_edits|inv_nextid|inv_pickup_nextid|inv_disc_nextid)$/;
   var INV_KEYS = {gm:'wmam_gm_inventory', tc:'wmam_tc_inventory', aw:'wmam_aw_inventory', ex:'wmam_ex_inventory', legacy:'wmam_inv_devices'};
 
   var cache = {};          // key -> string (the person's cloud data)
@@ -3833,7 +3834,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.18.2000';
+var BUILD_VERSION = '2026.10.18.2300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -13328,6 +13329,7 @@ var INV_BATCH_ID = 1;
 var INV_DELETION_REQUESTS = []; // {id, deviceIds:[], requestedBy, requestedAt, reason, status:'pending'|'approved'|'denied', reviewedBy, reviewedAt}
 // v2026.10.13: this save was called (request / approve / deny) but never defined, so those clicks crashed before saving
 function saveInvDeletionRequests(){ try{ localStorage.setItem('wmam_inv_deletion_requests', JSON.stringify(INV_DELETION_REQUESTS)); }catch(e){}
+  if((typeof INVREC !== 'undefined' && INVREC && INVREC.on !== false)){ invRecSoon(); return; }   // v2026.10.18
   try{ if(typeof supaClient !== 'undefined' && supaClient) supaClient.from('app_settings').upsert({ key:'inv_deletion_requests', value:JSON.stringify(INV_DELETION_REQUESTS) }, { onConflict:'key' }).then(function(){}, function(){}); }catch(e){} }
 var INV_PENDING_ASSIGNMENTS = []; // {id, batchId, devices:[], campaign, type, uploadDate, expiryDate, assignedToId:null, status:'uploaded'|'assigned'}
 
@@ -13619,6 +13621,7 @@ var CODED_CAMPAIGNS = EXD(['Gen Mobile','TruConnect','Assurance','Excess','Chuzo
 var PENDING_TRANSFERS = [];
 function savePendingTransfers(){
   try{ localStorage.setItem('wmam_pending_xfers', JSON.stringify(PENDING_TRANSFERS)); }catch(e){}
+  try{ if(typeof invRecSoon === 'function') invRecSoon(); }catch(e){}   // v2026.10.18: shared with everyone
 }
 function loadPendingTransfers(){
   try{
@@ -13663,6 +13666,7 @@ initSupplyInventory();
 
 function saveSupplyInventory(){
   try{ localStorage.setItem('wmam_supply_inv', JSON.stringify(SUPPLY_INVENTORY)); }catch(e){}
+  try{ if(typeof invRecSoon === 'function') invRecSoon(); }catch(e){}   // v2026.10.18: shared with everyone
 }
 function loadSupplyInventory(){
   try{
@@ -19910,12 +19914,13 @@ function _actxComm(r){ // what each record says
   var a = r.act ? r.act.commEligible !== false : null, d = r.dev ? (r.dev.commEligible === false ? false : (r.dev.commEligible === true ? true : null)) : null;
   return { act:a, dev:d, agree:(a === null || d === null || a === d) };
 }
-async function _actxLoadEdits(){ if(ACTX.edits) return ACTX.edits; ACTX.edits = [];
+async function _actxLoadEdits(){ if(ACTX.edits) return ACTX.edits; if((typeof INVREC !== 'undefined' && INVREC && INVREC.on === true)){ if(!ACTX.edits) ACTX.edits = []; try{ await invRecLoadAll(); }catch(e){} return ACTX.edits; } ACTX.edits = [];
   try{ var r = await supaClient.from('app_settings').select('value').eq('key', 'gm_activation_edits').maybeSingle(); if(r && r.data && r.data.value) ACTX.edits = JSON.parse(r.data.value) || []; }catch(e){}
   try{ if(!ACTX.edits.length){ var l = localStorage.getItem('wmam_gm_activation_edits'); if(l) ACTX.edits = JSON.parse(l) || []; } }catch(e){}
   return ACTX.edits; }
 async function _actxLog(entry){ await _actxLoadEdits(); ACTX.edits.unshift(entry); ACTX.edits = ACTX.edits.slice(0, 3000);
   try{ localStorage.setItem('wmam_gm_activation_edits', JSON.stringify(ACTX.edits)); }catch(e){}
+  if((typeof INVREC !== 'undefined' && INVREC && INVREC.on === true)){ try{ await invRecSync(); }catch(e){} return; }   // v2026.10.18
   try{ await supaClient.from('app_settings').upsert({ key:'gm_activation_edits', value:JSON.stringify(ACTX.edits), updated_at:new Date().toISOString() }, { onConflict:'key' }); }catch(e){} }
 // the one place a correction is applied (editor, report check and the assistant all use it)
 async function wmamActSetCommEligible(imei, eligible, reason, source){
@@ -23646,7 +23651,7 @@ function processAWInventoryUpload(input, batchId){
     if(!person && r.contact && out.unmatchedContacts.indexOf(r.contact) < 0) out.unmatchedContacts.push(r.contact);
     var holder = person || res.agent || owner, src = person ? 'shipping-contact' : (res.agent ? (res.source || 'market-manager') : 'owner-fallback');
     if(!/shipped/i.test(r.imeiStatus || 'shipped')) out.notShipped++;
-    var dev = { id:'aw-' + (++idN), imei:r.imei, type:'phone', campaign:'Assurance Wireless', model:r.model || r.sku, sku:r.sku, market:market || r.subDealer, subDealer:r.subDealer,
+    var dev = { id:_wmamUid('aw'), imei:r.imei, type:'phone', campaign:'Assurance Wireless', model:r.model || r.sku, sku:r.sku, market:market || r.subDealer, subDealer:r.subDealer,
       status:'assigned', holderId:holder ? holder.id : null, holderName:holder ? holder.name : '', assignedTo:holder ? holder.id : null, assignedDate:now.slice(0, 10),
       orderNo:r.order, orderDate:r.orderDate, shipDate:r.shipDate, tracking:r.tracking, vendorStatus:r.imeiStatus, receivedBy:r.contact, uploadedAt:now, uploadBatchId:batchId,
       chainOfCustody:[{ type:'uploaded', at:now, source:'aw-imei-order-report', batchId:batchId, order:r.order, shipDate:r.shipDate, market:market }, { type:'assigned-at-upload', at:now, to:holder ? holder.name : '', toId:holder ? holder.id : null, source:src, market:market }] };
@@ -26908,6 +26913,8 @@ function _invSyncReplacePool(poolKey, devices){
   var _tombFiltered = 0;
   if(typeof _invTombHas === 'function'){
     devices = devices.filter(function(d){
+      var _live = d && !(d.deletedAt || d.status === 'deleted');   // v2026.10.18: the database is the truth — a live device is always shown
+      if(_live && (_invTombHas(d.imei) || _invTombHas(d.sim))){ try{ _invTombRemove(d.imei); _invTombRemove(d.sim); }catch(e){} return true; }
       var gone = d && (_invTombHas(d.imei) || _invTombHas(d.sim));
       if(gone) _tombFiltered++;
       return !gone;
@@ -26923,6 +26930,7 @@ function _invSyncReplacePool(poolKey, devices){
   // emptied a real (non-empty) cloud set, those devices are legitimately deleted and
   // the pool SHOULD go empty; only a truly empty cloud read is refused.
   function apply(cur, fill){
+    if(window._invLoadedOnce && (window._invCloudPendingTimer || (window._invInflight || 0) > 0 || window._invUnsaved)){ console.warn('[invSyncReplacePool] kept this screen (a change is still saving) for '+poolKey); return false; }   // v2026.10.18
     if(_incomingCount === 0 && Array.isArray(cur) && cur.length > 0){
       console.warn('[invSyncReplacePool] refused to wipe '+poolKey+' ('+cur.length+' devices) with an empty set');
       return false;
@@ -27315,6 +27323,19 @@ function _invRowToDevice(row){
 // v2026.09.29 SAFE SAVES: only send devices this person actually changed. The old
 // code re-sent EVERY device in memory on every save, so one out-of-date screen
 // could overwrite everyone else's work.
+// v2026.10.18 INVENTORY ACCURACY: ids that can never collide, and the "final" states a device can never be pulled out of by mistake
+function _wmamUid(prefix){ return prefix + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8); }
+var _wmamUniqLast = 0;
+function _wmamUniqNum(){ var n = Date.now() * 1000 + Math.floor(Math.random() * 1000); if(n <= _wmamUniqLast) n = _wmamUniqLast + 1; _wmamUniqLast = n; return n; }
+function _invIsSold(d){ return !!(d && (d.status === 'sold' || d.status === 'activated' || d.soldAt || d.activatedAt)); }
+function _invIsDeleted(d){ return !!(d && (d.status === 'deleted' || d.deletedAt)); }
+// Excel turns long numbers like IMEIs into 3.51999E+14 and the real digits are lost. Such files are refused with a clear message.
+function _wmamExcelDamage(text){
+  if(typeof text !== 'string' || !text) return '';
+  var m = text.match(/\b\d\.\d{1,14}E\+1[3-9]\b/gi); if(!m || !m.length) return '';
+  return 'This file has ' + m.length + ' IMEI/SIM number' + (m.length === 1 ? '' : 's') + ' that Excel damaged (for example ' + m[0] + '). Excel removed the real digits, so these devices cannot be matched. Nothing was saved. Download the report again as CSV straight from the carrier (do not open it in Excel first), or format the IMEI column as Text before saving, then upload again.';
+}
+if(typeof window !== 'undefined'){ window._wmamUid = _wmamUid; window._wmamUniqNum = _wmamUniqNum; window._invIsSold = _invIsSold; window._invIsDeleted = _invIsDeleted; window._wmamExcelDamage = _wmamExcelDamage; }
 var _invSnap = {};
 function _invSigOf(d){
   var r = _invDeviceToRow(d, ''); if(!r) return '';
@@ -27343,6 +27364,7 @@ async function invDbUpsertDevices(poolKey, devices){
   });
   if(!rows.length) return {ok:true, count:0};
   var okAll = true, lastErr = null;
+  window._invInflight = (window._invInflight || 0) + 1;   // v2026.10.18: reloads wait for this save
   try{
     var CH = 500;
     for(var i=0;i<rows.length;i+=CH){
@@ -27350,6 +27372,8 @@ async function invDbUpsertDevices(poolKey, devices){
       if(res && res.error){ okAll=false; lastErr=res.error; window._invPathBLastError=res.error; console.warn('[invDbUpsertDevices] '+table+' chunk failed:', res.error); }
     }
   }catch(e){ okAll=false; lastErr=e; window._invPathBLastError=e; console.warn('[invDbUpsertDevices] '+table+' threw:', e); }
+  window._invInflight = Math.max(0, (window._invInflight || 1) - 1);
+  window._invUnsaved = okAll ? false : { at:new Date().toISOString(), table:table, count:rows.length, error:String((lastErr && (lastErr.message || lastErr)) || '') };
   if(okAll) _sent.forEach(function(x){ _invSnap[x[0]] = x[1]; });
   if(okAll && rows.some(function(r){ return r && (r.status === 'activated' || r.status === 'sold'); })){ try{ wmamScheduleBackfill(); }catch(e){} }
   else if(lastErr && /out of date/i.test(String(lastErr.message||lastErr))){ try{ wmamShowUpdateBanner(true); }catch(e){} }
@@ -27450,7 +27474,7 @@ async function invDbLoadPool(poolKey){
       // its recovery.
       var res = null, attempt = 0;
       while(attempt < 4){
-        res = await supaClient.from(table).select('*').range(offset, offset + PAGE - 1);
+        res = await supaClient.from(table).select('*').order('id').range(offset, offset + PAGE - 1);
         if(!(res && res.error)) break;
         if(typeof window._sbNoteResult === 'function') window._sbNoteResult(res.error);
         if(typeof window._sbLooksDown === 'function' && window._sbLooksDown(res.error)) break; // backend down — don't retry
@@ -27505,9 +27529,16 @@ async function wmamCheckForUpdate(){
 }
 if(typeof window!=='undefined' && location && /^https?:/.test(location.protocol)){ setInterval(wmamCheckForUpdate, 300000); document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='visible') wmamCheckForUpdate(); }); }
 if(typeof window!=='undefined'){ window.wmamCheckForUpdate = wmamCheckForUpdate; window.wmamShowUpdateBanner = wmamShowUpdateBanner; }
+async function _wmamInvFlushSaves(){   // v2026.10.18: send any waiting save first, and wait for saves in progress
+  try{ if(typeof invRecSync === 'function') await invRecSync(); }catch(e){}
+  if(window._invCloudPendingTimer){ clearTimeout(window._invCloudPendingTimer); window._invCloudPendingTimer = null; window._invCloudLast = 0; try{ if(typeof saveInventory === 'function') saveInventory(); }catch(e){} }
+  for(var i = 0; i < 60 && (window._invInflight || 0) > 0; i++) await new Promise(function(r){ setTimeout(r, 250); });
+}
 async function wmamInvReloadLive(rerender){
   if(_wmamInvLiveBusy) return true; _wmamInvLiveBusy = true;
   try{
+    try{ await _wmamInvFlushSaves(); }catch(e){}
+    if(window._invUnsaved){ try{ window._invCloudLast = 0; if(typeof saveInventory === 'function') saveInventory(); }catch(e){} return false; }   // a save failed: keep the changes on screen and retry, never reload over them
     var r = await invDbLoadAllFromTables();
     if(r && r.ok){ _wmamInvLiveAt = new Date(); INV_SYNC_CONFLICT = null;
       if(rerender !== false && window._currentPanelId && typeof gotoPanel === 'function'){ try{ gotoPanel(window._currentPanelId); }catch(e){} }
@@ -27548,6 +27579,7 @@ async function wmamInvVerify(){
 if(typeof window!=='undefined') window.wmamInvVerify = wmamInvVerify;
 async function invDbLoadAllFromTables(){
   if(typeof supaClient === 'undefined' || !supaClient) return {ok:false, error:'no-supabase'};
+  try{ if(typeof invRecLoadAll === 'function') await invRecLoadAll(); }catch(e){ console.warn('[inv records] load', e); }   // v2026.10.18
   var counts = {};
   var failed = false;
   for(var i=0;i<INV_SYNC_POOLS.length;i++){
@@ -27566,7 +27598,7 @@ async function invDbLoadAllFromTables(){
   if(!failed){ window._invPathBReady = true; _wmamInvLiveAt = new Date();
     try{ if(typeof wmamGMRulesLoad==='function') wmamGMRulesLoad().then(function(){ try{ wmamNormalizeAllDates(); }catch(e){} }); }catch(e){} }
   else { setTimeout(function(){ try{ wmamInvReloadLive(false); }catch(e){} }, 15000); }
-  console.log('[invDbLoadAllFromTables] loaded:', counts, 'pathB ready:', window._invPathBReady);
+  console.log('[invDbLoadAllFromTables] loaded:', counts, 'pathB ready:', window._invPathBReady); window._invLoadedOnce = true;
   // Persist to localStorage so panels reading from the local cache get fresh data
   try{ _invSyncWriteLocalOnly(); }catch(e){}
   return {ok:!failed, counts:counts};
@@ -27755,6 +27787,7 @@ function _wmamApplyInPlace(ref, val){
 function wmamNoteServerSetting(key, rawValue){ if(rawValue != null) _wmamSetSnap[key] = String(rawValue); }
 // a live update from someone else
 function wmamOnRemoteSetting(key, rawValue){
+  if((typeof INVREC !== 'undefined' && INVREC && INVREC.on === true) && _invRecKeys[key]) return;   // v2026.10.18: the database copy of the records — live record changes arrive on their own
   var ref = _wmamSetRef[key]; if(rawValue == null) return;
   var remote; try{ remote = JSON.parse(rawValue); }catch(e){ return; }
   var base = null; try{ base = _wmamSetSnap[key] != null ? JSON.parse(_wmamSetSnap[key]) : null; }catch(e){}
@@ -27768,7 +27801,360 @@ function wmamOnRemoteSetting(key, rawValue){
 }
 if(typeof window!=='undefined'){ Object.assign(window, { wmamMergeShared:wmamMergeShared, wmamNoteServerSetting:wmamNoteServerSetting, wmamOnRemoteSetting:wmamOnRemoteSetting, _wmamSetSnap:_wmamSetSnap }); }
 
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//  v2026.10.18 ONE SOURCE OF TRUTH — every shared inventory list lives in the database, one
+//  record per row (table inv_records). This screen keeps no private copy: it loads the records,
+//  saves only the records it changed (one at a time, never the whole list), and hears every
+//  change other people make. Every record carries a version number: a save made from an older
+//  version is merged field by field by the database, so two people never erase each other's work.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+var INV_REC_LISTS = [
+  ['inv_batches','INVENTORY_BATCHES','list'], ['inv_transfers','INVENTORY_TRANSFERS','list'], ['inv_requests','INVENTORY_REQUESTS','list'],
+  ['inv_deletion_requests','INV_DELETION_REQUESTS','list'], ['gm_activations','GM_ACTIVATIONS','list'], ['gm_transfers','GM_TRANSFERS','list'],
+  ['aw_activations','AW_ACTIVATIONS','list'], ['aw_transfers','AW_TRANSFERS','list'], ['tc_activations','TC_ACTIVATIONS','list'], ['tc_transfers','TC_TRANSFERS','list'],
+  ['ex_activations','EX_ACTIVATIONS','list'], ['ex_transfers','EX_TRANSFERS','list'], ['dart_transfers','DART_TRANSFERS','list'],
+  ['inv_pickups','INVENTORY_PICKUPS','list'], ['inv_discrepancies','INVENTORY_DISCREPANCY_TICKETS','list'], ['pending_xfers','PENDING_TRANSFERS','list'],
+  ['sold_reports','SOLD_REPORTS','list'], ['sold_report_batches','SOLD_REPORT_BATCHES','list'], ['tc_sim_shipments','TCSIM.shipments','list'],
+  ['gm_activation_edits','ACTX.edits','list'],
+  ['inv_markets','INV_MARKETS','map'], ['inv_upsell_pct','INV_UPSELL_REQUIREMENTS','map'], ['supply_inventory','SUPPLY_INVENTORY','map'], ['inv_tombstones','INV_TOMBSTONES','map']
+];
+var _invRecKeys = {}; INV_REC_LISTS.forEach(function(l){ _invRecKeys[l[0]] = l; });
+// per list: snap = what the database has (as far as this screen knows), ver = its version, pend = sent and not answered yet, bad = refused by the database
+var INVREC = { ready:false, on:null, loading:null, busy:false, again:false, lock:Promise.resolve(), queue:null,
+               snap:{}, fps:{}, ord:{}, ver:{}, pend:{}, bad:{}, wm:{}, unsaved:null, fails:0, timer:null, chan:null, lastLoad:0, loadErr:null, saved:0, dropped:[] };
+if(typeof window !== 'undefined'){ window._invRecKeys = _invRecKeys; window.INVREC = INVREC; }
+function _invRecS(o, key){ return o[key] || (o[key] = {}); }
+
+function _invRecGet(path){ var p = path.split('.'), o = window; for(var i = 0; i < p.length; i++){ if(o == null) return undefined; o = o[p[i]]; } return o; }
+function _invRecSet(path, v){ var p = path.split('.'), o = window; for(var i = 0; i < p.length - 1; i++){ if(o[p[i]] == null) return false; o = o[p[i]]; } o[p[p.length - 1]] = v; return true; }
+// the same text for the same content, whatever order the fields are in
+function _invRecSig(v){
+  if(v === null || v === undefined) return 'null';
+  if(typeof v !== 'object'){ var s = JSON.stringify(v); return s === undefined ? 'null' : s; }
+  if(typeof v.toJSON === 'function') return _invRecSig(v.toJSON());
+  if(Array.isArray(v)) return '[' + v.map(function(x){ return (x === undefined || typeof x === 'function') ? 'null' : _invRecSig(x); }).join(',') + ']';
+  var ks = Object.keys(v).filter(function(k){ return v[k] !== undefined && typeof v[k] !== 'function'; }).sort();
+  return '{' + ks.map(function(k){ return JSON.stringify(k) + ':' + _invRecSig(v[k]); }).join(',') + '}';
+}
+// how the same record is recognised after a screen replaces it with a new copy (same id, else same IMEI + order, else same order number)
+function _invRecFp(r){
+  if(r === null || typeof r !== 'object') return null;
+  if(r.id != null && r.id !== '') return 'id:' + r.id;
+  var im = String(r.imei || r.esn || '').replace(/\D/g, ''); if(im.length >= 10) return 'im:' + im + '|' + (r.orderNumber || r.order || '');
+  if(r.orderNumber) return 'on:' + r.orderNumber;
+  return null;
+}
+function _invRecClone(v){ return v === undefined ? null : JSON.parse(JSON.stringify(v)); }
+function _invRecUid(){ return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10); }
+function _invRecIsObj(v){ return v !== null && typeof v === 'object' && !Array.isArray(v); }
+// put the database's version INTO the same object, so any screen still holding it keeps working on the current record
+function _invRecInPlace(obj, data){
+  if(!_invRecIsObj(obj) || !_invRecIsObj(data)) return data;
+  Object.keys(obj).forEach(function(k){ if(!Object.prototype.hasOwnProperty.call(data, k)) delete obj[k]; });
+  Object.keys(data).forEach(function(k){ obj[k] = data[k]; });
+  return obj;
+}
+function _invRecSkip(v){ return v === null || v === undefined || typeof v === 'function'; }
+
+// give every record on this screen its database record number
+function _invRecIdsFor(key, arr, snap, fps){
+  var wm = INVREC.wm[key] || (INVREC.wm[key] = new WeakMap()), used = {}, out = new Array(arr.length), todo = [], i;
+  for(i = 0; i < arr.length; i++){ var r = arr[i], id = (r && typeof r === 'object') ? wm.get(r) : null; if(id && !used[id]){ used[id] = 1; out[i] = id; } else todo.push(i); }
+  if(!todo.length) return out;
+  var bySig = {}, byFp = {};
+  Object.keys(snap).forEach(function(id){ if(used[id]) return; (bySig[snap[id]] = bySig[snap[id]] || []).push(id); var f = fps[id]; if(f) (byFp[f] = byFp[f] || []).push(id); });
+  var take = function(list){ while(list && list.length){ var id = list.shift(); if(!used[id]) return id; } return null; };
+  todo.forEach(function(i){ var r = arr[i], id = take(bySig[_invRecSig(r)]);
+    if(!id){ var f = _invRecFp(r); if(f) id = take(byFp[f]); }
+    if(!id || used[id]) id = _invRecUid();
+    used[id] = 1; out[i] = id; if(r && typeof r === 'object') wm.set(r, id); });
+  return out;
+}
+
+// one thing at a time: a load never runs while a save is in the middle, and the other way round
+function _invRecExclusive(fn){ var run = INVREC.lock.then(fn, fn); INVREC.lock = run.then(function(){}, function(){}); return run; }
+
+// ── load every record (keyset pages, so nothing is skipped while others save) ──
+async function _invRecFetchAll(){
+  var rows = [], last = 0;
+  for(var pg = 0; pg < 500; pg++){
+    var r = null;
+    for(var t = 0; t < 4; t++){
+      r = await supaClient.from('inv_records').select('list_key,rec_id,data,ord,rid,ver,deleted_at').gt('rid', last).order('rid', { ascending:true }).limit(1000);
+      if(!(r && r.error)) break; await new Promise(function(res){ setTimeout(res, 400 * (t + 1)); });
+    }
+    if(r && r.error) throw r.error;
+    var d = (r && r.data) || []; rows = rows.concat(d); if(d.length < 1000) break; last = d[d.length - 1].rid;
+  }
+  return rows;
+}
+function _invRecApplyList(l, srvRows, goneRows, first){
+  var key = l[0], path = l[1], kind = l[2];
+  var cur = _invRecGet(path);
+  if(kind === 'list' && !Array.isArray(cur)){ cur = []; if(!_invRecSet(path, cur)) return; }
+  if(kind === 'map' && !_invRecIsObj(cur)){ cur = {}; if(!_invRecSet(path, cur)) return; }
+  var snap = _invRecS(INVREC.snap, key), fps = _invRecS(INVREC.fps, key), ord = _invRecS(INVREC.ord, key), ver = _invRecS(INVREC.ver, key), pend = _invRecS(INVREC.pend, key);
+  var srv = {}; srvRows.forEach(function(r){ srv[r.rec_id] = r; });
+  var gone = {}; (goneRows || []).forEach(function(r){ gone[r.rec_id] = r; });
+  var base = null;   // what this screen loaded at login, so a change made in the first seconds is kept, and anything deleted since is not brought back
+  if(first){
+    srvRows.forEach(function(r){ snap[r.rec_id] = _invRecSig(r.data); fps[r.rec_id] = _invRecFp(r.data); });
+    try{ var bs = (typeof _wmamSetSnap !== 'undefined' && _wmamSetSnap[key] != null) ? JSON.parse(_wmamSetSnap[key]) : null;
+      if(bs && typeof bs === 'object'){ base = {}; if(Array.isArray(bs)) bs.forEach(function(x){ base[_invRecSig(x)] = 1; }); else Object.keys(bs).forEach(function(k){ base[k + '=' + _invRecSig(bs[k])] = 1; }); } }catch(e){ base = null; }
+  }
+  // a row older than what this screen already knows (a save or a live change landed while this load was reading) never wins
+  var stale = function(r){ return ver[r.rec_id] != null && r.ver != null && Number(r.ver) < Number(ver[r.rec_id]); };
+  var nsnap = {};
+  if(kind === 'map'){
+    var out = {};
+    srvRows.forEach(function(r){ var id = r.rec_id, has = Object.prototype.hasOwnProperty.call(cur, id), L = has ? cur[id] : undefined, ls = has ? _invRecSig(L) : null, ss = _invRecSig(r.data);
+      if(pend[id] !== undefined){ if(has) out[id] = L; nsnap[id] = snap[id]; return; }                     // being saved right now
+      if(stale(r)){ if(has) out[id] = L; nsnap[id] = snap[id]; return; }
+      var mine = (!first && has && snap[id] !== undefined && ls !== snap[id]) || (first && base && has && ls !== ss && !base[id + '=' + ls]);
+      if(!first && !has && snap[id] !== undefined){ nsnap[id] = snap[id]; return; }                       // removed here, waiting to save
+      if(mine){ out[id] = L; nsnap[id] = first ? ss : snap[id]; }
+      else { out[id] = has ? (ls === ss ? L : _invRecInPlace(L, r.data)) : r.data; nsnap[id] = ss; }
+      ver[id] = r.ver; ord[id] = r.ord; });
+    Object.keys(cur).forEach(function(id){ if(srv[id] || Object.prototype.hasOwnProperty.call(out, id)) return;
+      if(pend[id] !== undefined){ out[id] = cur[id]; return; }
+      if(!first && snap[id] !== undefined) return;                                                        // someone else removed it
+      if(first && base && base[id + '=' + _invRecSig(cur[id])]) return;                                   // was there at login, removed since
+      if(gone[id] && !first) return;
+      out[id] = cur[id]; });                                                                              // new here, not saved yet
+    Object.keys(cur).forEach(function(k){ if(!Object.prototype.hasOwnProperty.call(out, k)) delete cur[k]; });
+    Object.keys(out).forEach(function(k){ cur[k] = out[k]; });
+  } else {
+    var ids = _invRecIdsFor(key, cur, snap, fps), local = {}, i;
+    for(i = 0; i < cur.length; i++) local[ids[i]] = { r:cur[i], i:i };
+    var res = [], placed = {}, wm = INVREC.wm[key];
+    srvRows.slice().sort(function(a, b){ return (a.ord - b.ord) || (a.rid - b.rid); }).forEach(function(r){
+      var id = r.rec_id, L = local[id], ss = _invRecSig(r.data);
+      if(L){ var ls = _invRecSig(L.r);
+        if(pend[id] !== undefined || stale(r)){ res.push(L.r); nsnap[id] = snap[id]; }
+        else if((!first && snap[id] !== undefined && ls !== snap[id]) || (first && base && ls !== ss && !base[ls])){ res.push(L.r); nsnap[id] = first ? ss : snap[id]; }   // changed here, waiting to save
+        else { var obj = (ls === ss) ? L.r : _invRecInPlace(L.r, r.data); res.push(obj); nsnap[id] = ss; if(obj && typeof obj === 'object') wm.set(obj, id); }
+        placed[id] = 1;
+      } else {
+        if(!first && snap[id] !== undefined && !stale(r)){ nsnap[id] = snap[id]; return; }                 // removed here, waiting to save
+        res.push(r.data); nsnap[id] = ss; if(r.data && typeof r.data === 'object') wm.set(r.data, id); placed[id] = 1;
+      }
+      if(!stale(r)){ ver[id] = r.ver; ord[id] = r.ord; fps[id] = _invRecFp(r.data); }
+    });
+    // records made on this screen and not saved yet keep their place; records removed by someone else go
+    for(i = 0; i < cur.length; i++){ var id2 = ids[i]; if(placed[id2] || srv[id2]) continue;
+      if(_invRecSkip(cur[i])) continue;
+      if(pend[id2] === undefined){
+        if(!first && snap[id2] !== undefined) continue;                                                   // someone else removed it
+        if(first && base && base[_invRecSig(cur[i])]) continue;                                           // was there at login, removed since
+        if(gone[id2]) continue;
+      } else nsnap[id2] = snap[id2];
+      var before = null; for(var j = i - 1; j >= 0; j--){ if(placed[ids[j]]){ before = cur[j]; break; } }
+      var at = before ? res.indexOf(before) + 1 : 0; res.splice(at, 0, cur[i]); placed[id2] = 1; }
+    cur.length = 0; Array.prototype.push.apply(cur, res);
+  }
+  Object.keys(nsnap).forEach(function(id){ if(nsnap[id] === undefined) delete nsnap[id]; });
+  INVREC.snap[key] = nsnap;
+}
+function _invRecLoadOnce(){
+  return _invRecExclusive(async function(){
+    if(!INVREC.ready){   // only once the database holds the records (the database step was run) does this screen switch over
+      var lv = await supaClient.from('app_settings').select('value').eq('key', 'inv_records_live').maybeSingle();
+      if(lv && lv.error) throw lv.error;
+      if(!(lv && lv.data && lv.data.value === 'yes')){ INVREC.on = false;   // the old way: save anything that waited for this answer
+        setTimeout(function(){ try{ window._invCloudLast = 0; if(typeof saveInventory === 'function') saveInventory(); }catch(e){} try{ if(typeof saveInvDeletionRequests === 'function') saveInvDeletionRequests(); }catch(e){} }, 50);
+        return false; }
+      invRecSubscribe();            // listen BEFORE reading, so nothing said in between is missed
+    }
+    INVREC.queue = INVREC.queue || [];
+    var rows = await _invRecFetchAll(), by = {}, gone = {};
+    rows.forEach(function(r){ if(r.deleted_at) (gone[r.list_key] = gone[r.list_key] || []).push(r); else (by[r.list_key] = by[r.list_key] || []).push(r); });
+    var first = !INVREC.ready;
+    INV_REC_LISTS.forEach(function(l){ try{ _invRecApplyList(l, by[l[0]] || [], gone[l[0]] || [], first); }catch(e){ console.warn('[inv records] ' + l[0], e); } });
+    INVREC.ready = true; INVREC.on = true; INVREC.lastLoad = Date.now(); INVREC.loadErr = null;
+    var q = INVREC.queue; INVREC.queue = null; (q || []).forEach(function(row){ try{ _invRecOnEvent(row); }catch(e){} });   // changes heard while reading
+    try{ if(typeof initSupplyInventory === 'function') initSupplyInventory(); }catch(e){}
+    try{ if(typeof TCSIM !== 'undefined' && TCSIM) TCSIM.loaded = true; }catch(e){}
+    console.log('[inv records] loaded ' + rows.length + ' records from the database' + (first ? ' (first load)' : ''));
+    if(first) setTimeout(invRecSync, 300);
+    return true;
+  });
+}
+async function invRecLoadAll(){
+  if(typeof supaClient === 'undefined' || !supaClient) return false;
+  if(INVREC.loading) return INVREC.loading;
+  INVREC.loading = (async function(){
+    try{ if(INVREC.ready) await invRecSync(); return await _invRecLoadOnce(); }
+    catch(e){ INVREC.queue = null; INVREC.loadErr = String((e && e.message) || e); console.warn('[inv records] load failed — retrying', e); return false; }
+    finally { INVREC.loading = null; }
+  })();
+  return INVREC.loading;
+}
+
+// ── save only what changed, record by record ──
+function invRecSoon(){ if(!INVREC.ready) return; if(INVREC.timer) clearTimeout(INVREC.timer); INVREC.timer = setTimeout(function(){ INVREC.timer = null; invRecSync(); }, 350); }
+function _invRecAck(key, cur, sent, back){
+  // the database answers with what it now holds (after merging other people's changes into a record saved from an older version)
+  var snap = _invRecS(INVREC.snap, key), ver = _invRecS(INVREC.ver, key), pend = _invRecS(INVREC.pend, key), fps = _invRecS(INVREC.fps, key), ord = _invRecS(INVREC.ord, key);
+  var byId = {}; (back || []).forEach(function(b){ byId[b.rec_id] = b; });
+  sent.forEach(function(x){ var b = byId[x.id]; delete pend[x.id];
+    if(!b){ snap[x.id] = x.sig; return; }
+    if(b.deleted_at){   // someone removed this record before this screen's change arrived: the removal stands, the change is kept in the history
+      INVREC.dropped.push({ list:key, id:x.id, at:new Date().toISOString() }); delete snap[x.id]; delete ver[x.id]; delete fps[x.id]; delete ord[x.id];
+      _invRecRemoveLocal(key, cur, x.id); _invRecRerender(); return; }
+    ver[x.id] = b.ver; var bs = _invRecSig(b.data); snap[x.id] = bs; fps[x.id] = _invRecFp(b.data);
+    if(bs !== x.sig){   // merged with someone else's change: show the merged record (unless this screen changed it again meanwhile — that goes next)
+      if(Array.isArray(cur)){ var ids = _invRecIdsFor(key, cur, snap, fps), at = ids.indexOf(x.id); if(at >= 0 && _invRecSig(cur[at]) === x.sig){ var o = _invRecInPlace(cur[at], b.data); if(o !== cur[at]){ cur[at] = o; if(o && typeof o === 'object') INVREC.wm[key].set(o, x.id); } } }
+      else if(_invRecIsObj(cur) && Object.prototype.hasOwnProperty.call(cur, x.id) && _invRecSig(cur[x.id]) === x.sig) cur[x.id] = _invRecInPlace(cur[x.id], b.data);
+      _invRecRerender(); }
+  });
+}
+function _invRecRemoveLocal(key, cur, id){
+  if(Array.isArray(cur)){ var snap = _invRecS(INVREC.snap, key), fps = _invRecS(INVREC.fps, key); var ids = _invRecIdsFor(key, cur, snap, fps), at = ids.indexOf(id); if(at >= 0) cur.splice(at, 1); }
+  else if(_invRecIsObj(cur)) delete cur[id];
+}
+async function _invRecSend(key, cur, list){
+  var okAll = true, lastErr = null, n = 0;
+  var post = function(part){ return supaClient.from('inv_records').upsert(part.map(function(x){ return x.row; }), { onConflict:'list_key,rec_id' }).select('rec_id,data,ver,deleted_at'); };
+  for(var c = 0; c < list.length; c += 100){ var part = list.slice(c, c + 100);
+    var res = await post(part);
+    if(res && res.error && part.length > 1 && !/fetch|network|Failed|timeout|503|502|504/i.test(String(res.error.message || ''))){
+      // one record the database refuses never holds back the others: send them one by one and set the refused one aside
+      for(var k = 0; k < part.length; k++){ var one = await post([part[k]]);
+        if(one && one.error){ _invRecS(INVREC.bad, key)[part[k].id] = { sig:part[k].sig, error:String(one.error.message || one.error) }; delete _invRecS(INVREC.pend, key)[part[k].id]; console.warn('[inv records] the database refused one record', key, part[k].id, one.error); okAll = false; lastErr = one.error; }
+        else { _invRecAck(key, cur, [part[k]], one.data); n++; } }
+      continue; }
+    if(res && res.error){ okAll = false; lastErr = res.error; part.forEach(function(x){ delete _invRecS(INVREC.pend, key)[x.id]; }); continue; }
+    _invRecAck(key, cur, part, res.data); n += part.length; }
+  return { ok:okAll, err:lastErr, n:n };
+}
+async function invRecSync(){
+  if(!INVREC.ready || typeof supaClient === 'undefined' || !supaClient) return !INVREC.unsaved;
+  if(INVREC.busy){ INVREC.again = true; return !INVREC.unsaved; }
+  INVREC.busy = true;
+  return _invRecExclusive(async function(){
+    var okAll = true, lastErr = null, sent = 0;
+    try{
+      for(var li = 0; li < INV_REC_LISTS.length; li++){
+        var l = INV_REC_LISTS[li], key = l[0], cur = _invRecGet(l[1]); if(cur == null || typeof cur !== 'object') continue;
+        var snap = _invRecS(INVREC.snap, key), fps = _invRecS(INVREC.fps, key), ord = _invRecS(INVREC.ord, key), ver = _invRecS(INVREC.ver, key), pend = _invRecS(INVREC.pend, key), bad = _invRecS(INVREC.bad, key);
+        var ins = [], ups = [], goneIds = [], seen = {}, ids, i;
+        var add = function(id, v, isNew, o){ var sg = _invRecSig(v);
+          if(bad[id] && bad[id].sig === sg) return;                                                        // refused before and not changed since
+          delete bad[id]; pend[id] = sg;
+          var row = { list_key:key, rec_id:id, data:_invRecClone(v), op:isNew ? 'new' : 'edit', base_ver:isNew ? null : (ver[id] != null ? Number(ver[id]) : null) };
+          if(isNew) row.ord = o;
+          (isNew ? ins : ups).push({ id:id, sig:sg, row:row }); };
+        if(l[2] === 'map'){
+          if(!_invRecIsObj(cur)) continue;
+          var maxo = 0; Object.keys(ord).forEach(function(k){ if(ord[k] > maxo) maxo = ord[k]; });
+          Object.keys(cur).forEach(function(id){ if(_invRecSkip(cur[id])) return; seen[id] = 1; var sg = _invRecSig(cur[id]);
+            if(pend[id] !== undefined) return;
+            if(snap[id] === undefined){ maxo += 1; ord[id] = maxo; add(id, cur[id], true, maxo); }
+            else if(snap[id] !== sg) add(id, cur[id], false); });
+        } else {
+          if(!Array.isArray(cur)) continue;
+          ids = _invRecIdsFor(key, cur, snap, fps);
+          for(i = 0; i < cur.length; i++){ var id = ids[i], r = cur[i]; if(_invRecSkip(r)) continue; seen[id] = 1;
+            if(pend[id] !== undefined) continue;
+            var sg2 = _invRecSig(r);
+            if(snap[id] === undefined){
+              // place it between its neighbours so everyone sees the list in the same order
+              var lo = null, hi = null, j;
+              for(j = i - 1; j >= 0; j--){ if(ord[ids[j]] != null){ lo = ord[ids[j]]; break; } }
+              for(j = i + 1; j < cur.length; j++){ if(ord[ids[j]] != null){ hi = ord[ids[j]]; break; } }
+              var o = (lo != null && hi != null && hi > lo) ? (lo + hi) / 2 : (lo != null ? lo + 1 : (hi != null ? hi - 1 : Date.now()));
+              if(lo != null && hi != null && hi <= lo) o = lo + 1e-6;
+              ord[id] = o; fps[id] = _invRecFp(r); add(id, r, true, o);
+            } else if(snap[id] !== sg2){ fps[id] = _invRecFp(r); add(id, r, false); }
+          }
+        }
+        Object.keys(snap).forEach(function(id){ if(!seen[id] && pend[id] === undefined) goneIds.push(id); });
+        if(!ins.length && !ups.length && !goneIds.length) continue;
+        var a = await _invRecSend(key, cur, ins); if(!a.ok){ okAll = false; lastErr = a.err; } sent += a.n;
+        var b = await _invRecSend(key, cur, ups); if(!b.ok){ okAll = false; lastErr = b.err; } sent += b.n;
+        for(var g = 0; g < goneIds.length; g += 200){ var gp = goneIds.slice(g, g + 200);
+          var dres = await supaClient.from('inv_records').update({ deleted_at:new Date().toISOString() }).eq('list_key', key).in('rec_id', gp).select('rec_id,ver');
+          if(dres && dres.error){ okAll = false; lastErr = dres.error; continue; }
+          (dres.data || []).forEach(function(x){ ver[x.rec_id] = x.ver; });
+          gp.forEach(function(id){ delete snap[id]; delete fps[id]; delete ord[id]; }); sent += gp.length; }
+      }
+    }catch(e){ okAll = false; lastErr = e; }
+    INVREC.busy = false;
+    if(okAll){ INVREC.unsaved = null; INVREC.fails = 0; window._invRecUnsaved = null; INVREC.saved += sent; }
+    else { INVREC.fails++; INVREC.unsaved = { at:new Date().toISOString(), error:String((lastErr && (lastErr.message || lastErr)) || '') }; window._invRecUnsaved = INVREC.unsaved;
+      console.warn('[inv records] save failed, retrying:', lastErr); setTimeout(invRecSync, Math.min(30000, 2000 * INVREC.fails));
+      try{ if(typeof _invChkBanner === 'function') _invChkBanner(); }catch(e){} }
+    if(INVREC.again){ INVREC.again = false; setTimeout(invRecSync, 50); }
+    return okAll;
+  }).catch(function(e){ INVREC.busy = false; return false; });
+}
+
+// ── hear other people's changes the moment they save ──
+var _invRecRerenderT = null;
+function _invRecRerender(){
+  if(_invRecRerenderT) return;
+  _invRecRerenderT = setTimeout(function(){ _invRecRerenderT = null;
+    try{ var id = window._currentPanelId; if(!id || !/(^inv|inv-|-inv|invx|^gm-|^tc-|^aw-|^dart|^ex-|inventory|sold|supply|pickup|transfer|xfer|activation)/i.test(String(id))) return;
+      var a = document.activeElement; if(a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable)) return;
+      if(typeof gotoPanel === 'function') gotoPanel(id); }catch(e){} }, 700);
+}
+function _invRecOnEvent(row){
+  if(!row) return; var l = _invRecKeys[row.list_key]; if(!l) return;
+  if(INVREC.queue){ INVREC.queue.push(row); return; }                               // a load is reading right now: apply after it
+  if(!INVREC.ready) return;
+  if(row.data === undefined && !row.deleted_at){ invRecLoadAll(); return; }          // too large to arrive live: fetch it
+  var key = l[0], cur = _invRecGet(l[1]), snap = _invRecS(INVREC.snap, key), ord = _invRecS(INVREC.ord, key), fps = _invRecS(INVREC.fps, key), ver = _invRecS(INVREC.ver, key), pend = _invRecS(INVREC.pend, key);
+  var id = row.rec_id, gone = !!row.deleted_at;
+  if(cur == null || typeof cur !== 'object') return;
+  if(row.ver != null && ver[id] != null && Number(row.ver) <= Number(ver[id])) return;   // already know this version (or newer) — e.g. the echo of this screen's own save
+  if(pend[id] !== undefined) return;                                                // this screen is saving it right now: the database's answer brings the merged record
+  var ss = gone ? null : _invRecSig(row.data);
+  if(l[2] === 'map'){
+    var has = Object.prototype.hasOwnProperty.call(cur, id), ls = has ? _invRecSig(cur[id]) : null;
+    if(has && snap[id] !== undefined && ls !== snap[id] && !gone) return;           // changed here too — this screen's save goes next and is merged
+    if(has && snap[id] === undefined && !gone) return;                               // made here, not saved yet
+    if(gone){ if(has && (snap[id] === undefined || ls === snap[id])) delete cur[id]; delete snap[id]; delete ord[id]; delete fps[id]; }
+    else { if(ls !== ss) cur[id] = has ? _invRecInPlace(cur[id], row.data) : row.data; snap[id] = ss; if(row.ord != null) ord[id] = row.ord; }
+  } else {
+    if(!Array.isArray(cur)) return;
+    var ids = _invRecIdsFor(key, cur, snap, fps), at = ids.indexOf(id);
+    if(at >= 0){ var lsig = _invRecSig(cur[at]);
+      if(snap[id] === undefined && !gone) return;                                    // made here, not saved yet
+      if(!gone && lsig !== snap[id]) return;                                         // changed here too — this screen's save goes next and is merged
+      if(gone){ cur.splice(at, 1); delete snap[id]; delete ord[id]; delete fps[id]; }
+      else { if(lsig !== ss){ var o = _invRecInPlace(cur[at], row.data); if(o !== cur[at]){ cur[at] = o; if(o && typeof o === 'object') INVREC.wm[key].set(o, id); } } snap[id] = ss; fps[id] = _invRecFp(row.data); }
+    } else if(!gone){
+      if(snap[id] !== undefined) return;                                            // removed here, waiting to save
+      var o2 = row.ord != null ? row.ord : Date.now(), pos = cur.length;
+      for(var i = 0; i < cur.length; i++){ var oi = ord[ids[i]]; if(oi != null && oi > o2){ pos = i; break; } }
+      cur.splice(pos, 0, row.data); if(row.data && typeof row.data === 'object') INVREC.wm[key].set(row.data, id); snap[id] = ss; ord[id] = o2; fps[id] = _invRecFp(row.data);
+    }
+  }
+  if(row.ver != null) ver[id] = row.ver;
+  if(key === 'supply_inventory'){ try{ if(typeof initSupplyInventory === 'function') initSupplyInventory(); }catch(e){} }
+  _invRecRerender();
+}
+function invRecSubscribe(){
+  if(INVREC.chan || typeof supaClient === 'undefined' || !supaClient || typeof supaClient.channel !== 'function') return;
+  try{ INVREC.chan = supaClient.channel('wmam-inv-records').on('postgres_changes', { event:'*', schema:'public', table:'inv_records' }, function(p){ try{ _invRecOnEvent(p.new && p.new.rec_id ? p.new : p.old); }catch(e){ console.warn('[inv records live]', e); } })
+    .subscribe(function(st){ if(st === 'SUBSCRIBED') console.log('[inv records] live updates on'); }); }catch(e){ console.warn('[inv records] live updates unavailable', e); }
+}
+if(typeof window !== 'undefined'){
+  Object.assign(window, { invRecLoadAll:invRecLoadAll, invRecSync:invRecSync, invRecSoon:invRecSoon, _invRecOnEvent:_invRecOnEvent, _invRecSig:_invRecSig });
+  setInterval(function(){ try{ if(INVREC.ready && (document.visibilityState !== 'hidden' || INVREC.unsaved)) invRecSync(); }catch(e){} }, 15000);   // catches any change that forgot to save
+  setInterval(function(){ try{ if((INVREC.ready || INVREC.on === false || INVREC.loadErr) && document.visibilityState !== 'hidden' && Date.now() - INVREC.lastLoad > (INVREC.loadErr ? 25000 : 110000) && window._wmamAuthed && window._wmamAuthed()){ INVREC.lastLoad = Date.now(); invRecLoadAll().then(function(ok){ if(ok) _invRecRerender(); }); } }catch(e){} }, 30000);
+  window.addEventListener('focus', function(){ try{ if(INVREC.ready && Date.now() - INVREC.lastLoad > 30000) invRecLoadAll().then(function(ok){ if(ok) _invRecRerender(); }); }catch(e){} });
+  window.addEventListener('beforeunload', function(e){ try{
+    if(INVREC.ready){ invRecSync(); if(INVREC.unsaved || INVREC.busy){ e.preventDefault(); e.returnValue = ''; return ''; } }
+    else if(INVREC.on !== false && INVREC.loadErr){ e.preventDefault(); e.returnValue = ''; return ''; }   // could not reach the records yet: changes on this screen are not saved
+  }catch(x){} });
+  window.addEventListener('online', function(){ try{ if(INVREC.ready) invRecSync(); else if(INVREC.loadErr) invRecLoadAll(); }catch(e){} });
+  document.addEventListener('visibilitychange', function(){ try{ if(INVREC.ready && document.visibilityState === 'hidden') invRecSync(); }catch(e){} });
+}
+
 function saveInventory(localOnly){
+  try{ if(typeof invRecSoon === 'function') invRecSoon(); }catch(e){}   // v2026.10.18: the changed records are saved one by one
   // Calvin 2026-07-01: localOnly=true writes localStorage but SKIPS all cloud
   // writes. Used by the realtime handler so a change RECEIVED from another
   // browser is persisted locally without being echoed back to the cloud — that
@@ -27911,6 +28297,7 @@ function saveInventory(localOnly){
       window._appSettingsWrite = {fails:0, pausedUntil:0, warned:false};
     }
     var pushKey = function(key, val){
+      if((typeof INVREC !== 'undefined' && INVREC && INVREC.on !== false) && _invRecKeys[key]) return;   // v2026.10.18: saved record by record (inv_records)
       // v2026.10.01: only write what THIS browser changed, merged with the database (never overwrite others' work)
       if(val && typeof val === 'object') _wmamSetRef[key] = val;
       var _mine = JSON.stringify(val);
@@ -29908,6 +30295,13 @@ function processGMInventoryUpload(csvText, batchId){
                        : uploadExpiry;
     }
 
+    if(_gmExisting && _invIsSold(_gmExisting)){ gmUpdatedCount++; return; }   // v2026.10.18: a sold phone stays sold when it shows up on a new shipment file
+    if(_gmExisting && _invIsDeleted(_gmExisting)){   // v2026.10.18: re-shipped after a delete = a real restore (never a hidden device)
+      _gmExisting.deletedAt = null; _gmExisting.deletedBy = null; _gmExisting.deletedByName = ''; _gmExisting.deletedReason = '';
+      try{ if(typeof _invTombRemove === 'function'){ _invTombRemove(_gmExisting.imei); _invTombRemove(_gmExisting.sim); } }catch(e){}
+      if(!Array.isArray(_gmExisting.chainOfCustody)) _gmExisting.chainOfCustody = [];
+      _gmExisting.chainOfCustody.push({ type:'restored-on-reupload', at:nowISO, batchId:batchId });
+    }
     if(_gmExisting){
       // VENDOR FILE WINS: reconcile the existing GM device's placement to the file.
       var _gmPrev = _gmExisting.holderId;
@@ -30104,7 +30498,7 @@ function _tcNextId(){
       if(m){ var n = parseInt(m[1], 10); if(n > maxN) maxN = n; }
     }
   });
-  return 'tc-' + (maxN + 1);
+  return _wmamUid('tc');   // v2026.10.18: never reuses a number
 }
 
 // Main upload processor. Returns {newDevices, duplicates, total, unknownMarkets, batchId}.
@@ -30442,7 +30836,7 @@ function processDartInventoryUpload(csvText, batchId, opts){
       // CREATE — new manifest unit; held by the market manager (never unassigned)
       var _cost = _dartRowCost(r, isPhone); if(_cost != null) costSet++;
       var _nd = {
-        id: 'dev-'+(++_dartMaxDevN),
+        id: _wmamUid('dev'),
         type: type,
         imei: isPhone ? imei : null,
         imei2: null,
@@ -30617,6 +31011,10 @@ function processTCInventoryUpload(htmlText, batchId){
       }
     }
 
+    if(_tcExisting && _invIsSold(_tcExisting)){ duplicates.push(imei); updatedCount++; return; }   // v2026.10.18: a sold device stays sold on re-upload
+    if(_tcExisting && _invIsDeleted(_tcExisting)){ _tcExisting.deletedAt = null; _tcExisting.deletedBy = null; _tcExisting.deletedByName = ''; _tcExisting.deletedReason = '';
+      try{ if(typeof _invTombRemove === 'function'){ _invTombRemove(_tcExisting.imei); _invTombRemove(_tcExisting.sim); } }catch(e){}
+      if(!Array.isArray(_tcExisting.chainOfCustody)) _tcExisting.chainOfCustody = []; _tcExisting.chainOfCustody.push({ type:'restored-on-reupload', at:nowISO, batchId:batchId }); }
     if(_tcExisting){
       // VENDOR FILE WINS: reconcile the existing device's placement to the file.
       var _prevHolder = _tcExisting.holderId;
@@ -30639,7 +31037,7 @@ function processTCInventoryUpload(htmlText, batchId){
       return;
     }
     var dev = {
-      id:             'tc-' + (++_tcIdN),
+      id:             _wmamUid('tc'),
       imei:           imei,
       type:           'phone',   // Calvin 2026-06-30: TC inventory is IMEI phones — type explicitly so phone/SIM counts read correctly everywhere
       campaign:       'TC (TruConnect)',
@@ -31399,6 +31797,7 @@ function gmAgentSignTransfer(transferId, confirmed){
 
   req.devices.forEach(function(rd){
     var dev = GM_INVENTORY.find(function(d){return d.imei===rd.imei;}); if(!dev) return;
+    if(_invIsSold(dev) || _invIsDeleted(dev)){ (window._invSkippedFinal = window._invSkippedFinal || []).push(dev.imei); console.warn('[transfer] skipped (already sold or deleted):', dev.imei); return; }   // v2026.10.18
     var now = new Date();
     var market = dev.market;
     var mcfg = gmEnsureMarket(market);
@@ -32225,6 +32624,10 @@ function inventorySummary(user){
     if(dbg && added2) console.log('[invSum] safety net added '+added2+' device(s) by holder match');
   }
 
+  // v2026.10.18: one device = one count (same IMEI never counted twice; deleted devices never counted)
+  try{ var _sumSeen = {}; var _sumKey = function(d){ var x = String(d.imei || d.sim || '').replace(/\D/g,''); return x || ('id:' + d.id); };
+    var _sumKeep = function(d){ if(!d || d.deletedAt || d.status === 'deleted') return false; var k = _sumKey(d); if(_sumSeen[k]) return false; _sumSeen[k] = 1; return true; };
+    all = all.filter(_sumKeep); lg = lg.filter(_sumKeep); }catch(e){}
   var total = all.length + lg.length;
   if(dbg) console.log('[invSum] FINAL total='+total+' for user='+(user&&user.id));
 
@@ -35451,6 +35854,7 @@ async function loadFromSupabase(){
     if(settings){
       // Calvin 2026-05-14: app_settings load is direct now — no queue check needed
       settings.forEach(function(s){
+        if(s && (typeof INVREC !== 'undefined' && INVREC && INVREC.on === true) && _invRecKeys[s.key]) return;   // v2026.10.18: these lists come from the records
         try{ if(s && s.key) wmamNoteServerSetting(s.key, s.value); }catch(e){}
         if(s.key==='report_name_map' && s.value){ try{ var _rn = JSON.parse(s.value); if(_rn && typeof _rn === 'object'){ Object.keys(WMAM_REPORT_NAMES).forEach(function(k){ delete WMAM_REPORT_NAMES[k]; }); Object.keys(_rn).forEach(function(k){ WMAM_REPORT_NAMES[k] = _rn[k]; }); } }catch(e){} }
         if(s.key==='brevo_key' && s.value) BREVO_API_KEY=s.value;
@@ -35735,7 +36139,14 @@ async function loadFromSupabase(){
       return s.key && supabaseInventoryKeys.indexOf(s.key) >= 0 && s.value;
     });
     if(!supabaseHadInventory){
+      // v2026.10.18: this person's own saved copies can be OLDER than what the database just sent. They are used only for
+      // lists the database did not send; shared records (transfers, sales lists, counters…) are never replaced by an old copy.
+      var _wmamSrvHas = {}; (settings || []).forEach(function(s){ if(s && s.key && s.value) _wmamSrvHas[s.key] = true; });
+      var _wmamKeep = {};
+      WMAM_SHARED_VARS.forEach(function(p){ if(_wmamSrvHas[p[1]]){ try{ _wmamKeep[p[0]] = window[p[0]]; }catch(e){} } });
       loadInventory();
+      WMAM_SHARED_VARS.forEach(function(p){ if(Object.prototype.hasOwnProperty.call(_wmamKeep, p[0])){ try{ var sv = _wmamKeep[p[0]], lv = window[p[0]];
+        window[p[0]] = (typeof sv === 'number' && typeof lv === 'number') ? Math.max(sv, lv) : sv; }catch(e){} } });
       // ── ONE-TIME BACKFILL ──
       // If Supabase has no inventory yet but this browser has local
       // inventory data (from before the cloud-sync fix), push it up
@@ -36839,7 +37250,7 @@ function _applyRealtimeInventoryEvent(payload, table, fromSelf){
   var dev = _invRowToDevice(row);
   if(!dev) return;
   // Calvin 2026-07-08: NEVER resurrect a permanently-deleted device via realtime.
-  if(typeof _invTombHas==='function' && (_invTombHas(dev.imei) || _invTombHas(dev.sim))){
+  if(typeof _invTombHas==='function' && (dev.deletedAt || dev.status === 'deleted') && (_invTombHas(dev.imei) || _invTombHas(dev.sim))){   // v2026.10.18: only deleted rows stay hidden
     var _tk = arr.findIndex(function(d){ return String(d.id) === String(dev.id); });
     if(_tk >= 0) arr.splice(_tk, 1);
     return;
@@ -48407,9 +48818,15 @@ function ownerInvFindBlockedByTransfer(){
 // vendor file that STILL lists that device does NOT resurrect it. Deleted stays deleted.
 // (An intentional re-add is possible by clearing the tombstone via _invTombRemove.)
 var INV_TOMBSTONES = {};
+var WMAM_SHARED_VARS = [['INVENTORY_BATCHES','inv_batches'],['INVENTORY_TRANSFERS','inv_transfers'],['INVENTORY_REQUESTS','inv_requests'],['INV_NEXT_ID','inv_nextid'],
+  ['GM_ACTIVATIONS','gm_activations'],['GM_TRANSFERS','gm_transfers'],['INV_MARKETS','inv_markets'],['INV_UPSELL_REQUIREMENTS','inv_upsell_pct'],['AW_ACTIVATIONS','aw_activations'],['AW_TRANSFERS','aw_transfers'],
+  ['TC_ACTIVATIONS','tc_activations'],['TC_TRANSFERS','tc_transfers'],['EX_ACTIVATIONS','ex_activations'],['EX_TRANSFERS','ex_transfers'],['DART_TRANSFERS','dart_transfers'],['INVENTORY_PICKUPS','inv_pickups'],
+  ['INVENTORY_DISCREPANCY_TICKETS','inv_discrepancies'],['PICKUP_NEXT_ID','inv_pickup_nextid'],['DISCREPANCY_NEXT_ID','inv_disc_nextid'],['TRAINING_SESSIONS','training_sessions'],['TRAINING_COMPLETIONS','training_completions'],
+  ['TRAINING_NEXT_ID','training_nextid'],['COMPLETION_NEXT_ID','completion_nextid'],['UPLOAD_SUBMISSIONS','upload_submissions'],['UPLOAD_NEXT_ID','upload_nextid'],['BG_AUTHORIZATIONS','bg_authorizations'],
+  ['BG_NEXT_ID','bg_nextid'],['CARRIER_TICKETS','carrier_tickets'],['TICKET_NEXT_ID','ticket_nextid'],['MARKETS','markets'],['MARKET_NEXT_ID','market_nextid']];
 function _invTombKey(x){ return String(x==null?'':x).replace(/\D/g,''); }
 function _invTombLoad(){ try{ INV_TOMBSTONES = JSON.parse(localStorage.getItem('wmam_inv_tombstones')||'{}')||{}; }catch(e){ INV_TOMBSTONES={}; } return INV_TOMBSTONES; }
-function _invTombSave(){ try{ localStorage.setItem('wmam_inv_tombstones', JSON.stringify(INV_TOMBSTONES)); }catch(e){} }
+function _invTombSave(){ try{ localStorage.setItem('wmam_inv_tombstones', JSON.stringify(INV_TOMBSTONES)); }catch(e){} try{ if(typeof invRecSoon === 'function') invRecSoon(); }catch(e){} }   // v2026.10.18: one deleted list, shared by everyone
 function _invTombAdd(imei, sim, meta){
   meta=meta||{}; var added=false;
   [imei, sim].forEach(function(v){ var k=_invTombKey(v); if(k && !INV_TOMBSTONES[k]){ INV_TOMBSTONES[k]={at:new Date().toISOString(), by:(meta.by!=null?meta.by:null), campaign:meta.campaign||null}; added=true; } });
@@ -62328,7 +62745,7 @@ function invRequestDeletion(deviceIds, reason){
   if(!Array.isArray(deviceIds)) deviceIds=[deviceIds];
   if(!reason){ reason=prompt('Reason for removal (required):'); if(!reason||!reason.trim()){ alert('A reason is required.'); return; } }
   var req = {
-    id: 'del-'+(INV_NEXT_ID++),
+    id: _wmamUid('del'),
     deviceIds: deviceIds,
     deviceCount: deviceIds.length,
     requestedBy: u.name,
@@ -65102,13 +65519,15 @@ function processInvUpload(){
   var added   = 0;
   var dupes   = 0;
 
+  var _xlBad = imeis.filter(function(x){ return /e\+/i.test(x); });   // v2026.10.18
+  if(_xlBad.length){ alert('These numbers were damaged by Excel and cannot be saved: ' + _xlBad.slice(0, 5).join(', ') + '. Type or paste the full 15-digit numbers.'); return; }
   imeis.forEach(function(imei){
     if(INVENTORY_DEVICES.find(function(d){return d.imei===imei;})){
       dupes++;
       return;
     }
     INVENTORY_DEVICES.push({
-      id:          'dev-'+(INV_NEXT_ID++),
+      id:          _wmamUid('dev'),
       type:        type,
       imei:        imei,
       campaign:    campaign,
@@ -75871,7 +76290,7 @@ function _commitDartScan(code, type, method, imei2){
   var batchId = 'dart-scan-' + new Date().toISOString().replace(/[^0-9]/g,'').slice(0,12);
 
   var device = {
-    id:               'dev-'+(INV_NEXT_ID++),
+    id:               _wmamUid('dev'),
     type:             type === 'sim' ? 'sim' : 'phone',
     imei:             type === 'sim' ? null  : clean,
     imei2:            type === 'sim' ? null  : clean2,   // null when not captured
@@ -78102,7 +78521,7 @@ function panelDartInventory(){
   // 'unassigned', 'available', or any unexpected status that gets introduced
   // in the future). Total ALWAYS == sum of the 4 counters. ALWAYS.
   var cAssigned   = all.filter(function(d){return d.status==='assigned';}).length;
-  var cActivated  = all.filter(function(d){return d.status==='activated';}).length;
+  var cActivated  = all.filter(function(d){return d.status==='activated' || d.status==='sold';}).length;   // v2026.10.18
   var cChargeback = all.filter(function(d){return d.status==='chargeback';}).length;
   var cTotal      = all.length;
   var cAvailable  = cTotal - cAssigned - cActivated - cChargeback;
@@ -78696,7 +79115,12 @@ function dartProcessSalesText(csvText){
     var imei=String(row[ciImei]||'').replace(/\D/g,'');
     var esn=String((ciEsn>=0?row[ciEsn]:'')||'').replace(/\D/g,'');
     if(!imei) continue;
-    if(seen[imei]){ result.dupes++; try{ var _dca2 = header.indexOf('customer account') >= 0 ? String(row[header.indexOf('customer account')] || '').replace(/\D/g,'') : ''; if(_dca2 && typeof _dartAttachAcct === 'function' && _dartAttachAcct(imei, _dca2, esn)) result.linked = (result.linked || 0) + 1; }catch(e){} continue; }
+    if(seen[imei]){ result.dupes++; try{ var _dca2 = header.indexOf('customer account') >= 0 ? String(row[header.indexOf('customer account')] || '').replace(/\D/g,'') : ''; if(_dca2 && typeof _dartAttachAcct === 'function' && _dartAttachAcct(imei, _dca2, esn)) result.linked = (result.linked || 0) + 1; }catch(e){}
+      try{ var _dDt=(typeof _gmIso==='function' && _gmIso(String((ciDate>=0?row[ciDate]:'')||'').trim())) || _ctToday(), _dAg=findAgent(ciCompany>=0?row[ciCompany]:'');   // v2026.10.18: sale already on record -> device shows sold
+        (INVENTORY_DEVICES||[]).forEach(function(d){ if(!d || _invIsDeleted(d) || _invIsSold(d)) return; var mI=String(d.imei||'').replace(/\D/g,'')===imei, mE=esn && String(d.sim||'').replace(/\D/g,'')===esn;
+          if(mI||mE){ d._statusBeforeSold=d.status; d.status='sold'; d.soldAt=_dDt; if(_dAg){ d.soldByAgentId=_dAg.id; d.soldByAgentName=_dAg.name; } if(!Array.isArray(d.chainOfCustody)) d.chainOfCustody=[];
+            d.chainOfCustody.push({type:'sold', at:_dDt, by:_dAg?_dAg.name:'', byId:_dAg?_dAg.id:null, source:'dart-sales-upload (sale already recorded)'}); result.flippedLate=(result.flippedLate||0)+1; } }); }catch(e){}
+      continue; }
     var date=String((ciDate>=0?row[ciDate]:'')||'').trim();
     date=(typeof _gmIso==='function' && _gmIso(date)) || _ctToday();
     var company=ciCompany>=0?row[ciCompany]:'';
@@ -78822,7 +79246,13 @@ function awProcessSalesText(csvText){
     if(ciDeact>=0   && String(row[ciDeact]||'').trim()){   result.skipped++; continue; }                      // deactivated
     var esn=String(ciEsn>=0?row[ciEsn]:'').replace(/\D/g,'');
     if(!esn){ result.skipped++; continue; }                                                                   // approved but no device serial
-    if(seen[esn]){ result.dupes++; continue; }
+    if(seen[esn]){ result.dupes++;
+      try{ var _awD=_mdy(ciDate>=0?row[ciDate]:''), _awA=findAgent(ciCode>=0?row[ciCode]:'');   // v2026.10.18: sale already on record -> make sure the device shows sold
+        [ (typeof AW_INVENTORY!=='undefined'&&Array.isArray(AW_INVENTORY))?AW_INVENTORY:[], (typeof INVENTORY_DEVICES!=='undefined'&&Array.isArray(INVENTORY_DEVICES))?INVENTORY_DEVICES:[] ].forEach(function(pool){
+          pool.forEach(function(dev){ if(dev && !_invIsDeleted(dev) && !_invIsSold(dev) && String(dev.imei||'').replace(/\D/g,'')===esn){ dev._statusBeforeSold=dev.status; dev.status='sold'; dev.soldAt=_awD;
+            if(_awA){ dev.soldByAgentId=_awA.id; dev.soldByAgentName=_awA.name; } if(!Array.isArray(dev.chainOfCustody)) dev.chainOfCustody=[]; dev.chainOfCustody.push({type:'sold', at:_awD, by:_awA?_awA.name:'', byId:_awA?_awA.id:null, source:'aw-sales-upload (sale already recorded)'}); result.flippedLate=(result.flippedLate||0)+1; } }); });
+      }catch(e){}
+      continue; }
     var code=ciCode>=0?row[ciCode]:'';
     var agent=findAgent(code) || (typeof wmamMapReportName==='function' ? wmamMapReportName('Assurance Wireless', code) : null);
     if(!agent){ try{ var _ad = (AW_INVENTORY||[]).find(function(x){ var a = String(x.imei||x.esn||'').replace(/\D/g,''), b2 = String(x.sim||x.iccid||'').replace(/\D/g,''), k = String(esn||'').replace(/\D/g,''); return k && (a===k||b2===k); }); if(_ad && !(_ad.status==='sold'||_ad.soldAt)){ _ad.status='sold'; _ad.soldAt=_mdy(ciDate>=0?row[ciDate]:''); _ad.reportAgentName=String(code||'').trim(); _ad.campaign=_ad.campaign||'Assurance Wireless'; } }catch(e){} }
@@ -78935,7 +79365,7 @@ function panelCarrierInventory(campaign){
 
   // Math invariant — same as DART: Uploaded is the residual category.
   var cAssigned   = all.filter(function(d){return d.status==='assigned';}).length;
-  var cActivated  = all.filter(function(d){return d.status==='activated';}).length;
+  var cActivated  = all.filter(function(d){return d.status==='activated' || d.status==='sold';}).length;   // v2026.10.18: sold counts as sold, never available
   var cChargeback = all.filter(function(d){return d.status==='chargeback';}).length;
   var cTotal      = all.length;
   var cAvailable  = cTotal - cAssigned - cActivated - cChargeback;
@@ -79557,9 +79987,14 @@ function processTCActivationUpload(htmlText, batchId){
     if(!orderNumber || (!imei && !_isSimRow && !(cells[15]||'').trim())){ return; }
 
     var dedupKey = imei + '|' + orderNumber;
+    var _tcReplacesKey = null;
     if(existingKeys[dedupKey]){
-      duplicates.push({imei:imei, orderNumber:orderNumber, agentName:agentName});
-      return;
+      var _tcPrev = null; try{ _tcPrev = (TC_ACTIVATIONS || []).find(function(a){ return a && ((a.imei||'') + '|' + (a.orderNumber||'')) === dedupKey && String(a.status||'').toLowerCase() === 'approved'; }); }catch(e){}
+      if(_tcPrev || String(status||'').toLowerCase() !== 'approved'){
+        duplicates.push({imei:imei, orderNumber:orderNumber, agentName:agentName});
+        return;
+      }
+      _tcReplacesKey = dedupKey;   // v2026.10.18: it was Pending (or unknown) before and is Approved now -> it becomes a sale
     }
     existingKeys[dedupKey] = true;
 
@@ -79608,6 +80043,7 @@ function processTCActivationUpload(htmlText, batchId){
       uploadedAt:    nowISO,
       source:        'tc-sold-by-agent-report'
     };
+    if(_tcReplacesKey) record._replacesKey = _tcReplacesKey;
 
     var sLower = status.toLowerCase();
     if(sLower === 'approved') approved.push(record);
@@ -79687,6 +80123,10 @@ async function applyTCActivations(parseResult){
 
   // ── Approved sales: credit the agent + bump scoreboard ──
   parseResult.approved.forEach(function(act){
+    if(act && act._replacesKey){   // v2026.10.18: the earlier Pending record of this same sale is replaced by the Approved one
+      for(var _ri = TC_ACTIVATIONS.length - 1; _ri >= 0; _ri--){ var _ra = TC_ACTIVATIONS[_ri]; if(_ra && ((_ra.imei||'') + '|' + (_ra.orderNumber||'')) === act._replacesKey && String(_ra.status||'').toLowerCase() !== 'approved') TC_ACTIVATIONS.splice(_ri, 1); }
+      delete act._replacesKey;
+    }
     TC_ACTIVATIONS.push(act);
 
     // Update the matching device record in TC_INVENTORY (skip SIM rows
@@ -81803,6 +82243,7 @@ function invFinalizeTransferAccept(campaign, transferId, skipSig){
   req.devices.forEach(function(rd){
     var dev = pool.find(function(d){return d.imei===rd.imei || (d.sim && (d.sim===rd.imei || d.sim===rd.sim));});
     if(!dev) return;
+    if(_invIsSold(dev) || _invIsDeleted(dev)){ (window._invSkippedFinal = window._invSkippedFinal || []).push(dev.imei || dev.sim); console.warn('[transfer] skipped (already sold or deleted):', dev.imei || dev.sim); return; }   // v2026.10.18
     // Snapshot sender's expiry BEFORE we overwrite anything — this is
     // the basis for the cap calculation.
     // Calvin 2026-05-19: fall back to vendorDueDate if both expiry fields
@@ -83443,12 +83884,14 @@ function syncAllToSupabase(){
           await supaClient.from('team_members').insert(t.members.map(function(mid){return{team_id:t.id,agent_id:mid};})).catch(function(){});
         }
       }
+      if((typeof INVREC !== 'undefined' && INVREC && INVREC.on === true)){ try{ await invRecSync(); }catch(e){} } else {   // v2026.10.18: saved record by record
       await supaClient.from('app_settings').upsert({key:'supply_inventory',value:JSON.stringify(SUPPLY_INVENTORY)},{onConflict:'key'}).catch(function(){});
       await supaClient.from('app_settings').upsert({key:'pending_xfers',value:JSON.stringify(PENDING_TRANSFERS)},{onConflict:'key'}).catch(function(){});
+      }
       await supaClient.from('app_settings').upsert({key:'prog_goals',value:JSON.stringify(PROG_GOALS)},{onConflict:'key'}).catch(function(){});
       await supaClient.from('app_settings').upsert({key:'social_links',value:JSON.stringify(SOCIAL_LINKS)},{onConflict:'key'}).catch(function(){});
       if(COMPANY_LOGO) await supaClient.from('app_settings').upsert({key:'company_logo',value:COMPANY_LOGO},{onConflict:'key'}).catch(function(){});
-      if(INV_DELETION_REQUESTS.length) await supaClient.from('app_settings').upsert(
+      if(INV_DELETION_REQUESTS.length && !(typeof INVREC !== 'undefined' && INVREC && INVREC.on === true)) await supaClient.from('app_settings').upsert(
         {key:'inv_deletion_requests',value:JSON.stringify(INV_DELETION_REQUESTS)},{onConflict:'key'}
       ).catch(function(){});
       if(typeof WMAM_DEPARTMENTS!=='undefined') await supaClient.from('app_settings').upsert(
@@ -84976,8 +85419,8 @@ function inventoryDisplayExpiry(device, viewer){
 //  removes the seller's oldest SIM. Track + flag only — never charged.
 // ══════════════════════════════════════════════════════════════════════
 var TCSIM = { shipments:[], loaded:false };
-async function tcSimLoad(){ try{ var r = await supaClient.from('app_settings').select('value').eq('key','tc_sim_shipments').maybeSingle(); if(r && r.data && r.data.value){ TCSIM.shipments = JSON.parse(r.data.value) || []; } TCSIM.loaded = true; }catch(e){} return TCSIM; }
-async function tcSimSave(){ var r = await supaClient.from('app_settings').upsert({ key:'tc_sim_shipments', value:JSON.stringify(TCSIM.shipments), updated_at:new Date().toISOString() }, { onConflict:'key' }); return !(r && r.error); }
+async function tcSimLoad(){ if((typeof INVREC !== 'undefined' && INVREC && INVREC.on === true)){ try{ await invRecLoadAll(); }catch(e){} TCSIM.loaded = true; return TCSIM; } try{ var r = await supaClient.from('app_settings').select('value').eq('key','tc_sim_shipments').maybeSingle(); if(r && r.data && r.data.value){ TCSIM.shipments = JSON.parse(r.data.value) || []; } TCSIM.loaded = true; }catch(e){} return TCSIM; }
+async function tcSimSave(){ if((typeof INVREC !== 'undefined' && INVREC && INVREC.on === true)) return await invRecSync(); var r = await supaClient.from('app_settings').upsert({ key:'tc_sim_shipments', value:JSON.stringify(TCSIM.shipments), updated_at:new Date().toISOString() }, { onConflict:'key' }); return !(r && r.error); }
 function _tcSimMyMarkets(u){ var out = []; try{ if(typeof wmamPlacementNames === 'function') out = wmamPlacementNames(u) || []; }catch(e){} try{ var m = wmamMarketNameFor(u.team); if(m && out.indexOf(m) < 0) out.push(m); }catch(e){} return out; }
 function _tcSimStatus(sh){
   if(sh.received){ var n = sh.received.count; return n === sh.qty ? { t:'RECEIVED', c:'#dcfce7;color:#166534' } : (n < sh.qty ? { t:'SHORT '+(sh.qty-n)+' \u2014 flagged', c:'#fee2e2;color:#991b1b' } : { t:'OVER '+(n-sh.qty)+' \u2014 flagged', c:'#fef3c7;color:#92400e' }); }
@@ -85302,7 +85745,7 @@ function ipSubmitPickup(){
 
     var now = new Date().toISOString();
     var pickup = {
-      id: PICKUP_NEXT_ID++,
+      id: _wmamUniqNum(),
       marketManagerId: u.id,
       marketManagerName: u.name,
       market: market.trim(),
@@ -85342,7 +85785,7 @@ function ipSubmitPickup(){
     // Per Q4=a: partial pickup → discrepancy ticket
     if(missing.length){
       var ticket = {
-        id: DISCREPANCY_NEXT_ID++,
+        id: _wmamUniqNum(),
         pickupId: pickup.id,
         marketManagerId: u.id,
         marketManagerName: u.name,
@@ -99705,7 +100148,7 @@ function submitSupplyRequest(){
   var items=[];
   SUPPLY_CATALOG.forEach(function(item){ var el=document.getElementById('ir-sup-'+item.id); if(!el) return; var qty=parseInt(el.value)||0; if(qty>0) items.push({id:item.id,name:item.name,icon:item.icon,qty:qty,unit:item.unit}); });
   if(!items.length){ if(errEl){errEl.textContent='⚠ Enter a quantity for at least one item.';errEl.style.display='block';} return; }
-  var req={id:'req-'+INV_NEXT_ID++,type:'supply',agentId:u.id,agentName:u.name,agentRole:u.role,items:items,reason:reason,date:new Date().toISOString().slice(0,10),status:'Pending',approvedBy:null,approvedDate:null};
+  var req={id:_wmamUid('req'),type:'supply',agentId:u.id,agentName:u.name,agentRole:u.role,items:items,reason:reason,date:new Date().toISOString().slice(0,10),status:'Pending',approvedBy:null,approvedDate:null};
   INVENTORY_REQUESTS.unshift(req); saveInventory();
   var itemSummary=items.map(function(i){return i.qty+'× '+i.name;}).join(', ');
   if(!CHANNEL_MSGS['national']) CHANNEL_MSGS['national']=[];
@@ -99742,7 +100185,7 @@ function submitInvRequest(){
   if(!freePhones&&!upsellPhones&&!sims&&!tablets){ if(errEl){ errEl.textContent='⚠ Request at least 1 device.'; errEl.style.display='block'; } return; }
 
   var req = {
-    id:'req-'+INV_NEXT_ID++, type:'device',
+    id:_wmamUid('req'), type:'device',
     agentId:u.id, agentName:u.name, agentRole:u.role,
     campaign:campaign, phones:freePhones+upsellPhones, upsell:upsellPhones,
     sims:sims, tablets:tablets, reason:reason,
@@ -99789,7 +100232,7 @@ function submitStarterKitRequest(){
   if(!size){ if(errEl){ errEl.textContent='⚠ Please select a shirt size.'; errEl.style.display='block'; } return; }
 
   var req = {
-    id:'req-'+INV_NEXT_ID++, type:'starter-kit',
+    id:_wmamUid('req'), type:'starter-kit',
     agentId:u.id, agentName:u.name, agentRole:u.role,
     shirtSize:size, notes:notes,
     items:[
@@ -99830,7 +100273,7 @@ function submitSupplyTransfer(){
   SUPPLY_CATALOG.forEach(function(item){ var el=document.getElementById('ir-xfer-'+item.id); if(!el) return; var qty=parseInt(el.value)||0; if(qty<=0) return; var stock=SUPPLY_INVENTORY[item.id]||{assigned:{}}; var myQty=(stock.assigned&&stock.assigned[u.id])||0; if(qty>myQty){if(errEl){errEl.textContent='⚠ Cannot transfer more '+item.name+' than you hold ('+myQty+').';errEl.style.display='block';} return;} supplyItems.push({id:item.id,name:item.name,icon:item.icon,qty:qty,unit:item.unit}); });
   if(errEl&&errEl.style.display==='block') return;
   if(!supplyItems.length){if(errEl){errEl.textContent='⚠ Enter quantities to transfer.';errEl.style.display='block';} return;}
-  var pendingId='pxfr-'+INV_NEXT_ID++;
+  var pendingId=_wmamUid('pxfr');
   var pending={id:pendingId,fromId:u.id,fromName:u.name,fromRole:u.role,toId:toId,toName:toAgent.name,toRole:toAgent.role,supplyItems:supplyItems,phones:[],sims:[],notes:notes,date:new Date().toISOString().slice(0,10),createdAt:new Date().toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}),status:'Awaiting Recipient Signature',recipientSig:null,recipientSigAt:null,approvedBy:null,approvedAt:null};
   PENDING_TRANSFERS.unshift(pending); savePendingTransfers();
   var summary=supplyItems.map(function(i){return i.qty+'× '+i.name;}).join(', ');
@@ -102805,7 +103248,7 @@ html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
 </script>
 <script>
 // ══════════════════════════════════════════════════════════════════════
-//  AI TEAM (v2026.10.18.2000) — your AI employees, each one its own person.
+//  AI TEAM (v2026.10.18.2300) — your AI employees, each one its own person.
 //  • The AI Team button opens your team: one card per employee with live status.
 //  • Each employee opens in their OWN window: move it, shrink it, minimize it
 //    (and keep talking from the small bar), several open at once.
@@ -104226,6 +104669,110 @@ function stuHtml(card, owner){
       + '</div>'; }).join('');
 }
 Object.assign(window, { stuLoad:stuLoad, stuSet:stuSet, stuLen:stuLen, stuFmt:stuFmt, stuToggle:stuToggle, stuUnclip:stuUnclip, stuAddClips:stuAddClips, stuMake:stuMake, stuAiVideo:stuAiVideo, stuPost:stuPost, stuChangeOpen:stuChangeOpen, stuChangeSend:stuChangeSend });
+// ═══ ✅ INVENTORY ACCURACY: the database checks every device in every campaign; the office sees any problem right away ═══
+var INVCHK = { rows:null, alerts:[], review:[], at:0, busy:false, err:'', seenSkip:0 };
+function _invChkCan(u){ u = u || (typeof DB !== 'undefined' && DB.current); if(!u) return false; try{ return isOwner(u) || u.fullOfficeAccess === true || [1, 20, 21].indexOf(Number(u.id)) >= 0 || (typeof _tcIsOffice === 'function' && _tcIsOffice(u)); }catch(e){ return false; } }
+function _invChkProblems(){ return (INVCHK.rows || []).filter(function(r){ return r.severity === 'problem' && Number(r.found) > 0; }); }
+async function invChkLoad(force){
+  if(!_invChkCan() || typeof supaClient === 'undefined' || !supaClient) return;
+  if(INVCHK.busy || (!force && INVCHK.rows && Date.now() - INVCHK.at < 5 * 60000)) return;
+  INVCHK.busy = true;
+  try{ var r = await supaClient.rpc('wmam_inventory_check'); if(r && r.error) throw new Error(r.error.message); INVCHK.rows = r.data || []; INVCHK.err = ''; INVCHK.at = Date.now();
+    var a = await supaClient.rpc('wmam_inventory_open_alerts'); INVCHK.alerts = (a && a.data) || [];
+    var rv = await supaClient.rpc('wmam_inventory_review_list'); INVCHK.review = (rv && !rv.error && rv.data) || []; }
+  catch(e){ INVCHK.err = String(e && e.message || e); if(/does not exist|not find the function/i.test(INVCHK.err)) INVCHK.rows = INVCHK.rows || null; }
+  INVCHK.busy = false;
+  if(window._currentPanelId === 'inv-accuracy') invChkRender(); else _invChkBanner();
+}
+function _invChkIsInvPanel(id){ return id && id !== 'inv-accuracy' && /(^inv|inv-|-inv|invx|^gm-|^tc-|^aw-|^dart|^ex-|inventory)/i.test(String(id)); }
+// the small centered notice on every inventory screen
+function _invChkBanner(){
+  var box = document.getElementById('boBody'); if(!box || !_invChkCan() || !_invChkIsInvPanel(window._currentPanelId)) return;
+  var old = document.getElementById('invChkBanner'); if(old) old.remove();
+  var p = _invChkProblems(), uns = window._invUnsaved || window._invRecUnsaved, h = '';
+  if(uns) h += '<div style="background:#fff7ed;border:1.5px solid #fdba74;color:#9a3412;border-radius:12px;padding:10px 14px;font-weight:800;font-size:.88rem">⚠ Some inventory changes have not reached the database yet — retrying automatically. Do not close this page.</div>';
+  if(p.length) h += '<div onclick="gotoPanel(\'inv-accuracy\')" style="cursor:pointer;background:#fef2f2;border:1.5px solid #fca5a5;color:#991b1b;border-radius:12px;padding:10px 14px;font-weight:800;font-size:.9rem">⚠ The inventory check found ' + p.reduce(function(s, r){ return s + Number(r.found); }, 0) + ' device problem' + (p.reduce(function(s, r){ return s + Number(r.found); }, 0) === 1 ? '' : 's') + ' · <u>See exactly which devices</u></div>';
+  else if(INVCHK.rows) h += '<div onclick="gotoPanel(\'inv-accuracy\')" style="cursor:pointer;color:#166534;font-weight:800;font-size:.8rem">✅ Every device reads correctly · checked ' + _aitEsc(_aitWhen(new Date(INVCHK.at).toISOString()) || 'just now') + '</div>';
+  if(!h) return;
+  var d = document.createElement('div'); d.id = 'invChkBanner'; d.style.cssText = 'max-width:860px;margin:10px auto 0;padding:0 16px;display:flex;flex-direction:column;gap:8px;align-items:center;text-align:center;font-family:Arial,sans-serif';
+  d.innerHTML = h; box.insertBefore(d, box.firstChild);
+}
+function _invChkRow(r){
+  var bad = r.severity === 'problem' && Number(r.found) > 0, info = r.severity === 'info';
+  var ex = String(r.examples || '').split(' | ').filter(Boolean);
+  return '<div style="background:#fff;border:1px solid ' + (bad ? '#fca5a5' : '#e5e7eb') + ';border-radius:14px;padding:12px 14px;margin:0 0 10px;text-align:center">'
+    + '<div style="display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap"><span style="font-size:1.1rem">' + (info ? 'ℹ️' : bad ? '⚠️' : '✅') + '</span><span style="font-weight:900">' + _aitEsc(r.check_name) + '</span>'
+    + (info ? '' : '<span style="display:inline-block;border-radius:999px;padding:2px 10px;font-weight:900;font-size:.8rem;background:' + (bad ? '#fee2e2' : '#dcfce7') + ';color:' + (bad ? '#b91c1c' : '#166534') + '">' + (bad ? r.found : 'OK') + '</span>') + '</div>'
+    + (ex.length && (bad || info) ? '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:center;margin-top:8px">' + ex.slice(0, 40).map(function(x){ return '<span style="background:#f1f5f9;border-radius:8px;padding:3px 8px;font-size:.76rem;font-family:monospace;color:#334155">' + _aitEsc(x) + '</span>'; }).join('') + (ex.length > 40 ? '<span style="font-size:.76rem;color:#64748b">+' + (ex.length - 40) + ' more</span>' : '') + '</div>' : '')
+    + '</div>';
+}
+function invChkRender(){
+  var box = document.getElementById('boBody'); if(!box || window._currentPanelId !== 'inv-accuracy') return;
+  var p = _invChkProblems(), rows = INVCHK.rows || [];
+  var tot = rows.filter(function(r){ return Number(r.n) === 0; })[0];
+  var h = '<div id="invChkWrap" style="max-width:860px;margin:0 auto;padding:16px;font-family:Arial,sans-serif;color:#0f172a;text-align:center">'
+    + '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:1.6rem;font-weight:700;letter-spacing:1px;color:#003594">✅ INVENTORY ACCURACY</div>'
+    + '<div style="font-size:.84rem;color:#64748b;margin:2px 0 12px">Every device in every campaign, checked against the sales records by the database itself. It also checks itself every hour and alerts the office when anything is off.</div>'
+    + '<div style="margin-bottom:12px">' + _socBtn(INVCHK.busy ? 'Checking…' : '🔄 Check now', 'invChkLoad(true)') + '</div>';
+  if(INVCHK.err && !rows.length) h += '<div style="color:#b91c1c;font-weight:700">Could not run the check: ' + _aitEsc(INVCHK.err) + '</div>';
+  else if(!rows.length) h += '<div style="color:#64748b;padding:20px">Checking every device…</div>';
+  else {
+    h += '<div style="background:' + (p.length ? '#fef2f2' : '#f0fdf4') + ';border:1.5px solid ' + (p.length ? '#fca5a5' : '#86efac') + ';border-radius:14px;padding:14px;margin-bottom:12px;font-weight:900;font-size:1.05rem;color:' + (p.length ? '#991b1b' : '#166534') + '">'
+      + (p.length ? '⚠ ' + p.length + ' kind' + (p.length === 1 ? '' : 's') + ' of problem found — the exact devices are listed below' : '✅ Every device reads correctly') + '<div style="font-size:.78rem;font-weight:600;color:#64748b;margin-top:4px">Checked ' + _aitEsc(_aitWhen(new Date(INVCHK.at).toISOString()) || 'just now') + '</div></div>';
+    if(INVCHK.alerts.length) h += '<div style="background:#fff;border:1px solid #fde68a;border-radius:14px;padding:12px 14px;margin:0 0 12px"><div style="font-weight:900;margin-bottom:8px">↩ Can be restored</div>' + INVCHK.alerts.slice(0, 30).map(function(a){
+        return '<div style="padding:8px 0;border-top:1px solid #f1f5f9;font-size:.84rem"><div><b>' + _aitEsc(a.imei || a.device_id || a.tbl || '') + '</b> · ' + _aitEsc(a.detail || '') + ' <span style="color:#64748b">' + _aitEsc(_aitWhen(a.at) || '') + '</span></div>'
+          + '<div style="display:flex;gap:8px;justify-content:center;margin-top:6px">' + _socBtn('↩ Restore', 'invChkResolve(' + a.id + ',true)', '#003594', '#fff', 'padding:6px 12px;font-size:.8rem') + _socBtn('It was meant to happen', 'invChkResolve(' + a.id + ',false)', '', '', 'padding:6px 12px;font-size:.8rem') + '</div></div>'; }).join('') + '</div>';
+    if(INVCHK.review.length) h += '<div style="background:#fff;border:1px solid #bfdbfe;border-radius:14px;padding:12px 14px;margin:0 0 12px"><div style="font-weight:900">📝 Waiting for you to decide</div><div style="font-size:.78rem;color:#64748b;margin:2px 0 6px">These were only on one person\'s screen, or came from a page that had not updated yet. Nothing was added by guessing — you choose.</div>' + INVCHK.review.slice(0, 40).map(function(v){
+        var d = v.data, what = (d && typeof d === 'object' && !Array.isArray(d) && (d.imei || d.orderNumber || d.id)) || (/^[a-z_]+-\d{6}$|^r-|^op-|^rv-/.test(String(v.rec_id || '')) ? '' : (v.rec_id || '')) || '';
+        return '<div style="padding:8px 0;border-top:1px solid #f1f5f9;font-size:.84rem"><div><b>' + _aitEsc(_invChkListName(v.list_key)) + (what ? ' · ' + _aitEsc(String(what)) : '') + '</b> · ' + _aitEsc(v.note || '') + (d && typeof d === 'object' && d.status ? ' <span style="color:#334155">(status: ' + _aitEsc(String(d.status)) + ')</span>' : '') + ' <span style="color:#64748b">' + _aitEsc(_aitWhen(v.at) || '') + '</span></div>'
+          + '<div style="display:flex;gap:8px;justify-content:center;margin-top:6px">' + _socBtn('＋ Add it', 'invChkReview(' + v.id + ',true)', '#003594', '#fff', 'padding:6px 12px;font-size:.8rem') + _socBtn('Not needed', 'invChkReview(' + v.id + ',false)', '', '', 'padding:6px 12px;font-size:.8rem') + '</div></div>'; }).join('') + (INVCHK.review.length > 40 ? '<div style="font-size:.78rem;color:#64748b;padding-top:6px">+' + (INVCHK.review.length - 40) + ' more</div>' : '') + '</div>';
+    h += rows.filter(function(r){ return Number(r.n) !== 0; }).sort(function(a, b){ var x = (a.severity === 'problem' && Number(a.found) > 0) ? 0 : 1, y = (b.severity === 'problem' && Number(b.found) > 0) ? 0 : 1; return x - y || a.n - b.n; }).map(_invChkRow).join('');
+    if(tot) h += _invChkRow(tot);
+  }
+  box.innerHTML = h + '</div>';
+}
+var INV_LIST_NAMES = { inv_batches:'Upload batches', inv_transfers:'Transfers', inv_requests:'Device requests', inv_deletion_requests:'Deletion requests', gm_activations:'Gen Mobile sales', gm_transfers:'Gen Mobile transfers',
+  aw_activations:'Assurance sales', aw_transfers:'Assurance transfers', tc_activations:'TruConnect sales', tc_transfers:'TruConnect transfers', ex_activations:'Excess sales', ex_transfers:'Excess transfers', dart_transfers:'DART transfers',
+  inv_pickups:'Pickups', inv_discrepancies:'Discrepancy tickets', pending_xfers:'Transfers waiting to be signed', sold_reports:'Sold reports', sold_report_batches:'Sold report uploads', tc_sim_shipments:'TruConnect SIM shipments',
+  gm_activation_edits:'Sale corrections', inv_markets:'Market settings', inv_upsell_pct:'Upsell rules', supply_inventory:'Supplies', inv_tombstones:'Deleted list' };
+function _invChkListName(k){ return INV_LIST_NAMES[k] || k; }
+async function invChkReview(id, add){ if(add && !window.confirm('Add this to the shared records for everyone?')) return;
+  try{ var r = await supaClient.rpc('wmam_inventory_review_resolve', { p_id:id, p_add:!!add }); if(r && r.error) throw new Error(r.error.message);
+    if(add && typeof invRecLoadAll === 'function') await invRecLoadAll(); }catch(e){ alert('Not done: ' + (e && e.message || e)); }
+  await invChkLoad(true); }
+async function invChkResolve(id, restore){ if(restore && !window.confirm('Put this back exactly as it was?')) return;
+  try{ var r = await supaClient.rpc('wmam_inventory_resolve', { p_alert:id, p_restore:!!restore }); if(r && r.error) throw new Error(r.error.message);
+    if(restore && typeof wmamInvReloadLive === 'function') await wmamInvReloadLive(false); }catch(e){ alert('Not done: ' + (e && e.message || e)); }
+  await invChkLoad(true); }
+// menu: Inventory → ✅ Accuracy Check (office only)
+(function(){ try{
+  if(typeof WMAM_NAV !== 'undefined' && Array.isArray(WMAM_NAV)){ var inv = WMAM_NAV.filter(function(s){ return s.key === 'inv'; })[0];
+    if(inv && !inv.cards.some(function(c){ return c.title === 'Accuracy Check'; })) inv.cards.push({ title:'Accuracy Check', icon:'✅', bg:'#dcfce7', tabs:[['inv-accuracy','Every device, checked']] }); }
+  if(typeof _wmamIdAllowed === 'function' && !window._invChkAllowWrapped){ window._invChkAllowWrapped = true; var _oa = _wmamIdAllowed;
+    _wmamIdAllowed = function(id){ if(id === 'inv-accuracy') return _invChkCan(DB.current); return _oa.apply(this, arguments); }; window._wmamIdAllowed = _wmamIdAllowed; }
+  if(typeof gotoPanel === 'function' && !window._invChkGotoWrapped){ window._invChkGotoWrapped = true; var _og = gotoPanel;
+    gotoPanel = function(id, params){ var r = _og.apply(this, arguments);
+      if(id === 'inv-accuracy'){ if(!_invChkCan()) return _og('bo'); invChkRender(); invChkLoad(true); }
+      else if(_invChkIsInvPanel(id)){ setTimeout(function(){ _invChkBanner(); invChkLoad(false); }, 60); }
+      return r; }; window.gotoPanel = gotoPanel; }
+}catch(e){ console.warn('[inventory accuracy]', e); } })();
+// files Excel damaged are refused before anything is saved (every upload: inventory files, sales/activation files, email intake)
+(function(){ try{
+  ['processGMInventoryUpload','processTCInventoryUpload','processDartInventoryUpload','processGMActivationCSV','processTCActivationUpload','dartProcessSalesText','awProcessSalesText','processAWInventoryUpload'].forEach(function(name){
+    var orig = window[name]; if(typeof orig !== 'function' || orig._xlGuard) return;
+    var w = function(text){ var bad = (typeof window._wmamExcelDamage === 'function') ? window._wmamExcelDamage(typeof text === 'string' ? text : '') : '';
+      if(bad){ try{ if(document.visibilityState === 'visible') alert(bad); }catch(e){}
+        try{ supaClient.rpc('wmam_inventory_note', { p_kind:'excel_damage', p_detail:name + ': ' + bad.slice(0, 300) }).then(function(){}, function(){}); }catch(e){}
+        return { ok:false, error:bad, summary:bad, newDevices:[], duplicates:[], total:0, unknownMarkets:{}, approved:[], pending:[], canceled:[], unmatchedAgents:[], matched:[], unmatched:[], chargebacks:[], created:0, merged:0, added:0, dupes:0, byAgent:{} }; }
+      return orig.apply(this, arguments); };
+    w._xlGuard = true; window[name] = w; });
+}catch(e){ console.warn('[excel guard]', e); } })();
+// when a transfer skips phones that were already sold, the person is told which ones
+setInterval(function(){ try{ var s = window._invSkippedFinal || []; if(s.length > INVCHK.seenSkip){ var nw = s.slice(INVCHK.seenSkip); INVCHK.seenSkip = s.length;
+  if(document.visibilityState === 'visible') alert('These devices were already sold (or removed), so they were not moved and stay sold: ' + nw.slice(0, 10).join(', ') + (nw.length > 10 ? ' and ' + (nw.length - 10) + ' more' : '')); } }catch(e){} }, 2000);
+// keep the banner current (unsaved changes, new problems)
+setInterval(function(){ try{ if(_invChkIsInvPanel(window._currentPanelId)) _invChkBanner(); if(document.visibilityState === 'visible' && _invChkIsInvPanel(window._currentPanelId)) invChkLoad(false); }catch(e){} }, 20000);
+Object.assign(window, { invChkLoad:invChkLoad, invChkRender:invChkRender, invChkResolve:invChkResolve, invChkReview:invChkReview });
 
 window.addEventListener('resize', function(){ Object.keys(AIT.wins).forEach(function(k){ if(AIT.wins[k].open) aitRenderWin(k); }); if(AIT.rosterOpen) aitRenderRoster(); });
 (function(){ var tries = 0; var t = setInterval(function(){ tries++; if(tries > 120){ clearInterval(t); return; } if(window._wmamAuthed && window._wmamAuthed() && typeof DB !== 'undefined' && DB.current){ clearInterval(t); aitInit(); } }, 1000); })();
