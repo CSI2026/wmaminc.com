@@ -3834,7 +3834,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.19.0430';
+var BUILD_VERSION = '2026.10.19.0500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -103251,7 +103251,7 @@ html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
 </script>
 <script>
 // ══════════════════════════════════════════════════════════════════════
-//  AI TEAM (v2026.10.19.0430) — your AI employees, each one its own person.
+//  AI TEAM (v2026.10.19.0500) — your AI employees, each one its own person.
 //  • The AI Team button opens your team: one card per employee with live status.
 //  • Each employee opens in their OWN window: move it, shrink it, minimize it
 //    (and keep talking from the small bar), several open at once.
@@ -105107,6 +105107,67 @@ async function pdSave(id){
       return r; }; window.gotoPanel = gotoPanel; }
 }catch(e){ console.warn('[people dates]', e); } })();
 Object.assign(window, { celebCheck:celebCheck, celebOpen:celebOpen, celebClose:celebClose, pdLoad:pdLoad, pdSave:pdSave });
+// ═══ 📥 Gen Mobile Excel files: the full IMEI is in each cell even when Excel only SHOWS 3.51999E+14 (narrow column) ═══
+// The Gen Mobile upload boxes take the .xlsx straight from Gen Mobile: every long number is read from the cell itself (the
+// column "expanded"), turned into the same CSV the upload already understands, and run through the normal upload.
+// A device saved earlier with a damaged IMEI is fixed when the same SIM shows up with its real IMEI.
+var GMX = { ids:{ 'gm-inv-file':'gmProcessInventoryUpload', 'gm-act-file':'gmProcessActivationUpload' } };
+function _gmxIsExcel(f){ return !!(f && /\.(xlsx|xlsm|xls)$/i.test(f.name || '')); }
+// one cell → its full text: whole numbers of 10+ digits are written out in full (only when Excel kept every digit)
+function _gmxFullNumbers(ws){
+  Object.keys(ws).forEach(function(k){ if(k.charAt(0) === '!') return; var c = ws[k];
+    if(c && c.t === 'n' && typeof c.v === 'number' && Number.isSafeInteger(c.v) && Math.abs(c.v) >= 1e9){ c.w = String(c.v); delete c.z; } });
+}
+async function _gmxExcelToCsv(file){
+  if(typeof XLSX === 'undefined') throw new Error('The spreadsheet reader did not load. Refresh the page and try again.');
+  var wb = XLSX.read(await file.arrayBuffer(), { type:'array' }), pick = null, headerAt = 0;
+  wb.SheetNames.forEach(function(n){ if(pick) return; var rows = XLSX.utils.sheet_to_json(wb.Sheets[n], { header:1, defval:'', raw:false }).slice(0, 15);
+    for(var i = 0; i < rows.length; i++){ if(rows[i].some(function(v){ return /^\s*(imei|sim|esn)\b/i.test(String(v)); })){ pick = n; headerAt = i; return; } } });
+  if(!pick) pick = wb.SheetNames[0];
+  var ws = wb.Sheets[pick]; _gmxFullNumbers(ws);
+  if(headerAt > 0 && ws['!ref']){ var rg = XLSX.utils.decode_range(ws['!ref']); rg.s.r += headerAt; ws['!ref'] = XLSX.utils.encode_range(rg); }   // title rows above the column names are skipped
+  return XLSX.utils.sheet_to_csv(ws, { blankrows:false });
+}
+async function _gmxPrepare(inputId){
+  var el = document.getElementById(inputId); var f = el && el.files && el.files[0];
+  if(!_gmxIsExcel(f)) return true;
+  var csv; try{ csv = await _gmxExcelToCsv(f); }catch(e){ alert('Could not read that Excel file: ' + (e.message || e)); return false; }
+  try{ var dt = new DataTransfer(); dt.items.add(new File([csv], String(f.name).replace(/\.(xlsx|xlsm|xls)$/i, '.csv'), { type:'text/csv' })); el.files = dt.files; }
+  catch(e){ alert('This browser could not open the Excel file. Please try Chrome or Safari.'); return false; }
+  return true;
+}
+// a device saved earlier with an IMEI Excel damaged (3.51999E+14) gets its real IMEI when its SIM shows up again with the full number
+function _gmxRepairFromCsv(csvText){
+  if(typeof parseGMInventoryCSV !== 'function' || typeof GM_INVENTORY === 'undefined' || !Array.isArray(GM_INVENTORY)) return 0;
+  var bad = GM_INVENTORY.filter(function(d){ return d && /e\+/i.test(String(d.imei || '')) && d.sim; }); if(!bad.length) return 0;
+  var bySim = {}; bad.forEach(function(d){ bySim[String(d.sim).trim()] = d; });
+  var have = {}; GM_INVENTORY.forEach(function(d){ if(d && d.imei) have[String(d.imei)] = 1; });
+  var fixed = [];
+  try{ parseGMInventoryCSV(csvText).forEach(function(r){
+    var imei = String(r['IMEI'] || '').trim(), sim = String(r['SIM'] || '').trim(), d = bySim[sim];
+    if(!d || !/^\d{15}$/.test(imei) || have[imei]) return;
+    var shown = String(d.imei), sig = (String(shown).split(/e/i)[0].replace(/\D/g, '') || '').length;
+    if(!Number(shown) || sig < 3 || Number(imei).toPrecision(sig) !== Number(shown).toPrecision(sig)) return;   // the real IMEI must round to exactly what Excel showed
+    if(!Array.isArray(d.chainOfCustody)) d.chainOfCustody = [];
+    d.chainOfCustody.push({ type:'imei-repaired', at:new Date().toISOString(), from:shown, to:imei, source:'Gen Mobile Excel file' });
+    d.imei = imei; have[imei] = 1; delete bySim[sim]; fixed.push(d); }); }catch(e){ console.warn('[gm excel repair]', e); return 0; }
+  if(fixed.length){ try{ invDbUpsertDevices('gm', fixed); }catch(e){} try{ if(typeof saveToStorage === 'function') saveToStorage(); }catch(e){}
+    try{ supaClient.rpc('wmam_inventory_note', { p_kind:'imei_repaired', p_detail:fixed.length + ' Gen Mobile IMEI(s) repaired from the Excel file: ' + fixed.map(function(d){ return d.imei; }).join(', ') }).then(function(){}, function(){}); }catch(e){} }
+  window._gmxLastFixed = fixed.map(function(d){ return d.imei; });
+  return fixed.length;
+}
+(function(){ try{
+  Object.keys(GMX.ids).forEach(function(inputId){ var name = GMX.ids[inputId], orig = window[name];
+    if(typeof orig !== 'function' || orig._gmx) return;
+    var w = async function(){ var args = arguments; if(!(await _gmxPrepare(inputId))) return; return orig.apply(this, args); };
+    w._gmx = true; window[name] = w; });
+  var p = window.processGMInventoryUpload;
+  if(typeof p === 'function' && !p._gmxRepair){ var wr = function(csvText){ try{ _gmxRepairFromCsv(csvText); }catch(e){} return p.apply(this, arguments); }; wr._gmxRepair = true; wr._xlGuard = p._xlGuard; window.processGMInventoryUpload = wr; }
+  // the boxes take Excel files too
+  setInterval(function(){ Object.keys(GMX.ids).forEach(function(id){ var el = document.getElementById(id); if(!el) return; if(!/xlsx/i.test(el.getAttribute('accept') || '')) el.setAttribute('accept', '.csv,.xlsx,.xls');
+      if(!document.getElementById(id + '-xl')){ var n = document.createElement('div'); n.id = id + '-xl'; n.style.cssText = 'font-size:.74rem;color:#059669;margin-top:4px;font-weight:700'; n.textContent = '✓ The Excel file straight from Gen Mobile works too. Full IMEIs are read even when the column shows 3.5E+14.'; el.insertAdjacentElement('afterend', n); } }); }, 1500);
+}catch(e){ console.warn('[gm excel]', e); } })();
+Object.assign(window, { _gmxExcelToCsv:_gmxExcelToCsv, _gmxRepairFromCsv:_gmxRepairFromCsv });
 
 window.addEventListener('resize', function(){ Object.keys(AIT.wins).forEach(function(k){ if(AIT.wins[k].open) aitRenderWin(k); }); if(AIT.rosterOpen) aitRenderRoster(); });
 (function(){ var tries = 0; var t = setInterval(function(){ tries++; if(tries > 120){ clearInterval(t); return; } if(window._wmamAuthed && window._wmamAuthed() && typeof DB !== 'undefined' && DB.current){ clearInterval(t); aitInit(); } }, 1000); })();
