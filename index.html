@@ -65,11 +65,14 @@
 
   // Stays on the device (tiny, needed before login or per-device by design)
   // v2026.10.05: browser backup snapshots stay on this device only (the real data lives in the database tables)
-  var BACKUP_KEYS = /^wmam_(backup_.*|auto_backups|agents_backup)$/;
+  // v2026.10.19.1720 (Calvin): backup snapshots are no longer kept on the device. Supabase makes them (nightly + Back Up Now);
+  // on the page they live in memory only for this visit, and old device copies are uploaded then cleared (step 6).
+  var BACKUP_KEYS = /^wmam_(backup_(?!lastday$).*|auto_backups|agents_backup)$/;
+  var bk = {};             // key -> string, this page visit only
   function isDeviceKey(k){
-    return /^(__|sb-)/.test(k) || k === 'wmam_session_id' || /^wmam_lang/.test(k) || /^wmam_force_reload/.test(k) || BACKUP_KEYS.test(k);
+    return /^(__|sb-)/.test(k) || k === 'wmam_session_id' || /^wmam_lang/.test(k) || /^wmam_force_reload/.test(k);
   }
-  function isCloudKey(k){ return typeof k === 'string' && /^_?wmam_/.test(k) && !isDeviceKey(k); }
+  function isCloudKey(k){ return typeof k === 'string' && /^_?wmam_/.test(k) && !isDeviceKey(k) && !BACKUP_KEYS.test(k); }
   // Never stored anywhere as a blob: these already live in their own Supabase tables
   // v2026.10.18 ONE SOURCE OF TRUTH: the shared inventory lists live only in the database (inv_records) — no private copy is read or written
   var TABLE_BACKED = /^wmam_(agents|gm_inventory|tc_inventory|aw_inventory|ex_inventory|inv_devices|inv_batches|inv_transfers|inv_requests|inv_deletion_requests|gm_activations|gm_transfers|aw_activations|aw_transfers|tc_activations|tc_transfers|ex_activations|ex_transfers|dart_transfers|inv_pickups|inv_discrepancies|pending_xfers|sold_reports|sold_report_batches|inv_markets|inv_upsell_pct|supply_inv|inv_tombstones|gm_activation_edits|inv_nextid|inv_pickup_nextid|inv_disc_nextid)$/;
@@ -172,6 +175,7 @@
 
   // ---- 4. Storage shim: wmam_* keys go to the cloud cache ------------
   P.getItem = function(k){
+    if(this === LS && BACKUP_KEYS.test(String(k))) return Object.prototype.hasOwnProperty.call(bk, String(k)) ? bk[String(k)] : null;
     if(this === LS && isCloudKey(k = String(k))){
       if(TABLE_BACKED.test(k)) return null;
       return Object.prototype.hasOwnProperty.call(cache, k) ? cache[k] : null;
@@ -186,10 +190,11 @@
       cache[k] = v; delete dels[k]; dirty[k] = true; schedule();
       return;
     }
-    if(this === LS && BACKUP_KEYS.test(String(k))){ try{ return rSet.apply(this, arguments); }catch(e){ return; } }   // a full device just skips the backup
+    if(this === LS && BACKUP_KEYS.test(String(k))){ bk[String(k)] = String(v); return; }   // memory only (Supabase keeps the real backups)
     return rSet.apply(this, arguments);
   };
   P.removeItem = function(k){
+    if(this === LS && BACKUP_KEYS.test(String(k))){ delete bk[String(k)]; return; }
     if(this === LS && isCloudKey(k = String(k))){
       if(Object.prototype.hasOwnProperty.call(cache, k)){ delete cache[k]; delete dirty[k]; dels[k] = true; schedule(); }
       return;
@@ -206,8 +211,8 @@
   };
   function listKeys(){
     var out = [], n = realLen(), i, k;
-    for(i = 0; i < n; i++){ k = rKey.call(LS, i); if(!isCloudKey(k)) out.push(k); }
-    return out.concat(Object.keys(cache));
+    for(i = 0; i < n; i++){ k = rKey.call(LS, i); if(!isCloudKey(k) && !BACKUP_KEYS.test(k)) out.push(k); }
+    return out.concat(Object.keys(cache), Object.keys(bk));
   }
   P.key = function(i){ if(this === LS){ var a = listKeys(); return i < a.length ? a[i] : null; } return rKey.apply(this, arguments); };
   try{
@@ -297,6 +302,42 @@
   };
   window._wmamAuthed = function(){ return state.mode !== 'guest' && !!state.uid; };
 
+  // ---- 6. v2026.10.19.1720: old backup copies on this device go to Supabase, then off the device ----
+  function gzB64(text){
+    if(typeof CompressionStream === 'undefined') return Promise.resolve({ enc: 'json', data: text });
+    var cs = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+    return new Response(cs).arrayBuffer().then(function(buf){
+      var u8 = new Uint8Array(buf), bin = '', i; for(i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+      return { enc: 'gzip-base64', data: btoa(bin) };
+    });
+  }
+  function noPasswords(text){                                            // backups never carry passwords
+    try{
+      var strip = function(k, v){ return k === 'password' ? undefined : v; };
+      var o = JSON.parse(text, strip);
+      if(Array.isArray(o)) o.forEach(function(b){ if(b && typeof b.json === 'string'){ try{ b.json = JSON.stringify(JSON.parse(b.json, strip)); }catch(e){} } });
+      return JSON.stringify(o);
+    }catch(e){ return text; }
+  }
+  var bkRescue = [];
+  function rescueNextBackup(){
+    if(state.mode !== 'cloud' || !bkRescue.length) return;
+    var k = bkRescue.shift(), v = null; try{ v = rGet.call(LS, k); }catch(e){}
+    if(v == null || v.length < 2){ setTimeout(rescueNextBackup, 1000); return; }
+    var clean = noPasswords(v);
+    gzB64(clean).then(function(z){
+      return fetch(URL + '/rest/v1/rpc/wmam_backup_save', { method: 'POST', headers: hdr(currentToken()),
+        body: JSON.stringify({ p_kind: 'device', p_payload: z.data, p_encoding: z.enc, p_meta: { key: k, bytes: clean.length, from: 'device' } }) });
+    }).then(function(res){
+      if(res && res.ok){ try{ rRem.call(LS, k); }catch(e){} console.log('[WMAM backups] device copy ' + k + ' saved to Supabase and cleared from this device'); setTimeout(rescueNextBackup, 15000); }
+      else { console.warn('[WMAM backups] could not upload ' + k + ' yet; it stays on this device until next time'); }
+    }, function(){ console.warn('[WMAM backups] offline; device backup copies stay until next time'); });
+  }
+  if(state.mode === 'cloud'){
+    try{ var _bn = realLen(), _bi, _bk2; for(_bi = 0; _bi < _bn; _bi++){ _bk2 = rKey.call(LS, _bi); if(_bk2 && BACKUP_KEYS.test(_bk2)) bkRescue.push(_bk2); } }catch(e){}
+    if(bkRescue.length) setTimeout(rescueNextBackup, 15000);
+  }
+
   window.addEventListener('beforeunload', function(e){
     if(state.mode === 'cloud' && pending()){ flush(); e.preventDefault(); e.returnValue = ''; return ''; }
   });
@@ -327,6 +368,15 @@
   if(state.mode === 'cloud' && pending()) schedule();
 })();
 
+</script>
+<script>
+// v2026.10.19.1720 app-ready links: on a real website these return exactly what the page address gives (unchanged);
+// inside a phone app (no real web address) they return the live site, so emailed/texted links keep working.
+function _wmamInApp(){ try{ if(window.Capacitor || window.cordova) return true; if(!/^https?:$/.test(location.protocol)) return true; var h = location.hostname || ''; return h === 'localhost' || h === 'appassets.androidplatform.net'; }catch(e){ return true; } }
+function _wmamSiteOrigin(){ return _wmamInApp() ? 'https://wmaminc.com' : location.origin; }
+function _wmamSitePage(){ return _wmamInApp() ? 'https://wmaminc.com/' : location.origin + (location.pathname || '/'); }
+function _wmamSiteHref(){ return _wmamInApp() ? 'https://wmaminc.com/' : window.location.href; }
+window._wmamInApp = _wmamInApp; window._wmamSiteOrigin = _wmamSiteOrigin; window._wmamSitePage = _wmamSitePage; window._wmamSiteHref = _wmamSiteHref;
 </script>
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -3834,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.19.1710';
+var BUILD_VERSION = '2026.10.19.1720';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -5566,7 +5616,7 @@ function _mirrorHighPriorityToEmail(n, opts){
         icon:     n.icon,
         fromName: n.fromName,
         formType: n.formType,
-        appUrl:   (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com',
+        appUrl:   _wmamSiteOrigin(),
         // Pass through any custom payload data the caller specified
         custom:   opts.emailPayload || null
       }
@@ -12593,7 +12643,7 @@ function sendOnboardingPacket(agentId,campaignName,contractType,customTiers){
         campaignName: campaignName,
         contractType: contractType,
         stepsTotal:   3,
-        appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        appUrl:       _wmamSiteOrigin()
       }
     }).catch(function(e){ console.warn('[sendOnboardingPacket] agent email failed:', e); });
   }
@@ -12975,7 +13025,7 @@ function agentCompleteStep(agentId,campaignName,step,data){
         stepLabel:    (step===1 ? '1099 Contractor Agreement' : step===2 ? 'Company Policy & Compliance' : 'Banking Information'),
         stepsComplete: done,
         stepsTotal:   3,
-        appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        appUrl:       _wmamSiteOrigin()
       }
     }).catch(function(){});
   }
@@ -13007,7 +13057,7 @@ function agentCompleteStep(agentId,campaignName,step,data){
             firstName:    (agent.name||'').split(' ')[0],
             fullName:     agent.name,
             campaignName: campaignName,
-            appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+            appUrl:       _wmamSiteOrigin()
           }
         }).catch(function(){});
       }
@@ -13031,7 +13081,7 @@ function agentCompleteStep(agentId,campaignName,step,data){
             firstName:    (agent.name||'').split(' ')[0],
             fullName:     agent.name,
             campaignName: campaignName,
-            appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+            appUrl:       _wmamSiteOrigin()
           }
         }).catch(function(){});
       }
@@ -15312,7 +15362,7 @@ if(typeof window!=='undefined'){ Object.assign(window, { panelGmPayLink:panelGmP
 // Customer buys send the customer to wmaminc.com/#gmpay=<private code>. They see
 // the order + ALL SALES FINAL terms, sign with their finger (drawn only), and
 // only then go on to Square to pay. #gmpaid=<id> is the "thank you" page.
-function _gmSignUrl(sale){ return (location.origin || 'https://wmaminc.com') + '/#gmpay=' + sale.sign_token; }
+function _gmSignUrl(sale){ return _wmamSiteOrigin() + '/#gmpay=' + sale.sign_token; }
 function _gmShareUrl(sale){ return (sale.payer==='customer' && sale.sign_token) ? _gmSignUrl(sale) : sale.square_link_url; }
 var GM_FINAL_TERMS_TEXT = 'No refunds, returns, or exchanges. Williams Marketing and Management, Inc. is not responsible for any cancellation, suspension, disconnection, or change of service, including any action taken by the carrier (Gen Mobile) or its programs.';
 function _gmPublicShell(inner){
@@ -15783,7 +15833,7 @@ if(typeof window!=='undefined'){ window.wmamCleanNav = wmamCleanNav; window.WMAM
 //  always credits that agent. Stops working if switched off, the agent is
 //  deactivated, or they lose their campaign code.
 // ══════════════════════════════════════════════════════════════════════
-function _wmamPayLinkUrl(token){ return (location.origin || 'https://wmaminc.com') + '/#paylink=' + token; }
+function _wmamPayLinkUrl(token){ return _wmamSiteOrigin() + '/#paylink=' + token; }
 function wmamLoadQR(cb){
   if(window.qrcode) return cb();
   var sc = document.createElement('script'); sc.src = 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js';
@@ -17049,7 +17099,7 @@ async function wmamGrantLoginNow(ids){
     a.loginGrantedAt = new Date().toISOString(); a.loginGrantedBy = me.name || '';
     try{ saveAgentToSupabase(a); }catch(e){}
     out.push({ id:a.id, name:a.name, email:a.email||'', username:uname, password:pw });
-    try{ if(a.email && typeof notifyByEmail === 'function'){ var origin = (location.origin||'https://wmaminc.com') + '/'; notifyByEmail({ toAgent:{id:a.id,name:a.name,email:a.email}, eventType:'agent.login_ready', payload:{ firstName:(a.name||'').split(' ')[0], fullName:a.name, username:uname, tempPassword:pw, loginUrl: origin+'#login', appUrl: origin } }); } }catch(e){}
+    try{ if(a.email && typeof notifyByEmail === 'function'){ var origin = _wmamSiteOrigin() + '/'; notifyByEmail({ toAgent:{id:a.id,name:a.name,email:a.email}, eventType:'agent.login_ready', payload:{ firstName:(a.name||'').split(' ')[0], fullName:a.name, username:uname, tempPassword:pw, loginUrl: origin+'#login', appUrl: origin } }); } }catch(e){}
   });
   try{ saveToStorage(); }catch(e){}
   if(out.length) wmamShowGrantedLogins(out);
@@ -17117,7 +17167,7 @@ function wmamEnsureAccess(a, why){
     var pw = 'wmam' + Math.floor(10000 + Math.random()*89999) + '!';
     a.password = pw;
     try{ saveAgentToSupabase(a); }catch(e){}
-    try{ if(a.email && typeof notifyByEmail === 'function'){ var origin = (location.origin||'https://wmaminc.com') + '/'; notifyByEmail({ toAgent:{id:a.id,name:a.name,email:a.email}, eventType:'agent.login_ready', payload:{ firstName:(a.name||'').split(' ')[0], fullName:a.name, username:a.username, tempPassword:pw, loginUrl:origin+'#login', appUrl:origin } }); } }catch(e){}
+    try{ if(a.email && typeof notifyByEmail === 'function'){ var origin = _wmamSiteOrigin() + '/'; notifyByEmail({ toAgent:{id:a.id,name:a.name,email:a.email}, eventType:'agent.login_ready', payload:{ firstName:(a.name||'').split(' ')[0], fullName:a.name, username:a.username, tempPassword:pw, loginUrl:origin+'#login', appUrl:origin } }); } }catch(e){}
     return { id:a.id, name:a.name, email:a.email||'', username:a.username, password:pw };
   }
   try{ saveAgentToSupabase(a); }catch(e){}
@@ -35993,6 +36043,8 @@ async function loadFromSupabase(){
             }
           } catch(e){ console.warn('[load] per-agent assigned_doc parse failed:',e); }
         }
+        // v2026.10.19.1720: the shared copy also refreshes this person's own copy, so the sign-in loaders read the real list (never an empty/old one)
+        if(s.value && {payroll_access:1,payroll_upload_access:1,payroll_weeks:1,payroll_debt_ledger:1,comp_plans:1,comp_assignments:1,comp_templates:1,onboard_templates:1,onboard_packages:1,onboard_assignments:1,store_items:1}[s.key] === 1){ try{ localStorage.setItem('wmam_' + s.key, s.value); }catch(e){} }
         if(s.key==='payroll_access' && s.value){ try{var pa=JSON.parse(s.value);if(Array.isArray(pa))PAYROLL_ACCESS=pa;}catch(e){} }
         if(s.key==='payroll_upload_access' && s.value){ try{var pua=JSON.parse(s.value);if(Array.isArray(pua))PAYROLL_UPLOAD_ACCESS=pua;}catch(e){} }
         if(s.key==='payroll_weeks' && s.value){ try{var pw=JSON.parse(s.value);if(Array.isArray(pw))PAYROLL_WEEKS=pw;}catch(e){} }
@@ -38224,7 +38276,7 @@ async function fireApplicationSubmittedEmail(applicantRow){
               + 'Log in to the WMAMinc back office to view their full application, then contact them and schedule their training.\n\n'
               + 'Open the notification bell and tap their application to see everything.',
           icon: '\uD83D\uDCDD', fromName: 'WMAMinc Applications',
-          appUrl: (typeof location!=='undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+          appUrl: _wmamSiteOrigin()
         }
       }).catch(function(e){ console.warn('[fireApplicationSubmittedEmail] manager '+r.email+':', e); });
       return;
@@ -38747,7 +38799,7 @@ function scanForOnboardingReminders(){
             hoursSinceSent: Math.floor(_hoursSince(status.packetSentAt)),
             cadence:      due,
             reminderNumber: (status.reminderCount || 0) + 1,
-            appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+            appUrl:       _wmamSiteOrigin()
           }
         }).catch(function(){});
       }
@@ -38916,7 +38968,7 @@ function bgDecide(agentId, campaign, newStatus, opts){
           oldStatus:    oldStatus,
           newStatus:    newStatus,
           reason:       opts.reason || '',
-          appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+          appUrl:       _wmamSiteOrigin()
         }
       }).catch(function(){});
     }
@@ -39094,7 +39146,7 @@ function bgFirePassedEmail(agent, campaigns){
         fullName:  agent.name,
         campaigns: campaigns,
         campaignsList: campaigns.join(', '),
-        appUrl:    (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        appUrl:    _wmamSiteOrigin()
       }
     }).catch(function(e){ console.warn('[bgFirePassedEmail] agent email failed:', e); });
   }
@@ -39118,7 +39170,7 @@ function bgFirePassedEmail(agent, campaigns){
         agentName:    agent.name,
         campaigns:    campaigns,
         campaignsList: campaigns.join(', '),
-        appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        appUrl:       _wmamSiteOrigin()
       }
     }).catch(function(e){ console.warn('[bgFirePassedEmail] upline email failed:', e); });
   }
@@ -39176,7 +39228,7 @@ function bgFireFailedEmail(agent, campaigns, reason){
         campaigns: campaigns,
         campaignsList: campaigns.join(', '),
         reason:    reason || '',
-        appUrl:    (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        appUrl:    _wmamSiteOrigin()
       }
     }).catch(function(e){ console.warn('[bgFireFailedEmail] agent email failed:', e); });
   }
@@ -39205,7 +39257,7 @@ function bgFireFailedEmail(agent, campaigns, reason){
           reason:       reason || '',
           costPerFail:  (function(){ var ch=(typeof _bgFailCharges==='function')?_bgFailCharges(campaigns):[]; return ch.map(function(c){return '$'+(c.amountCents/100).toFixed(2)+' ('+c.label+')';}).join(' + '); })(),
           costTotal:    (function(){ var ch=(typeof _bgFailCharges==='function')?_bgFailCharges(campaigns):[]; var t=ch.reduce(function(s,c){return s+c.amountCents;},0); return '$'+(t/100).toFixed(2); })(),
-          appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+          appUrl:       _wmamSiteOrigin()
         }
       }).catch(function(e){ console.warn('[bgFireFailedEmail] upline email failed:', e); });
     }
@@ -39706,9 +39758,7 @@ function inviteApplicant(opts){
 function _applicantSendInvitationEmail(app){
   if(!app || !app.email) return;
   if(typeof notifyByEmail !== 'function') return;
-  var origin = (typeof location !== 'undefined' && location.origin)
-    ? location.origin + (location.pathname || '/')
-    : 'https://wmaminc.com/';
+  var origin = _wmamSitePage();
   // Strip any trailing #hash or ?query, keep only base path
   origin = origin.split('#')[0].split('?')[0];
   // ── Calvin 2026-06-10 v0030 (next-day): HASH-based signing URLs ──
@@ -39816,7 +39866,7 @@ function _applicantNotifyOfficeBgReady(app, wasResubmit){
     }catch(e){}
   }
   // Email every onboarding staff member
-  var origin = (typeof location !== 'undefined' && location.origin) ? location.origin + (location.pathname||'/') : 'https://wmaminc.com/';
+  var origin = _wmamSitePage();
   getOnboardingStaff().forEach(function(a){
     if(!a.email) return;
     if(typeof notifyByEmail === 'function'){
@@ -39989,7 +40039,7 @@ function approveApplicant(applicantId){
   saveApplicants();
 
   // Fire login-credentials email
-  var origin = (typeof location !== 'undefined' && location.origin) ? location.origin + (location.pathname||'/') : 'https://wmaminc.com/';
+  var origin = _wmamSitePage();
   if(typeof notifyByEmail === 'function'){
     notifyByEmail({
       toAgent: {id:newAgent.id, name:newAgent.name, email:newAgent.email},
@@ -40086,7 +40136,7 @@ function rejectApplicant(applicantId, reason){
         campaigns: app.campaigns || [],
         campaignsList: (app.campaigns||[]).join(', '),
         reason: '',  // never expose internal reason to applicant
-        appUrl: (typeof location!=='undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        appUrl: _wmamSiteOrigin()
       }
     }).catch(function(){});
   }
@@ -40133,7 +40183,7 @@ function rejectApplicant(applicantId, reason){
         reason: reason || '',
         costPerFail: '$21.00',
         costTotal: '$'+((app.campaigns||['x']).length * 21).toFixed(2),
-        appUrl: (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+        appUrl: _wmamSiteOrigin()
       }
     }).catch(function(){});
   }
@@ -40239,9 +40289,7 @@ function rejectApplicantField(applicantId, fieldId, note){
 
 function _applicantSendResubmitEmail(app){
   if(!app || !app.email || typeof notifyByEmail !== 'function') return;
-  var origin = (typeof location !== 'undefined' && location.origin)
-    ? location.origin + (location.pathname||'/').split('#')[0].split('?')[0]
-    : 'https://wmaminc.com/';
+  var origin = _wmamSitePage();
   notifyByEmail({
     toAgent: {id:0, name:app.name, email:app.email},
     eventType: 'applicant.resubmit_request',
@@ -40268,7 +40316,7 @@ if(typeof window !== 'undefined'){
 function applicantRemindAndCancelScan(){
   var now = Date.now();
   var DAY_MS = 24*60*60*1000;
-  var origin = (typeof location !== 'undefined' && location.origin) ? location.origin + (location.pathname||'/') : 'https://wmaminc.com/';
+  var origin = _wmamSitePage();
   (APPLICANTS_PRE_BG||[]).forEach(function(app){
     if(!app || app.stage !== 'awaiting-esign') return;
     var invited = app.invitedAt ? new Date(app.invitedAt).getTime() : 0;
@@ -41177,7 +41225,7 @@ function sendFailedBgInvoiceEmail(invoice){
         amountDollars: (li.amountCents/100).toFixed(2)
       };
     }),
-    appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+    appUrl:       _wmamSiteOrigin()
   };
   recipients.forEach(function(r){
     notifyByEmail({
@@ -45140,7 +45188,7 @@ function onBgAuthSigned(agentId){
           firstName:    (agent.name||'').split(' ')[0],
           fullName:     agent.name,
           campaigns:    queuedNames.length ? queuedNames : campaignsToQueue,
-          appUrl:       (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+          appUrl:       _wmamSiteOrigin()
         }
       }).catch(function(e){ console.warn('[onBgAuthSigned] agent email failed:', e); });
     }catch(e){ console.warn('[onBgAuthSigned] agent email threw:', e); }
@@ -46022,7 +46070,7 @@ function saveAgentForm(){
             fullName:  na.name,
             role:      na.role,
             username:  na.username,
-            appUrl:    (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com'
+            appUrl:    _wmamSiteOrigin()
           }
         }).catch(function(){});
       } catch(e){ console.warn('[addAgent] account_created email failed:', e); }
@@ -46851,7 +46899,7 @@ function sendLoginInvite(){
     +'<td style="padding:8px 0"><span style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#888">PASSWORD</span><br><strong style="font-size:18px;color:#003594">'+pw+'</strong></td>'
     +'</tr></table></div>'
     +'<p style="color:#444">Once logged in, go to <strong>Settings</strong> to change your password anytime.</p>'
-    +'<div style="text-align:center;margin:24px 0"><a href="'+window.location.href+'" style="background:#003594;color:white;padding:12px 28px;border-radius:4px;text-decoration:none;font-weight:bold;letter-spacing:2px;text-transform:uppercase;font-size:13px">Log In Now</a></div>'
+    +'<div style="text-align:center;margin:24px 0"><a href="'+_wmamSiteHref()+'" style="background:#003594;color:white;padding:12px 28px;border-radius:4px;text-decoration:none;font-weight:bold;letter-spacing:2px;text-transform:uppercase;font-size:13px">Log In Now</a></div>'
     +'</div><div style="background:#002268;padding:16px;text-align:center">'
     +'<p style="color:rgba(255,255,255,.7);font-size:12px;margin:0">ONE TEAM. ONE DREAM.<br>Williams Marketing &amp; Management Inc.<br>info@wmaminc.com</p></div></div>';
   fetch('https://api.brevo.com/v3/smtp/email',{
@@ -63323,7 +63371,7 @@ function invConsumeApprovalToken(token){
 // approval modal for the transfer. Token is single-use, 72-hour TTL.
 function invBuildMagicLink(transferId, agentId){
   var token = invMintApprovalToken(transferId, agentId);
-  var origin = (typeof window !== 'undefined' && window.location) ? window.location.origin + window.location.pathname : '';
+  var origin = _wmamSitePage();
   return origin + '#inv-approve?t=' + encodeURIComponent(token);
 }
 
@@ -92458,7 +92506,7 @@ function apSendNewAgentWelcomeEmail(agent){
   // dropped agents on the marketing homepage instead of the login screen.
   // Use the current origin + #login so they land directly on the back-office
   // login page. Falls back to wmaminc.com/#login if location is unavailable.
-  var base = (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://wmaminc.com';
+  var base = _wmamSiteOrigin();
   var loginUrl = base + '/#login';
   var html = '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:white">'
     +'<div style="background:#003594;padding:24px;text-align:center"><h1 style="color:white;margin:0;letter-spacing:2px;font-size:22px">👋 WELCOME TO WMAMINC</h1><p style="color:rgba(255,255,255,.85);margin:6px 0 0;font-size:14px;letter-spacing:1px">YOUR ACCOUNT IS READY</p></div>'
@@ -103261,7 +103309,7 @@ html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
 </script>
 <script>
 // ══════════════════════════════════════════════════════════════════════
-//  AI TEAM (v2026.10.19.1710) — your AI employees, each one its own person.
+//  AI TEAM (v2026.10.19.1720) — your AI employees, each one its own person.
 //  • The AI Team button opens your team: one card per employee with live status.
 //  • Each employee opens in their OWN window: move it, shrink it, minimize it
 //    (and keep talking from the small bar), several open at once.
@@ -106119,7 +106167,7 @@ function _aitChatMenuHtml(id){ var w = _aitWin(id); if(!w.menu || !w.thread) ret
     + ((AIT.set.sharing || _aitIsOwner()) ? it('👥 Share with a teammate', "aitSharePick('" + id + "')") : '')
     + (AIT.set.projects !== false ? it('📁 Move to a project' + (t.project_id ? ' (in one now)' : ''), "aitMovePick('" + id + "')") : '') + it('✕ Close', "aitChatMenu('" + id + "')") + '</div></div>'; }
 function aitChatExport(id, how){ var w = _aitWin(id), e = _aitEmp(id), t = (w.threads || []).filter(function(x){ return x.id === w.thread; })[0] || {}; w.menu = false;
-  if(how === 'link'){ var u = location.origin + location.pathname + '?ai=' + encodeURIComponent(id) + '&t=' + w.thread; _aitCopyText(u).then(function(){ _aitToast('Link copied'); }); aitRenderWin(id); return; }
+  if(how === 'link'){ var u = (typeof _wmamSitePage === 'function' ? _wmamSitePage() : location.origin + location.pathname) + '?ai=' + encodeURIComponent(id) + '&t=' + w.thread; _aitCopyText(u).then(function(){ _aitToast('Link copied'); }); aitRenderWin(id); return; }
   var me = (DB.current && DB.current.name) || 'Me', txt = (t.title || 'Chat') + '\n' + new Date().toLocaleString() + '\n\n' + w.msgs.map(function(m){ var c = String(m.content || '').replace(/^(⚡ Fast:|🧩 Think:)\s*/, '').replace(/\[\[choice:\s*([^\]]*)\]\]/g, '• $1').replace(/\[file #\d+:?\s*([^\]]*)\]/g, '[file: $1]');
     return (m.role === 'user' ? me : m.role === 'assistant' ? e.name : '—') + (m.created_at ? ' (' + new Date(m.created_at).toLocaleString() + ')' : '') + ':\n' + c; }).join('\n\n');
   if(how === 'copy'){ _aitCopyText(txt).then(function(){ _aitToast('Chat copied'); }); }
@@ -106427,6 +106475,79 @@ function hsZoom(id){ var a = _hsAgent(id); if(!a || !a.profilePic) return;
   }
 }catch(e){ console.warn('[headshot setup]', e); } })();
 Object.assign(window, { hsPick:hsPick, hsUseOnboarding:hsUseOnboarding, hsZoom:hsZoom, hsRender:hsRender, hsLoad:hsLoad });
+</script>
+
+<script>
+// ═══ v2026.10.19.1720 — BACKUPS LIVE IN SUPABASE (Calvin approved) ═══
+// Supabase makes a snapshot every night (3:10 AM CT, only when something changed) and when office staff press Back Up Now.
+// Phones/computers keep no backup copies. Download still gives the JSON file.
+var WMAM_SB = { list: null, err: '', busy: false };
+function wmamCreateBackupSnapshot(force){ return { created:false, reason:'Supabase makes the backups now' }; }
+function wmamAutoBackupTick(){ /* Supabase makes the nightly backup */ }
+function wmamListBackups(){ return []; }                                    // no backup copies on this device
+function wmamBackupNow(){
+  WMAM_SB.busy = true; WMAM_SB.err = ''; _wmamSbRender();
+  return supaClient.rpc('wmam_backup_now').then(function(r){
+    if(r.error) throw new Error(r.error.message);
+    WMAM_SB.busy = false; return _wmamSbLoad();
+  }).catch(function(e){ WMAM_SB.busy = false; WMAM_SB.err = 'Back up did not finish: ' + (e && e.message || e); _wmamSbRender(); });
+}
+function _wmamSbLoad(){
+  return supaClient.rpc('wmam_backup_list').then(function(r){
+    if(r.error) throw new Error(r.error.message); WMAM_SB.list = r.data || []; _wmamSbRender();
+  }).catch(function(e){ WMAM_SB.err = 'Could not load the backups: ' + (e && e.message || e); _wmamSbRender(); });
+}
+function _wmamSbGunzip(b64){
+  var bin = atob(b64), u8 = new Uint8Array(bin.length); for(var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+}
+function wmamDownloadServerBackup(id){
+  WMAM_SB.err = ''; var btn = document.getElementById('sbDl-' + id); if(btn) btn.textContent = 'PREPARING…';
+  supaClient.rpc('wmam_backup_get', { p_id:id }).then(function(r){
+    if(r.error) throw new Error(r.error.message); var b = r.data || {};
+    return (b.encoding === 'gzip-base64' ? _wmamSbGunzip(b.payload) : Promise.resolve(b.payload)).then(function(txt){
+      var blob = new Blob([txt], { type:'application/json' }), a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = 'wmaminc_backup_' + String(b.taken_at || '').slice(0, 16).replace(/[:T]/g, '-') + '_' + b.kind + '.json';
+      document.body.appendChild(a); a.click(); setTimeout(function(){ try{ URL.revokeObjectURL(a.href); a.remove(); }catch(e){} }, 1500);
+    });
+  }).catch(function(e){ WMAM_SB.err = 'Download failed: ' + (e && e.message || e); }).then(function(){ _wmamSbRender(); });
+}
+function _wmamSbRender(){
+  var box = document.getElementById('wmamSbList'); if(!box) return;
+  var B = 'font-family:Barlow Condensed,sans-serif;', h = '';
+  if(WMAM_SB.err) h += '<div style="' + B + 'background:#fee2e2;border:1px solid #fecaca;color:#991b1b;border-radius:8px;padding:10px 14px;margin:10px 18px;font-weight:700">' + WMAM_SB.err.replace(/</g, '&lt;') + '</div>';
+  if(WMAM_SB.busy) h += '<div style="' + B + 'background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;border-radius:8px;padding:10px 14px;margin:10px 18px;font-weight:700">⏳ Supabase is making a backup…</div>';
+  if(WMAM_SB.list === null){ box.innerHTML = h + '<div style="padding:30px;text-align:center;color:var(--muted);' + B + '">Loading backups…</div>'; return; }
+  if(!WMAM_SB.list.length){ box.innerHTML = h + '<div style="padding:30px;text-align:center;color:var(--muted);' + B + '">No backups yet — click Back Up Now.</div>'; return; }
+  var kinds = { server:'Nightly / Back Up Now', device:'Copy moved off a device', daily:'Daily', manual:'Back Up Now', auto:'Automatic' };
+  WMAM_SB.list.forEach(function(b){
+    var m = b.meta || {}, when = new Date(b.taken_at).toLocaleString('en-US', { month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit' });
+    var size = ((b.bytes || b.stored_bytes || 0) / 1048576).toFixed(1) + ' MB';
+    var what = m.agents != null ? (m.agents + ' agents · ' + (m.settings || 0) + ' settings · ' + (m.inventory_rows || 0) + ' inventory records') : (m.key ? String(m.key).replace(/</g, '&lt;') : '');
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 22px;border-bottom:1px solid rgba(28,49,94,.07)">'
+      + '<div style="min-width:0"><div style="' + B + 'font-size:.85rem;font-weight:700;color:var(--brown)">' + when + ' · ' + (kinds[b.kind] || b.kind) + '</div>'
+      + '<div style="' + B + 'font-size:.68rem;color:var(--muted)">' + what + ' · ' + size + (b.made_by_name ? ' · by ' + String(b.made_by_name).replace(/</g, '&lt;') : '') + (m.still_current_at ? ' · still current ' + new Date(m.still_current_at).toLocaleDateString('en-US', { month:'short', day:'numeric' }) : '') + '</div></div>'
+      + '<button id="sbDl-' + b.id + '" onclick="wmamDownloadServerBackup(' + Number(b.id) + ')" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);' + B + 'font-size:.66rem;letter-spacing:2px;text-transform:uppercase;padding:8px 14px;border-radius:6px;cursor:pointer;min-height:36px">⬇ DOWNLOAD</button></div>';
+  });
+  box.innerHTML = h;
+}
+function panelBackups(){
+  var u = DB.current;
+  var office = u && ((typeof isOwner==='function'&&isOwner(u)) || (typeof isOfficeRole==='function'&&isOfficeRole(u)));
+  if(!office){ return panelHeader('🔒 Backups') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Office staff only.</div></div>'; }
+  var h = panelHeader('💾 Backups');
+  h += '<div class="bo-card" style="padding:20px 24px;margin-bottom:14px">'
+    +'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">'
+    +'<div><div style="font-family:Bebas Neue,sans-serif;font-size:1.05rem;letter-spacing:2px;color:var(--brown)">BACKUPS KEPT IN SUPABASE</div>'
+    +'<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)">Agents, every shared setting (programs, campaigns, payroll, comp, onboarding, documents) and all inventory — saved by Supabase every night and whenever you press Back Up Now. Nothing is kept on this computer or phone. Last 7 days kept.</div></div>'
+    +'<button onclick="wmamBackupNow()" class="btn-fire" style="font-size:.7rem;padding:10px 20px">💾 BACK UP NOW</button>'
+    +'</div></div>';
+  h += '<div class="bo-card" style="padding:6px 0" id="wmamSbList"></div>';
+  WMAM_SB.list = null; setTimeout(function(){ _wmamSbRender(); _wmamSbLoad(); }, 0);
+  return h;
+}
+window.wmamCreateBackupSnapshot = wmamCreateBackupSnapshot; window.wmamAutoBackupTick = wmamAutoBackupTick; window.wmamListBackups = wmamListBackups;
+window.wmamBackupNow = wmamBackupNow; window.panelBackups = panelBackups; window.wmamDownloadServerBackup = wmamDownloadServerBackup;
 </script>
 </body>
 </html>
