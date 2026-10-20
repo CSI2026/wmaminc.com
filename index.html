@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.20.0700';
+var BUILD_VERSION = '2026.10.20.0720';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -103311,7 +103311,7 @@ html { background: linear-gradient(160deg, #eef2f9 0%, #e7edf8 55%, #eaf0fa 100%
 </script>
 <script>
 // ══════════════════════════════════════════════════════════════════════
-//  AI TEAM (v2026.10.20.0700) — your AI employees, each one its own person.
+//  AI TEAM (v2026.10.20.0720) — your AI employees, each one its own person.
 //  • The AI Team button opens your team: one card per employee with live status.
 //  • Each employee opens in their OWN window: move it, shrink it, minimize it
 //    (and keep talking from the small bar), several open at once.
@@ -107416,7 +107416,7 @@ function formHtml(u){
   h += '<button onclick="etSubmit()" class="btn-fire" style="width:100%;justify-content:center;padding:12px;font-size:.78rem;letter-spacing:3px;margin-top:6px">Submit Order for Approval →</button>';
   h += '</div>';
   // this person's own orders
-  var mine = etOrders().filter(function(r){ return r.agentId === u.id; }).slice(0, 10);
+  var mine = etOrders().filter(function(r){ return r.agentId === u.id; }).slice(0, 25);
   if(mine.length){
     h += '<div class="bo-card" style="padding:16px 20px"><div style="' + L + ';margin-top:0">My ' + ET_COMPANY + ' orders</div>';
     mine.forEach(function(r){ var col = { Pending:'#D97706', Approved:'#059669', Denied:'#CC0000' }[r.status] || '#888';
@@ -107578,18 +107578,83 @@ window.etApprove = async function(id){
   if(!res || res.error || !d.ok){ r.approvedBy = null; r.approvedDate = null; btns.forEach(function(b){ b.disabled = false; }); return cardErr(id, 'The email did not send, so the order is still Pending: ' + esc((res && res.error && res.error.message) || d.error || 'unknown')); }
   r.status = 'Approved'; r.sentTo = to; r.sentFrom = acc.address; r.sentAt = new Date().toISOString(); r.orderNo = num;
   try{ saveInventory(); }catch(e){}
+  await etSendInvoice(r, acc);
   try{ pushNotification({ toIds:[r.agentId], icon:'✅', panel:'inv-request', title:ET_COMPANY + ' order approved', body:'Your order (' + r.lines.map(function(l){ return l.qty + '× ' + l.name; }).join(', ') + ') was approved and sent to ' + ET_COMPANY + '. Ships to ' + shipText(r.ship) + '.' }); }catch(e){}
   try{ showToast('Approved and sent to ' + to); }catch(e){}
   gotoPanel('inv-requests'); };
+// ── the requester's copy: their invoice (with prices), emailed when the office approves ──
+function requesterOf(r){ return (DB.agents || []).find(function(a){ return a.id === r.agentId; }) || null; }
+function invoiceEmail(r, approverName){ var a = requesterOf(r), first = String((a && a.name) || r.agentName || '').split(' ')[0] || 'there', num = orderNo(r);
+  return { to:String((a && a.email) || '').trim(), subject:'Your ' + ET_COMPANY + ' order was approved — #' + num,
+    text:'Hi ' + first + ',\n\nYour ' + ET_COMPANY + ' device order has been approved and sent to the company to be filled.\n\n'
+      + 'Order #: ' + num + '\nOrder date: ' + (r.orderDate || r.date) + '\nApproved by: ' + (approverName || r.approvedBy || '') + ' on ' + (r.approvedDate || today()) + '\n\nItems:\n'
+      + r.lines.map(function(l){ return '  ' + l.qty + ' x ' + l.name + ' @ ' + (l.price ? money(l.price) : 'no charge') + ' = ' + money(l.total); }).join('\n')
+      + '\n\nOrder total: ' + money(r.total) + '\n\nShipping to:\n  ' + r.ship.name + '\n  ' + r.ship.street + '\n  ' + r.ship.city + ', ' + r.ship.state + ' ' + r.ship.zip
+      + (r.notes ? '\n\nNotes: ' + r.notes : '') + '\n\nYour invoice is attached (PDF). You can also download it any time from Inventory Request > ' + ET_COMPANY + ' Order > My orders in the back office.\n\n'
+      + 'Williams Marketing and Management, Inc.\nwmaminc.com' }; }
+window.etInvoiceEmail = invoiceEmail;
+async function etSendInvoice(r, acc){
+  var m = invoiceEmail(r, DB.current && DB.current.name); r.invoiceError = '';
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(m.to)){ r.invoiceError = 'No email on file for ' + (r.agentName || 'the requester'); try{ saveInventory(); }catch(e){} return false; }
+  var res = null; try{ res = await wmamInvoke('email-center', { body:{ action:'send', account_id:acc.id, from:acc.address, to:m.to, subject:m.subject, text:m.text, attachments:[{ name:'WMAMinc-Invoice-' + orderNo(r) + '.pdf', type:'application/pdf', data:etPdfBase64(r, true) }] } }); }catch(e){ res = { error:{ message:String(e && e.message || e) } }; }
+  var d = (res && res.data) || {};
+  if(!res || res.error || !d.ok) r.invoiceError = 'Invoice email did not send: ' + ((res && res.error && res.error.message) || d.error || 'unknown');
+  else { r.invoiceTo = m.to; r.invoiceSentAt = new Date().toISOString(); }
+  try{ saveInventory(); }catch(e){} return !r.invoiceError; }
+window.etResendInvoice = async function(id){ var r = findOrder(id), u = DB.current; if(!r || r.status !== 'Approved' || !isOffice(u)) return;
+  var acc = null; try{ var a = await supaClient.from('email_accounts').select('id,address').eq('agent_id', u.id).order('created_at', { ascending:true }).limit(1); acc = a && a.data && a.data[0]; }catch(e){}
+  if(!acc){ alert('Your email is not connected in the Email Center yet.'); return; }
+  var ok = await etSendInvoice(r, acc); alert(ok ? 'Invoice emailed to ' + r.invoiceTo + '.' : r.invoiceError); gotoPanel('inv-requests'); };
+
+// ── record of every order (office) ──
+var REC = { status:'all', q:'', month:'' };
+function recRows(){ var q = REC.q.toLowerCase();
+  return etOrders().filter(function(r){ if(REC.status !== 'all' && (REC.status === 'flagged' ? !r.flagged : r.status !== REC.status)) return false;
+    if(REC.month && String(r.orderDate || r.date || '').slice(0, 7) !== REC.month) return false;
+    if(q && [orderNo(r), r.agentName, shipText(r.ship), (r.lines || []).map(function(l){ return l.name; }).join(' '), r.notes].join(' ').toLowerCase().indexOf(q) < 0) return false; return true; })
+  .sort(function(a, b){ return String(b.orderDate || b.date || '').localeCompare(String(a.orderDate || a.date || '')) || String(b.id).localeCompare(String(a.id)); }); }
+function recTable(){ var rows = recRows(), units = 0, cost = 0, TD = 'padding:7px 9px;border-top:1px solid var(--border);vertical-align:top;font-family:Barlow Condensed,sans-serif;font-size:.8rem;color:var(--brown)';
+  var TH = 'padding:7px 9px;text-align:left;font-family:Barlow Condensed,sans-serif;font-size:.64rem;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);white-space:nowrap';
+  var body = rows.map(function(r){ var u = (r.lines || []).reduce(function(t, l){ return t + (Number(l.qty) || 0); }, 0); units += u; cost += Number(r.total) || 0;
+    var col = { Pending:'#D97706', Approved:'#059669', Denied:'#CC0000' }[r.status] || '#888';
+    var mini = 'background:none;border:1px solid var(--border);border-radius:4px;padding:2px 7px;font-family:Barlow Condensed,sans-serif;font-size:.68rem;cursor:pointer;margin:0 4px 4px 0';
+    return '<tr><td style="' + TD + ';white-space:nowrap">' + esc(orderNo(r)) + '</td><td style="' + TD + ';white-space:nowrap">' + esc(r.orderDate || r.date) + '</td><td style="' + TD + '">' + esc(r.agentName) + '<div style="color:var(--muted);font-size:.7rem">' + esc(r.agentRole || '') + '</div></td>'
+      + '<td style="' + TD + '">' + esc(shipText(r.ship)) + (r.flagged ? '<div style="color:#c2410c;font-size:.72rem">🚩 ' + esc(r.flagReason || 'flagged') + '</div>' : '') + '</td>'
+      + '<td style="' + TD + '">' + (r.lines || []).map(function(l){ return l.qty + '× ' + esc(l.name); }).join('<br>') + '</td><td style="' + TD + ';text-align:right">' + u + '</td><td style="' + TD + ';text-align:right;white-space:nowrap">' + money(r.total) + '</td>'
+      + '<td style="' + TD + '"><b style="color:' + col + '">' + esc(r.status === 'Approved' ? 'Approved & sent' : r.status) + '</b>'
+      + (r.status === 'Approved' ? '<div style="color:var(--muted);font-size:.7rem">' + esc(r.approvedBy || '') + ' · ' + esc(String(r.sentAt || '').slice(0, 10)) + '<br>to ' + esc(r.sentTo || '') + '<br>' + (r.invoiceTo ? 'invoice → ' + esc(r.invoiceTo) : '<span style="color:#c2410c">' + esc(r.invoiceError || 'invoice not emailed') + '</span>') + '</div>' : '')
+      + (r.status === 'Denied' ? '<div style="color:var(--muted);font-size:.7rem">' + esc(r.approvedBy || '') + (r.denyReason ? ' · ' + esc(r.denyReason) : '') + '</div>' : '') + '</td>'
+      + '<td style="' + TD + '"><button style="' + mini + '" onclick="etPdfDownload(\'' + esc(r.id) + '\',false)">📄 Company</button><button style="' + mini + '" onclick="etPdfDownload(\'' + esc(r.id) + '\',true)">🧾 Invoice</button>'
+      + (r.status === 'Approved' ? '<button style="' + mini + '" onclick="etResendInvoice(\'' + esc(r.id) + '\')">✉ Re-send invoice</button>' : '') + '</td></tr>'; }).join('');
+  return '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;min-width:900px"><thead><tr style="background:#f4f6f8">'
+    + ['Order #','Order date','Requested by','Ship to','Items','Units','Cost','Status','PDFs'].map(function(t, i){ return '<th style="' + TH + (i === 5 || i === 6 ? ';text-align:right' : '') + '">' + t + '</th>'; }).join('') + '</tr></thead><tbody>'
+    + (body || '<tr><td colspan="9" style="' + TD + ';text-align:center;color:var(--muted);padding:18px">No orders match.</td></tr>') + '</tbody>'
+    + '<tfoot><tr style="background:#f4f6f8"><td colspan="5" style="' + TD + ';font-weight:700">' + rows.length + ' order' + (rows.length === 1 ? '' : 's') + '</td><td style="' + TD + ';text-align:right;font-weight:700">' + units + '</td><td style="' + TD + ';text-align:right;font-weight:700">' + money(cost) + '</td><td colspan="2" style="' + TD + '"></td></tr></tfoot></table></div>'; }
+function recordsHtml(){ var months = {}; etOrders().forEach(function(r){ var m = String(r.orderDate || r.date || '').slice(0, 7); if(m) months[m] = 1; });
+  var sel = 'class="f-select" style="width:auto;min-width:140px"';
+  return '<div class="bo-card" style="padding:16px 18px;margin-top:14px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px">'
+    + '<div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:1.5px;color:var(--brown)">📚 All ' + ET_COMPANY + ' orders — record</div>'
+    + '<button onclick="etRecCsv()" style="background:rgba(0,53,148,.08);border:1px solid rgba(0,53,148,.25);color:var(--blue);font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:2px;text-transform:uppercase;padding:7px 14px;border-radius:4px;cursor:pointer">⬇ Download CSV</button></div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"><select ' + sel + ' onchange="etRecSet(\'status\',this.value)">' + [['all','All statuses'],['Pending','Pending'],['Approved','Approved & sent'],['Denied','Denied'],['flagged','🚩 Flagged']].map(function(o){ return '<option value="' + o[0] + '"' + (REC.status === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select>'
+    + '<select ' + sel + ' onchange="etRecSet(\'month\',this.value)"><option value="">All months</option>' + Object.keys(months).sort().reverse().map(function(m){ return '<option value="' + m + '"' + (REC.month === m ? ' selected' : '') + '>' + m + '</option>'; }).join('') + '</select>'
+    + '<input class="f-input" style="flex:1 1 200px;min-width:0" placeholder="Search order #, agent, address, item…" value="' + esc(REC.q) + '" oninput="etRecSet(\'q\',this.value)"></div>'
+    + '<div id="etRecTable">' + recTable() + '</div></div>'; }
+window.etRecSet = function(k, v){ REC[k] = v; var t = document.getElementById('etRecTable'); if(t) t.innerHTML = recTable(); };
+window.etRecCsv = function(){ var c = function(v){ v = String(v == null ? '' : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  var out = [['Order #','Order date','Requested by','Role','Recipient','Street','City','State','ZIP','Items','Units','Cost','Status','Flagged','Approved by','Approved date','Sent to company','Invoice emailed to','Notes']].concat(recRows().map(function(r){ var s = r.ship || {};
+    return [orderNo(r), r.orderDate || r.date, r.agentName, r.agentRole, s.name, s.street, s.city, s.state, s.zip, (r.lines || []).map(function(l){ return l.qty + 'x ' + l.name; }).join('; '), (r.lines || []).reduce(function(t, l){ return t + (Number(l.qty) || 0); }, 0), (Number(r.total) || 0).toFixed(2), r.status, r.flagged ? (r.flagReason || 'yes') : '', r.approvedBy || '', r.approvedDate || '', r.sentTo || '', r.invoiceTo || '', r.notes || '']; }));
+  var blob = new Blob([out.map(function(row){ return row.map(c).join(','); }).join('\r\n')], { type:'text/csv' }), url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = 'enTouch-Assist-orders-' + today() + '.csv'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){ URL.revokeObjectURL(url); }, 4000); };
+
 if(typeof panelInvRequests === 'function' && !panelInvRequests._et){ var oReqs = panelInvRequests;
   window.panelInvRequests = panelInvRequests = function(){
     var all = INVENTORY_REQUESTS, mine = all.filter(function(r){ return r && r.type === 'entouch-order'; }), h;
     // the other request types render exactly as before
     try{ INVENTORY_REQUESTS = all.filter(function(r){ return !(r && r.type === 'entouch-order'); }); h = oReqs.apply(this, arguments); } finally { INVENTORY_REQUESTS = all; }
     var u = DB.current; if(!mine.length || !isOffice(u)) return h;
-    var pend = mine.filter(function(r){ return r.status === 'Pending'; }), done = mine.filter(function(r){ return r.status !== 'Pending'; }).slice(0, 15);
+    var pend = mine.filter(function(r){ return r.status === 'Pending'; });
     var s = '<div style="margin-bottom:18px"><div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:10px">📦 ' + ET_COMPANY + ' orders · ' + pend.length + ' waiting for approval' + (pend.some(function(r){ return r.flagged; }) ? ' · 🚩 ' + pend.filter(function(r){ return r.flagged; }).length + ' flagged' : '') + '</div>'
-      + '<div style="display:flex;flex-direction:column;gap:12px">' + pend.map(cardHtml).join('') + done.map(cardHtml).join('') + '</div></div>';
+      + '<div style="display:flex;flex-direction:column;gap:12px">' + pend.map(cardHtml).join('') + '</div>' + recordsHtml() + '</div>';
     var k = h.indexOf('<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">');
     return k >= 0 ? h.slice(0, k) + s + h.slice(k) : h + s; };
   panelInvRequests._et = true; }
