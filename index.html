@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.20.0950';
+var BUILD_VERSION = '2026.10.20.1230';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -108100,6 +108100,118 @@ if(typeof panelBO === 'function'){ var oBO = panelBO;
   load().then(function(){ if(isAcaAgent(DB.current) && (window._currentPanelId === 'bo' || !window._currentPanelId) && !document.getElementById('acaCard') && card(DB.current)) rerender(); }); } }catch(e){} }, 1500); })();
 window._aca = ACA;
 }catch(e){ console.warn('[aca application]', e); } })();
+</script>
+<script>
+// ═══ 📡 TruConnect "Devices Sold" report — read it correctly (Calvin 2026-10-20) ═══
+// "Do NOT change what we have, just make sure it reads the forms correctly."
+// The existing TruConnect sales reader only understood the "Sold by Agent" report (IMEI / Tribal / Agent / Status).
+// TruConnect's "Devices Sold" report (two layouts: 11 or 14 columns) uses Serial Number / Person Assigned /
+// Date Sold / Enrollment Number, so it was rejected. This add-on ONLY translates that report into the exact same
+// rows the existing reader produces. The existing preview, Commit button, saving, inventory and sales steps are untouched.
+// It also stops the TruConnect inventory upload from reading a Devices Sold report as inventory (wrong form).
+(function(){ try{
+if(window._tcDevSoldOn) return; window._tcDevSoldOn = true;
+
+function isDevSold(text){
+  if(!text || typeof text !== 'string' || text.indexOf('<t') < 0) return false;
+  var head = text.slice(0, 6000).toLowerCase();
+  return head.indexOf('serial number') >= 0 && head.indexOf('date sold') >= 0 && head.indexOf('person assigned') >= 0;
+}
+window.wmamTcIsDevicesSold = isDevSold;
+
+// Devices Sold report → the same record shape the existing "Sold by Agent" reader builds
+function readDevSold(text, batchId){
+  var p = parseTCInventoryHTML(text), h = (p.headers || []).map(function(x){ return String(x || '').trim().toLowerCase(); }), rows = p.rows || [];
+  var col = function(names){ for(var i = 0; i < names.length; i++){ var k = h.indexOf(names[i]); if(k >= 0) return k; } return -1; };
+  var cSer = col(['serial number']), cAg = col(['person assigned']), cDate = col(['date sold']), cEnr = col(['enrollment number']),
+      cTeam = col(['team dd', 'team name']), cType = col(['product type']), cNew = col(['new value']), cStat = col(['status']);
+  var empty = { approved:[], pending:[], canceled:[], unmatchedAgents:[], duplicates:[], batchId:batchId };
+  if(cSer < 0 || cAg < 0 || cDate < 0) return Object.assign({ ok:false, error:'File missing required columns (Serial Number, Person Assigned, Date Sold). Got: ' + (p.headers || []).join(', ') }, empty);
+  var existing = {};
+  (Array.isArray(window.TC_ACTIVATIONS) ? TC_ACTIVATIONS : []).forEach(function(a){ if(a) existing[(a.imei || '') + '|' + (a.orderNumber || '')] = String(a.status || '').toLowerCase(); });
+  var approved = [], pending = [], canceled = [], duplicates = [], unmatched = {}, nowISO = new Date().toISOString();
+  rows.forEach(function(cells){
+    var g = function(i){ return i >= 0 ? String(cells[i] || '').trim() : ''; };
+    var imei = g(cSer).replace(/\D/g, ''); if(/^0+$/.test(imei)) imei = '';
+    var agentName = g(cAg), planType = g(cType), isSim = /^sim\b/i.test(planType), order = g(cEnr) || imei;
+    if(!order || (!imei && !isSim)) return;
+    var key = imei + '|' + order, prev = existing[key];
+    if(prev === 'approved'){ duplicates.push({ imei:imei, orderNumber:order, agentName:agentName }); return; }
+    existing[key] = 'approved';
+    var teamName = g(cTeam), ag = _tcMatchAgentByName(agentName);
+    if(!ag && agentName) unmatched[agentName] = (unmatched[agentName] || 0) + 1;
+    var st = (g(cStat) || g(cNew) || 'Sold').toLowerCase();
+    var status = /^(sold|approved|activated)$/.test(st) ? 'Approved' : (/cancel|return|void/.test(st) ? 'Canceled' : 'Pending');
+    var rec = { imei:imei, orderNumber:order, saleDate:_tcParseDate(g(cDate)),
+      market:(typeof tcMarketTranslate === 'function') ? tcMarketTranslate(teamName) : teamName, teamName:teamName, state:'',
+      tribal:false, status:status, planType:planType, isSim:isSim,
+      agentName:agentName, agentId:ag ? ag.id : null, agentMatched:!!ag,
+      commission:ag ? _tcCommissionFor(ag, false) : 0, commissionNote:ag ? null : 'agent-not-matched',
+      uploadBatchId:batchId, uploadedAt:nowISO, source:'tc-devices-sold-report' };
+    if(prev !== undefined) rec._replacesKey = key;
+    if(status === 'Approved') approved.push(rec); else if(status === 'Canceled') canceled.push(rec); else { rec.unknownStatus = st; pending.push(rec); }
+  });
+  return { ok:true, total:rows.length, approved:approved, pending:pending, canceled:canceled, duplicates:duplicates,
+    unmatchedAgents:Object.keys(unmatched).map(function(n){ return { name:n, count:unmatched[n] }; }), batchId:batchId };
+}
+
+// the existing reader: Devices Sold report → translated; everything else → exactly as before
+var oProc = window.processTCActivationUpload;
+if(typeof oProc === 'function') window.processTCActivationUpload = processTCActivationUpload = function(text, batchId){ return isDevSold(text) ? readDevSold(text, batchId) : oProc.apply(this, arguments); };
+
+// the existing upload page's file check only looked for the word "IMEI" — let the Devices Sold report through to the same preview
+var oParse = window.tcParseActivations;
+if(typeof oParse === 'function'){
+  window.tcParseActivations = tcParseActivations = function(){
+    var el = document.getElementById('tc-act-file'), f = el && el.files && el.files[0];
+    if(!f) return oParse.apply(this, arguments);
+    var me = this, args = arguments, rd = new FileReader();
+    rd.onload = function(e){
+      var text = String(e.target.result || '');
+      if(!isDevSold(text)) return oParse.apply(me, args);
+      var res = processTCActivationUpload(text, 'tca-' + Date.now());
+      TC_ACT_UPLOAD_PREVIEW = res;
+      var pv = document.getElementById('tc-act-preview'); if(pv) pv.innerHTML = tcActivationsPreviewHTML(res);
+    };
+    rd.readAsText(f);
+  };
+}
+
+// emailed files to sold@: recognize the Devices Sold report as a TruConnect sales report (the existing job loads it)
+var refuse = 'This is a TruConnect Devices Sold (sales) report, not an inventory file, so it was not loaded as inventory. Upload it on TruConnect → Activations.';
+var oPlan = window._eminPlan;
+if(typeof oPlan === 'function'){
+  window._eminPlan = _eminPlan = async function(m, i, att){
+    try{
+      var box = _eminBox(m);
+      if(box === 'sold' || box === 'inv'){
+        var f = await _aiAttachment(m.id, i);
+        if(f && !f.err){ var t = _eminText(f);
+          if(t.html && isDevSold(t.text)) return box === 'sold' ? { task:'tc_sales_file', args:{ message_id:m.id, index:i, file_name:String(att && att.name || '') }, what:'TruConnect sales report' } : { err:refuse }; }
+      }
+    }catch(e){}
+    return oPlan.apply(this, arguments);
+  };
+}
+
+// wrong form: the TruConnect inventory upload never reads a Devices Sold report as inventory
+var oSync = window.processTCInventoryUploadWithSync;
+if(typeof oSync === 'function') window.processTCInventoryUploadWithSync = processTCInventoryUploadWithSync = async function(text){ if(isDevSold(text)) return { result:{ error:refuse, newDevices:[], duplicates:[], total:0 }, pathBOk:false, pathBError:refuse }; return oSync.apply(this, arguments); };
+var oInv = window.tcProcessInventoryUpload;
+if(typeof oInv === 'function'){
+  window.tcProcessInventoryUpload = tcProcessInventoryUpload = function(){
+    var el = document.getElementById('tc-inv-file'), f = el && el.files && el.files[0];
+    if(!f) return oInv.apply(this, arguments);
+    var me = this, args = arguments, rd = new FileReader();
+    rd.onload = function(e){
+      if(!isDevSold(String(e.target.result || ''))) return oInv.apply(me, args);
+      var pv = document.getElementById('tc-inv-preview');
+      if(pv) pv.innerHTML = '<div style="color:#CC0000;font-family:Barlow Condensed,sans-serif;font-size:.85rem">' + refuse + '</div>';
+    };
+    rd.readAsText(f);
+  };
+}
+}catch(e){ console.warn('[tc devices sold]', e); } })();
 </script>
 </body>
 </html>
