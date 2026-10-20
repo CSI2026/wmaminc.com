@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.20.1230';
+var BUILD_VERSION = '2026.10.20.1400';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -108144,9 +108144,10 @@ function readDevSold(text, batchId){
     var status = /^(sold|approved|activated)$/.test(st) ? 'Approved' : (/cancel|return|void/.test(st) ? 'Canceled' : 'Pending');
     var rec = { imei:imei, orderNumber:order, saleDate:_tcParseDate(g(cDate)),
       market:(typeof tcMarketTranslate === 'function') ? tcMarketTranslate(teamName) : teamName, teamName:teamName, state:'',
-      tribal:false, status:status, planType:planType, isSim:isSim,
+      // Calvin 2026-10-20: a Phone/Tablet on this report is Tribal. A SIM shows NLAD until the Wednesday commission report confirms NLAD or Tribal SIM.
+      tribal:!isSim, tribalFromPayFile:isSim, status:status, planType:planType, isSim:isSim,
       agentName:agentName, agentId:ag ? ag.id : null, agentMatched:!!ag,
-      commission:ag ? _tcCommissionFor(ag, false) : 0, commissionNote:ag ? null : 'agent-not-matched',
+      commission:ag ? _tcCommissionFor(ag, !isSim) : 0, commissionNote:ag ? null : 'agent-not-matched',
       uploadBatchId:batchId, uploadedAt:nowISO, source:'tc-devices-sold-report' };
     if(prev !== undefined) rec._replacesKey = key;
     if(status === 'Approved') approved.push(rec); else if(status === 'Canceled') canceled.push(rec); else { rec.unknownStatus = st; pending.push(rec); }
@@ -108158,6 +108159,28 @@ function readDevSold(text, batchId){
 // the existing reader: Devices Sold report → translated; everything else → exactly as before
 var oProc = window.processTCActivationUpload;
 if(typeof oProc === 'function') window.processTCActivationUpload = processTCActivationUpload = function(text, batchId){ return isDevSold(text) ? readDevSold(text, batchId) : oProc.apply(this, arguments); };
+
+// Wednesday commission report confirms a SIM from the Devices Sold report as NLAD or Tribal SIM (runs before the existing pay-file step, which is unchanged)
+var oInvSync = window.wmamTCInvoiceSyncSales;
+if(typeof oInvSync === 'function'){
+  window.wmamTCInvoiceSyncSales = wmamTCInvoiceSyncSales = function(match){
+    try{
+      (match && match.matched || []).forEach(function(m){
+        (m.row && m.row.details || []).forEach(function(d){
+          var order = String(d.orderNum || '').trim(); if(!order || typeof d.tribal === 'undefined') return;
+          (TC_ACTIVATIONS || []).forEach(function(a){
+            if(!a || !a.tribalFromPayFile || String(a.orderNumber || '').trim() !== order) return;
+            a.tribal = !!d.tribal; a.tribalFromPayFile = false; a.tribalConfirmedBy = 'pay-file';
+            var key = a.imei || ('TC-ORDER ' + order), ag = (DB.agents || []).find(function(x){ return x && x.id === a.agentId; });
+            ((ag && ag.monthlySales) || []).forEach(function(b){ (b.entries || []).forEach(function(e){ if(e && e.campaign === 'TruConnect' && e.imei === key) e.tribal = !!d.tribal; }); });
+            if(ag && typeof _wmamQueueAgentSave === 'function') _wmamQueueAgentSave(ag.id);
+          });
+        });
+      });
+    }catch(e){ console.warn('[tc devices sold] pay-file tribal', e); }
+    return oInvSync.apply(this, arguments);
+  };
+}
 
 // the existing upload page's file check only looked for the word "IMEI" — let the Devices Sold report through to the same preview
 var oParse = window.tcParseActivations;
@@ -108212,6 +108235,240 @@ if(typeof oInv === 'function'){
   };
 }
 }catch(e){ console.warn('[tc devices sold]', e); } })();
+</script>
+<script>
+// ═══ 🛟 SUPPORT CENTER + agent enTouch / Assist page (Calvin 2026-10-20) ═══
+// OFFICE: Communication → Support → Support Center. Click a company and every tool, link, phone number and email that
+//   company has for us is there. The office keeps it up to date (Edit). Agent requests and their outcomes are listed.
+// AGENTS & MANAGERS (Tool Center → enTouch Wireless / Assist Wireless): only their code, the enrollment link, the
+//   Agent Handbook, the 4 support numbers Calvin picked (no emails), "Send a request" and "My requests". Dashboards,
+//   AMS, Fusion, PayGo, logins etc. are office only (nothing deleted — the office still sees all of it).
+// Requests go straight to the company FROM the agent's company email (sent through agents@), office CC'd (server
+// function wmam-support); replies land back in agents@ through the catch-all. The AI reads the company's reply and tells the agent the outcome.
+(function(){ try{
+if(window._wmamSupportOn) return; window._wmamSupportOn = true;
+var AGENT_CAMPS = ['enTouch Wireless', 'Assist Wireless'];
+var KINDS = { login:'Login / password help', cgm:'Clear a stuck CGM enrollment', outage:'Report an error or outage' };
+var COLORS = { 'enTouch Wireless':'#0b5cad', 'Assist Wireless':'#7a3db8' };
+var esc = function(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]; }); };
+var F = 'font-family:Barlow Condensed,sans-serif';
+function isOff(u){ try{ return !!u && ((typeof isOwner === 'function' && isOwner(u)) || u.fullOfficeAccess === true || (typeof isOfficeRole === 'function' && isOfficeRole(u))); }catch(e){ return false; } }
+function codeFor(u, camp){ var c = (u && u.agentCodes) || {}, first = camp.split(' ')[0].toLowerCase(); var k = Object.keys(c).find(function(x){ var l = String(x).toLowerCase(); return l === camp.toLowerCase() || l === first || l.split(' ')[0] === first; }); return k ? String(c[k] || '').trim() : ''; }
+function toast(m){ try{ showToast(m); }catch(e){} }
+var tel = function(p){ return 'tel:' + String(p || '').replace(/option.*$|opt.*$|ext.*$/i, '').replace(/[^\d+]/g, ''); };
+
+// ───────────────────────── AGENT VIEW (inside the Tool Center) ─────────────────────────
+var SA = { info:null, reqs:null, kind:'', camp:null, sending:false, msg:'' };
+async function saLoad(){
+  try{ var r = await supaClient.rpc('wmam_support_agent_info'); SA.info = (r && r.data) || {}; }catch(e){ SA.info = {}; }
+  try{ var q = await supaClient.rpc('wmam_my_support_requests'); SA.reqs = (q && q.data) || []; }catch(e){ SA.reqs = []; }
+}
+function saFields(kind){
+  var inp = function(id, ph, label){ return '<label style="display:block;font-size:.8rem;color:#475569;margin:8px 0 3px;font-weight:700">' + label + '</label><input id="' + id + '" placeholder="' + esc(ph) + '" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:.95rem">'; };
+  var ta = function(id, ph, label){ return '<label style="display:block;font-size:.8rem;color:#475569;margin:8px 0 3px;font-weight:700">' + label + '</label><textarea id="' + id + '" placeholder="' + esc(ph) + '" rows="3" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:.95rem;font-family:inherit"></textarea>'; };
+  if(kind === 'login') return '<label style="display:block;font-size:.8rem;color:#475569;margin:8px 0 3px;font-weight:700">Which login?</label><select id="sa-system" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font-size:.95rem"><option>CGM</option><option>Fusion</option><option>Other</option></select>' + ta('sa-problem', 'Example: it says my password is wrong / my account is locked', 'What happens when you try to log in? *') + ta('sa-notes', 'Anything else (optional)', 'Notes');
+  if(kind === 'cgm') return inp('sa-order', 'CGM order number', 'CGM order number') + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div>' + inp('sa-cf', 'First name', 'Customer first name') + '</div><div>' + inp('sa-cl', 'Last name', 'Customer last name') + '</div></div>' + ta('sa-err', 'Copy the error CGM shows', 'Error message') + ta('sa-notes', 'Anything else (optional)', 'Notes') + '<div style="font-size:.76rem;color:#64748b;margin-top:6px">Order number OR the customer’s first and last name is required. Never type a Social Security number or date of birth here.</div>';
+  if(kind === 'outage') return ta('sa-what', 'Example: CGM will not load / NLAD is down', 'What is not working? *') + ta('sa-err', 'Copy the error you see', 'Error message') + inp('sa-when', 'Example: since 2pm today', 'When did it start?') + ta('sa-notes', 'Anything else (optional)', 'Notes');
+  return '';
+}
+function saHtml(u, camp){
+  var A = (SA.info && SA.info[camp]) || {}, col = COLORS[camp] || '#003594', code = codeFor(u, camp), office = isOff(u);
+  var h = '<div id="saView" style="' + F + '">';
+  if(office) h += '<div style="background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:8px 12px;margin-bottom:10px;font-size:.85rem;color:#9a3412">👁 This is what agents and managers see for ' + esc(camp) + '. <a href="#" onclick="TCUI.asAgent=false;tcRender();return false" style="color:#003594;font-weight:800">Back to the office view</a></div>';
+  // campaign + enrollment link
+  h += '<div style="border:2px solid ' + col + ';border-radius:12px;overflow:hidden;background:#fff;margin-bottom:12px"><div style="background:' + col + ';color:#fff;font-weight:800;padding:10px 14px;letter-spacing:1px;font-size:1.1rem">' + esc(camp) + '</div>'
+    + '<div style="padding:12px 14px;font-size:1rem">Your agent code: <b>' + (code ? esc(code) : '<span style="color:#b45309">not entered yet — ask the office</span>') + '</b></div>'
+    + '<div style="padding:0 14px 14px">' + (A.enroll_url ? '<a href="' + esc(A.enroll_url) + '" target="_blank" rel="noopener" style="display:block;text-align:center;background:#059669;color:#fff;border-radius:8px;padding:13px;font-weight:800;letter-spacing:1px;text-decoration:none;font-size:1.05rem">START AN ENROLLMENT →</a>'
+      + '<div style="margin-top:8px;font-size:.82rem;color:#64748b;text-align:center;word-break:break-all">' + esc(camp.split(' ')[0]) + ' enrollment link: ' + esc(A.enroll_url) + '</div>'
+      + '<div style="display:flex;gap:8px;margin-top:8px"><button onclick="saDownload(\'' + esc(camp) + '\')" style="flex:1;padding:11px;border:2px solid #003594;border-radius:8px;background:#fff;color:#003594;font-weight:800;letter-spacing:1px;cursor:pointer">⬇ DOWNLOAD LINK</button><button onclick="saCopy(\'' + esc(camp) + '\')" style="flex:1;padding:11px;border:2px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-weight:800;letter-spacing:1px;cursor:pointer">📋 COPY LINK</button></div>'
+      : '<div style="text-align:center;background:#f1f5f9;color:#64748b;border-radius:8px;padding:12px;font-weight:700">Enrollment link coming soon from the office</div>') + '</div></div>';
+  // handbook
+  if(A.handbook_url) h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><div><div style="font-weight:800;color:#003594">📘 Agent Handbook</div><div style="font-size:.85rem;color:#64748b">Plans, who qualifies, how to enter orders, error fixes</div></div><a href="' + esc(A.handbook_url) + '" target="_blank" rel="noopener" style="background:#003594;color:#fff;border-radius:8px;padding:10px 18px;font-weight:800;text-decoration:none;letter-spacing:1px">OPEN PDF</a></div>';
+  // support numbers (no emails)
+  var ph = A.phones || [];
+  if(ph.length){ h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:12px"><div style="font-weight:800;color:#0b1b3f;margin-bottom:4px">☎️ Support numbers</div>';
+    ph.forEach(function(p){ h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-top:1px solid #f1f5f9"><div style="min-width:0"><div style="font-weight:800">' + esc(p.t) + '</div><div style="font-size:.82rem;color:#64748b">' + esc(p.d || '') + '</div></div><a href="' + tel(p.phone) + '" style="white-space:nowrap;color:#003594;font-weight:800;text-decoration:none">' + esc(p.phone) + '</a></div>'; });
+    h += '</div>'; }
+  // send a request
+  var types = (A.request_types || []).filter(function(k){ return KINDS[k]; });
+  if(types.length){
+    h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:12px"><div style="font-weight:800;color:#0b1b3f">📨 Send a request</div><div style="font-size:.84rem;color:#64748b;margin:2px 0 8px">We send it to ' + esc(camp.split(' ')[0]) + ' for you. You’ll get the answer here and by email.</div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap">' + types.map(function(k){ var on = SA.kind === k && SA.camp === camp; return '<button onclick="saPick(\'' + k + '\')" style="padding:9px 12px;border-radius:999px;border:2px solid #003594;background:' + (on ? '#003594' : '#fff') + ';color:' + (on ? '#fff' : '#003594') + ';font-weight:800;cursor:pointer">' + esc(KINDS[k]) + '</button>'; }).join('') + '</div>';
+    if(SA.kind && SA.camp === camp) h += '<div id="saForm" style="margin-top:6px">' + saFields(SA.kind) + '<button id="saSend" onclick="saSend()" style="margin-top:12px;width:100%;padding:13px;border:none;border-radius:8px;background:#059669;color:#fff;font-weight:800;letter-spacing:1px;font-size:1rem;cursor:pointer">' + (SA.sending ? 'SENDING…' : 'SEND REQUEST') + '</button></div>';
+    if(SA.msg) h += '<div style="margin-top:10px;padding:10px;border-radius:8px;font-size:.9rem;' + (/^✅/.test(SA.msg) ? 'background:#ecfdf5;color:#065f46' : 'background:#fef2f2;color:#991b1b') + '">' + esc(SA.msg) + '</div>';
+    h += '</div>';
+  }
+  // my requests
+  var mine = (SA.reqs || []).filter(function(r){ return r.campaign === camp; });
+  if(mine.length){ h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:12px"><div style="font-weight:800;color:#0b1b3f;margin-bottom:4px">🗂 My requests</div>';
+    mine.forEach(function(r){ var st = r.status === 'answered' ? ['Answered', '#059669'] : (r.status === 'failed' ? ['Not sent — the office was told', '#b91c1c'] : ['Sent — waiting for ' + camp.split(' ')[0], '#b45309']);
+      h += '<div style="padding:9px 0;border-top:1px solid #f1f5f9"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><b>#' + r.id + ' · ' + esc(KINDS[r.kind] || r.kind) + '</b><span style="color:' + st[1] + ';font-weight:800;font-size:.85rem">' + st[0] + '</span></div><div style="font-size:.78rem;color:#94a3b8">' + new Date(r.created_at).toLocaleString() + '</div>'
+        + (r.outcome ? '<div style="margin-top:6px;background:#f8fafc;border-left:3px solid #059669;padding:8px 10px;border-radius:4px;font-size:.92rem">' + esc(r.outcome) + '</div>' : '') + '</div>'; });
+    h += '</div>'; }
+  return h + '</div>';
+}
+// download the enrollment link to the agent's device, named after the company ("enTouch Enrollment" / "Assist Enrollment")
+window.saDownload = function(camp){
+  var A = (SA.info && SA.info[camp]) || {}, url = A.enroll_url; if(!url) return;
+  var nm = camp.split(' ')[0] + ' Enrollment', file = nm.replace(/\s+/g, '-') + '.html';
+  var page = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(nm) + '</title><meta http-equiv="refresh" content="0;url=' + esc(url) + '"></head>'
+    + '<body style="font-family:Arial,sans-serif;text-align:center;padding:40px 16px"><h2 style="color:#003594">' + esc(nm) + '</h2><p><a href="' + esc(url) + '" style="display:inline-block;background:#059669;color:#fff;padding:14px 22px;border-radius:8px;text-decoration:none;font-weight:bold">Open ' + esc(nm) + '</a></p><p style="color:#666;font-size:13px;word-break:break-all">' + esc(url) + '</p></body></html>';
+  try{ var b = new Blob([page], { type:'text/html' }), a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = file; document.body.appendChild(a); a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1500); toast('Saved "' + file + '" to your device'); }
+  catch(e){ alert('Could not download. Use Copy link instead.'); }
+};
+window.saCopy = function(camp){
+  var url = ((SA.info && SA.info[camp]) || {}).enroll_url; if(!url) return;
+  var done = function(){ toast(camp.split(' ')[0] + ' enrollment link copied'); };
+  try{ navigator.clipboard.writeText(url).then(done, function(){ prompt('Copy this link:', url); }); }catch(e){ prompt('Copy this link:', url); }
+};
+window.saPick = function(k){ SA.kind = SA.kind === k ? '' : k; SA.camp = TCUI.camp; SA.msg = ''; tcRender(); };
+window.saSend = async function(){
+  if(SA.sending) return; var v = function(id){ var e = document.getElementById(id); return e ? String(e.value || '').trim() : ''; };
+  var b = { action:'request', campaign:SA.camp, kind:SA.kind, notes:v('sa-notes') };
+  if(SA.kind === 'login'){ b.system = v('sa-system'); b.problem = v('sa-problem'); if(!b.problem){ alert('Tell us what happens when you try to log in.'); return; } }
+  if(SA.kind === 'cgm'){ b.order_number = v('sa-order'); b.customer_first = v('sa-cf'); b.customer_last = v('sa-cl'); b.error_message = v('sa-err'); if(!b.order_number && !(b.customer_first && b.customer_last)){ alert('Add the CGM order number or the customer’s first and last name.'); return; } }
+  if(SA.kind === 'outage'){ b.what = v('sa-what'); b.error_message = v('sa-err'); b.when = v('sa-when'); if(!b.what){ alert('Tell us what is not working.'); return; } }
+  if(/\b\d{3}-?\d{2}-?\d{4}\b/.test(JSON.stringify(b))){ alert('Please remove any Social Security number before sending.'); return; }
+  SA.sending = true; tcRender();
+  var r = await wmamInvoke('wmam-support', { body:b }); SA.sending = false;
+  var d = r && r.data;
+  if(d && d.ok){ SA.msg = '✅ Sent (request #' + d.id + '). We’ll let you know the outcome here and by email.'; SA.kind = ''; await saLoad(); }
+  else SA.msg = (d && d.error) || (r && r.error && r.error.message) || 'Could not send. Try again.';
+  tcRender();
+};
+// take over the Tool Center's enTouch / Assist tab for agents & managers (the office keeps the full page, and can preview the agent view)
+if(typeof tcRender === 'function'){
+  var oRender = tcRender;
+  window.tcRender = tcRender = function(){
+    var r = oRender.apply(this, arguments);
+    try{
+      var u = DB.current, box = document.getElementById('tcBox'); if(!box || !u || AGENT_CAMPS.indexOf(TCUI.camp) < 0) return r;
+      var office = isOff(u);
+      if(office && !TCUI.asAgent){
+        if(!document.getElementById('saPreviewBtn')){ var bar = box.children[1]; if(bar) bar.insertAdjacentHTML('afterend', '<div id="saPreviewBtn" style="margin:-4px 0 10px;' + F + '"><a href="#" onclick="TCUI.asAgent=true;tcRender();return false" style="color:#003594;font-weight:800">👁 See what agents see for ' + esc(TCUI.camp) + '</a> <span style="color:#94a3b8;font-size:.85rem">· everything below is office only</span></div>'); }
+        return r;
+      }
+      if(TCUI.edit) return r;
+      while(box.children.length > 2) box.removeChild(box.lastChild);
+      if(!SA.info){ box.insertAdjacentHTML('beforeend', '<div style="padding:20px;color:#888">Loading…</div>'); saLoad().then(function(){ tcRender(); }); return r; }
+      box.insertAdjacentHTML('beforeend', saHtml(u, TCUI.camp));
+    }catch(e){ console.warn('[support agent view]', e); }
+    return r;
+  };
+}
+
+// ───────────────────────── OFFICE: SUPPORT CENTER ─────────────────────────
+var SC = { rows:null, reqs:null, camp:null, edit:false, draft:null, tab:'company' };
+async function scLoad(){
+  var a = await supaClient.from('wmam_support_center').select('*').order('sort');
+  SC.rows = (a && a.data) || [];
+  var b = await supaClient.from('wmam_support_requests').select('*').order('id', { ascending:false }).limit(150);
+  SC.reqs = (b && b.data) || [];
+  if(!SC.camp || !SC.rows.some(function(x){ return x.campaign === SC.camp; })) SC.camp = (SC.rows[0] || {}).campaign || null;
+}
+function scRow(){ return (SC.rows || []).find(function(x){ return x.campaign === SC.camp; }); }
+function agentName(id){ var a = (DB.agents || []).find(function(x){ return x && x.id === id; }); return a ? a.name : ('#' + id); }
+function itemView(it){
+  return '<div style="display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid #f1f5f9;flex-wrap:wrap"><div style="min-width:0;flex:1 1 260px"><div style="font-weight:800">' + (it.u ? '<a href="' + esc(it.u) + '" target="_blank" rel="noopener" style="color:#003594">' + esc(it.t) + ' ↗</a>' : esc(it.t)) + '</div>'
+    + (it.d ? '<div style="font-size:.84rem;color:#64748b">' + esc(it.d) + '</div>' : '') + '</div><div style="text-align:right;font-size:.9rem;white-space:nowrap">'
+    + (it.phone ? '<div><a href="' + tel(it.phone) + '" style="color:#003594;font-weight:800;text-decoration:none">📞 ' + esc(it.phone) + '</a></div>' : '')
+    + (it.email ? '<div><a href="mailto:' + esc(it.email) + '" style="color:#003594;text-decoration:none">✉️ ' + esc(it.email) + '</a></div>' : '') + '</div></div>';
+}
+function inpE(path, val, ph, wide){ return '<input data-scp="' + esc(path) + '" value="' + esc(val || '') + '" placeholder="' + esc(ph) + '" style="' + (wide ? 'width:100%;' : 'flex:1 1 150px;min-width:0;') + 'box-sizing:border-box;padding:7px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem">'; }
+function scCompanyHtml(){
+  var R = scRow(); if(!R) return '<div style="color:#888;padding:20px">No companies yet.</div>';
+  var D = SC.edit ? SC.draft : R, O = D.office || {}, A = D.agent || {}, ed = SC.edit, h = '';
+  var agentSide = AGENT_CAMPS.indexOf(R.campaign) >= 0;
+  if(agentSide){
+    h += '<div style="background:#fff;border:2px solid ' + (COLORS[R.campaign] || '#003594') + ';border-radius:12px;padding:12px 14px;margin-bottom:12px"><div style="font-weight:900;color:#0b1b3f">👥 What agents & managers see</div><div style="font-size:.82rem;color:#64748b;margin-bottom:6px">Shown in their Tool Center and in their coded email. No company emails are ever shown to agents.</div>';
+    if(ed){
+      h += '<div style="font-size:.8rem;font-weight:800;margin-top:6px">Enrollment link (the page where they enroll customers — never a dashboard)</div>' + inpE('agent.enroll_url', A.enroll_url, 'https://…', true)
+        + '<div style="font-size:.8rem;font-weight:800;margin-top:8px">Agent Handbook PDF link</div>' + inpE('agent.handbook_url', A.handbook_url, 'https://…', true)
+        + '<div style="font-size:.8rem;font-weight:800;margin-top:8px">Support numbers agents see</div>';
+      (A.phones || []).forEach(function(p, i){ h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">' + inpE('agent.phones.' + i + '.t', p.t, 'Name') + inpE('agent.phones.' + i + '.phone', p.phone, 'Phone') + inpE('agent.phones.' + i + '.d', p.d, 'What it’s for') + '<button onclick="scDel(\'agent.phones\',' + i + ')" style="border:1px solid #fca5a5;background:#fff;color:#b91c1c;border-radius:6px;padding:6px 9px;cursor:pointer">✕</button></div>'; });
+      h += '<button onclick="scAdd(\'agent.phones\')" style="margin-top:6px;border:1px dashed #003594;background:#fff;color:#003594;border-radius:6px;padding:6px 10px;cursor:pointer;font-weight:700">+ Add number</button>';
+    } else {
+      h += '<div style="padding:6px 0"><b>Enrollment link:</b> ' + (A.enroll_url ? '<a href="' + esc(A.enroll_url) + '" target="_blank" rel="noopener" style="color:#003594">' + esc(A.enroll_url) + '</a>' : '<span style="color:#b45309;font-weight:800">not added yet — agents see "coming soon" and the coded email waits until both links are in</span>') + '</div>'
+        + '<div style="padding:6px 0"><b>Handbook:</b> ' + (A.handbook_url ? '<a href="' + esc(A.handbook_url) + '" target="_blank" rel="noopener" style="color:#003594">Open PDF</a>' : '—') + '</div>'
+        + '<div style="padding:6px 0"><b>Support numbers:</b> ' + ((A.phones || []).map(function(p){ return esc(p.t) + ' ' + esc(p.phone); }).join(' · ') || '—') + '</div>';
+    }
+    h += '</div>';
+    // request routing
+    var rt = O.routes || {};
+    h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:12px"><div style="font-weight:900;color:#0b1b3f">📨 Where agent requests go</div><div style="font-size:.82rem;color:#64748b;margin-bottom:6px">Sent straight to the company FROM the agent’s company email (first.last@wmaminc.com), the office CC’d every time. Replies come back into agents@ for the AI.</div>';
+    Object.keys(KINDS).forEach(function(k){ h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:5px 0;border-top:1px solid #f1f5f9"><div style="flex:0 0 220px;font-weight:700">' + esc(KINDS[k]) + '</div>' + (ed ? inpE('office.routes.' + k, rt[k], 'company email') : '<div>' + (rt[k] ? esc(rt[k]) : '<span style="color:#b45309">not set — agents can’t send this</span>') + '</div>') + '</div>'; });
+    h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:5px 0;border-top:1px solid #f1f5f9"><div style="flex:0 0 220px;font-weight:700">Office CC</div>' + (ed ? inpE('office.cc', O.cc, 'info@wmaminc.com') : '<div>' + esc(O.cc || 'info@wmaminc.com') + '</div>') + '</div></div>';
+  }
+  // all tools & channels
+  (O.sections || []).forEach(function(s, si){
+    h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:12px">';
+    if(ed){
+      h += '<div style="display:flex;gap:6px">' + inpE('office.sections.' + si + '.title', s.title, 'Section name') + '<button onclick="scDel(\'office.sections\',' + si + ')" style="border:1px solid #fca5a5;background:#fff;color:#b91c1c;border-radius:6px;padding:6px 9px;cursor:pointer">Delete section</button></div>';
+      (s.items || []).forEach(function(it, ii){ var p = 'office.sections.' + si + '.items.' + ii + '.';
+        h += '<div style="border-top:1px solid #f1f5f9;padding:8px 0;display:flex;gap:6px;flex-wrap:wrap">' + inpE(p + 't', it.t, 'Name / department') + inpE(p + 'phone', it.phone, 'Phone') + inpE(p + 'email', it.email, 'Email') + inpE(p + 'u', it.u, 'Link') + inpE(p + 'd', it.d, 'What it’s for / hours', true) + '<button onclick="scDel(\'office.sections.' + si + '.items\',' + ii + ')" style="border:1px solid #fca5a5;background:#fff;color:#b91c1c;border-radius:6px;padding:6px 9px;cursor:pointer">✕ Remove</button></div>'; });
+      h += '<button onclick="scAdd(\'office.sections.' + si + '.items\')" style="margin-top:6px;border:1px dashed #003594;background:#fff;color:#003594;border-radius:6px;padding:6px 10px;cursor:pointer;font-weight:700">+ Add contact / tool</button>';
+    } else {
+      h += '<div style="font-weight:900;color:#0b1b3f">' + esc(s.title) + '</div>' + (s.items || []).map(itemView).join('');
+    }
+    h += '</div>';
+  });
+  if(ed) h += '<button onclick="scAdd(\'office.sections\')" style="border:1px dashed #003594;background:#fff;color:#003594;border-radius:8px;padding:9px 14px;cursor:pointer;font-weight:800">+ Add section</button>';
+  h += '<div style="font-size:.76rem;color:#9ca3af;margin-top:10px">Last updated ' + new Date(R.updated_at).toLocaleString() + (R.updated_by ? ' by ' + esc(R.updated_by) : '') + '</div>';
+  return h;
+}
+function scReqHtml(){
+  var L = SC.reqs || [];
+  if(!L.length) return '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:20px;color:#64748b">No agent requests yet.</div>';
+  var st = { sending:['Sending', '#64748b'], sent:['Sent — waiting', '#b45309'], replied:['Reply in', '#0b5cad'], answered:['Answered', '#059669'], failed:['Not sent', '#b91c1c'] };
+  return '<div style="display:flex;flex-direction:column;gap:10px">' + L.map(function(r){ var s = st[r.status] || [r.status, '#64748b'], d = r.details || {};
+    var det = Object.keys(d).filter(function(k){ return d[k]; }).map(function(k){ return '<b>' + esc(k.replace(/_/g, ' ')) + ':</b> ' + esc(d[k]); }).join(' · ');
+    return '<div style="background:#fff;border:1px solid #e5e7eb;border-left:4px solid ' + s[1] + ';border-radius:10px;padding:10px 12px"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><b>#' + r.id + ' · ' + esc(agentName(r.agent_id)) + ' · ' + esc(r.campaign) + ' · ' + esc(KINDS[r.kind] || r.kind) + '</b><span style="color:' + s[1] + ';font-weight:800">' + s[0] + '</span></div>'
+      + '<div style="font-size:.8rem;color:#94a3b8">' + new Date(r.created_at).toLocaleString() + ' · to ' + esc(r.to_addr || '') + ' · cc ' + esc(r.cc_addr || '') + ' · as ' + esc(r.company_email || '') + '</div>'
+      + (det ? '<div style="font-size:.86rem;margin-top:4px">' + det + '</div>' : '') + (r.error ? '<div style="color:#b91c1c;font-size:.84rem;margin-top:4px">' + esc(r.error) + '</div>' : '')
+      + (r.outcome ? '<div style="margin-top:6px;background:#f0fdf4;border-left:3px solid #059669;padding:7px 9px;border-radius:4px;font-size:.9rem"><b>Told the agent:</b> ' + esc(r.outcome) + '</div>' : '') + '</div>'; }).join('') + '</div>';
+}
+function scRender(){
+  var box = document.getElementById('scBox'); if(!box) return; var u = DB.current;
+  if(!isOff(u)){ box.innerHTML = '<div style="padding:30px;color:#888">Office only.</div>'; return; }
+  if(!SC.rows){ box.innerHTML = '<div style="padding:30px;color:#888">Loading…</div>'; scLoad().then(scRender).catch(function(e){ box.innerHTML = '<div style="padding:30px;color:#b91c1c">Could not load: ' + esc(e.message || e) + '</div>'; }); return; }
+  var waiting = (SC.reqs || []).filter(function(r){ return r.status === 'sent' || r.status === 'failed'; }).length;
+  var h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px"><div style="font-size:1.7rem;font-weight:800;color:#003594;letter-spacing:1px">🛟 SUPPORT CENTER</div>'
+    + (SC.tab === 'company' ? (SC.edit ? '<div style="display:flex;gap:6px"><button onclick="scSave()" style="padding:9px 14px;border:none;border-radius:8px;background:#16a34a;color:#fff;font-weight:800;cursor:pointer">✔ Save</button><button onclick="SC.edit=false;SC.draft=null;scRender()" style="padding:9px 14px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;font-weight:800;cursor:pointer">Cancel</button></div>' : '<button onclick="scEdit()" style="padding:9px 14px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">✏ Edit</button>') : '') + '</div>';
+  h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">' + (SC.rows || []).map(function(x){ var on = SC.tab === 'company' && x.campaign === SC.camp; return '<button data-c="' + esc(x.campaign) + '" onclick="if(SC.edit&&!confirm(\'Leave without saving?\'))return;SC.edit=false;SC.tab=\'company\';SC.camp=this.dataset.c;scRender()" style="padding:8px 14px;border-radius:999px;border:2px solid #003594;background:' + (on ? '#003594' : '#fff') + ';color:' + (on ? '#fff' : '#003594') + ';font-weight:800;cursor:pointer">' + esc(x.campaign) + '</button>'; }).join('')
+    + '<button onclick="if(SC.edit&&!confirm(\'Leave without saving?\'))return;SC.edit=false;SC.tab=\'requests\';scRender()" style="padding:8px 14px;border-radius:999px;border:2px solid #059669;background:' + (SC.tab === 'requests' ? '#059669' : '#fff') + ';color:' + (SC.tab === 'requests' ? '#fff' : '#047857') + ';font-weight:800;cursor:pointer">📨 Agent requests' + (waiting ? ' (' + waiting + ')' : '') + '</button></div>';
+  h += SC.tab === 'requests' ? scReqHtml() : scCompanyHtml();
+  box.innerHTML = h;
+}
+window.SC = SC; window.scRender = scRender;
+function getP(o, path){ return path.split('.').reduce(function(a, k){ return a == null ? a : a[k]; }, o); }
+function setP(o, path, v){ var k = path.split('.'), t = o; for(var i = 0; i < k.length - 1; i++){ if(t[k[i]] == null) t[k[i]] = /^\d+$/.test(k[i + 1]) ? [] : {}; t = t[k[i]]; } t[k[k.length - 1]] = v; }
+function collect(){ document.querySelectorAll('#scBox [data-scp]').forEach(function(el){ setP(SC.draft, el.getAttribute('data-scp'), String(el.value || '').trim()); }); }
+window.scEdit = function(){ var R = scRow(); if(!R) return; SC.draft = JSON.parse(JSON.stringify({ office:R.office || {}, agent:R.agent || {} })); SC.edit = true; scRender(); };
+window.scAdd = function(path){ collect(); var arr = getP(SC.draft, path); if(!Array.isArray(arr)){ arr = []; setP(SC.draft, path, arr); } arr.push(/sections$/.test(path) ? { title:'New section', items:[] } : {}); scRender(); };
+window.scDel = function(path, i){ collect(); var arr = getP(SC.draft, path); if(Array.isArray(arr)){ if(/sections$/.test(path) && !confirm('Delete this whole section?')) return; arr.splice(i, 1); } scRender(); };
+window.scSave = async function(){
+  collect(); var D = SC.draft;
+  (D.office.sections || []).forEach(function(s){ s.items = (s.items || []).map(function(it){ var o = {}; ['t', 'd', 'u', 'phone', 'email'].forEach(function(k){ if(it[k]) o[k] = it[k]; }); return o; }).filter(function(it){ return it.t || it.phone || it.email || it.u; }); });
+  if(D.agent && D.agent.phones) D.agent.phones = D.agent.phones.filter(function(p){ return p.t || p.phone; });
+  var bad = [D.agent && D.agent.enroll_url, D.agent && D.agent.handbook_url].filter(function(x){ return x && !/^https:\/\//i.test(x); });
+  if(bad.length){ alert('Links must start with https://'); return; }
+  if(D.agent && D.agent.enroll_url && /dashboard|myagentdashboard|telcoprovider|\/ams\b/i.test(D.agent.enroll_url) && !confirm('That link looks like a dashboard, not an enrollment page. Agents should only get enrollment links. Save it anyway?')) return;
+  var r = await supaClient.rpc('wmam_support_center_save', { p_campaign:SC.camp, p_office:D.office, p_agent:D.agent });
+  if(r && r.error){ alert('Not saved: ' + r.error.message); return; }
+  SC.edit = false; SC.draft = null; await scLoad(); SA.info = null; toast('Support Center saved'); scRender();
+};
+function scPage(){ setTimeout(function(){ SC.rows = null; scRender(); }, 0); return '<div style="max-width:1000px;margin:0 auto;padding:12px;' + F + '"><div id="scBox"><div style="padding:30px;text-align:center;color:#888">Loading…</div></div></div>'; }
+window.scPage = scPage;
+
+// menu: Communication → Support → Support Center (office only)
+try{ var comms = WMAM_NAV.find(function(n){ return n.key === 'comms'; });
+  if(comms && !comms.cards.some(function(c){ return c.title === 'Support'; })) comms.cards.push({ title:'Support', icon:'🛟', bg:'#dcfce7', tabs:[['support-center', 'Support Center']] }); }catch(e){}
+var _scAllow = function(u, id){ return id === 'support-center' ? isOff(u) : null; };
+if(typeof _wmamIdAllowed === 'function'){ var _scId = _wmamIdAllowed; _wmamIdAllowed = function(id){ var a = _scAllow(DB.current, id); return a === null ? _scId.apply(this, arguments) : a; }; }
+if(typeof _wmamTabAllowed === 'function'){ var _scTab = _wmamTabAllowed; _wmamTabAllowed = function(u, id){ var a = _scAllow(u, id); return a === null ? _scTab.apply(this, arguments) : a; }; }
+if(typeof canAccess === 'function'){ var _scCan = canAccess; canAccess = function(u, area){ var a = _scAllow(u, area); return a === null ? _scCan.apply(this, arguments) : a; }; }
+if(typeof panelBO === 'function'){ var _scBO = panelBO; panelBO = function(){ if(window._currentPanelId === 'support-center') return scPage(); return _scBO.apply(this, arguments); }; }
+}catch(e){ console.warn('[support center]', e); } })();
 </script>
 </body>
 </html>
