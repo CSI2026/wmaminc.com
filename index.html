@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.20.1800';
+var BUILD_VERSION = '2026.10.20.1900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -109265,6 +109265,245 @@ if(typeof panelPayrollOwner === 'function'){
 // the Operating Costs page reads the cloud list first, so every device shows the same costs
 if(typeof panelOperatingCosts === 'function'){ var oOC = panelOperatingCosts; var _ocSynced = 0; window.panelOperatingCosts = panelOperatingCosts = function(){ if(Date.now() - _ocSynced > 30000){ _ocSynced = Date.now(); costsSync(false).then(function(){ if(window._currentPanelId === 'operating-costs') gotoPanel('operating-costs'); }).catch(function(){}); } return oOC.apply(this, arguments); }; }
 }catch(e){ console.warn('[owner P&L v2]', e); } })();
+</script>
+<script>
+// ═══ 📑 COMPANY CONTRACTS — READER, PAYOUTS & AGENT CONTRACT DRAFTS (Calvin 2026-10-20) — OWNER ONLY ═══
+// 1) Upload a company contract (PDF or photos). Every page is read (scanned pages too) by the "contract-reader" function.
+// 2) Calvin checks what the AI read and fixes anything, then files it. Nothing is filed without his OK.
+// 3) Payouts: for every line the company pays WMAMinc, Calvin sets what the Field Agent / Team Leader / Market Manager /
+//    Campaign Manager get. "You keep" is shown live; a warning shows when payouts reach or pass what the company pays.
+// 4) Agent contract: the AI writes a DRAFT agent contract from Calvin's payouts + the company's chargeback, equipment and
+//    compliance rules (never the company's rates or the margin). Calvin edits and approves it.
+// 5) The P&L shows each filed company with its pay schedule, and the company names in "+ Company payment".
+// Storage: table wmam_company_contracts (owner-only RLS), files in the private "company-contracts" bucket.
+(function(){ try{
+if(window._wmamContractsOn) return; window._wmamContractsOn = true;
+var esc = function(s){ return (typeof _escapeHtml === 'function') ? _escapeHtml(s == null ? '' : String(s)) : String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]; }); };
+var $$ = function(n){ n = Number(n); return isNaN(n) ? '—' : (n < 0 ? '−$' : '$') + Math.abs(n).toFixed(2); };
+var ROLES = [['agent', 'Field Agent'], ['tl', 'Team Leader'], ['mgr', 'Market Manager'], ['cm', 'Campaign Manager']];
+var CC = { rows:null, open:null, tab:'terms', busy:'', err:'', draft:null, role:'agent' };
+window.CC = CC;
+function isOwn(){ try{ return typeof isOwner === 'function' && isOwner(DB.current); }catch(e){ return false; } }
+async function load(){ var r = await supaClient.from('wmam_company_contracts').select('*').neq('status', 'archived').order('id', { ascending:false }); if(r.error) throw new Error(r.error.message); CC.rows = r.data || []; }
+function cur(){ return (CC.rows || []).filter(function(x){ return x.id === CC.open; })[0] || null; }
+async function save(id, patch){ patch.updated_at = new Date().toISOString(); var r = await supaClient.from('wmam_company_contracts').update(patch).eq('id', id).select().single(); if(r.error) throw new Error(r.error.message); CC.rows = CC.rows.map(function(x){ return x.id === id ? r.data : x; }); return r.data; }
+async function errOf(res){ var e = res && res.error, d = res && res.data; if(d && d.error) return d.error; if(e){ try{ if(e.context && typeof e.context.json === 'function'){ var j = await e.context.json(); if(j && j.error) return j.error; } }catch(x){} return String(e.message || e); } return (d && d.ok) ? '' : 'Could not reach the server.'; }
+
+// ── reading the file in the browser: every page becomes an image (scans included) + the text layer ──
+async function pdfLib(){ if(!window.pdfjsLib){ await new Promise(function(res, rej){ var s = document.createElement('script'); s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'; s.onload = res; s.onerror = function(){ rej(new Error('Could not load the PDF reader.')); }; document.head.appendChild(s); }); } window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; return window.pdfjsLib; }
+async function readFile(file, onStep){
+  var pages = [], text = '';
+  if(/pdf$/i.test(file.type) || /\.pdf$/i.test(file.name)){
+    var lib = await pdfLib(), doc = await lib.getDocument({ data:new Uint8Array(await file.arrayBuffer()) }).promise, n = Math.min(doc.numPages, 30);
+    for(var i = 1; i <= n; i++){ onStep('Reading page ' + i + ' of ' + n + '…'); var pg = await doc.getPage(i);
+      try{ var tc = await pg.getTextContent(); text += '\n=== PAGE ' + i + ' ===\n' + tc.items.map(function(t){ return t.str; }).join(' '); }catch(e){}
+      var vp = pg.getViewport({ scale:1 }), sc = Math.min(1.6, 1400 / Math.max(vp.width, vp.height)), v2 = pg.getViewport({ scale:sc });
+      var cv = document.createElement('canvas'); cv.width = Math.round(v2.width); cv.height = Math.round(v2.height); await pg.render({ canvasContext:cv.getContext('2d'), viewport:v2 }).promise;
+      pages.push(cv.toDataURL('image/jpeg', 0.72)); }
+    return { pages:pages, text:text, count:doc.numPages };
+  }
+  if(/^image\//.test(file.type)){ onStep('Reading the photo…'); var url = await new Promise(function(res){ var fr = new FileReader(); fr.onload = function(){ res(fr.result); }; fr.readAsDataURL(file); });
+    var img = await new Promise(function(res, rej){ var im = new Image(); im.onload = function(){ res(im); }; im.onerror = rej; im.src = url; });
+    var s2 = Math.min(1, 1600 / Math.max(img.width, img.height)), c2 = document.createElement('canvas'); c2.width = Math.round(img.width * s2); c2.height = Math.round(img.height * s2); c2.getContext('2d').drawImage(img, 0, 0, c2.width, c2.height);
+    return { pages:[c2.toDataURL('image/jpeg', 0.75)], text:'', count:1 }; }
+  throw new Error('Upload a PDF or a photo of the contract.');
+}
+window.ccUpload = async function(input){
+  var files = Array.prototype.slice.call(input.files || []); input.value = ''; if(!files.length) return;
+  CC.err = ''; var step = function(t){ CC.busy = t; render(); };
+  try{
+    var pages = [], text = '', name = files.map(function(f){ return f.name; }).join(', '), count = 0;
+    for(var k = 0; k < files.length; k++){ var r = await readFile(files[k], step); pages = pages.concat(r.pages); text += r.text; count += r.count; }
+    if(pages.length > 30){ pages = pages.slice(0, 30); }
+    step('Saving the file…');
+    var path = 'c-' + Date.now() + '-' + files[0].name.replace(/[^A-Za-z0-9._-]+/g, '_');
+    try{ await supaClient.storage.from('company-contracts').upload(path, files[0], { upsert:false }); }catch(e){ path = null; }
+    step('The AI is reading ' + count + ' page' + (count === 1 ? '' : 's') + ' (about a minute)…');
+    var res = await wmamInvoke('contract-reader', { body:{ action:'read', pages:pages, text:text } }); var e = await errOf(res); if(e) throw new Error(e);
+    var t = res.data.terms || {};
+    var ins = await supaClient.from('wmam_company_contracts').insert({ created_by:DB.current && DB.current.id, company:t.company || '', program:t.program || '', campaigns:t.campaigns || [], file_name:name, file_path:path, pages:count, extracted:t, terms:t, status:'draft' }).select().single();
+    if(ins.error) throw new Error(ins.error.message);
+    CC.rows = [ins.data].concat(CC.rows || []); CC.open = ins.data.id; CC.tab = 'terms';
+  }catch(x){ CC.err = String(x.message || x); }
+  CC.busy = ''; render();
+};
+
+// ── page ──
+function render(){
+  var box = document.getElementById('ccBox'); if(!box) return;
+  if(!isOwn()){ box.innerHTML = '<div style="padding:30px;color:#888">Company contracts are for the owner only.</div>'; return; }
+  if(CC.rows == null){ box.innerHTML = '<div style="padding:30px;text-align:center;color:#888">Loading…</div>'; load().then(render).catch(function(e){ box.innerHTML = '<div style="padding:30px;color:#b91c1c">Could not load: ' + esc(e.message) + '</div>'; }); return; }
+  var h = '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px"><div><div style="font-family:Bebas Neue,Barlow Condensed,sans-serif;font-size:1.7rem;letter-spacing:2px;color:#003594">📑 COMPANY CONTRACTS</div><div style="font-size:.85rem;color:#64748b">Your contracts with the companies that pay WMAMinc. Owner only.</div></div>'
+    + '<label style="padding:11px 16px;border-radius:10px;background:#059669;color:#fff;font-weight:900;cursor:pointer">+ Add a contract<input type="file" accept="application/pdf,image/*" multiple style="display:none" onchange="ccUpload(this)"></label></div>';
+  if(CC.busy) h += '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:12px;margin-bottom:12px;font-weight:800;color:#1e3a8a">⏳ ' + esc(CC.busy) + '</div>';
+  if(CC.err) h += '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:12px;margin-bottom:12px;font-weight:800;color:#b91c1c">' + esc(CC.err) + '</div>';
+  if(!CC.rows.length) h += '<div style="background:#fff;border:1px dashed #cbd5e1;border-radius:12px;padding:26px;text-align:center;color:#64748b">No contracts yet. Tap <b>+ Add a contract</b> and pick the PDF (or photos of each page).</div>';
+  CC.rows.forEach(function(c){ var t = c.terms || {}, open = CC.open === c.id;
+    var st = c.status === 'confirmed' ? '<span style="background:#dcfce7;color:#166534;border-radius:999px;padding:2px 9px;font-size:.72rem;font-weight:900">FILED</span>' : '<span style="background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 9px;font-size:.72rem;font-weight:900">NEEDS YOUR CHECK</span>';
+    var paid = (t.rates || []).length, set = (t.rates || []).filter(function(r){ var p = (c.payouts || {})[r.id]; return p && p.agent !== undefined && p.agent !== ''; }).length;
+    h += '<div style="background:#fff;border:1px solid #e5e7eb;border-left:5px solid ' + (c.status === 'confirmed' ? '#059669' : '#f59e0b') + ';border-radius:12px;margin-bottom:12px;overflow:hidden">'
+      + '<div onclick="CC.open=CC.open===' + c.id + '?null:' + c.id + ';CC.tab=\'terms\';ccRender()" style="padding:12px 14px;cursor:pointer;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">'
+      + '<div><div style="font-weight:900;color:#0b1b3f;font-size:1.05rem">' + (open ? '▾ ' : '▸ ') + esc(t.company || c.company || 'Company') + ' — ' + esc(t.program || c.program || '') + '</div><div style="font-size:.8rem;color:#64748b"><b>' + esc(progName(t.wmam_program)) + '</b> · ' + esc(t.pay_type === 'hourly' ? 'hourly' : t.pay_type === 'mixed' ? 'hourly + commission' : 'commission') + ' · ' + esc((t.campaigns || []).join(', ')) + (t.effective_date ? ' · effective ' + esc(t.effective_date) : '') + ' · <span style="word-break:break-all">' + esc(c.file_name || '') + '</span></div></div>'
+      + '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + st + '<span style="font-size:.78rem;color:#475569">payouts ' + set + '/' + paid + '</span>' + (c.agent_contract_status === 'approved' ? '<span style="background:#e0e7ff;color:#3730a3;border-radius:999px;padding:2px 9px;font-size:.72rem;font-weight:900">AGENT CONTRACT ✔</span>' : '') + '</div></div>';
+    if(open) h += body(c);
+    h += '</div>'; });
+  box.innerHTML = h;
+}
+function tabs(){ var b = function(k, l){ var on = CC.tab === k; return '<button type="button" onclick="CC.tab=\'' + k + '\';ccRender()" style="flex:1;padding:10px;border:none;border-bottom:3px solid ' + (on ? '#003594' : 'transparent') + ';background:none;font-weight:900;color:' + (on ? '#003594' : '#64748b') + ';cursor:pointer">' + l + '</button>'; };
+  return '<div style="display:flex;border-top:1px solid #e5e7eb;border-bottom:1px solid #e5e7eb;background:#f8fafc">' + b('terms', '1 · What it says') + b('pay', '2 · Payouts') + b('agent', '3 · Agent contract') + '</div>'; }
+function body(c){ return tabs() + '<div style="padding:12px 14px">' + (CC.tab === 'pay' ? payTab(c) : CC.tab === 'agent' ? agentTab(c) : termsTab(c)) + '</div>'; }
+var inp = 'width:100%;box-sizing:border-box;padding:8px 9px;border:1px solid #cbd5e1;border-radius:7px;font-size:14px';
+function f(k, v, ph){ return '<input data-cc="' + k + '" value="' + esc(v == null ? '' : v) + '" placeholder="' + esc(ph || '') + '" style="' + inp + '">'; }
+function termsTab(c){
+  var t = c.terms || {}, ps = t.pay_schedule || {}, h = '';
+  if((t.needs_review || []).length) h += '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:10px 12px;margin-bottom:10px"><div style="font-weight:900;color:#9a3412">The AI flagged these for you to check</div><ul style="margin:6px 0 0 18px;padding:0">' + t.needs_review.map(function(x){ return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>';
+  var g = function(l, x){ return '<div><div style="font-size:.72rem;font-weight:900;letter-spacing:1px;color:#475569;text-transform:uppercase;margin:6px 0 3px">' + l + '</div>' + x + '</div>'; };
+  var progs = programs(), pv = progName(t.wmam_program), camps = progs[pv] || [];
+  var allC = camps.concat((t.campaigns || []).filter(function(x){ return camps.indexOf(x) < 0; }));
+  var sel = 'style="' + inp + '"';
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px 12px;margin-bottom:8px">'
+    + g('WMAMinc program', '<select data-cc="wmam_program" onchange="ccProg(this.value)" ' + sel + '>' + Object.keys(progs).concat(pv && !progs[pv] ? [pv] : []).map(function(k){ return '<option' + (k === pv ? ' selected' : '') + '>' + esc(k) + '</option>'; }).join('') + '<option value="__new">+ New program…</option></select>')
+    + g('How the company pays you', '<select data-cc="pay_type" ' + sel + '>' + [['commission', 'Commission (per sale / lead / enrollment)'], ['hourly', 'Hourly (per hour worked)'], ['mixed', 'Hourly + commission']].map(function(o){ return '<option value="' + o[0] + '"' + ((t.pay_type || 'commission') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select>') + '</div>'
+    + g('Campaigns this contract covers', '<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">' + allC.map(function(c){ return '<label style="display:flex;gap:5px;align-items:center;border:1px solid #cbd5e1;border-radius:999px;padding:5px 10px;font-weight:700;font-size:.85rem;cursor:pointer"><input type="checkbox" data-ccamp="' + esc(c) + '"' + ((t.campaigns || []).indexOf(c) >= 0 ? ' checked' : '') + '>' + esc(c) + '</label>'; }).join('')
+      + '<input id="ccNewCamp" placeholder="+ new campaign name" style="' + inp + ';max-width:220px"></div>');
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px 12px;margin-top:6px">' + g('Company', f('company', t.company)) + g('Contract / program name', f('program', t.program)) + g('Effective date', f('effective_date', t.effective_date, 'YYYY-MM-DD'))
+    + g('Term / renewal', f('term', t.term)) + g('Approved states', f('approved_states', (t.approved_states || []).join(', '))) + g('Their pay period', f('pay_schedule.period', ps.period)) + g('When they pay you', f('pay_schedule.pay_day', ps.pay_day)) + g('How often', f('pay_schedule.frequency', ps.frequency)) + g('How', f('pay_schedule.how', ps.how)) + '</div>';
+  var table = function(title, key, cols){ var L = t[key] || []; var hh = '<div style="font-weight:900;color:#003594;margin:14px 0 6px">' + title + '</div><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.88rem"><tr>' + cols.map(function(cc){ return '<th style="text-align:left;padding:5px;border-bottom:2px solid #e5e7eb;color:#475569">' + cc[1] + '</th>'; }).join('') + '<th></th></tr>';
+    L.forEach(function(x, i){ hh += '<tr>' + cols.map(function(cc){ var v = x[cc[0]]; if(Array.isArray(v)) v = v.join(', '); return '<td style="padding:4px;border-bottom:1px solid #f1f5f9;min-width:' + (cc[2] || 90) + 'px"><input data-cc="' + key + '.' + i + '.' + cc[0] + '" value="' + esc(v == null ? '' : v) + '" style="' + inp + '"></td>'; }).join('') + '<td><button type="button" onclick="ccRow(\'' + key + '\',' + i + ',-1)" style="border:none;background:none;color:#b91c1c;font-weight:900;cursor:pointer">✕</button></td></tr>'; });
+    return hh + '</table></div><button type="button" onclick="ccRow(\'' + key + '\',-1,1)" style="margin-top:4px;border:1px dashed #94a3b8;background:#fff;border-radius:7px;padding:5px 10px;cursor:pointer;font-weight:700">+ line</button>'; };
+  h += table('💵 What WMAMinc gets paid', 'rates', [['label', 'Paid for', 160], ['amount', '$', 70], ['unit', 'Unit', 110], ['tier', 'Tier', 70], ['states', 'States', 160], ['conditions', 'Conditions', 160]]);
+  h += table('🎯 Spiffs / volume incentives', 'incentives', [['label', 'Incentive', 150], ['amount', '$ extra', 70], ['condition', 'When', 130], ['applies_to', 'On line', 70], ['total_with_base', '$ total', 70]]);
+  h += table('🔁 Residuals', 'residuals', [['label', 'Residual', 150], ['amount', '$', 70], ['unit', 'Unit', 120], ['condition', 'When', 200]]);
+  h += table('💸 Your costs / fees', 'costs', [['label', 'Cost', 160], ['amount', '$', 70], ['how', 'How charged', 140], ['when', 'When', 200]]);
+  h += table('↩️ Chargebacks / clawbacks', 'chargebacks', [['label', 'Chargeback', 150], ['rule', 'Trigger', 220], ['days', 'Days', 60], ['amount', 'Amount', 120]]);
+  h += table('🛡 Compliance your agents must follow', 'compliance', [['topic', 'Topic', 130], ['rule', 'Rule', 360]]);
+  h += '<div style="font-weight:900;color:#003594;margin:14px 0 6px">Termination</div>' + f('termination', t.termination);
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" onclick="ccSaveTerms(' + c.id + ',true)" style="flex:1;min-width:180px;padding:12px;border:none;border-radius:9px;background:#059669;color:#fff;font-weight:900;cursor:pointer">' + (c.status === 'confirmed' ? 'Save changes' : '✓ It’s right — file it') + '</button>'
+    + '<button type="button" onclick="ccSaveTerms(' + c.id + ',false)" style="flex:1;min-width:140px;padding:12px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;font-weight:800;cursor:pointer">Save as draft</button>'
+    + (c.file_path ? '<button type="button" onclick="ccOpenFile(' + c.id + ')" style="padding:12px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;font-weight:800;cursor:pointer">📄 Original</button>' : '')
+    + '<button type="button" onclick="ccArchive(' + c.id + ')" style="padding:12px;border:1px solid #fecaca;border-radius:9px;background:#fff;color:#b91c1c;font-weight:800;cursor:pointer">Archive</button></div>';
+  return h;
+}
+function programs(){ var m = {}; try{ m = _buildAPProgramCampaigns() || {}; }catch(e){} ['Lifeline', 'Internet', 'ACA'].forEach(function(k){ m[k] = m[k] || []; }); return m; }
+function progName(v){ v = String(v || '').trim(); if(!v) return 'Lifeline'; var k = Object.keys(programs()).filter(function(x){ return x.toLowerCase() === v.toLowerCase(); })[0]; return k || v; }
+window.ccProg = function(v){ var c = cur(); if(!c) return; var t = collect(c); if(v === '__new'){ var n = prompt('Name of the new program (e.g. Energy, Home Security):'); if(!n || !n.trim()){ render(); return; } v = n.trim(); } t.wmam_program = v; c.terms = t; render(); };
+function collect(c){ var t = JSON.parse(JSON.stringify(c.terms || {}));
+  var boxes = document.querySelectorAll('[data-ccamp]'); if(boxes.length || document.getElementById('ccNewCamp')){ var cs = []; Array.prototype.forEach.call(boxes, function(b){ if(b.checked) cs.push(b.getAttribute('data-ccamp')); }); var nc = document.getElementById('ccNewCamp'); if(nc && nc.value.trim()) nc.value.split(',').forEach(function(x){ x = x.trim(); if(x && cs.indexOf(x) < 0) cs.push(x); }); t.campaigns = cs; }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-cc]'), function(el){ var k = el.getAttribute('data-cc').split('.'), v = el.value;
+    if(k.length === 1 && k[0] === 'wmam_program' && v === '__new') return;
+    if(k.length === 1){ if(k[0] === 'campaigns' || k[0] === 'approved_states') t[k[0]] = v.split(',').map(function(x){ return x.trim(); }).filter(Boolean); else t[k[0]] = v; return; }
+    if(k[0] === 'pay_schedule'){ t.pay_schedule = t.pay_schedule || {}; t.pay_schedule[k[1]] = v; return; }
+    var row = (t[k[0]] = t[k[0]] || [])[+k[1]]; if(!row) return; var num = ['amount', 'total_with_base', 'days'];
+    if(k[2] === 'states') row.states = v.split(',').map(function(x){ return x.trim(); }).filter(Boolean); else if(num.indexOf(k[2]) >= 0 && /^-?\d+(\.\d+)?$/.test(v.replace(/[$,\s]/g, ''))) row[k[2]] = Number(v.replace(/[$,\s]/g, '')); else row[k[2]] = v; });
+  return t; }
+window.ccRow = function(key, i, d){ var c = cur(); if(!c) return; var t = collect(c); t[key] = t[key] || [];
+  if(d < 0) t[key].splice(i, 1); else { var pre = { rates:'r', incentives:'i', residuals:'s', costs:'c', chargebacks:'k', compliance:'p' }[key] || 'x', n = 1; while(t[key].some(function(x){ return x.id === pre + n; })) n++; t[key].push({ id:pre + n }); }
+  c.terms = t; render(); };
+window.ccSaveTerms = async function(id, confirm){ var c = cur(); if(!c) return; try{ var t = collect(c);
+  var patch = { terms:t, company:t.company || '', program:t.program || '', campaigns:t.campaigns || [], history:(c.history || []).concat([{ at:new Date().toISOString(), what:confirm ? 'filed' : 'draft saved' }]) };
+  if(confirm){ patch.status = 'confirmed'; patch.confirmed_at = new Date().toISOString(); }
+  await save(id, patch); try{ showToast(confirm ? 'Filed — now set the payouts' : 'Saved'); }catch(e){} if(confirm) CC.tab = 'pay'; render(); }catch(x){ alert('Not saved: ' + x.message); } };
+window.ccArchive = async function(id){ if(!confirm('Archive this contract? It leaves this list (nothing is deleted).')) return; await save(id, { status:'archived' }); CC.rows = CC.rows.filter(function(x){ return x.id !== id; }); CC.open = null; render(); };
+window.ccOpenFile = async function(id){ var c = (CC.rows || []).filter(function(x){ return x.id === id; })[0]; if(!c || !c.file_path) return; var r = await supaClient.storage.from('company-contracts').createSignedUrl(c.file_path, 600); if(r.data && r.data.signedUrl) window.open(r.data.signedUrl, '_blank'); else alert('Could not open the file.'); };
+
+// ── payouts + margin ──
+function payLines(t){ var L = []; (t.rates || []).forEach(function(r){ L.push({ id:r.id, label:r.label + (r.tier ? ' — ' + r.tier : ''), sub:[r.unit, (r.states || []).join(', ')].filter(Boolean).join(' · '), co:Number(r.amount) }); });
+  (t.incentives || []).forEach(function(r){ L.push({ id:r.id, label:r.label, sub:'extra ' + (r.condition || ''), co:Number(r.amount), extra:true }); });
+  (t.residuals || []).forEach(function(r){ L.push({ id:r.id, label:r.label || 'Residual', sub:[r.unit, r.condition].filter(Boolean).join(' · '), co:Number(r.amount) }); }); return L; }
+function payTab(c){
+  var t = c.terms || {}, P = c.payouts || {}, L = payLines(t);
+  if(c.status !== 'confirmed') return '<div style="color:#92400e;font-weight:800">File the contract first (tab 1), then set the payouts.</div>';
+  if(!L.length) return '<div style="color:#64748b">This contract has no pay lines. Add them in tab 1.</div>';
+  var h = '<div style="font-size:.85rem;color:#475569;margin-bottom:8px">Set what each role is paid for each line. <b>You keep</b> = what the company pays WMAMinc − everyone’s payout. Leave a role blank if it isn’t paid on that line.</div>';
+  var cell = function(l, r, p){ return '<input data-pay="' + esc(l.id) + '.' + r[0] + '" inputmode="decimal" value="' + esc(p[r[0]] == null ? '' : p[r[0]]) + '" oninput="ccKeep()" placeholder="—" style="' + inp + ';text-align:center;min-width:64px">'; };
+  if(window.innerWidth < 700){
+    L.forEach(function(l){ var p = P[l.id] || {};
+      h += '<div style="border:1px solid #e5e7eb;border-radius:10px;padding:10px;margin-bottom:10px;text-align:left"><div style="font-weight:900">' + esc(l.label) + '</div><div style="font-size:.75rem;color:#64748b">' + esc(l.sub) + '</div>'
+        + '<div style="display:flex;justify-content:space-between;margin:6px 0;font-weight:900"><span style="color:#003594">Company pays you ' + $$(l.co) + '</span><span>You keep <span id="keep-' + esc(l.id) + '"></span></span></div>'
+        + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">' + ROLES.map(function(r){ return '<label style="font-size:.72rem;font-weight:800;color:#475569">' + r[1] + cell(l, r, p) + '</label>'; }).join('') + '</div></div>'; });
+    h += '<div>';
+  } else {
+    h += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.88rem;min-width:720px"><tr><th style="text-align:left;padding:6px;border-bottom:2px solid #e5e7eb">Line</th><th style="padding:6px;border-bottom:2px solid #e5e7eb;color:#003594">Company pays you</th>'
+      + ROLES.map(function(r){ return '<th style="padding:6px;border-bottom:2px solid #e5e7eb">' + r[1] + '</th>'; }).join('') + '<th style="padding:6px;border-bottom:2px solid #e5e7eb;color:#059669">You keep</th></tr>';
+    L.forEach(function(l){ var p = P[l.id] || {};
+      h += '<tr><td style="padding:6px;border-bottom:1px solid #f1f5f9"><b>' + esc(l.label) + '</b><div style="font-size:.75rem;color:#64748b">' + esc(l.sub) + '</div></td><td style="text-align:center;font-weight:900;color:#003594;border-bottom:1px solid #f1f5f9">' + $$(l.co) + '</td>'
+        + ROLES.map(function(r){ return '<td style="padding:4px;border-bottom:1px solid #f1f5f9">' + cell(l, r, p) + '</td>'; }).join('')
+        + '<td id="keep-' + esc(l.id) + '" style="text-align:center;font-weight:900;border-bottom:1px solid #f1f5f9"></td></tr>'; });
+    h += '</table>';
+  }
+  h += '</div><div id="ccWarn" style="margin-top:8px"></div>';
+  h += '<div style="margin-top:10px"><div style="font-size:.72rem;font-weight:900;letter-spacing:1px;color:#475569;text-transform:uppercase;margin-bottom:3px">Your pay schedule for agents on this campaign</div><input id="ccSched" value="' + esc(P._schedule || 'Weekly — sales week Thursday through Wednesday, paid on the following WMAMinc payroll') + '" style="' + inp + '"></div>';
+  h += '<button type="button" onclick="ccSavePay(' + c.id + ')" style="margin-top:12px;width:100%;padding:12px;border:none;border-radius:9px;background:#059669;color:#fff;font-weight:900;cursor:pointer">Save payouts</button>';
+  if(c.payouts_at) h += '<div style="font-size:.75rem;color:#64748b;margin-top:6px;text-align:center">Last saved ' + esc(new Date(c.payouts_at).toLocaleString()) + '</div>';
+  setTimeout(window.ccKeep, 0);
+  return h;
+}
+window.ccKeep = function(){ var c = cur(); if(!c) return; var L = payLines(c.terms || {}), warn = [];
+  L.forEach(function(l){ var tot = 0, any = false; ROLES.forEach(function(r){ var el = document.querySelector('[data-pay="' + l.id + '.' + r[0] + '"]'); var v = el && parseFloat(String(el.value).replace(/[^0-9.\-]/g, '')); if(el && el.value.trim() !== '' && !isNaN(v)){ tot += v; any = true; } });
+    var keep = l.co - tot, cell = document.getElementById('keep-' + l.id); if(cell){ cell.textContent = any ? $$(keep) : '—'; cell.style.color = !any ? '#94a3b8' : keep <= 0 ? '#b91c1c' : '#059669'; }
+    if(any && keep <= 0) warn.push(l.label + ': payouts ' + $$(tot) + ' are ' + (keep === 0 ? 'equal to' : 'more than') + ' what the company pays you (' + $$(l.co) + ')'); });
+  var w = document.getElementById('ccWarn'); if(w) w.innerHTML = warn.length ? '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:10px 12px;color:#b91c1c;font-weight:800">⚠ No profit on: ' + warn.map(esc).join(' · ') + '</div>' : ''; };
+window.ccSavePay = async function(id){ var c = cur(); if(!c) return; var P = {};
+  Array.prototype.forEach.call(document.querySelectorAll('[data-pay]'), function(el){ var k = el.getAttribute('data-pay').split('.'), v = String(el.value).trim(); if(v === '') return; var n = parseFloat(v.replace(/[^0-9.\-]/g, '')); if(isNaN(n)) return; (P[k[0]] = P[k[0]] || {})[k[1]] = n; });
+  var s = document.getElementById('ccSched'); P._schedule = s ? s.value.trim() : '';
+  try{ await save(id, { payouts:P, payouts_at:new Date().toISOString(), history:(c.history || []).concat([{ at:new Date().toISOString(), what:'payouts saved' }]) }); try{ showToast('Payouts saved'); }catch(e){} render(); }catch(x){ alert('Not saved: ' + x.message); } };
+
+// ── agent contract draft ──
+function agentTab(c){
+  if(c.status !== 'confirmed') return '<div style="color:#92400e;font-weight:800">File the contract and set the payouts first.</div>';
+  var P = c.payouts || {}, h = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px"><select id="ccRole" style="' + inp + ';max-width:220px">' + ROLES.map(function(r){ return '<option value="' + r[0] + '"' + (CC.role === r[0] ? ' selected' : '') + '>' + r[1] + ' contract</option>'; }).join('') + '</select>'
+    + '<button type="button" onclick="ccDraft(' + c.id + ')" style="padding:10px 14px;border:none;border-radius:9px;background:#003594;color:#fff;font-weight:900;cursor:pointer">' + (c.agent_contract ? '↻ Write a new draft' : '✍ Write the draft') + '</button>'
+    + '<span style="font-size:.8rem;color:#64748b">Uses your payouts + the company’s chargeback, equipment and compliance rules. Never shows the company’s rates or your margin.</span></div>';
+  if(c.agent_contract){
+    h += '<div style="font-size:.8rem;font-weight:900;color:' + (c.agent_contract_status === 'approved' ? '#166534' : '#92400e') + ';margin-bottom:6px">' + (c.agent_contract_status === 'approved' ? '✔ Approved ' + esc(new Date(c.agent_contract_at).toLocaleDateString()) : 'DRAFT — read it, change anything, then approve') + '</div>'
+      + '<div id="ccDoc" contenteditable="true" style="background:#fff;border:1px solid #cbd5e1;border-radius:10px;padding:16px 18px;max-height:560px;overflow:auto;line-height:1.5;font-family:Georgia,serif">' + c.agent_contract + '</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button type="button" onclick="ccDoc(' + c.id + ',false)" style="flex:1;min-width:140px;padding:12px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;font-weight:800;cursor:pointer">Save my edits</button>'
+      + '<button type="button" onclick="ccDoc(' + c.id + ',true)" style="flex:1;min-width:160px;padding:12px;border:none;border-radius:9px;background:#059669;color:#fff;font-weight:900;cursor:pointer">✓ Approve this contract</button>'
+      + '<button type="button" onclick="ccPrint(' + c.id + ')" style="padding:12px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;font-weight:800;cursor:pointer">🖨 Print / PDF</button></div>';
+  } else if(!Object.keys(P).filter(function(k){ return k !== '_schedule'; }).length) h += '<div style="color:#92400e;font-weight:800">Set the payouts (tab 2) first.</div>';
+  return h;
+}
+window.ccDraft = async function(id){ var c = cur(); if(!c) return; var role = (document.getElementById('ccRole') || {}).value || 'agent'; CC.role = role;
+  if(c.agent_contract && c.agent_contract_status === 'approved' && !confirm('Write a new draft? The approved one stays until you approve the new one.')) return;
+  CC.busy = 'The AI is writing the ' + role + ' contract draft…'; render();
+  try{ var res = await wmamInvoke('contract-reader', { body:{ action:'agent_contract', terms:c.terms, payouts:c.payouts, role:role, agentSchedule:(c.payouts || {})._schedule } }); var e = await errOf(res); if(e) throw new Error(e);
+    var keep = c.agent_contract_status === 'approved' ? { approved_contract:c.agent_contract, approved_at:c.agent_contract_at } : {};
+    await save(id, { agent_contract:res.data.html, agent_contract_status:'draft', history:(c.history || []).concat([Object.assign({ at:new Date().toISOString(), what:role + ' contract drafted' }, keep)]) }); }catch(x){ CC.err = x.message; }
+  CC.busy = ''; render(); };
+window.ccDoc = async function(id, approve){ var c = cur(), el = document.getElementById('ccDoc'); if(!c || !el) return;
+  if(approve && !confirm('Approve this contract? It becomes the contract for this campaign.')) return;
+  var patch = { agent_contract:el.innerHTML.replace(/DRAFT\s*[—-]\s*for owner review/gi, approve ? '' : 'DRAFT — for owner review'), history:(c.history || []).concat([{ at:new Date().toISOString(), what:approve ? 'agent contract approved' : 'agent contract edited' }]) };
+  if(approve){ patch.agent_contract_status = 'approved'; patch.agent_contract_at = new Date().toISOString(); }
+  try{ await save(id, patch); try{ showToast(approve ? 'Approved' : 'Saved'); }catch(e){} render(); }catch(x){ alert('Not saved: ' + x.message); } };
+window.ccPrint = function(id){ var c = (CC.rows || []).filter(function(x){ return x.id === id; })[0]; if(!c) return; var w = window.open('', '_blank'); if(!w) return alert('Allow pop-ups to print.');
+  w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>' + esc((c.terms || {}).program || 'Agent contract') + '</title><style>body{font-family:Georgia,serif;max-width:780px;margin:30px auto;padding:0 20px;line-height:1.5}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px;text-align:left}</style></head><body><div style="text-align:center;font-family:Arial;letter-spacing:2px;font-size:12px;color:#003594">WILLIAMS MARKETING AND MANAGEMENT, INC.</div>' + c.agent_contract + '</body></html>'); w.document.close(); setTimeout(function(){ w.print(); }, 400); };
+window.ccRender = render;
+
+// ── page + menu: Payroll → Comp Plans → "Company Contracts" (owner only) ──
+function page(){ CC.rows = null; setTimeout(render, 0); return '<div style="max-width:1100px;margin:0 auto;padding:12px"><div id="ccBox"><div style="padding:30px;text-align:center;color:#888">Loading…</div></div></div>'; }
+try{ var pay = WMAM_NAV.find(function(n){ return n.key === 'payroll'; }), card = pay && pay.cards.filter(function(c){ return /comp\s*plans/i.test(c.title); })[0];
+  if(card && !card.tabs.some(function(t){ return t[0] === 'company-contracts'; })) card.tabs.unshift(['company-contracts', 'Company Contracts']); }catch(e){}
+var allow = function(u, id){ return id === 'company-contracts' ? !!(u && typeof isOwner === 'function' && isOwner(u)) : null; };
+if(typeof _wmamIdAllowed === 'function'){ var a1 = _wmamIdAllowed; _wmamIdAllowed = function(id){ var a = allow(DB.current, id); return a === null ? a1.apply(this, arguments) : a; }; }
+if(typeof _wmamTabAllowed === 'function'){ var a2 = _wmamTabAllowed; _wmamTabAllowed = function(u, id){ var a = allow(u, id); return a === null ? a2.apply(this, arguments) : a; }; }
+if(typeof canAccess === 'function'){ var a3 = canAccess; canAccess = function(u, area){ var a = allow(u, area); return a === null ? a3.apply(this, arguments) : a; }; }
+if(typeof panelBO === 'function'){ var a4 = panelBO; panelBO = function(){ if(window._currentPanelId === 'company-contracts') return page(); return a4.apply(this, arguments); }; }
+
+// ── P&L: filed companies show with their pay schedule, and their names are offered in "+ Company payment" ──
+if(typeof window.pl2AddPayment === 'function'){ var oPay = window.pl2AddPayment; window.pl2AddPayment = function(){ var r = oPay.apply(this, arguments);
+  (async function(){ try{ var q = await supaClient.from('wmam_company_contracts').select('company,program').eq('status', 'confirmed'); var dl = document.getElementById('pl2CoList'); if(dl && q.data) q.data.forEach(function(x){ var v = x.company + (x.program ? ' (' + x.program + ')' : ''); if(!dl.querySelector('option[value="' + v.replace(/"/g, '') + '"]')){ var o = document.createElement('option'); o.value = v; dl.appendChild(o); } }); }catch(e){} })(); return r; }; }
+var _ccList = null, _ccAt = 0;
+function plCard(){ var box = document.getElementById('pl2Box'); if(!box || document.getElementById('pl2Contracts') || !/By payroll Friday/.test(box.textContent || '')) return;
+  if(_ccList == null || Date.now() - _ccAt > 60000){ if(_ccAt && Date.now() - _ccAt < 3000) return; _ccAt = Date.now(); supaClient.from('wmam_company_contracts').select('company,program,terms').eq('status', 'confirmed').then(function(q){ _ccList = (q && q.data) || []; plCard(); }); return; }
+  if(!_ccList.length) return;
+  var d = document.createElement('div'); d.id = 'pl2Contracts';
+  d.innerHTML = '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin:12px 0"><div style="font-weight:900;color:#0b1b3f;margin-bottom:6px">📑 Who pays you and when (from your filed contracts)</div>'
+    + _ccList.map(function(x){ var p = (x.terms || {}).pay_schedule || {}; return '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:4px 0;border-bottom:1px solid #f1f5f9;font-size:.88rem"><span><b>' + esc(x.company) + '</b> — ' + esc(x.program || '') + '</span><span style="color:#475569">' + esc([p.period && ('sales ' + p.period), p.pay_day && ('paid ' + p.pay_day)].filter(Boolean).join(' · ')) + '</span></div>'; }).join('')
+    + '<div style="font-size:.75rem;color:#64748b;margin-top:4px">Payroll → Comp Plans → Company Contracts</div></div>';
+  var anchor = Array.prototype.filter.call(box.querySelectorAll('div'), function(x){ return /^By payroll Friday$/.test((x.textContent || '').trim()); })[0];
+  if(anchor) anchor.parentNode.insertBefore(d, anchor); else box.appendChild(d); }
+try{ new MutationObserver(function(){ if(document.getElementById('pl2Box')) plCard(); }).observe(document.body, { childList:true, subtree:true }); }catch(e){}
+}catch(e){ console.warn('[company contracts]', e); } })();
 </script>
 </body>
 </html>
