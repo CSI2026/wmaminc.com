@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.22.1730';
+var BUILD_VERSION = '2026.10.22.1740';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -23135,6 +23135,21 @@ function _gmLineDate(raw, period){ var s = String(raw || '').trim(); if(!s) retu
   return d; }
 function _gmIsCredit(type, raw){ return /credit|refund|return(ed)?\b/i.test(String(type || '')) || /^\s*\+/.test(String(raw || '')); }
 function _gmIsSimOnly(type, model){ var t = String(type || '') + ' ' + String(model || ''); return /\b(sim|byod)\b/i.test(t) && !/data|plan|bundle/i.test(t) && !/upsell|phone|device/i.test(String(type || '')); }
+// Calvin 2026-10-22: a Tribal (Oklahoma) phone is never charged to the agent for more than its cost minus the Tribal credit
+// (iPhone SE $110 − $55 Tribal credit = $55). Cost = the phone's cost in inventory (sheet of the month it was ordered), else the price list.
+function _gmTribalCap(e, row){
+  var digits = String(e.imei || '').replace(/\D/g, ''), inv = digits ? (typeof GM_INVENTORY !== 'undefined' ? GM_INVENTORY : []).find(function(x){ return x && !x.deletedAt && String(x.imei || '').replace(/\D/g, '') === digits; }) : null;
+  var isT = (typeof gmIsTribalMarket === 'function') ? function(m){ return gmIsTribalMarket(m); } : function(m){ return /(^|[^a-z])(ok|oklahoma)([^a-z]|$)/i.test(String(m || '')); };
+  if(!(isT(inv && inv.market) || isT(e.market) || isT(row && row.market) || /tribal|\btrb\b/i.test(String(e.type || '')))) return null;
+  var P = (typeof GMPAY !== 'undefined' && GMPAY.pricing) || null;
+  if(!P || !Array.isArray(P.devices) || !P.devices.length) return { err:'the Gen Mobile price list was not loaded' };
+  var dev = (inv && inv.model ? gmFindDevice(P, inv.model) : null) || gmFindDevice(P, e.model);
+  if(!dev) return { err:'“' + (e.model || (inv && inv.model) || '?') + '” is not on the Gen Mobile price list' };
+  var full = 0; try{ if(inv && typeof wmamGMCost === 'function') full = Number(wmamGMCost(inv)) || 0; }catch(x){}
+  if(!(full > 0)) full = Number(dev.full) || 0; if(!(full > 0)) return { err:'no cost for “' + dev.model + '”' };
+  var credit = Math.min(typeof gmTribalCredit === 'function' ? gmTribalCredit(P, dev) : (+dev.tribalCredit || 55), full);
+  return { cap:Math.round((full - credit) * 100) / 100, full:full, credit:credit, model:dev.model };
+}
 function _gmIsFreeDevice(type){ return /^\s*free\b/i.test(String(type || '')); }
 function _gmIsDataLine(type, model){ return /data|plan|bundle/i.test(String(type || '') + ' ' + String(model || '')); }
 function parseGenMobilePayEmail2610(text){
@@ -23171,22 +23186,27 @@ function parseGenMobilePayEmail2610(text){
 }
 // decide every device line: deduct, recorded (paid on the Pay Link), credit, SIM (no cost)
 function gmApplyDeviceRules(result){
-  var flags = [], credits = [];
+  var flags = [], credits = [], tcheck = [];
   Object.keys(result.rows).forEach(function(code){ var r = result.rows[code], tot = 0;
     (r.chargebacks || []).forEach(function(e){ var cost = e.cents == null ? 0 : Math.abs(e.cents);
       if(_gmIsCredit(e.type, e.amountRaw)){ e.decision = 'credit'; e.amount = 0; e.why = 'Device credit — never charged. Add it as a Credit.'; credits.push(e); return; }
       if(_gmIsFreeDevice(e.type)){ e.decision = 'free'; e.amount = 0; e.why = 'Free phone — not an upsell, no charge to the agent.'; return; }
       if(_gmIsSimOnly(e.type, e.model)){ e.decision = 'sim'; e.amount = 0; e.why = 'SIM card — no cost to the agent.'; return; }
       if(!cost){ e.decision = 'zero'; e.amount = 0; e.why = 'No amount on this line.'; return; }
+      var tnote = '', tc = _gmTribalCap(e, r);
+      if(tc && tc.err) tcheck.push(e.agentCode + ' ' + (e.model || '') + ' IMEI ' + (e.imei || '?') + ' (' + tc.err + ')');
+      else if(tc && cost > Math.round(tc.cap * 100)){ e.tribalCap = tc; tnote = ' Tribal phone: $' + tc.full + ' − $' + tc.credit + ' Tribal credit = $' + tc.cap + ' (Gen Mobile file showed $' + (cost / 100).toFixed(2) + ').'; cost = Math.round(tc.cap * 100);
+        if(cost <= 0){ e.decision = 'tcovered'; e.amount = 0; e.why = 'Tribal credit covers this phone — not deducted.' + tnote; return; } }
       var day = e.date || '';
       var pre = day ? day < GM_UPSELL_CUTOFF : ((result.periodEnd || '') !== '' && result.periodEnd < GM_UPSELL_CUTOFF);
-      if(pre){ e.decision = 'deduct'; e.amount = -cost; e.why = 'Order dated ' + (day || 'before 10/1') + ' (before Oct 1): agent collected this in the field — deducted.'; tot += e.amount; return; }
+      if(pre){ e.decision = 'deduct'; e.amount = -cost; e.why = 'Order dated ' + (day || 'before 10/1') + ' (before Oct 1): agent collected this in the field — deducted.' + tnote; tot += e.amount; return; }
       var v = plvVerify(e.imei, { needsPlan:_gmIsDataLine(e.type, e.model) }); e.verify = v;
       if(v.paid){ e.decision = 'paid'; e.amount = 0; e.why = 'Order dated ' + (day || '?') + ': paid on the Pay Link' + (v.sale && v.sale.paid_at ? ' ' + String(v.sale.paid_at).slice(0, 10) : '') + (v.sale && v.sale.agent_name ? ' by ' + v.sale.agent_name : '') + ' — recorded, NOT deducted.'; return; }
-      e.decision = 'flag'; e.amount = -cost; e.why = 'Order dated ' + (day || '(no date)') + ': ' + v.why + ' — FLAGGED and deducted from the agent.'; tot += e.amount;
+      e.decision = 'flag'; e.amount = -cost; e.why = 'Order dated ' + (day || '(no date)') + ': ' + v.why + ' — FLAGGED and deducted from the agent.' + tnote; tot += e.amount;
       flags.push(e); });
     r.chargebackTotal = tot; });
   result.flags = flags; result.credits = credits;
+  if(tcheck.length) result.errors.push('Tribal credit could not be checked on ' + tcheck.length + ' Oklahoma phone charge' + (tcheck.length === 1 ? '' : 's') + ' — charged as Gen Mobile billed it. Check before saving: ' + tcheck.join('; '));
   if(!PLV.loaded && (result.deviceLines || []).some(function(e){ return e.decision === 'flag'; })) result.errors.push('Pay Link records did not load, so device charges dated 10/1 or later could not be checked and were DEDUCTED. Reopen this pay file once the connection is back before you save it.');
   if(flags.length) result.errors.push(flags.length + ' device charge' + (flags.length === 1 ? '' : 's') + ' dated 10/1 or later ' + (flags.length === 1 ? 'is' : 'are') + ' NOT paid on the Pay Link and ' + (flags.length === 1 ? 'was' : 'were') + ' deducted from the agent: ' + flags.map(function(e){ return e.agentCode + ' IMEI ' + (e.imei || '?') + ' $' + (Math.abs(e.amount) / 100).toFixed(2); }).join('; '));
   if(credits.length) result.errors.push(credits.length + ' Gen Mobile device credit' + (credits.length === 1 ? '' : 's') + ' (never charged) — add as a Credit: ' + credits.map(function(e){ return e.agentCode + ' ' + (e.model || '') + ' ' + (e.amountRaw || ''); }).join('; '));
@@ -23255,12 +23275,12 @@ gmCalculateWeek2610 = function(rows){ var res = _gmCalculateWeek2610Dev.apply(th
     var byCode = {}; L.forEach(function(e){ (byCode[e.agentCode] = byCode[e.agentCode] || []).push(e); });
     var codeOwner = function(code){ return (DB.agents || []).find(function(a){ var ac = a && a.agentCodes || {}; return ac['Gen Mobile'] && String(ac['Gen Mobile']).trim().toLowerCase() === String(code).trim().toLowerCase(); }) || (DB.agents || []).find(function(a){ return a && a.active && String(a.name || '').trim().toLowerCase() === String(code).trim().toLowerCase(); }); };
     Object.keys(byCode).forEach(function(code){ var a = codeOwner(code); if(!a) return; var ibo = _gm26Ibo(a.id), payeeId = ibo ? ibo.id : a.id, e = res.perAgent[payeeId]; if(!e) e = res.perAgent[payeeId] = { amount:0, breakdown:[], rows:0 };
-      var lines = byCode[code], ded = lines.filter(function(x){ return x.decision === 'deduct' || x.decision === 'flag'; }), paid = lines.filter(function(x){ return x.decision === 'paid'; }), cr = lines.filter(function(x){ return x.decision === 'credit'; }), fr = lines.filter(function(x){ return x.decision === 'free'; });
+      var lines = byCode[code], ded = lines.filter(function(x){ return x.decision === 'deduct' || x.decision === 'flag'; }), paid = lines.filter(function(x){ return x.decision === 'paid'; }), cr = lines.filter(function(x){ return x.decision === 'credit'; }), fr = lines.filter(function(x){ return x.decision === 'free' || x.decision === 'tcovered'; });
       var tag = (ibo && ibo.id !== a.id) ? ' (' + a.name + ')' : '';
       e.breakdown = e.breakdown.map(function(b){ if(b.label === 'Chargebacks' + (tag ? ' (' + a.name + ', paid to ' + ibo.name + ')' : '') || (b.label === 'Chargebacks' && !tag)){ var pre = ded.filter(function(x){ return x.decision === 'deduct'; }).length, fl = ded.length - pre;
         return Object.assign({}, b, { label:'Phone deductions' + tag + ' — ' + ded.length + ' device charge' + (ded.length === 1 ? '' : 's') + (pre ? ' (' + pre + ' before 10/1)' : '') + (fl ? ' (' + fl + ' not paid on Pay Link)' : ''), count:ded.length, deviceLines:ded.map(function(x){ return { date:x.date, imei:x.imei, model:x.model, type:x.type, amount:x.amount / 100, why:x.why }; }) }); } return b; });
       if(paid.length) e.breakdown.push({ label:'Device charges paid on the Pay Link' + tag + ' — recorded, not deducted', count:paid.length, rate:0, amount:0, deviceLines:paid.map(function(x){ return { date:x.date, imei:x.imei, model:x.model, type:x.type, amount:0, gm_charge:(x.cents == null ? 0 : -Math.abs(x.cents)) / 100, why:x.why }; }) });
-      if(fr.length) e.breakdown.push({ label:'Free phones' + tag + ' — not upsells, not deducted', count:fr.length, rate:0, amount:0, deviceLines:fr.map(function(x){ return { date:x.date, imei:x.imei, model:x.model, type:x.type, amount:0, gm_charge:(x.cents == null ? 0 : -Math.abs(x.cents)) / 100, why:x.why }; }) });
+      if(fr.length) e.breakdown.push({ label:'No-cost phones' + tag + ' — free or covered by the Tribal credit, not deducted', count:fr.length, rate:0, amount:0, deviceLines:fr.map(function(x){ return { date:x.date, imei:x.imei, model:x.model, type:x.type, amount:0, gm_charge:(x.cents == null ? 0 : -Math.abs(x.cents)) / 100, why:x.why }; }) });
       if(cr.length) e.breakdown.push({ label:'Device credits from Gen Mobile' + tag + ' — not charged (office: add as a Credit)', count:cr.length, rate:0, amount:0 }); });
   } }catch(err){ console.warn('[gm device lines]', err); }
   return res; };
@@ -23459,7 +23479,7 @@ function _pprSales(carrier, row){ var a = (row && row.activations) || {}, out = 
   else Object.keys(a).forEach(function(k){ if(k.charAt(0) === '_') return; var v = Number(a[k]) || 0; if(v) out.push(k + ' ' + v); });
   return out; }
 function _pprDeviceRows(carrier, row){ if(carrier !== 'Gen Mobile' || !row || !Array.isArray(row.chargebacks) || !row.chargebacks.length) return '';
-  var esc = _escapeHtml, col = { deduct:'#b91c1c', flag:'#dc2626', paid:'#16a34a', credit:'#1d4ed8', sim:'#64748b', zero:'#64748b', free:'#16a34a' }, lab = { deduct:'DEDUCTED (before 10/1)', flag:'FLAGGED — not paid on Pay Link — DEDUCTED', paid:'PAID on Pay Link — not deducted', credit:'CREDIT — not charged', sim:'SIM — no cost', zero:'no amount', free:'FREE phone — not an upsell, not deducted' };
+  var esc = _escapeHtml, col = { deduct:'#b91c1c', flag:'#dc2626', paid:'#16a34a', credit:'#1d4ed8', sim:'#64748b', zero:'#64748b', free:'#16a34a', tcovered:'#16a34a' }, lab = { deduct:'DEDUCTED (before 10/1)', flag:'FLAGGED — not paid on Pay Link — DEDUCTED', paid:'PAID on Pay Link — not deducted', credit:'CREDIT — not charged', sim:'SIM — no cost', zero:'no amount', free:'FREE phone — not an upsell, not deducted', tcovered:'Tribal credit covers it — not deducted' };
   return '<div style="margin:8px 0 4px;font-weight:900;color:#003594;font-size:.8rem;letter-spacing:1px">PHONE / UPSELL LINES ON THE GEN MOBILE FILE (' + row.chargebacks.length + ')</div><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.78rem"><tr style="background:#f1f5f9"><th style="padding:4px 6px;text-align:left">Order date</th><th style="padding:4px 6px;text-align:left">Order #</th><th style="padding:4px 6px;text-align:left">Model / type</th><th style="padding:4px 6px;text-align:left">IMEI / SIM</th><th style="padding:4px 6px;text-align:right">Gen Mobile</th><th style="padding:4px 6px;text-align:right">Charged to agent</th><th style="padding:4px 6px;text-align:left">Result</th></tr>'
     + row.chargebacks.map(function(e){ var d = e.decision || 'deduct'; return '<tr style="border-top:1px solid #eef0f4"><td style="padding:4px 6px">' + esc(e.date || e.rawDate || '') + '</td><td style="padding:4px 6px">' + esc(e.order || '') + '</td><td style="padding:4px 6px">' + esc((e.model || '') + (e.type ? ' · ' + e.type : '')) + '</td><td style="padding:4px 6px;font-family:monospace">' + esc(e.imei || '') + '</td><td style="padding:4px 6px;text-align:right">' + esc(e.amountRaw || '') + '</td><td style="padding:4px 6px;text-align:right;font-weight:800">' + _ppM(e.amount || 0) + '</td><td style="padding:4px 6px;color:' + (col[d] || '#111') + ';font-weight:700">' + (lab[d] || d) + '</td></tr>'; }).join('') + '</table></div>'; }
 function pprCampaignHtml(det){
