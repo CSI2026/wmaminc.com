@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.22.1770';
+var BUILD_VERSION = '2026.10.22.1780';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15119,7 +15119,7 @@ function xtcSubmit(){
     var status = now ? 'pending-agent-signature' : ((inv || (u.canTransferWithoutApproval === true && !shortDated.length)) ? 'pending-agent-signature' : 'pending-inv-dept-approval');
     var req = { id:cfg.id+'t-'+Date.now()+'-'+made, campaign:campaign, fromId:from?from.id:u.id, fromName:from?from.name:u.name, fromRole:from?from.role:u.role, toId:to.id, toName:to.name, toRole:to.role, imeis:imeis, devices:snap, reason:XTC.reason||'Transfer Center', status:status, createdAt:new Date().toISOString(), shortDatedImeis:shortDated, toMarket:tm||null, method:'transfer-center', requestedBy:u.name,
       approvedBy:null, approvedAt:null, invDeptApprovedBy: inv ? u.id : null, invDeptApprovedByName: inv ? u.name : null, invDeptApprovedAt: inv ? new Date().toISOString() : null };
-    cfg.transfers().push(req); made++;
+    cfg.transfers().push(req); made++; if(status === 'pending-inv-dept-approval') XTC._needAppr = (XTC._needAppr || 0) + imeis.length;
     if(now){ try{ invFinalizeTransferAccept(campaign, req.id, true); }catch(e){ console.warn('[transfer center] finalize', e); }
       req.status = 'completed'; req.overrideBy = u.name; req.overrideAt = new Date().toISOString(); req.completedAt = req.completedAt || req.overrideAt;
       imeis.forEach(function(im){ var d = pool.find(function(x){ return x.imei === im; }); if(d){ if(tm) d.market = tm; d.assignedTo = to.id; d.holderId = to.id; d.receivedAt = _ctToday(); d.dateHolderId = String(to.id); moved++; } }); }
@@ -15127,7 +15127,8 @@ function xtcSubmit(){
       if(status === 'pending-agent-signature') try{ pushNotification({ toIds:[to.id], toRoles:[], icon:'\uD83D\uDCE6', title:'Inventory to sign for', body:imeis.length+' '+campaign+' phone(s) from '+(from?from.name:u.name)+' \u2014 open Sign & Invoices.', panel:'inv-sign', priority:'high' }); }catch(e){} }
   });
   try{ saveInventory(); }catch(e){}
-  try{ showToast(now ? 'Done \u2014 '+moved+' phone(s) moved and logged' : (to ? 'Sent to '+to.name+' to e-sign ('+P.rows.length+' phones)' : 'Market updated for '+moved+' phone(s)')); }catch(e){}
+  var _appr = XTC._needAppr || 0; XTC._needAppr = 0;
+  try{ showToast(now ? 'Done \u2014 '+moved+' phone(s) moved and logged' : (_appr ? 'Sent to Makenzie (Inventory) for approval \u2014 '+_appr+' phone(s). '+(to ? to.name : 'They')+' signs after she approves.' : (to ? 'Sent to '+to.name+' to e-sign ('+P.rows.length+' phones)' : 'Market updated for '+moved+' phone(s)'))); }catch(e){}
   XTC.imeis = ''; XTC.preview = null; gotoPanel('inv-transfer-center');
 }
 if(typeof window!=='undefined'){ Object.assign(window, { panelInvTransferCenter:panelInvTransferCenter, xtcReadFile:xtcReadFile, xtcPreview:xtcPreview, xtcSubmit:xtcSubmit, xtcRenderPreview:xtcRenderPreview, XTC:XTC }); }
@@ -113195,6 +113196,82 @@ if(typeof panelPayrollLoans === 'function'){ var oLoans = panelPayrollLoans;
     return h; };
 }
 }catch(e){ console.warn('[payroll 1750]', e); } })();
+
+</script>
+<script>
+// ═══ 🚨 TRANSFER APPROVAL ALERT — a transfer waiting on the Inventory Dept can never be missed (Calvin 2026-10-22) ═══
+// "Makenzie must approve unless the manager's profile has approval turned off. She didn't get a notice at all. It needs to be a
+//  pop-up that does not go away until she goes to the transfer request and addresses it."
+// • The SERVER writes the notice the moment any screen creates a transfer that waits on the Inventory Dept (inv_records trigger
+//   wmam_xfer_approval_alert) — so it can't be skipped by any page, old or new.
+// • Here: for the approver (Makenzie; app setting "transfer_approvers", default [3]) a full-screen alert that can't be closed,
+//   on every page, checked against the SERVER every 15 s, until nothing is waiting. The only way out is "Go to Transfer
+//   Approvals" — it reloads the inventory first so every waiting transfer is listed there. It comes back if she leaves that
+//   page while something is still waiting.
+// • The approval queue now lists waiting transfers from EVERY campaign (DART, enTouch, Assist … were missing).
+(function(){ try{
+if(window._wmamXferAlertOn) return; window._wmamXferAlertOn = true;
+var esc = function(s){ return (typeof _escapeHtml === 'function') ? _escapeHtml(s == null ? '' : String(s)) : String(s == null ? '' : s); };
+var XA = { list:[], approvers:[3], busy:false, loadedApprovers:false };
+window.WMAM_XFER_ALERT = XA;
+function me(){ return (typeof DB !== 'undefined' && DB.current) || null; }
+function isApprover(u){ u = u || me(); return !!u && XA.approvers.indexOf(Number(u.id)) >= 0; }
+async function loadApprovers(){ if(XA.loadedApprovers) return; XA.loadedApprovers = true;
+  try{ var r = await supaClient.from('app_settings').select('value').eq('key', 'transfer_approvers').maybeSingle(); if(r && r.data && r.data.value){ var v = JSON.parse(r.data.value); if(Array.isArray(v) && v.length) XA.approvers = v.map(Number); } }catch(e){} }
+
+// the approval queue: every campaign, not just four
+if(typeof invDeptPendingApprovalList === 'function'){
+  window.invDeptPendingApprovalList = invDeptPendingApprovalList = function(){
+    var out = [], seen = [];
+    Object.keys((typeof CAMPAIGN_REGISTRY !== 'undefined' && CAMPAIGN_REGISTRY) || {}).forEach(function(camp){
+      if(typeof EX_DECOMMISSIONED !== 'undefined' && EX_DECOMMISSIONED && /^Excess/i.test(camp)) return;
+      var cfg = campaignCfg(camp), L = []; if(!cfg || typeof cfg.transfers !== 'function') return;
+      try{ L = cfg.transfers() || []; }catch(e){ return; }
+      L.forEach(function(t){ if(t && t.status === 'pending-inv-dept-approval' && seen.indexOf(t) < 0){ seen.push(t); out.push({ transfer:t, campaign:camp }); } });
+    });
+    out.sort(function(a, b){ return String(b.transfer.createdAt || '').localeCompare(String(a.transfer.createdAt || '')); });
+    return out; };
+}
+function localPending(){ var out = []; try{ invDeptPendingApprovalList().forEach(function(x){ var t = x.transfer; out.push({ id:t.id, campaign:x.campaign, fromName:t.fromName, toName:t.toName, count:(t.imeis || []).length, createdAt:t.createdAt, reason:t.reason }); }); }catch(e){} return out; }
+function ago(iso){ var t = Date.parse(iso || ''); if(!t) return ''; var m = Math.max(0, Math.round((Date.now() - t) / 60000)); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : m < 1440 ? Math.round(m / 60) + ' hr ago' : Math.round(m / 1440) + ' day' + (Math.round(m / 1440) === 1 ? '' : 's') + ' ago'; }
+function onApprovalPage(){ return window._currentPanelId === 'inv-dept-approvals'; }
+function render(){
+  var ov = document.getElementById('wmamXferAlert');
+  if(!isApprover() || !XA.list.length || onApprovalPage()){ if(ov) ov.remove(); return; }
+  var n = XA.list.length;
+  var html = '<div style="background:#fff;border-radius:16px;width:100%;max-width:480px;max-height:calc(100vh - 32px);overflow-y:auto;box-shadow:0 24px 60px rgba(0,0,0,.45);font-family:Arial,Helvetica,sans-serif;text-align:center">'
+    + '<div style="background:#b91c1c;color:#fff;padding:16px 18px;border-radius:16px 16px 0 0"><div style="font-size:2rem;line-height:1">🚨</div><div style="font-weight:900;font-size:1.15rem;letter-spacing:.5px;margin-top:6px">TRANSFER' + (n === 1 ? '' : 'S') + ' NEED' + (n === 1 ? 'S' : '') + ' YOUR APPROVAL</div><div style="font-size:.85rem;opacity:.9;margin-top:3px">' + n + ' waiting — the phones can’t move until you approve or deny</div></div>'
+    + '<div style="padding:12px 16px;text-align:left">' + XA.list.slice(0, 8).map(function(x){ return '<div style="border:1px solid #fecaca;background:#fef2f2;border-radius:10px;padding:9px 11px;margin:7px 0"><div style="font-weight:900;color:#7f1d1d">' + esc(x.fromName || 'Someone') + ' → ' + esc(x.toName || '?') + '</div><div style="font-size:.84rem;color:#475569">' + esc(x.campaign || '') + ' · ' + (x.count || 0) + ' device' + (x.count === 1 ? '' : 's') + (x.createdAt ? ' · ' + esc(ago(x.createdAt)) : '') + '</div>' + (x.reason ? '<div style="font-size:.8rem;color:#64748b;margin-top:2px;overflow-wrap:anywhere">“' + esc(String(x.reason).slice(0, 120)) + '”</div>' : '') + '</div>'; }).join('') + (n > 8 ? '<div style="color:#64748b;font-size:.82rem">+ ' + (n - 8) + ' more</div>' : '') + '</div>'
+    + '<div style="padding:4px 16px 16px"><button type="button" onclick="wmamXferAlertGo()" style="width:100%;border:none;border-radius:12px;background:#b91c1c;color:#fff;font-weight:900;font-size:1.05rem;padding:15px;cursor:pointer">Go to Transfer Approvals →</button><div style="color:#64748b;font-size:.76rem;margin-top:8px">This stays up until every waiting transfer is approved or denied.</div></div></div>';
+  if(!ov){ ov = document.createElement('div'); ov.id = 'wmamXferAlert'; ov.setAttribute('role', 'alertdialog'); ov.setAttribute('aria-modal', 'true');
+    ov.style.cssText = 'position:fixed;inset:0;z-index:2147483600;background:rgba(15,23,42,.72);display:flex;align-items:center;justify-content:center;padding:16px';
+    document.body.appendChild(ov); }
+  if(ov.getAttribute('data-h') !== html){ ov.setAttribute('data-h', html); ov.innerHTML = html; }
+}
+async function poll(){
+  var u = me(); if(!u) return; await loadApprovers(); if(!isApprover(u) || XA.busy) return; XA.busy = true;
+  try{ var r = await supaClient.rpc('wmam_pending_transfer_approvals');
+    // the server OR this screen saying "waiting" is enough — never miss one (Go to Transfer Approvals reloads, so a stale copy clears itself)
+    var m = {}, list = [];
+    ((r && !r.error && Array.isArray(r.data)) ? r.data : []).concat(localPending()).forEach(function(x){ if(!x || !x.id || m[x.id]) return; m[x.id] = 1; list.push({ id:x.id, campaign:x.campaign, fromName:x.fromName, toName:x.toName, count:x.count, createdAt:x.createdAt, reason:x.reason }); });
+    XA.list = list; }
+  catch(e){ XA.list = localPending(); }
+  XA.busy = false; render();
+}
+window.wmamXferAlertPoll = poll;
+window.wmamXferAlertGo = async function(){
+  var ov = document.getElementById('wmamXferAlert'); if(ov){ var b = ov.querySelector('button'); if(b){ b.disabled = true; b.textContent = 'Opening…'; } }
+  try{ if(typeof invRecLoadAll === 'function') await invRecLoadAll(); }catch(e){}
+  try{ gotoPanel('inv-dept-approvals'); }catch(e){}
+  setTimeout(render, 60);
+};
+// re-check whenever a page opens (leaving the approvals page brings it back if something is still waiting)
+if(typeof gotoPanel === 'function'){ var oGo = gotoPanel; window.gotoPanel = gotoPanel = function(){ var r = oGo.apply(this, arguments); try{ setTimeout(function(){ render(); if(!onApprovalPage()) poll(); }, 80); }catch(e){} return r; }; }
+// approve / deny → re-check right away
+['invDeptApprove', 'invDeptDeny'].forEach(function(fn){ var o = window[fn]; if(typeof o !== 'function') return; window[fn] = function(){ var r = o.apply(this, arguments); setTimeout(poll, 1200); return r; }; });
+setInterval(function(){ try{ poll(); }catch(e){} }, 15000);
+(function wait(n){ try{ if(me()){ setTimeout(poll, 1500); return; } }catch(e){} if(n < 120) setTimeout(function(){ wait(n + 1); }, 1000); })(0);
+}catch(e){ console.warn('[transfer alert]', e); } })();
 
 </script>
 </body>
