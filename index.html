@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.21.1200';
+var BUILD_VERSION = '2026.10.21.1300';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -8140,10 +8140,10 @@ function payrollApproveWeek(weekId){
     // v2026.10.15: one finalize per FRIDAY deposit (all campaigns together), not per campaign week — so loans/fees are never taken twice
     var _pe = w.periodEnd, _F = (typeof ppWeekPayDate === 'function') ? ppWeekPayDate(w) : '', _key = _F ? payDepositKey(_F) : _pe;
     var _left = PAYROLL_WEEKS.filter(function(x){ return x && !x.deleted && x.status !== 'approved' && x.status !== 'finalized' && x.status !== 'rejected' && (_F ? ppWeekPayDate(x) === _F : x.periodEnd === _pe); }).length;
-    if(_left === 0 && typeof OBLIGATION_COMMITS !== 'undefined' && !OBLIGATION_COMMITS[_key] && !OBLIGATION_COMMITS[_pe] && typeof payrollCommitObligations === 'function'){
-      w.autoFinalized = true;
-      if(payrollCommitObligations(_pe)){ try{ showToast('Week ending '+_pe+' finalized automatically \u2014 surplus, disputes and expired phones recorded'); }catch(e){} }
-    } else if(_left > 0){ try{ showToast(_left+' more campaign file'+(_left===1?'':'s')+' to approve for this week \u2014 it finalizes automatically after the last one'); }catch(e){} }
+    // v2026.10.21.1300 (Calvin): saving the last campaign NO LONGER finalizes the week. Payroll sends it for approval and
+    // Calvin approves & finalizes in Approve by Campaign — then everyone's pay stub is released.
+    if(_left === 0){ try{ showToast('Every campaign is saved \u2014 send this payroll for approval in Approve by Campaign'); }catch(e){} }
+    else if(_left > 0){ try{ showToast(_left+' more campaign file'+(_left===1?'':'s')+' to save for this payroll'); }catch(e){} }
   }catch(e){ console.warn('[auto-finalize]', e); }
   return true;
 }
@@ -111645,6 +111645,188 @@ if(typeof window.wpsAgent === 'function'){ var oAg = window.wpsAgent; window.wps
   try{ var a = (DB.agents || []).find(function(x){ return String(x.id) === String(id); }); if(a && isOffice() && wmamHasGMCode(a)){ boxHtml(a).then(function(h){ var ov = document.getElementById('wpsAg'); var inner = ov && ov.firstElementChild; if(inner && !document.getElementById('wtrBox')) inner.insertAdjacentHTML('beforeend', h); }); } }catch(e){}
   return r; }; }
 }catch(e){ console.warn('[tribal pay link]', e); } })();
+</script>
+<script>
+// ═══ 💵 NEW PAYROLL PROCESS — save each campaign → Calvin approves → everyone's pay stub (Calvin 2026-10-21) ═══
+// 1. Payroll (K-Anna) uploads each pay file and SAVES each campaign in Payroll → Pay Files → Approve by Campaign.
+//    Nothing finalizes by itself any more.
+// 2. When every campaign for that Friday is saved, payroll presses "Send to Calvin for approval" (Calvin gets a dashboard notice).
+// 3. Calvin presses "Approve & finalize payroll". Loans/fees/expired phones/surplus/disputes are recorded ONCE, every person's
+//    itemized stub is saved (wmam_pay_stubs) and released, and each person gets a dashboard notice.
+//    Calvin can switch on "Let payroll finalize without me" — then payroll does step 3 too. Calvin can reopen a finalized Friday.
+// 4. Everyone (agents, managers, office) sees ONLY their own stub, only after it's finalized: Me → My Pay → Payroll Center.
+//    The old "My Payroll (beta)" list and the owner beta switchboard are replaced by the Payroll Center.
+(function(){ try{
+if(window._wmamPayFlowOn) return; window._wmamPayFlowOn = true;
+var esc = function(s){ return (typeof _escapeHtml === 'function') ? _escapeHtml(s == null ? '' : String(s)) : String(s == null ? '' : s); };
+var M = function(c){ return (typeof _ppM === 'function') ? _ppM(c) : '$' + ((Number(c) || 0) / 100).toFixed(2); };
+var PF = { rel:{}, set:{ payroll_can_finalize:false }, loaded:0, busy:false };
+window.WMAM_PAYFLOW = PF;
+function me(){ return DB.current; }
+function owner(){ try{ return isOwner(me()); }catch(e){ return false; } }
+function approver(u){ u = u || me(); if(!u) return false; try{ if(isOwner(u)) return true; }catch(e){} var d = u.depts; if(typeof d === 'string'){ try{ d = JSON.parse(d); }catch(e){ d = {}; } } if(typeof d === 'string'){ try{ d = JSON.parse(d); }catch(e){ d = {}; } }
+  return u.role === 'Payroll' || !!(d && (d.payroll === true || d.payroll === 'true')); }
+function staff(u){ u = u || me(); try{ return !!u && (isOwner(u) || wmamIsPayrollStaff(u)); }catch(e){ return false; } }
+function canFinalize(){ return owner() || (approver() && PF.set.payroll_can_finalize === true); }
+function longDate(f){ try{ return _payLongDate(f); }catch(e){ return f; } }
+function shortDate(f){ try{ return _gmShort(f); }catch(e){ return f; } }
+function today(){ try{ return _ctToday(); }catch(e){ return new Date().toISOString().slice(0, 10); } }
+async function loadRel(){
+  try{ var r = await supaClient.from('wmam_payroll_release').select('*').order('pay_date', { ascending:false }).limit(40); PF.rel = {}; ((r && r.data) || []).forEach(function(x){ PF.rel[x.pay_date] = x; }); }catch(e){}
+  try{ var s = await supaClient.from('wmam_payroll_settings').select('*').eq('id', 1).maybeSingle(); if(s && s.data) PF.set = s.data; }catch(e){}
+  PF.loaded = Date.now();
+}
+window.wmamPayFlowLoad = loadRel;
+function statusOf(F){ var r = PF.rel[F]; return r ? r.status : 'open'; }
+
+// ── campaigns no longer finalize the week by themselves (see payrollApproveWeek) ──
+// ── payroll may undo a save while the Friday is still open (Calvin can always) ──
+var oUn = payrollUnapproveWeek;
+payrollUnapproveWeek = function(weekId, reason){
+  if(owner()) return oUn.apply(this, arguments);
+  var w = (PAYROLL_WEEKS || []).find(function(x){ return x && x.id === weekId; }); if(!w || w.status !== 'approved' || !approver()) return false;
+  var F = ppWeekPayDate(w), st = statusOf(F); if(st === 'released' || st === 'submitted') return false;
+  w.status = 'draft'; (w.approvalHistory = w.approvalHistory || []).push({ action:'unapproved', actorId:me().id, actorName:me().name, reason:reason || '', at:new Date().toISOString() });
+  savePayrollWeeks(); try{ saveToStorage(); }catch(e){} return true; };
+window.payrollUnapproveWeek = payrollUnapproveWeek;
+
+// ── every old "Finalize" button now goes through the new approval ──
+var FLOW = { on:false };
+var oCO = payrollCommitObligations, oCD = payrollCommitDeposit;
+payrollCommitObligations = function(){ if(FLOW.on) return oCO.apply(this, arguments); try{ alert('Payroll is finalized in Payroll → Pay Files → Approve by Campaign, after every campaign is saved and Calvin approves.'); }catch(e){} gotoPanel('payroll-process'); return false; };
+payrollCommitDeposit = function(){ if(FLOW.on) return oCD.apply(this, arguments); try{ alert('Payroll is finalized in Payroll → Pay Files → Approve by Campaign, after every campaign is saved and Calvin approves.'); }catch(e){} gotoPanel('payroll-process'); return false; };
+window.payrollCommitObligations = payrollCommitObligations; window.payrollCommitDeposit = payrollCommitDeposit;
+
+// ── the Fridays and their campaigns ──
+function fridays(){ var s = {}; (PAYROLL_WEEKS || []).forEach(function(w){ if(w && !w.deleted && w.status !== 'rejected'){ var f = ppWeekPayDate(w); if(f) (s[f] = s[f] || []).push(w); } }); return s; }
+function weekNet(w){ return (w.rows || []).reduce(function(t, r){ return t + (r.grossCents || 0); }, 0); }
+function stubsFor(F){ var dep = payrollBuildDeposit(F), out = []; Object.keys(dep.rollup.agents).forEach(function(id){ var S = payStubData(id, dep); if(S) out.push(S); }); return { dep:dep, stubs:out }; }
+
+// ── Approve by Campaign (replaces the old owner-only "Payroll Processing" page) ──
+function pill(t, bg, fg){ return '<span style="display:inline-block;border-radius:999px;padding:4px 11px;font-size:.74rem;font-weight:900;letter-spacing:.5px;background:' + bg + ';color:' + fg + ';white-space:nowrap">' + t + '</span>'; }
+function B(label, on, kind){ var c = { go:['#047857', '#fff', '#047857'], blue:['#003594', '#fff', '#003594'], line:['#fff', '#003594', '#cbd5e1'], red:['#fff', '#b91c1c', '#fca5a5'] }[kind || 'line']; return '<button onclick="' + on + '" style="background:' + c[0] + ';color:' + c[1] + ';border:1.5px solid ' + c[2] + ';border-radius:10px;padding:9px 14px;font-weight:900;cursor:pointer;font-size:.84rem">' + label + '</button>'; }
+function page(){
+  var u = me(), F = fridays(), keys = Object.keys(F).sort().reverse().slice(0, 8), h = '';
+  h += '<div style="max-width:1000px;margin:0 auto">';
+  h += '<div style="text-align:center;margin:4px 0 14px"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;letter-spacing:2px;color:#003594">✅ APPROVE BY CAMPAIGN</div>'
+    + '<div style="color:#475569;font-size:.9rem;max-width:700px;margin:0 auto">① Upload each pay file · ② <b>Save</b> each campaign after you check it · ③ when every campaign is saved, ' + (PF.set.payroll_can_finalize ? '<b>finalize payroll</b>' : '<b>send it to Calvin</b> — he approves') + ' · ④ everyone’s itemized pay stub shows in their Payroll Center.</div></div>';
+  if(owner()) h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:10px 14px;margin-bottom:14px"><div style="font-size:.88rem"><b>Who finalizes payroll:</b> ' + (PF.set.payroll_can_finalize ? 'Payroll (K-Anna) finalizes without you.' : 'You approve every Friday before stubs go out.') + (PF.set.updated_by ? '<div style="font-size:.74rem;color:#64748b">Last changed by ' + esc(PF.set.updated_by) + '</div>' : '') + '</div>'
+    + B(PF.set.payroll_can_finalize ? 'Require my approval again' : 'Let payroll finalize without me', 'wpfSetFinal(' + (!PF.set.payroll_can_finalize) + ')', PF.set.payroll_can_finalize ? 'red' : 'line') + '</div>';
+  h += '<div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:14px">' + B('⬆ Upload pay file', "gotoPanel('payroll-upload')") + B('🧾 All pay stubs', "gotoPanel('payroll-rollup')") + B('⚖ Loans, fees & expired phones', "gotoPanel('payroll-loans')") + '</div>';
+  if(!keys.length) return h + '<div class="bo-card" style="padding:30px;text-align:center;color:#64748b">No pay files yet. Upload a pay file to begin.</div></div>';
+  keys.forEach(function(f){
+    var list = F[f].slice().sort(function(a, b){ return String(a.carrier).localeCompare(String(b.carrier)); }), saved = list.filter(function(w){ return w.status === 'approved' || w.status === 'finalized'; }), st = statusOf(f), R = PF.rel[f] || {};
+    var all = saved.length === list.length, total = list.reduce(function(t, w){ return t + weekNet(w); }, 0);
+    var sp = st === 'released' ? pill('✔ FINALIZED', '#dcfce7', '#166534') : st === 'submitted' ? pill('WAITING FOR CALVIN', '#fef3c7', '#92400e') : st === 'reopened' ? pill('REOPENED', '#fee2e2', '#991b1b') : (all ? pill('ALL SAVED', '#e0f2fe', '#075985') : pill(saved.length + ' OF ' + list.length + ' SAVED', '#f1f5f9', '#475569'));
+    h += '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:16px">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 16px;background:#0b1b3f;color:#fff"><div><div style="font-weight:900;font-size:1.05rem">Payroll for ' + esc(longDate(f)) + '</div><div style="font-size:.8rem;opacity:.85">' + list.length + ' campaign file' + (list.length === 1 ? '' : 's') + ' · ' + M(total) + ' on the pay files</div></div>' + sp + '</div>';
+    list.forEach(function(w){
+      var ok = w.status === 'approved' || w.status === 'finalized', who = w.approvedByName ? ' by ' + esc(w.approvedByName) : '', when = w.approvedAt ? ' · ' + esc(String(w.approvedAt).slice(5, 10).replace('-', '/')) : '';
+      h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:11px 16px;border-top:1px solid #eef2f7">'
+        + '<div style="min-width:0;text-align:left"><div style="font-weight:900;color:#0b1b3f">' + esc(w.carrier || '?') + ' <span style="font-weight:600;color:#64748b;font-size:.82rem">· ' + esc(_payWkLabel(w)) + '</span></div><div style="font-size:.8rem;color:#64748b">' + (w.rows || []).length + ((w.rows || []).length === 1 ? ' person · ' : ' people · ') + M(weekNet(w)) + (w.editedAfterApproval ? ' · <b style="color:#b45309">edited after saving</b>' : '') + '</div></div>'
+        + '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + (ok ? pill('✔ SAVED' + who + when, '#dcfce7', '#166534') : pill('NOT SAVED', '#fef3c7', '#92400e'))
+        + B('Review', "gotoPanel('payroll-week-detail',{weekId:'" + esc(w.id) + "'})")
+        + (st === 'released' || st === 'submitted' ? '' : (!ok ? (approver() ? B('✔ Save campaign', "wpfSave('" + esc(w.id) + "')", 'go') : '') : ((owner() || approver()) ? B('Undo save', "wpfUnsave('" + esc(w.id) + "')", 'red') : '')))
+        + '</div></div>';
+    });
+    // the finish line for this Friday
+    h += '<div style="padding:12px 16px;border-top:2px solid #e2e8f0;background:#f8fafc;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">';
+    if(st === 'released'){
+      h += '<div style="font-size:.88rem;text-align:left"><b style="color:#166534">Finalized ' + esc(String(R.released_at || '').slice(0, 10)) + (R.released_by ? ' by ' + esc(R.released_by) : '') + '</b> · ' + (R.people || 0) + ' pay stubs released · ' + M(R.total_cents || 0) + '</div><div style="display:flex;gap:6px;flex-wrap:wrap">' + B('🧾 View pay stubs', "gotoPanel('payroll-rollup',{payDate:'" + f + "'})", 'blue') + (owner() ? B('Reopen', "wpfReopen('" + f + "')", 'red') : '') + '</div>';
+    } else if(!all){
+      h += '<div style="font-size:.88rem;color:#475569;text-align:left">Save every campaign above. Then ' + (canFinalize() ? 'finalize payroll here.' : 'send it to Calvin for approval here.') + '</div>';
+    } else if(canFinalize()){
+      h += '<div style="font-size:.88rem;text-align:left">' + (st === 'submitted' ? '<b>' + esc(R.submitted_by || 'Payroll') + '</b> sent this for approval ' + esc(String(R.submitted_at || '').slice(0, 10)) + '. ' : 'Every campaign is saved. ') + 'Finalizing records loans, fees, expired phones, surplus and disputes once, and sends every person their pay stub.</div>'
+        + B('✔ Approve & finalize payroll', "wpfFinalize('" + f + "')", 'go');
+    } else if(approver()){
+      h += st === 'submitted' ? '<div style="font-size:.88rem;text-align:left"><b style="color:#92400e">Sent to Calvin ' + esc(String(R.submitted_at || '').slice(0, 10)) + '.</b> Pay stubs go out as soon as he approves.</div>' + B('Send again', "wpfSubmit('" + f + "')")
+        : '<div style="font-size:.88rem;text-align:left">Every campaign is saved. Send it to Calvin — pay stubs go out when he approves.</div>' + B('Send to Calvin for approval', "wpfSubmit('" + f + "')", 'blue');
+    } else h += '<div style="font-size:.88rem;color:#475569">Waiting for payroll.</div>';
+    h += '</div></div>';
+  });
+  return h + '</div>';
+}
+function render(){ if(window._currentPanelId !== 'payroll-process') return; var b = document.getElementById('boBody'); if(!b) return; var bar = ''; try{ bar = wmamTabBarFor('payroll-process'); }catch(e){} b.innerHTML = bar + page(); }
+window.wpfRender = render;
+window.wpfSave = function(id){ var w = (PAYROLL_WEEKS || []).find(function(x){ return x && x.id === id; }); if(!w) return; if(!confirm('Save ' + w.carrier + ' (' + _payWkLabel(w) + ')? It counts toward this Friday’s payroll.')) return; if(!payrollApproveWeek(id)) return alert('Could not save — only payroll or Calvin can save a campaign.'); render(); };
+window.wpfUnsave = function(id){ var why = prompt('Why undo this save? (logged)'); if(!why || !why.trim()) return; if(!payrollUnapproveWeek(id, why.trim())) return alert('Could not undo — this Friday was already sent or finalized. Ask Calvin to reopen it.'); render(); };
+window.wpfSubmit = async function(f){
+  if(!approver()) return; var list = fridays()[f] || []; if(list.some(function(w){ return w.status !== 'approved' && w.status !== 'finalized'; })) return alert('Save every campaign first.');
+  var x = stubsFor(f), bad = x.stubs.filter(function(S){ return !S.ok; }); if(bad.length) return alert('These pay stubs don’t add up to the saved pay — fix them first: ' + bad.map(function(S){ return S.name; }).join(', '));
+  var total = x.stubs.reduce(function(t, S){ return t + (S.netCents || 0); }, 0), camps = list.map(function(w){ return w.carrier; });
+  var r = await supaClient.rpc('wmam_payroll_submit', { p_pay_date:f, p_campaigns:camps, p_total_cents:total, p_people:x.stubs.length });
+  if(r && r.error) return alert('Not sent: ' + r.error.message);
+  await loadRel(); render(); try{ cdFlash('Sent to Calvin for approval'); }catch(e){}
+};
+window.wpfFinalize = async function(f){
+  if(PF.busy) return; var list = fridays()[f] || [];
+  if(list.some(function(w){ return w.status !== 'approved' && w.status !== 'finalized'; })) return alert('Save every campaign first.');
+  var ok = await supaClient.rpc('wmam_payroll_can_finalize'); if(!ok || ok.error || ok.data !== true) return alert('Only Calvin can approve payroll right now.');
+  var x = stubsFor(f), bad = x.stubs.filter(function(S){ return !S.ok; }); if(bad.length) return alert('These pay stubs don’t add up to the saved pay — fix them first: ' + bad.map(function(S){ return S.name; }).join(', '));
+  var total = x.stubs.reduce(function(t, S){ return t + (S.netCents || 0); }, 0);
+  if(!confirm('Approve and finalize payroll for ' + longDate(f) + '?\n\n' + x.stubs.length + ' people · ' + M(total) + '\n\nLoans, fees, expired phones, Pay Link surplus and disputes are recorded once, and everyone gets their pay stub.')) return;
+  PF.busy = true;
+  try{
+    if(!x.dep.committed){ FLOW.on = true; var c = false; try{ c = oCD(f); }finally{ FLOW.on = false; } if(!c && !payrollBuildDeposit(f).committed){ PF.busy = false; return; } x = stubsFor(f); }
+    total = x.stubs.reduce(function(t, S){ return t + (S.netCents || 0); }, 0);
+    var r = await supaClient.rpc('wmam_payroll_release_stubs', { p_pay_date:f, p_stubs:JSON.parse(JSON.stringify(x.stubs)), p_campaigns:list.map(function(w){ return w.carrier; }), p_total_cents:total });
+    if(r && r.error) throw new Error(r.error.message);
+    await loadRel(); render(); try{ cdFlash('Payroll finalized — ' + x.stubs.length + ' pay stubs sent'); }catch(e){}
+  }catch(e){ alert('Payroll was NOT finalized: ' + (e.message || e)); }
+  PF.busy = false;
+};
+window.wpfReopen = async function(f){ if(!owner()) return; var why = prompt('Reopen payroll for ' + longDate(f) + '? Everyone’s stub is hidden until you finalize again.\n\nReason:'); if(!why || !why.trim()) return;
+  var r = await supaClient.rpc('wmam_payroll_reopen', { p_pay_date:f, p_note:why.trim() }); if(r && r.error) return alert(r.error.message); await loadRel(); render(); };
+window.wpfSetFinal = async function(v){ if(!owner()) return; if(!confirm(v ? 'Let payroll (K-Anna) finalize payroll and send stubs without your approval?' : 'Require your approval again before stubs go out?')) return;
+  var r = await supaClient.rpc('wmam_payroll_set_can_finalize', { p_on:!!v }); if(r && r.error) return alert(r.error.message); await loadRel(); render(); };
+
+// ── Payroll Center: each person's own finalized stubs ──
+var PC = { rows:[], sel:null, loaded:false };
+function nextFriday(){ var d = new Date(today() + 'T12:00:00'); var add = (5 - d.getDay() + 7) % 7; d.setDate(d.getDate() + add); return d.toISOString().slice(0, 10); }
+async function loadMine(){ var u = me(); PC.rows = []; if(!u) return;
+  try{ var r = await supaClient.from('wmam_pay_stubs').select('pay_date,net_cents,data,released_at').eq('agent_id', u.id).eq('hidden', false).order('pay_date', { ascending:false }).limit(60); PC.rows = (r && r.data) || []; }catch(e){}
+  await loadRel(); PC.loaded = true; }
+function centerHtml(){
+  var u = me(), h = '<div style="max-width:900px;margin:0 auto">', nf = nextFriday(), relNF = PF.rel[nf];
+  h += '<div style="text-align:center;margin:4px 0 12px"><div style="font-family:Bebas Neue,sans-serif;font-size:1.8rem;letter-spacing:2px;color:#003594">💵 PAYROLL CENTER</div><div style="color:#475569;font-size:.9rem">Your itemized pay stubs — every campaign, override, credit and deduction. A stub shows here once payroll is finalized.</div></div>';
+  var hasNF = PC.rows.some(function(x){ return x.pay_date === nf; });
+  if(!hasNF) h += '<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:12px 14px;margin-bottom:12px;text-align:center;color:#92400e;font-weight:700">⏳ Payroll for ' + esc(longDate(nf)) + ' is being processed. Your pay stub shows here as soon as it’s finalized.</div>';
+  if(!PC.rows.length) return h + '<div class="bo-card" style="padding:30px;text-align:center;color:#64748b">No finalized pay stubs yet.</div></div>';
+  if(!PC.sel || !PC.rows.some(function(x){ return x.pay_date === PC.sel; })) PC.sel = PC.rows[0].pay_date;
+  h += '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:center;margin-bottom:12px">' + PC.rows.slice(0, 12).map(function(x){ var on = x.pay_date === PC.sel; return '<button onclick="WPC2.sel=\'' + x.pay_date + '\';wpcCenterRender()" style="border:2px solid ' + (on ? '#003594' : '#e2e8f0') + ';background:' + (on ? '#003594' : '#fff') + ';color:' + (on ? '#fff' : '#0b1b3f') + ';border-radius:999px;padding:7px 12px;font-weight:800;font-size:.82rem;cursor:pointer">' + esc(shortDate(x.pay_date)) + ' · ' + M(x.net_cents) + '</button>'; }).join('') + '</div>';
+  var row = PC.rows.find(function(x){ return x.pay_date === PC.sel; });
+  h += '<div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:8px"><button onclick="wpcPrintMine()" style="padding:9px 14px;border:none;border-radius:8px;background:#003594;color:#fff;font-weight:800;cursor:pointer">🖨 Print / Save PDF</button></div>';
+  try{ h += _PAY_STUB_CSS + payStubHtml(row.data); }catch(e){ h += '<div class="bo-card" style="padding:20px;color:#b91c1c">This stub could not be shown.</div>'; }
+  return h + '</div>';
+}
+window.WPC2 = PC;
+window.wpcCenterRender = function(){ if(window._currentPanelId !== 'my-payroll') return; var b = document.getElementById('boBody'); if(!b) return; var bar = ''; try{ bar = wmamTabBarFor('my-payroll'); }catch(e){} b.innerHTML = bar + centerHtml(); };
+window.wpcPrintMine = function(){ var row = PC.rows.find(function(x){ return x.pay_date === PC.sel; }); if(!row) return; var w = window.open('', '_blank'); if(!w) return alert('Allow pop-ups to print.');
+  w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Pay stub ' + row.pay_date + '</title>' + _PAY_STUB_CSS + '</head><body style="margin:14px;background:#fff">' + payStubHtml(row.data) + '</body></html>'); w.document.close(); setTimeout(function(){ try{ w.print(); }catch(e){} }, 400); };
+// everyone active may open their own Payroll Center (the old beta list is gone)
+if(typeof hasPayrollViewAccess === 'function'){ window.hasPayrollViewAccess = hasPayrollViewAccess = function(u){ return !!(u && u.active !== false); }; }
+
+// ── This Week's Payroll + Pay Stubs pages: their "Finalize" buttons now point to the approval step ──
+if(typeof payHomeRender === 'function'){ var oHome = payHomeRender; window.payHomeRender = payHomeRender = function(){ var r = oHome.apply(this, arguments); try{ var box = document.getElementById('payHomeBox'); if(box){ [].slice.call(box.querySelectorAll('div')).forEach(function(d){ var b = d.firstElementChild; if(b && b.tagName === 'B' && /3\. Finalize/.test(b.textContent)){ var btn = d.querySelector('button'); if(btn){ btn.disabled = false; btn.textContent = 'Approve by Campaign →'; btn.onclick = function(e){ e.preventDefault(); gotoPanel('payroll-process'); }; btn.removeAttribute('onclick'); btn.onclick = function(){ gotoPanel('payroll-process'); }; } } }); } }catch(e){} return r; }; }
+if(typeof panelPayrollRollup === 'function'){ var oRoll = panelPayrollRollup; window.panelPayrollRollup = panelPayrollRollup = function(){ var h = oRoll.apply(this, arguments); try{ h = String(h).replace(/<button onclick="if\(confirm\('Finalize this[\s\S]*?<\/button>/, '<button onclick="gotoPanel(\'payroll-process\')" style="padding:9px 14px;border:none;border-radius:8px;background:#047857;color:#fff;font-weight:800;cursor:pointer">✔ Finalize in Approve by Campaign →</button>'); }catch(e){} return h; }; }
+
+// ── menu: Me → My Pay → Payroll Center (everyone) · Payroll → People & Pay Stubs keeps the office view ──
+function addMenu(){ try{ var me2 = (WMAM_NAV || []).filter(function(n){ return n.key === 'me'; })[0]; if(me2 && !me2.cards.some(function(c){ return c._wpc; })){ me2.cards.unshift({ title:'My Pay', icon:'💵', bg:'#dcfce7', tabs:[['my-payroll', 'Payroll Center']], _wpc:true }); }
+  (WMAM_NAV || []).forEach(function(n){ (n.cards || []).forEach(function(c){ (c.tabs || []).forEach(function(t){ if(t[0] === 'my-payroll') t[1] = 'Payroll Center'; if(t[0] === 'payroll-process') t[1] = 'Approve by Campaign'; }); }); });
+  Object.keys(WMAM_TAB_GROUPS || {}).forEach(function(k){ var g = WMAM_TAB_GROUPS[k]; (g && g.tabs || []).forEach(function(t){ if(t[0] === 'my-payroll') t[1] = 'Payroll Center'; }); });
+  try{ var sec = me2, i0 = 0; Object.keys(WMAM_TAB_GROUPS).forEach(function(k){ if(/^nav-me-/.test(k)) delete WMAM_TAB_GROUPS[k]; }); (sec.cards || []).forEach(function(c, i){ WMAM_TAB_GROUPS['nav-me-' + i] = { title:c.title, icon:c.icon, tabs:c.tabs, card:c, navCard:true }; }); }catch(e){} }catch(e){} }
+addMenu();
+if(typeof wmamCleanNav === 'function'){ var oCN = wmamCleanNav; window.wmamCleanNav = wmamCleanNav = function(){ var r = oCN.apply(this, arguments); addMenu(); return r; }; }
+var allow = function(u, id){ if(id === 'my-payroll') return !!(u && u.active !== false); if(id === 'payroll-process') return staff(u); if(id === 'payroll-view-beta') return !!(u && u.active !== false); return null; };
+if(typeof _wmamIdAllowed === 'function'){ var a1 = _wmamIdAllowed; window._wmamIdAllowed = _wmamIdAllowed = function(id){ var r = allow(DB.current, id); return r === null ? a1.apply(this, arguments) : r; }; }
+if(typeof _wmamTabAllowed === 'function'){ var a2 = _wmamTabAllowed; window._wmamTabAllowed = _wmamTabAllowed = function(u, id){ var r = allow(u, id); return r === null ? a2.apply(this, arguments) : r; }; }
+if(typeof canAccess === 'function'){ var a3 = canAccess; window.canAccess = canAccess = function(u, area){ var r = allow(u, area); return r === null ? a3.apply(this, arguments) : r; }; }
+if(typeof gotoPanel === 'function'){ var oGo = gotoPanel; window.gotoPanel = gotoPanel = function(id, params){
+  if(id === 'payroll-view-beta'){ arguments[0] = id = 'my-payroll'; }   // the old beta page is replaced by the Payroll Center
+  if(id === 'payroll-process'){ if(!staff()) return oGo.call(this, 'bo'); var r = oGo.apply(this, arguments); window._currentPanelId = 'payroll-process'; var b = document.getElementById('boBody'); if(b) b.innerHTML = '<div style="padding:30px;text-align:center;color:#888">Loading payroll…</div>'; Promise.resolve(typeof wmamPayAutoLoad === 'function' ? wmamPayAutoLoad() : null).catch(function(){}).then(loadRel).then(render); return r; }
+  if(id === 'my-payroll'){ var r2 = oGo.apply(this, arguments); window._currentPanelId = 'my-payroll'; if(params && params.payDate) PC.sel = String(params.payDate).slice(0, 10); var b2 = document.getElementById('boBody'); if(b2) b2.innerHTML = '<div style="padding:30px;text-align:center;color:#888">Loading your pay stubs…</div>'; loadMine().then(wpcCenterRender); return r2; }
+  return oGo.apply(this, arguments); }; }
+}catch(e){ console.warn('[payroll flow]', e); } })();
 </script>
 </body>
 </html>
