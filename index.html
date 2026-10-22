@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.22.1700';
+var BUILD_VERSION = '2026.10.22.1710';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -112447,7 +112447,7 @@ window.cpReadFile = async function(input){
 //  who it belongs to, and it goes to Makenzie for approval, and once she approves the agent gets the invoice, it gets signed
 //  and the agent now has the inventory in their name." — for any campaign, IMEIs AND SIM (CCID/ICCID) numbers.
 //  • Scanner: phones with a built-in barcode reader (Android/Chrome) use it — several barcodes per frame, ~8 reads a second;
-//    others use ZXing. Barcodes that are not an IMEI (15 digits) or a SIM number (19–20 digits starting 89) are skipped
+//    others (iPhone) use ZXing C++ (WebAssembly, v1710 — reads dense box QR codes, several codes per frame); old ZXing last. Barcodes that are not an IMEI (15 digits) or a SIM number (19–20 digits starting 89) are skipped
 //    quietly (box UPCs, SKUs), every number is check-digit verified, labels like "IMEI: 35…" or ICCIDs ending in "F" read right.
 //  • Each scan is looked up in EVERY campaign's inventory at once — the campaign is found automatically.
 //  • "Send invoice to" → one transfer per campaign on the existing engine: Makenzie (Inventory Dept) approves → the person
@@ -112456,6 +112456,10 @@ window.cpReadFile = async function(input){
 //    person ("can transfer without approval" on their profile). Outside the sender's market always goes to her.
 //    Inventory Dept / owner sends skip approval (they are the approvers). Phones under 21 days still always go to her.
 //  Lives at Inventory → Inventory Center → Transfers (the page is now this one button) and on My Inventory.
+//  v1710 (Calvin 2026-10-22): TruConnect box QR codes. One scan of the carton's QR reads every kit in the box — each line is
+//  IMEI + its kitted SIM (+ serial), so 40 numbers = 20 phones + 20 SIMs, kept together as 20 kits. Phones already in
+//  inventory get their kitted SIM saved (office); kits not in the system yet can be added to TruConnect inventory for the
+//  person picked under "Send invoice to" (office) — they get the acceptance invoice to sign, same as a file upload.
 (function(){ try{
 if(window._wmamScanSendOn) return; window._wmamScanSendOn = true;
 var esc = function(v){ return (typeof _escapeHtml === 'function') ? _escapeHtml(v == null ? '' : String(v)) : String(v == null ? '' : v); };
@@ -112471,6 +112475,15 @@ wmamCheckId = function(raw){
   return c; };
 window.wmamCheckId = wmamCheckId;
 
+// ── the strong reader (ZXing C++ compiled to WebAssembly) — reads dense box QR codes the older reader can't ──
+var WASM_URL = 'https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.4/dist/iife/reader/index.js', _wasmP = null;
+function loadWasm(){ if(window.ZXingWASM && window.ZXingWASM.readBarcodes) return Promise.resolve(window.ZXingWASM); if(_wasmP) return _wasmP;
+  _wasmP = new Promise(function(res, rej){ var sc = document.createElement('script'); sc.src = WASM_URL; sc.async = true; sc.onload = function(){ window.ZXingWASM ? res(window.ZXingWASM) : rej(new Error('reader missing')); }; sc.onerror = function(){ _wasmP = null; rej(new Error('Could not load the barcode reader')); }; document.head.appendChild(sc); });
+  return _wasmP; }
+window.wmamLoadWasmReader = loadWasm;
+var WASM_OPTS = { formats:['QRCode', 'DataMatrix', 'PDF417', 'Code128', 'Code39', 'Code93', 'EAN13', 'ITF', 'Codabar'], tryHarder:true, tryRotate:true, tryInvert:false, tryDownscale:true, maxNumberOfSymbols:12 };
+async function wasmRead(W, imageData){ try{ var r = await W.readBarcodes(imageData, WASM_OPTS); return (r || []).filter(function(x){ return x && x.isValid !== false && x.text; }).map(function(x){ return x.text; }); }catch(e){ return []; } }
+window.wmamWasmRead = wasmRead;
 // ── 2. the live camera: native reader when the phone has one (fast, many per frame), ZXing otherwise ──
 var NATIVE_FORMATS = ['code_128', 'code_39', 'code_93', 'ean_13', 'itf', 'qr_code', 'data_matrix', 'pdf417', 'codabar'];
 _wscanStart = async function(){
@@ -112490,8 +112503,15 @@ _wscanStart = async function(){
     };
     var det = null;
     if('BarcodeDetector' in window){ try{ var sup = await window.BarcodeDetector.getSupportedFormats(); var f = NATIVE_FORMATS.filter(function(x){ return sup.indexOf(x) >= 0; }); if(f.indexOf('code_128') >= 0) det = new window.BarcodeDetector({ formats:f }); }catch(e){ det = null; } }
-    var busy = false;
-    if(det){
+    var busy = false, W = null;
+    if(!det){ try{ W = await Promise.race([loadWasm(), new Promise(function(_, j){ setTimeout(function(){ j(new Error('slow')); }, 8000); })]); await W.readBarcodes(new ImageData(8, 8), WASM_OPTS); }catch(e){ W = null; } }
+    if(!det && W){
+      WSCAN.engine = 'wasm';
+      var wc = document.createElement('canvas'), wx = wc.getContext('2d', { willReadFrequently:true });
+      WSCAN.timer = setInterval(async function(){ if(busy || !v.videoWidth || !document.getElementById('wscanOv')) return; busy = true;
+        try{ var sc = Math.min(1, 1600 / v.videoWidth); wc.width = Math.round(v.videoWidth * sc); wc.height = Math.round(v.videoHeight * sc); wx.drawImage(v, 0, 0, wc.width, wc.height);
+          (await wasmRead(W, wx.getImageData(0, 0, wc.width, wc.height))).forEach(handle); }catch(e){} finally{ busy = false; } }, 150);
+    } else if(det){
       WSCAN.engine = 'native';
       WSCAN.timer = setInterval(async function(){ if(busy || !v.videoWidth || !document.getElementById('wscanOv')) return; busy = true;
         try{ var res = await det.detect(v); (res || []).forEach(function(r){ handle(r.rawValue); }); }catch(e){} finally{ busy = false; } }, 120);
@@ -112520,6 +112540,49 @@ window._wscanStart = _wscanStart;
 var oRender = _wscanRender;
 _wscanRender = function(){ var r = oRender.apply(this, arguments); try{ if(typeof WSCAN.onRender === 'function') WSCAN.onRender(); }catch(e){} return r; };
 window._wscanRender = _wscanRender;
+
+// ── 2b. box QR codes (a manifest: PO, carton, then one line per kit = IMEI + SIM + serial) ──
+function parseManifest(text){
+  var t = String(text || ''); if(!/[\r\n\t]/.test(t)) return null;
+  var kits = [], po = '', carton = '', m;
+  if((m = t.match(/PO\s*#?\s*:?\s*([A-Za-z0-9-]+)/i))) po = m[1];
+  if((m = t.match(/C\s*\/\s*NO\.?\s*:?\s*([A-Za-z0-9-]+)/i))) carton = m[1];
+  t.split(/[\r\n]+/).forEach(function(line){ var im = null, sim = null, serial = '';
+    line.split(/[\t,;|]+|\s{2,}/).forEach(function(tok){ var c = wmamCheckId(tok.trim()); if(c.ok && c.kind === 'imei' && !im) im = c.value; else if(c.ok && c.kind === 'sim' && !sim) sim = c.value; else if(!c.ok && /^[A-Z0-9]{8,}$/i.test(tok.trim()) && /[A-Z]/i.test(tok)) serial = tok.trim(); });
+    if(im || sim) kits.push({ imei:im, sim:sim, serial:serial }); });
+  var n = kits.reduce(function(a, k){ return a + (k.imei ? 1 : 0) + (k.sim ? 1 : 0); }, 0);
+  return n >= 2 ? { po:po, carton:carton, kits:kits } : null;
+}
+window.wmamParseManifest = parseManifest;
+var oAdd = wmamScanAdd;
+wmamScanAdd = function(raw, quiet){
+  if(WSCAN.anyCode) return oAdd.apply(this, arguments);
+  var M = parseManifest(raw); if(!M) return oAdd.apply(this, arguments);
+  WSCAN.boxes = WSCAN.boxes || {}; var bk = M.carton || M.kits.map(function(k){ return k.imei || k.sim; }).join(',');
+  var added = 0, have = {}; WSCAN.list.forEach(function(x){ have[x.value] = 1; });
+  M.kits.forEach(function(k){
+    if(k.imei && !have[k.imei]){ WSCAN.list.push({ ok:true, kind:'imei', value:k.imei, kitSim:k.sim || null, serial:k.serial, box:M.carton, po:M.po }); have[k.imei] = 1; added++; }
+    if(k.sim && !have[k.sim]){ WSCAN.list.push({ ok:true, kind:'sim', value:k.sim, kitOf:k.imei || null, box:M.carton, po:M.po }); have[k.sim] = 1; added++; } });
+  if(!added){ if(!quiet) _wscanStatus('Box ' + (M.carton || '') + ' already scanned', '#b45309'); return false; }
+  WSCAN.boxes[bk] = { po:M.po, carton:M.carton, kits:M.kits.length };
+  if(!quiet) _wscanBeep(true); _wscanRender();
+  var ph = M.kits.filter(function(k){ return k.imei; }).length, sm = M.kits.filter(function(k){ return k.sim; }).length;
+  _wscanStatus('📦 Box ' + (M.carton || '') + ' read: ' + ph + ' phone' + (ph === 1 ? '' : 's') + ' + ' + sm + ' SIM' + (sm === 1 ? '' : 's') + (ph && sm ? ' (' + Math.min(ph, sm) + ' kits)' : ''), '#166534');
+  return true;
+};
+window.wmamScanAdd = wmamScanAdd;
+// the photo option also reads QR codes now
+if(typeof _decodeMultipleBarcodesFromImage === 'function'){ var oPhoto = _decodeMultipleBarcodesFromImage;
+  _decodeMultipleBarcodesFromImage = function(img){
+    var wq = loadWasm().then(async function(W){ var cv = document.createElement('canvas'), sc = Math.min(1, 3000 / Math.max(img.naturalWidth || img.width, img.naturalHeight || img.height)); cv.width = Math.round((img.naturalWidth || img.width) * sc); cv.height = Math.round((img.naturalHeight || img.height) * sc); var cx = cv.getContext('2d'); cx.drawImage(img, 0, 0, cv.width, cv.height);
+      return (await wasmRead(W, cx.getImageData(0, 0, cv.width, cv.height))).map(function(t){ return { text:t }; }); }).catch(function(){ return []; });
+    var qr = _loadZxing().then(function(ZX){ try{ var cv = document.createElement('canvas'), sc = Math.min(1, 2200 / Math.max(img.naturalWidth || img.width, img.naturalHeight || img.height)); cv.width = Math.round((img.naturalWidth || img.width) * sc); cv.height = Math.round((img.naturalHeight || img.height) * sc); cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+      var h = new Map(); h.set(ZX.DecodeHintType.TRY_HARDER, true); h.set(ZX.DecodeHintType.POSSIBLE_FORMATS, [ZX.BarcodeFormat.QR_CODE, ZX.BarcodeFormat.DATA_MATRIX, ZX.BarcodeFormat.PDF_417]);
+      var r = new ZX.MultiFormatReader(); r.setHints(h); return [{ text:r.decode(new ZX.BinaryBitmap(new ZX.HybridBinarizer(new ZX.HTMLCanvasElementLuminanceSource(cv)))).getText() }]; }catch(e){ return []; } });
+    var nat = ('BarcodeDetector' in window) ? (async function(){ try{ var d = new window.BarcodeDetector({ formats:['qr_code', 'data_matrix', 'code_128', 'code_39', 'itf', 'pdf417'] }); var bm = await createImageBitmap(img); return (await d.detect(bm)).map(function(x){ return { text:x.rawValue }; }); }catch(e){ return []; } })() : Promise.resolve([]);
+    return Promise.all([qr, nat, oPhoto.apply(this, arguments).catch(function(){ return []; }), wq]).then(function(a){ var seen = {}, out = []; a[3].concat(a[0], a[1], a[2]).forEach(function(x){ var t = x && (x.text || x); if(t && !seen[t]){ seen[t] = 1; out.push(typeof x === 'object' ? x : { text:t }); } }); return out; });
+  };
+  window._decodeMultipleBarcodesFromImage = _decodeMultipleBarcodesFromImage; }
 
 // ── 3. Makenzie approves every transfer unless she turns it off ──
 var APPROFF_KEY = 'transfer_approval_off';
@@ -112559,17 +112622,34 @@ function resolve(v){
     if(!office && String(_wmamHolderOf(d)) !== String(u.id)){ info.why = 'not in your inventory'; return info; }
     info.ok = true; return info;
   }
+  var gone = findAnywhere(v);
+  if(gone) return { camp:gone.camp, dev:gone.dev, why:'already in the system (removed from inventory) — the office can restore it', dup:true };
   return { why:'not in any campaign’s inventory — check the number or upload it first' };
 }
+// every record in every campaign, removed ones included — so nothing can ever be added twice
+function findAnywhere(v){ v = digits(v); if(!v) return null;
+  var L = camps(); for(var i = 0; i < L.length; i++){ var d = (_uxfPool(L[i]) || []).find(function(x){ return x && (digits(x.imei) === v || digits(x.sim) === v || digits(x.kitSim) === v); }); if(d) return { camp:L[i], dev:d }; }
+  var extra = [].concat(typeof INVENTORY_DEVICES !== 'undefined' ? INVENTORY_DEVICES : [], typeof GM_INVENTORY !== 'undefined' ? GM_INVENTORY : [], typeof TC_INVENTORY !== 'undefined' ? TC_INVENTORY : [], typeof AW_INVENTORY !== 'undefined' ? AW_INVENTORY : []);
+  var d2 = extra.find(function(x){ return x && (digits(x.imei) === v || digits(x.sim) === v || digits(x.kitSim) === v); }); return d2 ? { camp:d2.campaign || 'inventory', dev:d2 } : null; }
+window.wmamFindAnywhere = findAnywhere;
 
 // ── 5. the pop-up ──
 var SS = { to:'', reason:'Distribution to team', busy:false, done:null, cache:{} };
 window.SCANSEND = SS;
 function info(x){ if(!x || !x.ok) return null; var k = x.value; if(!SS.cache[k]) SS.cache[k] = resolve(k); return SS.cache[k]; }
-function items(){ return WSCAN.list.map(function(x){ return { x:x, r:info(x) }; }); }
+function items(){
+  var phones = {}; WSCAN.list.forEach(function(x){ if(x.kind === 'imei' && x.kitSim) phones[x.value] = x.kitSim; });
+  return WSCAN.list.filter(function(x){ return !(x.kind === 'sim' && x.kitOf && phones[x.kitOf] === x.value); }).map(function(x){ var r = info(x);
+    if(r && r.ok && SS.to && r.dev && String(_wmamHolderOf(r.dev)) === String(SS.to)) r = Object.assign({}, r, { ok:false, why:'they already hold it' });   // can't send to the person who has it
+    return { x:x, r:r, kit:x.kitSim || null }; }); }
+function kitCount(list){ return list.filter(function(it){ return it.kit; }).length; }
 function people(){
   var u = DB.current, used = {}; items().forEach(function(it){ if(it.r && it.r.ok) used[it.r.camp] = 1; }); var cs = Object.keys(used);
-  return (DB.agents || []).filter(function(a){ return a && a.active !== false && !a.deletedAt && a.id !== u.id && (_uxfIsOffice(a) || (cs.length ? cs.every(function(c){ return _uxfHasCode(a, c); }) : uxfCampaigns(a).length > 0)); })
+  var office = _uxfIsOffice(u), mk = _uxfMarketOf(u), down = {};
+  if(!office){ try{ (typeof aiTeamDownline === 'function' ? aiTeamDownline(u) : []).forEach(function(a){ down[String(a.id)] = 1; }); }catch(e){} }
+  // v1710 (Calvin): a manager can send to anyone in their market or their downline (Sheila → Najee: same market, under Tanita). Office can send to anyone.
+  var reach = function(a){ return office || _uxfIsOffice(a) || (!!mk && _uxfMarketOf(a) === mk) || !!down[String(a.id)]; };
+  return (DB.agents || []).filter(function(a){ return a && a.active !== false && !a.deletedAt && a.id !== u.id && reach(a) && (_uxfIsOffice(a) || (cs.length ? cs.every(function(c){ return _uxfHasCode(a, c); }) : uxfCampaigns(a).length > 0)); })
     .sort(function(a, b){ return String(a.name).localeCompare(String(b.name)); }); }
 function panel(){
   var el = document.getElementById('ssPanel'); if(!el) return;
@@ -112577,34 +112657,75 @@ function panel(){
   var list = all.length ? all.slice().reverse().map(function(it){ var x = it.x, r = it.r, ok = r && r.ok;
     var why = !x.ok ? x.why : (r && r.why) || '';
     return '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;padding:5px 2px;border-bottom:1px solid #f1f5f9;font-size:.84rem;text-align:left"><div style="min-width:0;flex:1 1 auto"><div style="font-family:monospace;color:' + (ok ? '#111' : '#b91c1c') + ';word-break:break-all">' + (ok ? '✔ ' : '✖ ') + esc(x.value) + '</div>'
-      + '<div style="font-size:.74rem;color:' + (ok ? '#166534' : '#b91c1c') + '">' + (x.kind === 'sim' ? 'SIM' : 'IMEI') + (r && r.camp ? ' · ' + esc(label(r.camp)) + ' · ' + esc(r.model) + (r.cost ? ' · ' + money(r.cost) : '') : '') + (why ? ' — ' + esc(why) : '') + '</div></div>'
-      + '<button onclick="wmamScanRemove(\'' + x.value + '\')" style="border:none;background:none;color:#b91c1c;cursor:pointer;font-size:1rem;flex:0 0 auto">✕</button></div>'; }).join('')
+      + (it.kit ? '<div style="font-family:monospace;font-size:.78rem;color:#475569;word-break:break-all">+ SIM ' + esc(it.kit) + '</div>' : '')
+      + '<div style="font-size:.74rem;color:' + (ok ? '#166534' : '#b91c1c') + '">' + (it.kit ? '📦 Kit' : (x.kind === 'sim' ? 'SIM' : 'IMEI')) + (r && r.camp ? ' · ' + esc(label(r.camp)) + ' · ' + esc(r.model) + (r.cost ? ' · ' + money(r.cost) : '') : '') + (why ? ' — ' + esc(why) : '') + '</div></div>'
+      + '<button onclick="ssRemove(\'' + x.value + '\')" style="border:none;background:none;color:#b91c1c;cursor:pointer;font-size:1rem;flex:0 0 auto">✕</button></div>'; }).join('')
     : '<div style="color:#94a3b8;font-size:.84rem;padding:8px;text-align:center">Nothing scanned yet.</div>';
   var bad = all.length - ready.length, byCamp = {}; ready.forEach(function(it){ byCamp[it.r.camp] = (byCamp[it.r.camp] || 0) + 1; });
   var ppl = people(); if(SS.to && !ppl.some(function(a){ return String(a.id) === String(SS.to); })) SS.to = '';
   var to = (DB.agents || []).find(function(a){ return String(a.id) === String(SS.to); }), rule = to ? uxfRule(u, to) : null;
-  var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px"><span style="font-size:.88rem"><b style="color:#166534">' + ready.length + ' ready</b>' + (bad ? ' · <span style="color:#b91c1c">' + bad + ' can’t be sent</span>' : '') + '</span><span style="font-size:.74rem;color:#64748b">' + Object.keys(byCamp).map(function(c){ return esc(label(c)) + ' ' + byCamp[c]; }).join(' · ') + '</span></div>'
+  var kr = kitCount(ready), boxes = Object.keys(WSCAN.boxes || {});
+  var h = (boxes.length ? '<div style="margin-top:6px;font-size:.8rem;color:#334155;background:#f1f5f9;border-radius:8px;padding:6px 8px">📦 ' + boxes.map(function(k){ var b = WSCAN.boxes[k]; return 'Box ' + esc(b.carton || '') + (b.po ? ' · PO ' + esc(b.po) : '') + ' · ' + b.kits + ' kits'; }).join(' &nbsp;|&nbsp; ') + '</div>' : '')
+    + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px"><span style="font-size:.88rem"><b style="color:#166534">' + ready.length + ' ready' + (kr ? ' (' + kr + ' kit' + (kr === 1 ? '' : 's') + ' = ' + kr + ' phone' + (kr === 1 ? '' : 's') + ' + ' + kr + ' SIM' + (kr === 1 ? '' : 's') + ')' : '') + '</b>' + (bad ? ' · <span style="color:#b91c1c">' + bad + ' can’t be sent</span>' : '') + '</span><span style="font-size:.74rem;color:#64748b">' + Object.keys(byCamp).map(function(c){ return esc(label(c)) + ' ' + byCamp[c]; }).join(' · ') + '</span></div>'
     + '<div style="max-height:180px;overflow:auto;border:1px solid #e5e7eb;border-radius:10px;padding:4px 8px;margin-top:4px">' + list + '</div>';
   if(bad) h += '<button onclick="ssClearBad()" style="margin-top:6px;border:none;background:none;color:#b91c1c;font-weight:800;font-size:.8rem;cursor:pointer">Remove the ' + bad + ' that can’t be sent</button>';
   h += '<div style="font-size:.72rem;font-weight:800;letter-spacing:1px;color:#475569;text-transform:uppercase;margin:12px 0 4px">Send invoice to</div>'
     + '<select id="ssTo" onchange="SCANSEND.to=this.value;ssPanel()" style="width:100%;padding:12px;border:2px solid ' + (to ? '#16a34a' : '#cbd5e1') + ';border-radius:10px;font-size:16px;background:#fff"><option value="">— who is this for? —</option>' + ppl.map(function(a){ var mk = _uxfMarketOf(a); return '<option value="' + a.id + '"' + (String(a.id) === String(SS.to) ? ' selected' : '') + '>' + esc(a.name) + ' (' + esc(a.role || '') + (mk ? ' · ' + esc(mk) : '') + ')</option>'; }).join('') + '</select>'
     + '<select id="ssReason" onchange="SCANSEND.reason=this.value" style="width:100%;margin-top:6px;padding:9px;border:1px solid #cbd5e1;border-radius:10px;font-size:14px;background:#fff">' + ['Distribution to team', 'Return to manager', 'Rebalancing between agents', 'Agent leaving', 'Other'].map(function(o){ return '<option' + (o === SS.reason ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select>';
   if(rule) h += '<div style="margin-top:8px;padding:8px 10px;border-radius:10px;font-size:.84rem;font-weight:700;background:' + (rule.needsApproval ? '#fef3c7;color:#92400e' : '#ecfdf5;color:#166534') + '">' + esc(rule.why) + '</div>';
+  var miss = all.filter(function(it){ return it.x.ok && it.x.kind === 'imei' && it.r && !it.r.camp; });
+  if(miss.length && _uxfIsOffice(u)){ var tcm = {}; ((typeof TC_INVENTORY !== 'undefined' ? TC_INVENTORY : []) || []).forEach(function(d){ if(d && d.model) tcm[d.model] = d; }); var models = Object.keys(tcm).sort();
+    if(!SS.inModel){ var c8 = models.filter(function(m){ return /stratus\s*c8/i.test(m); })[0]; SS.inModel = c8 || models[0] || ''; }
+    if(SS.inCost == null || SS.inCost === ''){ var md = tcm[SS.inModel]; SS.inCost = md ? (md.cost != null ? md.cost : md.deviceCost) : ''; }
+    var mk = miss.filter(function(it){ return it.kit; }).length;
+    h += '<div style="margin-top:12px;border:2px dashed #2563eb;border-radius:12px;padding:10px;background:#eff6ff"><div style="font-weight:900;color:#1e3a8a">📥 ' + miss.length + ' not in the system yet' + (mk ? ' (' + mk + ' kits)' : '') + ' — add to TruConnect inventory</div>'
+      + '<div style="font-size:.78rem;color:#334155;margin:2px 0 6px">They are added for the person under <b>Send invoice to</b>, who gets the acceptance invoice to sign (same as a file upload). The TruConnect file later fills in the rest.</div>'
+      + '<input list="ssModels" value="' + esc(SS.inModel) + '" oninput="SCANSEND.inModel=this.value" placeholder="Model (e.g. Cloud Mobile Stratus C8 (TMO))" style="width:100%;padding:9px;border:1px solid #93c5fd;border-radius:8px;font-size:14px;box-sizing:border-box"><datalist id="ssModels">' + models.map(function(m){ return '<option value="' + esc(m) + '">'; }).join('') + '</datalist>'
+      + '<div style="display:flex;gap:6px;align-items:center;margin-top:6px"><span style="font-size:.85rem;font-weight:700">Cost each $</span><input inputmode="decimal" value="' + esc(SS.inCost == null ? '' : SS.inCost) + '" oninput="SCANSEND.inCost=this.value" style="width:90px;padding:8px;border:1px solid #93c5fd;border-radius:8px;font-size:14px"></div>'
+      + '<button onclick="ssIntake()" ' + (to && !SS.busy ? '' : 'disabled') + ' style="width:100%;margin-top:8px;padding:12px;border:none;border-radius:10px;font-weight:900;color:#fff;background:' + (to && !SS.busy ? '#2563eb' : '#94a3b8') + ';cursor:pointer">📥 Add ' + miss.length + ' to inventory' + (to ? ' for ' + esc(String(to.name).split(' ')[0]) : ' (pick the person above)') + '</button></div>'; }
+  var noSim = all.filter(function(it){ return it.kit && it.r && it.r.dev && !digits(it.r.dev.sim); });
+  if(noSim.length && _uxfIsOffice(u)) h += '<button onclick="ssSaveSims()" style="width:100%;margin-top:8px;padding:10px;border:1px solid #64748b;border-radius:10px;background:#fff;color:#334155;font-weight:800;cursor:pointer">💾 Save ' + noSim.length + ' kitted SIM' + (noSim.length === 1 ? '' : 's') + ' to their phones (no transfer)</button>';
   var can = ready.length && to && !SS.busy;
   h += '<button id="ssSend" onclick="ssSend()" ' + (can ? '' : 'disabled') + ' style="width:100%;margin-top:10px;padding:15px;border:none;border-radius:12px;font-size:16px;font-weight:900;color:#fff;cursor:' + (can ? 'pointer' : 'default') + ';background:' + (can ? '#16a34a' : '#94a3b8') + '">' + (SS.busy ? '⏳ Sending…' : '📄 Send invoice' + (to ? ' to ' + esc(String(to.name).split(' ')[0]) : '') + ' (' + ready.length + ')') + '</button>';
   el.innerHTML = h;
 }
 window.ssPanel = panel;
-window.ssClearBad = function(){ var keep = items().filter(function(it){ return it.r && it.r.ok; }).map(function(it){ return it.x.value; }); WSCAN.list = WSCAN.list.filter(function(x){ return keep.indexOf(x.value) >= 0; }); _wscanRender(); };
+window.ssRemove = function(v){ var x = WSCAN.list.find(function(y){ return y.value === v; }); WSCAN.list = WSCAN.list.filter(function(y){ return y.value !== v && !(x && x.kitSim && y.value === x.kitSim); }); _wscanRender(); };
+// office: save each phone's kitted SIM on its inventory record
+function saveKitSims(list){ if(!_uxfIsOffice(DB.current)) return 0; var n = 0;
+  list.forEach(function(it){ if(it.kit && it.r && it.r.dev && !digits(it.r.dev.sim)){ it.r.dev.sim = it.kit; it.r.dev.kitSim = it.kit; if(it.x.box) it.r.dev.carton = it.x.box; if(it.x.po) it.r.dev.poNumber = it.x.po; n++; } });
+  if(n){ try{ saveInventory(); }catch(e){} } return n; }
+window.ssSaveSims = function(){ var n = saveKitSims(items()); SS.cache = {}; _wscanRender(); _wscanStatus(n ? '💾 ' + n + ' kitted SIM' + (n === 1 ? '' : 's') + ' saved to their phones' : 'Nothing to save', '#166534'); };
+window.ssIntake = function(){
+  var u = DB.current, to = (DB.agents || []).find(function(a){ return String(a.id) === String(SS.to); }); if(!to || !_uxfIsOffice(u) || SS.busy) return;
+  var model = String(SS.inModel || '').trim(), cost = Number(String(SS.inCost == null ? '' : SS.inCost).replace(/[^0-9.]/g, ''));
+  if(!model){ alert('Enter the model.'); return; } if(!(cost >= 0) || String(SS.inCost).trim() === ''){ alert('Enter the cost each (use 0 if none).'); return; }
+  var miss = items().filter(function(it){ return it.x.ok && it.x.kind === 'imei' && it.r && !it.r.camp; }); if(!miss.length) return;
+  if(!confirm('Add ' + miss.length + ' ' + model + ' to TruConnect inventory for ' + to.name + '? They will get the invoice to sign.')) return;
+  var now = new Date().toISOString(), batch = 'box-' + Date.now(), market = _uxfMarketOf(to) || '', added = [], skipped = [];
+  miss = miss.filter(function(it){ if(findAnywhere(it.x.value)){ skipped.push(it.x.value); return false; } return true; });   // never add the same phone twice
+  miss.forEach(function(it){ if(it.kit && findAnywhere(it.kit)){ skipped.push('SIM ' + it.kit); it = Object.assign({}, it, { kit:null }); }
+    var d = { id:_wmamUid('tc'), imei:it.x.value, sim:it.kit || null, kitSim:it.kit || null, type:'phone', campaign:'TC (TruConnect)', model:model, cost:cost, deviceCost:cost, deviceCostSource:'entered at box scan',
+      market:market, status:'assigned', holderId:to.id, holderName:to.name, assignedTo:to.id, assignedToName:to.name, assignedDate:now.slice(0, 10), uploadedAt:now, uploadDate:now.slice(0, 10), uploadBatchId:batch, carton:it.x.box || '', poNumber:it.x.po || '', serial:it.x.serial || '',
+      chainOfCustody:[{ type:'uploaded', at:now, source:'box-qr-scan', batchId:batch, by:u.name, carton:it.x.box || '', po:it.x.po || '' }, { type:'assigned-at-upload', at:now, to:to.name, toId:to.id, role:to.role, market:market, source:'box-qr-scan' }] };
+    try{ if(typeof wmamApplyGMDates === 'function') wmamApplyGMDates(d); }catch(e){}
+    TC_INVENTORY.push(d); added.push(d); });
+  try{ invCreateAcceptanceTransfersForUpload('TruConnect', added, u); }catch(e){ console.warn('[box intake] acceptance', e); }
+  try{ saveInventory(); }catch(e){ console.warn('[box intake] save', e); }
+  SS.cache = {}; WSCAN.list = WSCAN.list.filter(function(x){ return !added.some(function(d){ return d.imei === x.value || (d.sim && d.sim === x.value); }); }); _wscanRender();
+  _wscanStatus('📥 Added ' + added.length + ' to TruConnect inventory for ' + to.name + ' — they get the invoice to sign.' + (skipped.length ? ' Skipped ' + skipped.length + ' already in the system.' : ''), '#1e3a8a');
+  try{ showToast(added.length + ' added to TruConnect inventory for ' + to.name); }catch(e){}
+};
+window.ssClearBad = function(){ var keep = []; items().filter(function(it){ return it.r && it.r.ok; }).forEach(function(it){ keep.push(it.x.value); if(it.kit) keep.push(it.kit); }); WSCAN.list = WSCAN.list.filter(function(x){ return keep.indexOf(x.value) >= 0; }); _wscanRender(); };
 window.wmamScanSend = function(){
   wmamOpenScanner({ title:'Scan & Send' });
-  SS.to = ''; SS.busy = false; SS.done = null; SS.cache = {};
+  SS.to = ''; SS.busy = false; SS.done = null; SS.cache = {}; SS.inModel = ''; SS.inCost = null; WSCAN.boxes = {};
   var ov = document.getElementById('wscanOv'); if(!ov) return;
   try{ var vb = document.getElementById('wscanVid').parentElement; vb.style.aspectRatio = '16/9'; vb.style.maxHeight = '34vh'; vb.style.margin = '0 auto'; }catch(e){}
   var use = document.getElementById('wscanUse'); if(use && use.parentElement){ use.parentElement.style.display = 'none'; }
   var lst = document.getElementById('wscanList'); if(lst){ lst.style.display = 'none'; var cnt = document.getElementById('wscanCount'); if(cnt && cnt.parentElement) cnt.parentElement.style.display = 'none';
     lst.insertAdjacentHTML('afterend', '<div id="ssPanel"></div><button onclick="wmamCloseScanner()" style="width:100%;margin-top:8px;padding:10px;border:1px solid #cbd5e1;border-radius:10px;background:#fff;font-weight:700;cursor:pointer">Close</button>'); }
-  var hint = ov.querySelector('div[style*="font-size:.8rem;color:#6b7280"]'); if(hint) hint.textContent = 'Scan IMEIs or SIM numbers (any campaign) — it beeps for each one. A scanner gun works too. Then pick who it’s for and send the invoice.';
+  var hint = ov.querySelector('div[style*="font-size:.8rem;color:#6b7280"]'); if(hint) hint.textContent = 'Scan IMEIs, SIM numbers or a box QR code (any campaign) — it beeps for each one. A scanner gun works too. Then pick who it’s for and send the invoice.';
   // typing a number by hand
   var paste = document.getElementById('wscanPaste'); if(paste){ paste.placeholder = 'Type or paste IMEIs / SIM numbers'; }
   WSCAN.onRender = panel; panel();
@@ -112612,6 +112733,7 @@ window.wmamScanSend = function(){
 window.ssSend = async function(){
   var u = DB.current, to = (DB.agents || []).find(function(a){ return String(a.id) === String(SS.to); }); if(!to || SS.busy) return;
   var ready = items().filter(function(it){ return it.r && it.r.ok; }); if(!ready.length) return;
+  var simsSaved = saveKitSims(ready);
   var groups = {}; ready.forEach(function(it){ (groups[it.r.camp] = groups[it.r.camp] || []).push(it.r); });
   var noCode = Object.keys(groups).filter(function(c){ return !(_uxfIsOffice(to) || _uxfHasCode(to, c)); });
   if(noCode.length){ alert(to.name + ' has no agent code for ' + noCode.map(label).join(', ') + '. Ask the office to add it, or send those to someone else.'); return; }
@@ -112644,6 +112766,7 @@ window.ssSend = async function(){
   var okN = results.filter(function(r){ return r.ok; }).reduce(function(t, r){ return t + r.n; }, 0), wait = results.some(function(r){ return r.ok && /inv-dept/.test(r.status); });
   el.innerHTML = '<div style="text-align:center;padding:10px 4px"><div style="font-size:2rem">' + (okN ? '✅' : '⚠️') + '</div><div style="font-weight:900;color:' + (okN ? '#166534' : '#b91c1c') + ';font-size:1.1rem">' + (okN ? 'Sent ' + okN + ' to ' + esc(to.name) : 'Nothing was sent') + '</div>'
     + '<div style="font-size:.88rem;color:#334155;margin-top:4px">' + (okN ? (wait ? 'Waiting for Makenzie to approve. Then ' + esc(String(to.name).split(' ')[0]) + ' gets the invoice to sign, and the inventory moves into their name.' : esc(String(to.name).split(' ')[0]) + ' gets the invoice to sign now. Once signed, the inventory is in their name.') : '') + '</div>'
+    + (simsSaved ? '<div style="font-size:.8rem;color:#334155;margin-top:4px">📦 ' + simsSaved + ' kitted SIM' + (simsSaved === 1 ? '' : 's') + ' saved to their phones.</div>' : '')
     + results.map(function(r){ return '<div style="font-size:.82rem;margin-top:4px;color:' + (r.ok ? '#166534' : '#b91c1c') + '">' + (r.ok ? '✔ ' : '✖ ') + esc(label(r.camp)) + ' · ' + r.n + (r.ok ? (/inv-dept/.test(r.status) ? ' · waiting for Makenzie' : ' · waiting for their signature') : ' · ' + esc(r.why)) + '</div>'; }).join('')
     + '<div style="display:flex;gap:8px;margin-top:12px"><button onclick="wmamScanSend()" style="flex:1;padding:12px;border:2px solid #003594;border-radius:10px;background:#fff;color:#003594;font-weight:800;cursor:pointer">📷 Scan more</button><button onclick="wmamCloseScanner();try{gotoPanel(\'inv-transfers\')}catch(e){}" style="flex:1;padding:12px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Done</button></div></div>';
   WSCAN.list = []; WSCAN.onRender = null;
