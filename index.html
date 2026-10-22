@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.22.1600';
+var BUILD_VERSION = '2026.10.22.1700';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -112440,6 +112440,246 @@ window.cpReadFile = async function(input){
   UI.busy = ''; cpRender();
 };
 }catch(e){ console.warn('[carrier pricing]', e); } })();
+</script>
+<script>
+// ═══ 📷 SCAN & SEND — ONE BUTTON, ANY CAMPAIGN (Calvin 2026-10-22) ═══
+// "One click button, pop up scanner, it scans and reads the inventory accurately. Hit send invoice to and a drop down of
+//  who it belongs to, and it goes to Makenzie for approval, and once she approves the agent gets the invoice, it gets signed
+//  and the agent now has the inventory in their name." — for any campaign, IMEIs AND SIM (CCID/ICCID) numbers.
+//  • Scanner: phones with a built-in barcode reader (Android/Chrome) use it — several barcodes per frame, ~8 reads a second;
+//    others use ZXing. Barcodes that are not an IMEI (15 digits) or a SIM number (19–20 digits starting 89) are skipped
+//    quietly (box UPCs, SKUs), every number is check-digit verified, labels like "IMEI: 35…" or ICCIDs ending in "F" read right.
+//  • Each scan is looked up in EVERY campaign's inventory at once — the campaign is found automatically.
+//  • "Send invoice to" → one transfer per campaign on the existing engine: Makenzie (Inventory Dept) approves → the person
+//    gets the invoice and e-signs → the inventory is in their name.
+//  • Makenzie approves every transfer unless SHE turns approvals off — per market (Transfers page, office switch) or per
+//    person ("can transfer without approval" on their profile). Outside the sender's market always goes to her.
+//    Inventory Dept / owner sends skip approval (they are the approvers). Phones under 21 days still always go to her.
+//  Lives at Inventory → Inventory Center → Transfers (the page is now this one button) and on My Inventory.
+(function(){ try{
+if(window._wmamScanSendOn) return; window._wmamScanSendOn = true;
+var esc = function(v){ return (typeof _escapeHtml === 'function') ? _escapeHtml(v == null ? '' : String(v)) : String(v == null ? '' : v); };
+var money = function(n){ return (typeof _gmMoney === 'function') ? _gmMoney(Number(n) || 0) : '$' + (Number(n) || 0).toFixed(2); };
+
+// ── 1. reading numbers: labels with words, ICCIDs with a trailing F ──
+var oCheck = wmamCheckId;
+wmamCheckId = function(raw){
+  var s = String(raw == null ? '' : raw), c = oCheck(s);
+  if(c.ok || !/[A-Za-z:]/.test(s)) return c;
+  var runs = s.match(/\d{15,20}/g) || [];
+  for(var i = 0; i < runs.length; i++){ var r = oCheck(runs[i]); if(r.ok) return r; }
+  return c; };
+window.wmamCheckId = wmamCheckId;
+
+// ── 2. the live camera: native reader when the phone has one (fast, many per frame), ZXing otherwise ──
+var NATIVE_FORMATS = ['code_128', 'code_39', 'code_93', 'ean_13', 'itf', 'qr_code', 'data_matrix', 'pdf417', 'codabar'];
+_wscanStart = async function(){
+  try{
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('this browser cannot open the camera');
+    var stream = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ facingMode:{ ideal:'environment' }, width:{ ideal:1920 }, height:{ ideal:1080 } } });
+    var v = document.getElementById('wscanVid'); if(!v){ stream.getTracks().forEach(function(t){ t.stop(); }); return; }
+    v.srcObject = stream; try{ await v.play(); }catch(e){}
+    WSCAN.stream = stream;
+    try{ var tr = stream.getVideoTracks()[0], caps = tr.getCapabilities ? tr.getCapabilities() : {}; if(caps.focusMode && caps.focusMode.indexOf('continuous') >= 0) await tr.applyConstraints({ advanced:[{ focusMode:'continuous' }] }); }catch(e){}
+    var last = {}, skipAt = 0;
+    var handle = function(text){
+      text = String(text || '').trim(); if(!text) return;
+      if(last[text] && Date.now() - last[text] < 2500) return; last[text] = Date.now();
+      if(!WSCAN.anyCode){ var c = wmamCheckId(text); if(!c.ok && !c.kind){ if(Date.now() - skipAt > 1500){ skipAt = Date.now(); _wscanStatus('Skipped a barcode that isn’t an IMEI or SIM number', '#64748b'); } return; } }
+      wmamScanAdd(text);
+    };
+    var det = null;
+    if('BarcodeDetector' in window){ try{ var sup = await window.BarcodeDetector.getSupportedFormats(); var f = NATIVE_FORMATS.filter(function(x){ return sup.indexOf(x) >= 0; }); if(f.indexOf('code_128') >= 0) det = new window.BarcodeDetector({ formats:f }); }catch(e){ det = null; } }
+    var busy = false;
+    if(det){
+      WSCAN.engine = 'native';
+      WSCAN.timer = setInterval(async function(){ if(busy || !v.videoWidth || !document.getElementById('wscanOv')) return; busy = true;
+        try{ var res = await det.detect(v); (res || []).forEach(function(r){ handle(r.rawValue); }); }catch(e){} finally{ busy = false; } }, 120);
+    } else {
+      WSCAN.engine = 'zxing';
+      var ZX = await _loadZxing(); if(!ZX || !ZX.MultiFormatReader) throw new Error('Barcode reader did not load');
+      var hints = new Map(); hints.set(ZX.DecodeHintType.TRY_HARDER, true);
+      try{ hints.set(ZX.DecodeHintType.POSSIBLE_FORMATS, [ZX.BarcodeFormat.CODE_128, ZX.BarcodeFormat.CODE_39, ZX.BarcodeFormat.CODE_93, ZX.BarcodeFormat.EAN_13, ZX.BarcodeFormat.ITF, ZX.BarcodeFormat.QR_CODE, ZX.BarcodeFormat.DATA_MATRIX, ZX.BarcodeFormat.PDF_417]); }catch(e){}
+      var mf = new ZX.MultiFormatReader(); mf.setHints(hints);
+      var cv = document.createElement('canvas'), ctx = cv.getContext('2d', { willReadFrequently:true }), flip = 0;
+      var tryDecode = function(sx, sy, sw, sh){ cv.width = Math.min(1280, sw); cv.height = Math.round(sh * cv.width / sw); ctx.drawImage(v, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+        try{ var lum = new ZX.HTMLCanvasElementLuminanceSource(cv), bmp = new ZX.BinaryBitmap(new ZX.HybridBinarizer(lum)); return mf.decodeWithState(bmp).getText(); }catch(e){ return null; } finally{ try{ mf.reset(); }catch(e){} } };
+      WSCAN.timer = setInterval(function(){
+        if(busy || !v.videoWidth || !document.getElementById('wscanOv')) return; busy = true;
+        try{ var W = v.videoWidth, H = v.videoHeight; flip = (flip + 1) % 3;
+          // the green box band every time; the upper and lower bands in turn (several barcodes on one label)
+          var t = tryDecode(0, Math.round(H * 0.3), W, Math.round(H * 0.4));
+          if(!t) t = flip === 1 ? tryDecode(0, 0, W, Math.round(H * 0.45)) : (flip === 2 ? tryDecode(0, Math.round(H * 0.55), W, Math.round(H * 0.45)) : tryDecode(0, 0, W, H));
+          if(t) handle(t);
+        }finally{ busy = false; } }, 180);
+    }
+    _wscanStatus('Camera on — point at a barcode', '#166534');
+  }catch(e){ _wscanStatus('Camera not available (' + (e && e.message || e) + '). Use the photo, a scanner gun, or type the numbers.', '#b91c1c'); }
+};
+window._wscanStart = _wscanStart;
+var oRender = _wscanRender;
+_wscanRender = function(){ var r = oRender.apply(this, arguments); try{ if(typeof WSCAN.onRender === 'function') WSCAN.onRender(); }catch(e){} return r; };
+window._wscanRender = _wscanRender;
+
+// ── 3. Makenzie approves every transfer unless she turns it off ──
+var APPROFF_KEY = 'transfer_approval_off';
+UXF.apprOff = UXF.apprOff || {};
+uxfLoad = async function(){ try{ var r = await supaClient.from('app_settings').select('value').eq('key', APPROFF_KEY).maybeSingle(); UXF.apprOff = (r && r.data && r.data.value) ? (JSON.parse(r.data.value) || {}) : {}; UXF.loaded = true; }catch(e){} return UXF; };
+uxfSaveAppr = async function(){ var r = await supaClient.from('app_settings').upsert({ key:APPROFF_KEY, value:JSON.stringify(UXF.apprOff), updated_at:new Date().toISOString() }, { onConflict:'key' }); return !(r && r.error); };
+wmamMarketApprovalOn = function(market){ return !UXF.apprOff[String(market || '')]; };
+uxfRule = function(u, to){
+  if(_uxfIsOffice(u)) return { needsApproval:false, outside:false, why:'Inventory Dept — no approval step. ' + (to ? to.name : 'They') + ' signs the invoice.' };
+  var sm = _uxfMarketOf(u), rm = _uxfMarketOf(to), same = !!sm && sm === rm;
+  if(!same) return { needsApproval:true, outside:true, why:'Goes to Makenzie for approval (outside your market), then ' + (to ? to.name : 'they') + ' signs the invoice.' };
+  if(u && u.canTransferWithoutApproval === true) return { needsApproval:false, outside:false, why:'Makenzie turned approvals off for you — ' + (to ? to.name : 'they') + ' signs the invoice.' };
+  return wmamMarketApprovalOn(sm) ? { needsApproval:true, outside:false, why:'Goes to Makenzie for approval, then ' + (to ? to.name : 'they') + ' signs the invoice.' }
+    : { needsApproval:false, outside:false, why:'Makenzie turned approvals off for ' + sm + ' — ' + (to ? to.name : 'they') + ' signs the invoice.' };
+};
+uxfSetAppr = async function(m, on){ if(!_uxfIsOffice(DB.current)){ alert('Only the Inventory Dept or owner can change this.'); return; } if(on) delete UXF.apprOff[m]; else UXF.apprOff[m] = true; if(!(await uxfSaveAppr())){ alert('Not saved — check the connection.'); return; } try{ showToast(m + ': Makenzie approval ' + (on ? 'ON' : 'OFF')); }catch(e){} uxfRender(); };
+uxfOfficeSwitchHtml = function(){
+  var mk = []; try{ mk = marketActiveList().map(function(m){ return m.name; }); }catch(e){}
+  return '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px"><b>🔒 Makenzie approves every transfer — by market</b><div style="font-size:.8rem;color:#6b7280;margin:2px 0 8px">ON (checked): every transfer in that market waits for Makenzie, then the person signs the invoice. Uncheck to turn approvals off for that market (the person just signs). Outside the sender’s market always goes to Makenzie. For one person, use “can transfer without approval” on their profile.</div>'
+    + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">' + mk.map(function(m){ var on = wmamMarketApprovalOn(m); return '<label style="display:flex;align-items:center;gap:8px;border:1px solid ' + (on ? '#86efac' : '#fcd34d') + ';background:' + (on ? '#f0fdf4' : '#fffbeb') + ';border-radius:10px;padding:8px 12px;font-size:.86rem;font-weight:700;cursor:pointer"><input type="checkbox"' + (on ? ' checked' : '') + ' onchange="uxfSetAppr(\'' + String(m).replace(/'/g, "\\'") + '\', this.checked)"> ' + esc(m) + (on ? '' : ' — approvals OFF') + '</label>'; }).join('') + '</div></div>';
+};
+Object.assign(window, { uxfLoad:uxfLoad, uxfSaveAppr:uxfSaveAppr, wmamMarketApprovalOn:wmamMarketApprovalOn, uxfRule:uxfRule, uxfSetAppr:uxfSetAppr, uxfOfficeSwitchHtml:uxfOfficeSwitchHtml });
+
+// ── 4. find a scanned number in every campaign ──
+function digits(x){ return String(x || '').replace(/\D/g, ''); }
+function camps(){ return Object.keys(CAMPAIGN_REGISTRY).filter(function(c){ var cfg = CAMPAIGN_REGISTRY[c]; return cfg && cfg.active !== false && cfg.inventory; }); }
+function label(c){ var cfg = CAMPAIGN_REGISTRY[c] || {}; return String(cfg.label || c).replace(/^TC \((.*)\)$/, '$1'); }
+function resolve(v){
+  var u = DB.current, office = _uxfIsOffice(u);
+  for(var i = 0, L = camps(); i < L.length; i++){ var c = L[i], pool = _uxfPool(c) || [];
+    var d = pool.find(function(x){ return x && !x.deletedAt && (digits(x.imei) === v || digits(x.sim) === v); });
+    if(!d) continue;
+    var key = digits(d.imei) || digits(d.sim), info = { camp:c, dev:d, key:key, model:d.type === 'sim' ? 'SIM card' : (d.model || 'phone'), cost:_uxfCost(d) };
+    var st = wmamDevState(d); if(st === 'sold' || st === 'deleted'){ info.why = 'already ' + (st === 'sold' ? 'sold / activated' : 'removed'); return info; }
+    var vr = invValidateTransfer(c, [d.imei || d.sim], u.id);
+    if(!vr.passed){ var e = vr.errors[0] || {}; info.why = e.type === 'not-held-by-sender' ? 'held by ' + (e.currentHolder || 'someone else') : e.type === 'acceptance-pending' ? 'you haven’t signed for it yet (Sign & Invoices)' : e.type === 'already-in-pending-transfer' ? 'already in a pending transfer' : e.type === 'already-activated' ? 'already activated' : 'can’t be sent'; return info; }
+    if(!office && String(_wmamHolderOf(d)) !== String(u.id)){ info.why = 'not in your inventory'; return info; }
+    info.ok = true; return info;
+  }
+  return { why:'not in any campaign’s inventory — check the number or upload it first' };
+}
+
+// ── 5. the pop-up ──
+var SS = { to:'', reason:'Distribution to team', busy:false, done:null, cache:{} };
+window.SCANSEND = SS;
+function info(x){ if(!x || !x.ok) return null; var k = x.value; if(!SS.cache[k]) SS.cache[k] = resolve(k); return SS.cache[k]; }
+function items(){ return WSCAN.list.map(function(x){ return { x:x, r:info(x) }; }); }
+function people(){
+  var u = DB.current, used = {}; items().forEach(function(it){ if(it.r && it.r.ok) used[it.r.camp] = 1; }); var cs = Object.keys(used);
+  return (DB.agents || []).filter(function(a){ return a && a.active !== false && !a.deletedAt && a.id !== u.id && (_uxfIsOffice(a) || (cs.length ? cs.every(function(c){ return _uxfHasCode(a, c); }) : uxfCampaigns(a).length > 0)); })
+    .sort(function(a, b){ return String(a.name).localeCompare(String(b.name)); }); }
+function panel(){
+  var el = document.getElementById('ssPanel'); if(!el) return;
+  var all = items(), ready = all.filter(function(it){ return it.r && it.r.ok; }), u = DB.current;
+  var list = all.length ? all.slice().reverse().map(function(it){ var x = it.x, r = it.r, ok = r && r.ok;
+    var why = !x.ok ? x.why : (r && r.why) || '';
+    return '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;padding:5px 2px;border-bottom:1px solid #f1f5f9;font-size:.84rem;text-align:left"><div style="min-width:0;flex:1 1 auto"><div style="font-family:monospace;color:' + (ok ? '#111' : '#b91c1c') + ';word-break:break-all">' + (ok ? '✔ ' : '✖ ') + esc(x.value) + '</div>'
+      + '<div style="font-size:.74rem;color:' + (ok ? '#166534' : '#b91c1c') + '">' + (x.kind === 'sim' ? 'SIM' : 'IMEI') + (r && r.camp ? ' · ' + esc(label(r.camp)) + ' · ' + esc(r.model) + (r.cost ? ' · ' + money(r.cost) : '') : '') + (why ? ' — ' + esc(why) : '') + '</div></div>'
+      + '<button onclick="wmamScanRemove(\'' + x.value + '\')" style="border:none;background:none;color:#b91c1c;cursor:pointer;font-size:1rem;flex:0 0 auto">✕</button></div>'; }).join('')
+    : '<div style="color:#94a3b8;font-size:.84rem;padding:8px;text-align:center">Nothing scanned yet.</div>';
+  var bad = all.length - ready.length, byCamp = {}; ready.forEach(function(it){ byCamp[it.r.camp] = (byCamp[it.r.camp] || 0) + 1; });
+  var ppl = people(); if(SS.to && !ppl.some(function(a){ return String(a.id) === String(SS.to); })) SS.to = '';
+  var to = (DB.agents || []).find(function(a){ return String(a.id) === String(SS.to); }), rule = to ? uxfRule(u, to) : null;
+  var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px"><span style="font-size:.88rem"><b style="color:#166534">' + ready.length + ' ready</b>' + (bad ? ' · <span style="color:#b91c1c">' + bad + ' can’t be sent</span>' : '') + '</span><span style="font-size:.74rem;color:#64748b">' + Object.keys(byCamp).map(function(c){ return esc(label(c)) + ' ' + byCamp[c]; }).join(' · ') + '</span></div>'
+    + '<div style="max-height:180px;overflow:auto;border:1px solid #e5e7eb;border-radius:10px;padding:4px 8px;margin-top:4px">' + list + '</div>';
+  if(bad) h += '<button onclick="ssClearBad()" style="margin-top:6px;border:none;background:none;color:#b91c1c;font-weight:800;font-size:.8rem;cursor:pointer">Remove the ' + bad + ' that can’t be sent</button>';
+  h += '<div style="font-size:.72rem;font-weight:800;letter-spacing:1px;color:#475569;text-transform:uppercase;margin:12px 0 4px">Send invoice to</div>'
+    + '<select id="ssTo" onchange="SCANSEND.to=this.value;ssPanel()" style="width:100%;padding:12px;border:2px solid ' + (to ? '#16a34a' : '#cbd5e1') + ';border-radius:10px;font-size:16px;background:#fff"><option value="">— who is this for? —</option>' + ppl.map(function(a){ var mk = _uxfMarketOf(a); return '<option value="' + a.id + '"' + (String(a.id) === String(SS.to) ? ' selected' : '') + '>' + esc(a.name) + ' (' + esc(a.role || '') + (mk ? ' · ' + esc(mk) : '') + ')</option>'; }).join('') + '</select>'
+    + '<select id="ssReason" onchange="SCANSEND.reason=this.value" style="width:100%;margin-top:6px;padding:9px;border:1px solid #cbd5e1;border-radius:10px;font-size:14px;background:#fff">' + ['Distribution to team', 'Return to manager', 'Rebalancing between agents', 'Agent leaving', 'Other'].map(function(o){ return '<option' + (o === SS.reason ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select>';
+  if(rule) h += '<div style="margin-top:8px;padding:8px 10px;border-radius:10px;font-size:.84rem;font-weight:700;background:' + (rule.needsApproval ? '#fef3c7;color:#92400e' : '#ecfdf5;color:#166534') + '">' + esc(rule.why) + '</div>';
+  var can = ready.length && to && !SS.busy;
+  h += '<button id="ssSend" onclick="ssSend()" ' + (can ? '' : 'disabled') + ' style="width:100%;margin-top:10px;padding:15px;border:none;border-radius:12px;font-size:16px;font-weight:900;color:#fff;cursor:' + (can ? 'pointer' : 'default') + ';background:' + (can ? '#16a34a' : '#94a3b8') + '">' + (SS.busy ? '⏳ Sending…' : '📄 Send invoice' + (to ? ' to ' + esc(String(to.name).split(' ')[0]) : '') + ' (' + ready.length + ')') + '</button>';
+  el.innerHTML = h;
+}
+window.ssPanel = panel;
+window.ssClearBad = function(){ var keep = items().filter(function(it){ return it.r && it.r.ok; }).map(function(it){ return it.x.value; }); WSCAN.list = WSCAN.list.filter(function(x){ return keep.indexOf(x.value) >= 0; }); _wscanRender(); };
+window.wmamScanSend = function(){
+  wmamOpenScanner({ title:'Scan & Send' });
+  SS.to = ''; SS.busy = false; SS.done = null; SS.cache = {};
+  var ov = document.getElementById('wscanOv'); if(!ov) return;
+  try{ var vb = document.getElementById('wscanVid').parentElement; vb.style.aspectRatio = '16/9'; vb.style.maxHeight = '34vh'; vb.style.margin = '0 auto'; }catch(e){}
+  var use = document.getElementById('wscanUse'); if(use && use.parentElement){ use.parentElement.style.display = 'none'; }
+  var lst = document.getElementById('wscanList'); if(lst){ lst.style.display = 'none'; var cnt = document.getElementById('wscanCount'); if(cnt && cnt.parentElement) cnt.parentElement.style.display = 'none';
+    lst.insertAdjacentHTML('afterend', '<div id="ssPanel"></div><button onclick="wmamCloseScanner()" style="width:100%;margin-top:8px;padding:10px;border:1px solid #cbd5e1;border-radius:10px;background:#fff;font-weight:700;cursor:pointer">Close</button>'); }
+  var hint = ov.querySelector('div[style*="font-size:.8rem;color:#6b7280"]'); if(hint) hint.textContent = 'Scan IMEIs or SIM numbers (any campaign) — it beeps for each one. A scanner gun works too. Then pick who it’s for and send the invoice.';
+  // typing a number by hand
+  var paste = document.getElementById('wscanPaste'); if(paste){ paste.placeholder = 'Type or paste IMEIs / SIM numbers'; }
+  WSCAN.onRender = panel; panel();
+};
+window.ssSend = async function(){
+  var u = DB.current, to = (DB.agents || []).find(function(a){ return String(a.id) === String(SS.to); }); if(!to || SS.busy) return;
+  var ready = items().filter(function(it){ return it.r && it.r.ok; }); if(!ready.length) return;
+  var groups = {}; ready.forEach(function(it){ (groups[it.r.camp] = groups[it.r.camp] || []).push(it.r); });
+  var noCode = Object.keys(groups).filter(function(c){ return !(_uxfIsOffice(to) || _uxfHasCode(to, c)); });
+  if(noCode.length){ alert(to.name + ' has no agent code for ' + noCode.map(label).join(', ') + '. Ask the office to add it, or send those to someone else.'); return; }
+  SS.busy = true; panel();
+  var rule = uxfRule(u, to), results = [];
+  var host = document.createElement('div'); host.style.display = 'none'; document.body.appendChild(host);
+  var stay = window._currentPanelId;
+  try{
+    for(var c in groups){ var cfg = CAMPAIGN_REGISTRY[c], ids = groups[c].map(function(r){ return r.dev.imei || r.dev.sim; }), fbt = '';
+      var before = ((c === 'Gen Mobile' ? (typeof GM_TRANSFERS !== 'undefined' ? GM_TRANSFERS : []) : ((cfg.transfers && cfg.transfers()) || [])) || []).length;
+      window.__wmamXferNeedsApproval = rule.needsApproval;
+      try{
+        if(c === 'Gen Mobile'){
+          host.innerHTML = '<select id="gmt-to-agent"><option value="' + to.id + '" selected></option></select><select id="gmt-market"><option value="" selected></option></select><textarea id="gmt-imeis"></textarea>';
+          document.getElementById('gmt-imeis').value = ids.join('\n'); gmInitiateTransfer();
+        } else {
+          host.innerHTML = '<select id="xfr-to-' + cfg.id + '"><option value="' + to.id + '" selected></option></select><select id="xfr-reason-' + cfg.id + '"><option selected></option></select><textarea id="xfr-imeis-' + cfg.id + '"></textarea><div id="xfr-feedback-' + cfg.id + '"></div>';
+          document.getElementById('xfr-reason-' + cfg.id).options[0].value = SS.reason + (rule.outside ? ' [OUTSIDE MARKET: ' + _uxfMarketOf(u) + ' → ' + _uxfMarketOf(to) + ']' : ''); document.getElementById('xfr-imeis-' + cfg.id).value = ids.join('\n'); invInitiateTransfer(c);
+          var fb = document.getElementById('xfr-feedback-' + cfg.id); fbt = fb ? fb.textContent.trim() : '';
+        }
+      } finally { window.__wmamXferNeedsApproval = null; }
+      var list = (c === 'Gen Mobile' ? (typeof GM_TRANSFERS !== 'undefined' ? GM_TRANSFERS : []) : ((cfg.transfers && cfg.transfers()) || [])) || [];
+      var made = list.length > before ? list[list.length - 1] : list.slice().reverse().find(function(t){ return t && String(t.toId || t.toAgentId) === String(to.id) && (t.imeis || []).some(function(i){ return ids.indexOf(i) >= 0; }) && /pending/.test(String(t.status || '')) && Date.now() - new Date(t.createdAt || 0).getTime() < 60000; });
+      results.push({ camp:c, n:ids.length, ok:!!made, status:made ? made.status : '', why:made ? '' : (fbt || 'not sent — check the alert') });
+    }
+  } finally { host.remove(); }
+  SS.busy = false; SS.done = { to:to, results:results };
+  try{ if(stay && window._currentPanelId !== stay) gotoPanel(stay); }catch(e){}
+  var el = document.getElementById('ssPanel'); if(!el) return;
+  var okN = results.filter(function(r){ return r.ok; }).reduce(function(t, r){ return t + r.n; }, 0), wait = results.some(function(r){ return r.ok && /inv-dept/.test(r.status); });
+  el.innerHTML = '<div style="text-align:center;padding:10px 4px"><div style="font-size:2rem">' + (okN ? '✅' : '⚠️') + '</div><div style="font-weight:900;color:' + (okN ? '#166534' : '#b91c1c') + ';font-size:1.1rem">' + (okN ? 'Sent ' + okN + ' to ' + esc(to.name) : 'Nothing was sent') + '</div>'
+    + '<div style="font-size:.88rem;color:#334155;margin-top:4px">' + (okN ? (wait ? 'Waiting for Makenzie to approve. Then ' + esc(String(to.name).split(' ')[0]) + ' gets the invoice to sign, and the inventory moves into their name.' : esc(String(to.name).split(' ')[0]) + ' gets the invoice to sign now. Once signed, the inventory is in their name.') : '') + '</div>'
+    + results.map(function(r){ return '<div style="font-size:.82rem;margin-top:4px;color:' + (r.ok ? '#166534' : '#b91c1c') + '">' + (r.ok ? '✔ ' : '✖ ') + esc(label(r.camp)) + ' · ' + r.n + (r.ok ? (/inv-dept/.test(r.status) ? ' · waiting for Makenzie' : ' · waiting for their signature') : ' · ' + esc(r.why)) + '</div>'; }).join('')
+    + '<div style="display:flex;gap:8px;margin-top:12px"><button onclick="wmamScanSend()" style="flex:1;padding:12px;border:2px solid #003594;border-radius:10px;background:#fff;color:#003594;font-weight:800;cursor:pointer">📷 Scan more</button><button onclick="wmamCloseScanner();try{gotoPanel(\'inv-transfers\')}catch(e){}" style="flex:1;padding:12px;border:none;border-radius:10px;background:#003594;color:#fff;font-weight:800;cursor:pointer">Done</button></div></div>';
+  WSCAN.list = []; WSCAN.onRender = null;
+};
+var oClose = wmamCloseScanner;
+wmamCloseScanner = function(){ WSCAN.onRender = null; WSCAN.engine = null; return oClose.apply(this, arguments); };
+window.wmamCloseScanner = wmamCloseScanner;
+
+// ── 6. the Transfers page: one button (replaces the old scan / paste / preview steps) ──
+function bigButton(){ return '<button onclick="wmamScanSend()" style="width:100%;max-width:520px;display:block;margin:0 auto;padding:20px 16px;border:none;border-radius:16px;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;cursor:pointer;box-shadow:0 6px 18px rgba(22,163,74,.3)"><div style="font-size:1.8rem">📷</div><div style="font-size:1.25rem;font-weight:900;letter-spacing:.5px">Scan &amp; Send</div><div style="font-size:.85rem;opacity:.9;margin-top:2px">Scan IMEIs or SIM numbers · pick who it’s for · send the invoice</div></button>'; }
+window.wmamScanSendButton = bigButton;
+uxfRender = function(){
+  var box = document.getElementById('uxfBox'); if(!box) return; var u = DB.current, office = _uxfIsOffice(u), cs = uxfCampaigns(u);
+  var h = '<div style="text-align:center;margin-bottom:12px"><div style="font-family:Barlow Condensed,sans-serif;font-size:1.7rem;font-weight:800;color:#003594;letter-spacing:1px">🔁 TRANSFERS</div><div style="font-size:.86rem;color:#64748b">Any campaign · phones and SIM cards · ' + (office ? 'you can send to anyone' : 'Makenzie approves, then the person signs the invoice') + '</div></div>';
+  if(!cs.length){ box.innerHTML = h + '<div class="bo-card" style="padding:24px;color:#6b7280;text-align:center">You don’t have an agent code for any Lifeline campaign yet, so there’s nothing to transfer.</div>'; return; }
+  h += bigButton();
+  if(!office){ var held = []; cs.forEach(function(c){ var mine = (_uxfPool(c) || []).filter(function(d){ return d && !d.deletedAt && ['sold', 'deleted'].indexOf(wmamDevState(d)) < 0 && String(_wmamHolderOf(d)) === String(u.id); }); if(mine.length){ var s = mine.filter(function(d){ return d.type === 'sim'; }).length; held.push('<div style="flex:1 1 140px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:8px 10px;text-align:center"><div style="font-size:.68rem;font-weight:800;color:#6b7280;letter-spacing:1px;text-transform:uppercase">' + esc(label(c)) + '</div><div style="font-weight:900;font-size:1.1rem">' + (mine.length - s) + ' phone' + (mine.length - s === 1 ? '' : 's') + (s ? ' · ' + s + ' SIM' + (s === 1 ? '' : 's') : '') + '</div></div>'); } });
+    h += '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin:14px auto 0;max-width:720px">' + (held.length ? held.join('') : '<div style="color:#94a3b8;font-size:.86rem">You don’t hold any inventory right now.</div>') + '</div>'; }
+  // recent transfers, every campaign
+  var nm = function(id){ var a = (DB.agents || []).find(function(x){ return x && String(x.id) === String(id); }); return a ? a.name : (id || ''); }, tr = [];
+  cs.forEach(function(c){ var cfg = CAMPAIGN_REGISTRY[c]; var L = c === 'Gen Mobile' && typeof GM_TRANSFERS !== 'undefined' ? GM_TRANSFERS : ((cfg.transfers && cfg.transfers()) || []); (L || []).forEach(function(t){ if(t && (office || String(t.fromAgentId || t.fromId || t.from) === String(u.id) || String(t.toAgentId || t.toId || t.to) === String(u.id))) tr.push({ c:c, t:t }); }); });
+  tr.sort(function(a, b){ return String(b.t.createdAt || b.t.date || '').localeCompare(String(a.t.createdAt || a.t.date || '')); }); tr = tr.slice(0, 12);
+  h += '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin:16px auto 0;max-width:720px"><b>Recent transfers</b>'
+    + (tr.length ? tr.map(function(x){ var t = x.t, n = (t.imeis || t.devices || []).length, st = String(t.status || ''); return '<div style="font-size:.82rem;padding:6px 0;border-top:1px solid #f1f5f9">' + (/complete|accepted|signed|approved/.test(st) && !/pending/.test(st) ? '✔' : /denied|cancel|reject/.test(st) ? '✖' : '⏳') + ' ' + esc(String(t.createdAt || t.date || '').slice(5, 10)) + ' · ' + esc(label(x.c)) + ' · ' + n + ' item' + (n === 1 ? '' : 's') + ' ' + esc(nm(t.fromAgentId || t.fromId || t.from)) + ' → ' + esc(nm(t.toAgentId || t.toId || t.to)) + ' <span style="color:#6b7280">· ' + esc(st.replace(/-/g, ' ').replace('inv dept', 'Makenzie') || 'sent') + '</span></div>'; }).join('') : '<div style="font-size:.84rem;color:#94a3b8;padding-top:6px">No transfers yet.</div>')
+    + '<div style="font-size:.78rem;color:#64748b;margin-top:8px">Waiting on you? Open <a href="#" onclick="gotoPanel(\'pending-transfers\');return false">Pending Transfers</a> or <a href="#" onclick="gotoPanel(\'inv-sign\');return false">Sign &amp; Invoices</a>.</div></div>';
+  if(office) h += '<div style="max-width:720px;margin:0 auto">' + uxfOfficeSwitchHtml() + '</div>';
+  box.innerHTML = h;
+};
+window.uxfRender = uxfRender;
+// My Inventory: the same button at the top
+if(typeof gotoPanel === 'function'){ var oGo = gotoPanel;
+  gotoPanel = function(id){ var r = oGo.apply(this, arguments);
+    if(id === 'inv-my-inventory'){ setTimeout(function(){ try{ var b = document.getElementById('boBody'); if(b && !document.getElementById('ssMineBtn') && uxfCampaigns(DB.current).length){ var d = document.createElement('div'); d.id = 'ssMineBtn'; d.style.cssText = 'margin:10px auto 14px;max-width:520px;padding:0 8px'; d.innerHTML = bigButton(); var head = b.querySelector('h1, h2, [class*="panel-title"]'); var tabs = b.firstElementChild; (tabs && tabs.nextSibling) ? b.insertBefore(d, tabs.nextSibling) : b.prepend(d); } }catch(e){} }, 350); }
+    return r; };
+  window.gotoPanel = gotoPanel; }
+}catch(e){ console.warn('[scan & send]', e); } })();
 </script>
 </body>
 </html>
