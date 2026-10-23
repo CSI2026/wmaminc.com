@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.23.1890';
+var BUILD_VERSION = '2026.10.23.1900';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -113807,6 +113807,10 @@ function owner(){ try{ return isOwner(me()); }catch(e){ return false; } }
 function now(){ return Date.now() + DJ.off; }
 function T(id){ return DJ.tracks.find(function(t){ return t.id === id; }); }
 function music(){ return DJ.tracks.filter(function(t){ return t.kind === 'music' && t.active; }); }
+// Calvin 2026-10-23: the radio plays what he picks. With nothing picked it plays HIS artists, never the hype pack first.
+function defaultQueue(){ var a = music().filter(function(t){ return t.grp === 'artist'; }); if(!a.length) a = music(); return a.map(function(t){ return t.id; }); }
+function okIds(q){ return (q || []).filter(function(id){ var t = T(id); return t && t.active && t.kind === 'music'; }); }
+function savedQueue(room){ var q = okIds((DJ.state[room] || {}).queue); return q.length ? q : defaultQueue(); }
 function roomName(r){ var x = ROOMS.find(function(z){ return z[0] === r; }); return x ? x[1] : r; }
 function fmt(s){ s = Math.max(0, Math.round(s || 0)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
 
@@ -113842,9 +113846,10 @@ function autoWindow(room){ var r = ROOMS.find(function(z){ return z[0] === room;
   var call = ctMs(t.date, '09:00'); return { start:call - 15 * 60000, end:call + 75 * 60000, call:call }; }
 function eff(room){
   var s = DJ.state[room] || {}, rules = s.rules || {};
-  if(s.playing && Array.isArray(s.queue) && s.queue.length && s.startedAt) return { src:'radio', queue:s.queue, startedAt:s.startedAt, vol:s.vol == null ? 70 : s.vol, fadeAt:s.fadeAt, fadeSecs:s.fadeSecs, dj:s.dj && s.dj.live };
+  var fadeDone = !!(s.fadeAt && s.fadeSecs && now() - s.fadeAt >= s.fadeSecs * 1000);   // a finished fade = stopped, even if no one saved it
+  if(s.playing && !fadeDone && okIds(s.queue).length && s.startedAt) return { src:'radio', queue:okIds(s.queue), startedAt:s.startedAt, vol:s.vol == null ? 70 : s.vol, fadeAt:s.fadeAt, fadeSecs:s.fadeSecs, dj:s.dj && s.dj.live };
   if(rules.autoStart !== false){ var w = autoWindow(room), n = now();
-    if(w && n >= w.start && n <= w.end && !(s.at && s.at >= w.start)) return { src:'auto', queue:music().map(function(t){ return t.id; }), startedAt:w.start, vol:s.vol == null ? 70 : s.vol }; }
+    if(w && n >= w.start && n <= w.end && !(s.at && s.at >= w.start)) return { src:'auto', queue:savedQueue(room), startedAt:w.start, vol:s.vol == null ? 70 : s.vol }; }
   return null; }
 function position(e){
   var q = e.queue.map(T).filter(Boolean); if(!q.length) return null;
@@ -113899,7 +113904,7 @@ window.djPad = firePad;
 async function setRoom(patch, msg){ if(!canDJ(DJ.sel)) return; var r = await supaClient.rpc('wmam_dj_set', { p_room:DJ.sel, p_patch:patch });
   if(r && r.error){ flash('⚠ Not saved: ' + r.error.message); return null; } DJ.state[DJ.sel] = r.data || DJ.state[DJ.sel]; if(msg) flash(msg); tick(); renderDJ(); return r.data; }
 function cumBefore(q, idx){ var s = 0; for(var i = 0; i < idx; i++){ var t = T(q[i]); s += t ? t.seconds : 0; } return s; }
-function curQueue(){ var s = DJ.state[DJ.sel] || {}, e = eff(DJ.sel); return (e && e.queue) || (s.queue && s.queue.length ? s.queue : music().map(function(t){ return t.id; })); }
+function curQueue(){ var e = eff(DJ.sel); return (e && e.queue) || savedQueue(DJ.sel); }
 window.djPlay = function(){ var e = eff(DJ.sel), s = DJ.state[DJ.sel] || {};
   if(e && e.src === 'radio' && !e.fadeAt){ var p = position(e); return setRoom({ playing:false, pausedIdx:p ? p.i : 0, pausedOff:p ? p.off : 0, dj:{ live:false } }, 'Paused. Nobody in ' + roomName(DJ.sel) + ' hears music now.'); }
   var q = curQueue(), idx = s.pausedIdx || 0, off = s.pausedOff || 0; if(e && e.src === 'auto'){ var pa = position(e); if(pa){ idx = pa.i; off = pa.off; } }
@@ -113924,7 +113929,16 @@ window.djTalkDown = function(ev){ if(ev) ev.preventDefault(); talk(true); }; win
 window.djStopAll = function(){ setRoom({ playing:false, fadeAt:null, fadeSecs:null, dj:{ live:false }, rules:Object.assign({}, (DJ.state[DJ.sel] || {}).rules || {}) }, 'Everything stopped in ' + roomName(DJ.sel) + '.'); DJ.talk[DJ.sel] = false; };
 window.djSel = function(r){ DJ.sel = r; DJ.curKey = ''; tick(); renderDJ(); };
 window.djListen = function(on){ DJ.listen = !!on; DJ.curKey = ''; tick(); renderDJ(); };
-window.djQueueAdd = function(id){ var e = eff(DJ.sel), q = curQueue().slice(), p = e ? position(e) : null; var at = p ? p.i + 1 : q.length; q = q.filter(function(x, i){ return x !== id || (p && i === p.i); }); if(p && at > q.length) at = q.length; q.splice(at, 0, id);
+function qSet(nq, msg){ nq = okIds(nq); if(!nq.length) nq = defaultQueue(); var e = eff(DJ.sel), p = e ? position(e) : null;
+  if(e && p){ var cur = e.queue[p.i], idx = nq.indexOf(cur); return setRoom({ queue:nq, playing:true, _start:true, _offsetMs:idx >= 0 ? Math.round((cumBefore(nq, idx) + p.off) * 1000) : 0, fadeAt:null, fadeSecs:null }, msg); }
+  return setRoom({ queue:nq, pausedIdx:0, pausedOff:0 }, msg); }
+window.djQRemove = function(id){ var q = curQueue().filter(function(x){ return x !== id; }); qSet(q, 'Taken off the radio list.'); };
+window.djQUp = function(id){ var q = curQueue().slice(), i = q.indexOf(id); if(i > 0){ q.splice(i, 1); q.splice(i - 1, 0, id); } qSet(q, 'Moved up.'); };
+window.djQUse = function(kind){ var l = music().filter(function(t){ return kind === 'all' ? true : t.grp === kind; }).map(function(t){ return t.id; }); if(!l.length) return flash(kind === 'artist' ? 'No artist songs yet. Upload them in the Library.' : 'No songs there yet.');
+  if(kind === 'all'){ var a = l.filter(function(id){ return T(id).grp === 'artist'; }); l = a.concat(l.filter(function(id){ return a.indexOf(id) < 0; })); }
+  qSet(l, kind === 'artist' ? 'The radio list is now your artists only.' : kind === 'hype' ? 'The radio list is now the hype music.' : 'The radio list is your artists first, then the hype music.'); };
+window.djQueueAdd = function(id){ var q = curQueue().slice(); if(q.indexOf(id) >= 0) return flash('“' + T(id).title + '” is already on the radio list.'); q.push(id); return qSet(q, '“' + T(id).title + '” added to the end of the radio list.'); };
+window.djQueueAddOld = function(id){ var e = eff(DJ.sel), q = curQueue().slice(), p = e ? position(e) : null; var at = p ? p.i + 1 : q.length; q = q.filter(function(x, i){ return x !== id || (p && i === p.i); }); if(p && at > q.length) at = q.length; q.splice(at, 0, id);
   if(e && p) return setRoom({ queue:q, playing:true, _start:true, _offsetMs:Math.round((cumBefore(q, q.indexOf(e.queue[p.i]) >= 0 ? q.indexOf(e.queue[p.i]) : 0) + p.off) * 1000) }, '“' + T(id).title + '” plays next.');
   return setRoom({ queue:q }, '“' + T(id).title + '” added to Room Radio.'); };
 window.djPlayNow = function(id){ var e = eff(DJ.sel), q = curQueue().slice(), p = e ? position(e) : null; q = q.filter(function(x){ return x !== id; }); var at = p ? Math.min(p.i + 1, q.length) : 0; q.splice(at, 0, id);
@@ -113945,7 +113959,7 @@ window.djUpload = async function(){ var f = (document.getElementById('djFile') |
   var url = supaClient.storage.from('dj-media').getPublicUrl(path).data.publicUrl;
   var ins = await supaClient.from('wmam_dj_tracks').insert({ title:title || f.name.replace(/\.[a-z0-9]+$/i, ''), artist:artist, kind:'music', grp:'artist', url:url, seconds:Math.round(secs * 10) / 10, added_by:(me() || {}).name || '' }).select('*').single();
   if(ins && ins.error){ if(btn){ btn.disabled = false; btn.textContent = '⬆ Upload song'; } return flash('⚠ Saved the file but not the song: ' + ins.error.message); }
-  ins.data.seconds = Number(ins.data.seconds); DJ.tracks.push(ins.data); DJ.tab = 'artists'; flash('Uploaded “' + ins.data.title + '” by ' + artist + '. Tap “+ Radio” to put it on.'); renderDJ(); };
+  ins.data.seconds = Number(ins.data.seconds); DJ.tracks.push(ins.data); DJ.tab = 'artists'; try{ var q0 = savedQueue(DJ.sel); if(q0.indexOf(ins.data.id) < 0){ q0.push(ins.data.id); qSet(q0); } }catch(e){} flash('Uploaded “' + ins.data.title + '” by ' + artist + '. It plays on the radio list automatically.'); renderDJ(); };
 // the owner's copy measures real song lengths so everyone stays in sync
 async function measure(){ if(!owner()) return; for(var i = 0; i < DJ.tracks.length; i++){ var t = DJ.tracks[i]; if(t._m) continue; t._m = true;
   var d = await new Promise(function(res){ var a = new Audio(); a.preload = 'metadata'; a.crossOrigin = 'anonymous'; var to = setTimeout(function(){ res(0); }, 8000); a.onloadedmetadata = function(){ clearTimeout(to); res(a.duration || 0); }; a.onerror = function(){ clearTimeout(to); res(0); }; a.src = t.url; });
@@ -113962,19 +113976,22 @@ function airHtml(){ var e = eff(DJ.sel), p = e ? position(e) : null, s = DJ.stat
     + '<label class="dj-chk" title="Play what the room hears on this device"><input type="checkbox" ' + (DJ.listen ? 'checked' : '') + ' onchange="djListen(this.checked)"> Hear it here</label><button class="dj-btn dj-stop" onclick="djStopAll()">■ STOP ALL SOUND</button></div></div>'; }
 function trackRow(t, opts){ var c = ACOL[t.artist] || (t.kind === 'sfx' ? '#475569' : '#0f766e');
   return '<div class="dj-song"><div class="dj-art" style="background:' + c + '">' + esc((t.artist || '♪').split(' ').map(function(w){ return w[0]; }).join('').slice(0, 2)) + '</div><div class="dj-nm"><b>' + esc(t.title) + '</b><small>' + esc(t.artist || '') + ' · ' + fmt(t.seconds) + '</small></div>'
-    + (t.kind === 'music' ? '<button class="dj-mini" onclick="djQueueAdd(\'' + t.id + '\')">+ Radio</button><button class="dj-mini" onclick="djPlayNow(\'' + t.id + '\')">▶ Play now</button><button class="dj-mini" onclick="djWalkin(\'' + t.id + '\')">Walk-in</button>' : '<button class="dj-mini" onclick="djPreview(\'' + t.id + '\')">🔈 Preview (only you)</button>')
+    + (t.kind === 'music' ? '<button class="dj-mini" onclick="djQueueAdd(\'' + t.id + '\')">+ Radio list</button><button class="dj-mini" onclick="djPlayNow(\'' + t.id + '\')">▶ Play now</button><button class="dj-mini" onclick="djWalkin(\'' + t.id + '\')">Walk-in</button>' : '<button class="dj-mini" onclick="djPreview(\'' + t.id + '\')">🔈 Preview (only you)</button>')
     + (opts && opts.rm ? '<button class="dj-mini dj-rm" data-rm="' + t.id + '" onclick="djRemove(\'' + t.id + '\')">Remove</button>' : '') + '</div>'; }
 window.djPreview = function(id){ var t = T(id); if(!t) return; if(DJ._pv){ try{ DJ._pv.pause(); }catch(e){} } DJ._pv = new Audio(t.url); setVol(DJ._pv, 0.8); DJ._pv.play().catch(function(){}); flash('Previewing “' + t.title + '” on your device only.'); };
 function renderDJ(){ var b = document.getElementById('djRoot'); if(!b) return; var y = window.scrollY; b.innerHTML = pageInner(); window.scrollTo(0, y); }
 function pageInner(){
   if(!DJ.loaded) return '<div style="padding:30px;text-align:center;color:#64748b">Loading the DJ Room…</div>';
   var s = DJ.state[DJ.sel] || {}, e = eff(DJ.sel), p = e ? position(e) : null, rules = s.rules || {}, q = curQueue().map(T).filter(Boolean), live = !!(s.dj && s.dj.live);
-  var start = p ? p.i : (s.pausedIdx || 0), show = []; for(var k = 0; k < Math.min(q.length, 5); k++) show.push({ t:q[(start + k) % q.length], k:k });
+  var curId = p ? p.t.id : null;
   var h = airHtml();
   h += '<div class="dj-main"><div class="dj-grid">';
   // 1 radio
   h += '<section class="dj-deck" style="--c:#2f6bff"><div class="dj-dh"><div class="dj-t">🔵 1 · ROOM RADIO</div><div class="dj-w">Plays songs for everyone at the same time: while they wait, before you arrive, and after they join. Runs by itself.</div></div><div class="dj-db">'
-    + show.map(function(x){ var t = x.t, now0 = x.k === 0 && p; return '<div class="dj-q"><div class="dj-art" style="background:' + (ACOL[t.artist] || '#0f766e') + '">' + (x.k === 0 && p ? '▶' : (x.k + 1)) + '</div><div class="dj-nm"><b>' + esc(t.title) + '</b><small>' + esc(t.artist || '') + ' · ' + fmt(t.seconds) + '</small>' + (now0 ? '<div class="dj-prog"><i style="width:' + Math.min(100, p.off / t.seconds * 100) + '%"></i></div>' : '') + '</div><span class="dj-tag' + (now0 ? ' now' : '') + '">' + (now0 ? 'NOW' : x.k === 0 ? 'FIRST' : x.k === 1 ? 'NEXT' : '#' + (x.k + 1)) + '</span></div>'; }).join('')
+    + '<div class="dj-lbl">Radio list · ' + q.length + ' song' + (q.length === 1 ? '' : 's') + ' · plays in this order, then repeats</div>'
+    + '<div class="dj-row"><button class="dj-mini" onclick="djQUse(\'artist\')">🎤 Use My Artists</button><button class="dj-mini" onclick="djQUse(\'hype\')">🔥 Use Hype Music</button><button class="dj-mini" onclick="djQUse(\'all\')">➕ Both</button></div>'
+    + '<div class="dj-qlist">' + q.map(function(t, k){ var now0 = t.id === curId; return '<div class="dj-q' + (now0 ? ' on' : '') + '"><div class="dj-art" style="background:' + (ACOL[t.artist] || '#0f766e') + '">' + (now0 ? '▶' : (k + 1)) + '</div><div class="dj-nm"><b>' + esc(t.title) + '</b><small>' + esc(t.artist || '') + ' · ' + fmt(t.seconds) + '</small>' + (now0 ? '<div class="dj-prog"><i style="width:' + Math.min(100, p.off / t.seconds * 100) + '%"></i></div>' : '') + '</div>'
+      + (now0 ? '<span class="dj-tag now">NOW</span>' : '<button class="dj-mini" title="Play this now" onclick="djPlayNow(\'' + t.id + '\')">▶</button>' + (k ? '<button class="dj-mini" title="Move up" onclick="djQUp(\'' + t.id + '\')">↑</button>' : '') + '<button class="dj-mini dj-rm" title="Take off the radio list" onclick="djQRemove(\'' + t.id + '\')">✕</button>') + '</div>'; }).join('') + '</div>'
     + '<div class="dj-row"><button class="dj-btn dj-pri" onclick="djPlay()">' + (e && e.src === 'radio' && !e.fadeAt ? '⏸ Pause' : '▶ Play') + '</button><button class="dj-btn dj-soft" onclick="djSkip()">⏭ Skip</button><button class="dj-btn dj-soft" onclick="djShuffle()">🔀 Shuffle</button><button class="dj-btn dj-soft" onclick="djFade(30)">🌙 Fade out (30 sec)</button></div>'
     + '<label class="dj-lbl" for="djVolR">Volume for everyone · <span id="djVolV">' + (s.vol == null ? 70 : s.vol) + '</span>%</label><input id="djVolR" type="range" min="0" max="100" value="' + (s.vol == null ? 70 : s.vol) + '" oninput="djVol(this.value)">'
     + '<div class="dj-lbl">Auto rules</div>'
@@ -114017,7 +114034,7 @@ var CSS = '.dj-wrap{max-width:1180px;margin:0 auto;padding:4px 0 30px;font-famil
   + '.dj-chk{display:flex;gap:8px;align-items:center;font-size:.86rem}.dj-air .dj-chk{color:#cbd5e1}.dj-btn{border:0;border-radius:10px;padding:10px 14px;font-weight:800;cursor:pointer;font-size:.86rem;background:#e2e8f0;color:#0b1b3f}.dj-btn[disabled]{opacity:.5;cursor:not-allowed}.dj-stop{background:#ef4444;color:#fff}.dj-pri{background:var(--c);color:#fff}.dj-soft{background:color-mix(in srgb,var(--c) 14%,#fff);color:var(--c)}'
   + '.dj-main{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px;align-items:start}@media(max-width:980px){.dj-main{grid-template-columns:1fr}}.dj-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}@media(max-width:760px){.dj-grid{grid-template-columns:1fr}}.dj-wide{grid-column:1/-1}'
   + '.dj-deck{background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 2px 10px rgba(15,23,42,.07);min-width:0}.dj-dh{background:var(--c);color:#fff;padding:12px 14px}.dj-t{font-weight:900;letter-spacing:1px}.dj-w{font-size:.82rem;opacity:.95;margin-top:2px}.dj-db{padding:12px 14px;display:flex;flex-direction:column;gap:9px}'
-  + '.dj-q,.dj-song{display:flex;gap:9px;align-items:center;padding:6px 0;border-bottom:1px dashed #e2e8f0;min-width:0;flex-wrap:wrap}.dj-art{width:34px;height:34px;border-radius:8px;flex:0 0 34px;display:grid;place-items:center;color:#fff;font-weight:900;font-size:.8rem}.dj-nm{flex:1 1 140px;min-width:0}.dj-nm b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dj-nm small{color:#64748b}'
+  + '.dj-qlist{max-height:340px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:10px;padding:0 8px}.dj-q.on{background:#eff6ff}.dj-q,.dj-song{display:flex;gap:9px;align-items:center;padding:6px 0;border-bottom:1px dashed #e2e8f0;min-width:0;flex-wrap:wrap}.dj-art{width:34px;height:34px;border-radius:8px;flex:0 0 34px;display:grid;place-items:center;color:#fff;font-weight:900;font-size:.8rem}.dj-nm{flex:1 1 140px;min-width:0}.dj-nm b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dj-nm small{color:#64748b}'
   + '.dj-tag{font-size:.66rem;font-weight:900;letter-spacing:1px;border-radius:99px;padding:3px 8px;background:#f1f5f9;color:#475569}.dj-tag.now{background:#2f6bff;color:#fff}.dj-prog{height:5px;background:#e2e8f0;border-radius:99px;overflow:hidden;margin-top:4px}.dj-prog i{display:block;height:100%;background:#2f6bff}'
   + '.dj-lbl{font-size:.7rem;font-weight:800;letter-spacing:1.5px;color:#64748b;text-transform:uppercase}.dj-db input[type=range]{width:100%;accent-color:var(--c)}.dj-status{font-size:.8rem;border-radius:8px;padding:6px 9px;background:#f1f5f9;color:#475569;font-weight:700}.dj-status.live{background:#8b5cf6;color:#fff}.dj-note{font-size:.8rem;color:#64748b}'
   + '.dj-pads{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.dj-pad{border:0;border-radius:12px;padding:12px 6px;color:#fff;font-weight:900;font-size:.84rem;cursor:pointer;line-height:1.2}.dj-pad span{display:block;font-size:1.5rem;margin-bottom:3px}.dj-pad small{display:block;font-weight:600;font-size:.68rem;opacity:.92;margin-top:3px}.dj-pad:active{transform:scale(.97)}'
