@@ -3884,7 +3884,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.22.1860';
+var BUILD_VERSION = '2026.10.22.1870';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -113778,6 +113778,318 @@ if(typeof panelCallScheduleAdmin === 'function' && !panelCallScheduleAdmin._cr){
     return cardHtml() + base; }; panelCallScheduleAdmin._cr = true;
   try{ if(typeof PANEL_MAP !== 'undefined' && PANEL_MAP['call-schedule-admin']) PANEL_MAP['call-schedule-admin'] = panelCallScheduleAdmin; }catch(e){} }
 }catch(e){ console.warn('[call reminder emails]', e); } })();
+
+</script>
+<script>
+// ═══ 🎧 DJ ROOM — real music for company calls (Calvin 2026-10-22) ═══
+// "I want live music or preselected music playing while people are waiting to join the call or have joined and the host
+//  hasn't joined yet, or joined but still letting the music play until they turn it off." · "clearly see which one is what"
+// Approved layout: ON AIR bar · 1 Room Radio · 2 DJ Mode · 3 Hype Pads · 4 Music Library · 5 Studio (coming next).
+// • Everyone in a call room (waiting room or in the call) hears the SAME song at the SAME second: the owner's choices are
+//   saved per room on the server (wmam_dj_state, server clock) and every device plays its own copy in sync. The music never
+//   goes through anyone's mic, so it is clean and echo-free. Real recordings only (Mixkit free license + Calvin's artists),
+//   stored in the public dj-media bucket.
+// • Hype Pads and DJ talk-over go out instantly to everyone in the room (realtime broadcast).
+// • Auto: the radio starts by itself 15 min before each scheduled call (National Mon, Lifeline Wed/Fri, 9:00 CST) and keeps
+//   playing after the host joins until the host fades it out (rules can be changed).
+// • Replaces the old waiting-room music completely (old player, playlist, radio streams and its settings page).
+(function(){ try{
+if(window._wmamDjOn) return; window._wmamDjOn = true;
+var esc = function(s){ return (typeof _escapeHtml === 'function') ? _escapeHtml(s == null ? '' : String(s)) : String(s == null ? '' : s); };
+var ROOMS = [['room-national', 'National Team Call', [1]], ['room-lifeline', 'Lifeline Team Call', [3, 5]], ['room-internet', 'Internet Team Call', []], ['room-aca', 'ACA Team Call', []], ['room-office', 'Admin Office Meeting', []]];
+var ARTISTS = ['Clay Mercer', 'Lennox Ray', 'Kash', 'Amari Grace', 'Kidman'];
+var ACOL = { 'Clay Mercer':'#be123c', 'Lennox Ray':'#1e40af', 'Kash':'#111827', 'Amari Grace':'#a16207', 'Kidman':'#4d7c0f' };
+var PADS = [['walkin', '🚪', 'Walk-in hit', '#e2571a', 'plays when someone joins'], ['count', '⏱', 'Countdown to 9:00', '#d7263d', '10-sec voice countdown + fanfare'], ['stadium', '📣', 'Stadium hype', '#e8a317', 'crowd, drums & horns'], ['clap', '👏', 'Applause', '#1f9d55', 'cheering crowd'], ['roll', '🥁', 'Drumroll', '#0e8fb0', 'before a big shout-out'], ['win', '🏆', 'Big win!', '#c2287b', 'victory crowd']];
+var DJ = { tracks:[], state:{}, room:null, sel:'room-national', off:0, ch:null, listen:true, local:0.8, muted:false, A:[null, null], cur:null, curKey:'', loaded:false, presence:{}, tab:'artists', talk:{}, busy:false };
+window.WMAM_DJ = DJ;
+function me(){ return (typeof DB !== 'undefined' && DB.current) || null; }
+function owner(){ try{ return isOwner(me()); }catch(e){ return false; } }
+function now(){ return Date.now() + DJ.off; }
+function T(id){ return DJ.tracks.find(function(t){ return t.id === id; }); }
+function music(){ return DJ.tracks.filter(function(t){ return t.kind === 'music' && t.active; }); }
+function roomName(r){ var x = ROOMS.find(function(z){ return z[0] === r; }); return x ? x[1] : r; }
+function fmt(s){ s = Math.max(0, Math.round(s || 0)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+
+// ───────── server clock + data ─────────
+async function clock(){ try{ var t0 = Date.now(); var r = await supaClient.rpc('wmam_dj_now'); var t1 = Date.now(); var o = r && !r.error ? Number(r.data) - (t0 + t1) / 2 : NaN; if(isFinite(o) && Math.abs(o) < 86400000) DJ.off = o; }catch(e){} }
+async function load(){
+  try{ var r = await supaClient.from('wmam_dj_tracks').select('*').eq('active', true).order('created_at', { ascending:true }); if(r && !r.error) DJ.tracks = (r.data || []).map(function(t){ t.seconds = Number(t.seconds) || 0; return t; }); }catch(e){}
+  try{ var s = await supaClient.from('wmam_dj_state').select('room,state'); if(s && !s.error) (s.data || []).forEach(function(x){ DJ.state[x.room] = x.state || {}; }); }catch(e){}
+  DJ.loaded = true;
+}
+function subscribe(){
+  if(DJ.ch || typeof supaClient === 'undefined' || typeof supaClient.channel !== 'function') return;
+  try{
+    DJ.ch = supaClient.channel('wmam-dj', { config:{ presence:{ key:String((me() || {}).id || Math.random()) }, broadcast:{ self:false } } })
+      .on('postgres_changes', { event:'*', schema:'public', table:'wmam_dj_state' }, function(p){ var row = p.new || {}; if(row.room){ DJ.state[row.room] = row.state || {}; tick(); if(onDJ()) renderDJ(); } })
+      .on('broadcast', { event:'pad' }, function(m){ var d = m.payload || {}; if(d.room && d.room === hearRoom()) schedulePad(d.pad, d.at); })
+      .on('broadcast', { event:'duck' }, function(m){ var d = m.payload || {}; if(d.room){ DJ.talk[d.room] = !!d.talk; tick(); } })
+      .on('presence', { event:'sync' }, function(){ try{ DJ.presence = DJ.ch.presenceState() || {}; }catch(e){} if(onDJ()) renderAir(); })
+      .subscribe(function(st){ if(st === 'SUBSCRIBED') trackMe(); });
+  }catch(e){ console.warn('[dj] realtime', e); }
+}
+function trackMe(){ try{ if(DJ.ch) DJ.ch.track({ room:DJ.room || '', inCall:inCall(), name:(me() || {}).name || '' }); }catch(e){} }
+function listeners(room){ var w = 0, c = 0; Object.keys(DJ.presence || {}).forEach(function(k){ var l = DJ.presence[k] || [], x = l[l.length - 1] || {}; if(x.room === room){ if(x.inCall) c++; else w++; } }); return { w:w, c:c }; }
+
+// ───────── what a room should be hearing right now ─────────
+function ctMs(dayStr, hhmm){ // 9:00 Central on a given Central date → epoch ms
+  var guess = Date.parse(dayStr + 'T' + hhmm + ':00Z');
+  for(var i = 0; i < 2; i++){ var p = new Intl.DateTimeFormat('en-US', { timeZone:'America/Chicago', hour12:false, year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }).formatToParts(new Date(guess)).reduce(function(o, x){ o[x.type] = x.value; return o; }, {});
+    var shown = Date.parse(p.year + '-' + p.month + '-' + p.day + 'T' + (p.hour === '24' ? '00' : p.hour) + ':' + p.minute + ':00Z'); guess += Date.parse(dayStr + 'T' + hhmm + ':00Z') - shown; }
+  return guess; }
+function ctToday(){ var p = new Intl.DateTimeFormat('en-CA', { timeZone:'America/Chicago' }).format(new Date(now())); var d = new Date(p + 'T12:00:00Z').getUTCDay(); return { date:p, dow:d }; }
+function autoWindow(room){ var r = ROOMS.find(function(z){ return z[0] === room; }); if(!r || !r[2].length) return null; var t = ctToday(); if(r[2].indexOf(t.dow) < 0) return null;
+  var call = ctMs(t.date, '09:00'); return { start:call - 15 * 60000, end:call + 75 * 60000, call:call }; }
+function eff(room){
+  var s = DJ.state[room] || {}, rules = s.rules || {};
+  if(s.playing && Array.isArray(s.queue) && s.queue.length && s.startedAt) return { src:'radio', queue:s.queue, startedAt:s.startedAt, vol:s.vol == null ? 70 : s.vol, fadeAt:s.fadeAt, fadeSecs:s.fadeSecs, dj:s.dj && s.dj.live };
+  if(rules.autoStart !== false){ var w = autoWindow(room), n = now();
+    if(w && n >= w.start && n <= w.end && !(s.at && s.at >= w.start)) return { src:'auto', queue:music().map(function(t){ return t.id; }), startedAt:w.start, vol:s.vol == null ? 70 : s.vol }; }
+  return null; }
+function position(e){
+  var q = e.queue.map(T).filter(Boolean); if(!q.length) return null;
+  var total = q.reduce(function(a, t){ return a + (t.seconds || 0); }, 0); if(total <= 0) return null;
+  var el = (now() - e.startedAt) / 1000; if(el < 0) el = 0; el = el % total;
+  for(var i = 0; i < q.length; i++){ if(el < q[i].seconds) return { i:i, t:q[i], off:el, left:q[i].seconds - el, next:q[(i + 1) % q.length] }; el -= q[i].seconds; }
+  return { i:0, t:q[0], off:0, left:q[0].seconds, next:q[1 % q.length] }; }
+function level(room, e){ if(!e) return 0; var v = (e.vol == null ? 70 : e.vol) / 100;
+  if(e.fadeAt && e.fadeSecs){ var f = 1 - (now() - e.fadeAt) / (e.fadeSecs * 1000); v *= Math.max(0, Math.min(1, f)); }
+  if(DJ.talk[room]) v *= 0.25; return v; }
+
+// ───────── the player (every device) ─────────
+function inCall(){ var c = document.getElementById('jitsiContainer'), m = document.getElementById('videoCallModal'); return !!(m && m.style.display !== 'none' && c && c.style.display !== 'none' && c.children.length); }
+function onDJ(){ return window._currentPanelId === 'dj-room'; }
+function hearRoom(){ if(DJ.room) return DJ.room; if(onDJ() && owner() && DJ.listen) return DJ.sel; return null; }
+function el(i){ if(!DJ.A[i]){ var a = new Audio(); a.preload = 'auto'; a.crossOrigin = 'anonymous'; DJ.A[i] = a; } return DJ.A[i]; }
+function setVol(a, v){ try{ a.volume = Math.max(0, Math.min(1, v)); }catch(e){} }
+function stopAll(){ [0, 1].forEach(function(i){ var a = DJ.A[i]; if(a){ try{ a.pause(); }catch(e){} } }); DJ.curKey = ''; DJ.cur = null; }
+function tick(){
+  var room = hearRoom(), e = room ? eff(room) : null, p = e ? position(e) : null, v = room ? level(room, e) : 0;
+  if(!p || v <= 0.001 || DJ.muted){ if(DJ.curKey){ var a0 = DJ.A[DJ.active || 0]; if(a0 && (!p || v <= 0.001)) fadeOutEl(a0, 0.6); else if(a0) setVol(a0, 0); if(!p || v <= 0.001) DJ.curKey = ''; } DJ.cur = p; paintRadio(room, e, p); return; }
+  var key = room + '|' + p.t.id + '|' + (e.startedAt || 0) + '|' + p.i, act = DJ.active || 0, a = el(act);
+  if(key !== DJ.curKey){ // new song: crossfade from the old element
+    var old = DJ.curKey ? a : null; act = DJ.curKey ? 1 - act : act; DJ.active = act; a = el(act);
+    if(old) fadeOutEl(old, e.src === 'radio' && DJ.state[room] && DJ.state[room].xfade ? 3 : 0.8);
+    a.src = p.t.url; DJ.curKey = key; try{ a.currentTime = p.off; }catch(x){} a.onloadedmetadata = function(){ try{ var q = position(eff(hearRoom()) || e); if(q) a.currentTime = q.off; }catch(x){} };
+  } else if(Math.abs((a.currentTime || 0) - p.off) > 1.5 && a.readyState >= 1){ try{ a.currentTime = p.off; }catch(x){} }
+  setVol(a, v * DJ.local); if(a.paused){ var pr = a.play(); if(pr && pr.catch) pr.catch(function(){ DJ.needTap = true; paintRadio(room, e, p); }); else DJ.needTap = false; } else DJ.needTap = false;
+  DJ.cur = p; paintRadio(room, e, p);
+}
+function fadeOutEl(a, secs){ var v0 = a.volume || 0, t0 = Date.now(); clearInterval(a._fd); a._fd = setInterval(function(){ var f = 1 - (Date.now() - t0) / (secs * 1000); if(f <= 0){ clearInterval(a._fd); try{ a.pause(); }catch(e){} return; } setVol(a, v0 * f); }, 60); }
+setInterval(function(){ try{ tick(); }catch(e){} }, 1000);
+// a tap anywhere unlocks sound on phones
+document.addEventListener('pointerdown', function(){ if(DJ.needTap){ DJ.needTap = false; DJ.curKey = ''; tick(); } }, true);
+
+// pads: everyone in the room plays the same real recording at the same moment
+var padEls = {};
+function padTrack(pad){ return DJ.tracks.find(function(t){ return t.pad === pad && t.active; }); }
+function playSfx(pad, vol){ var t = padTrack(pad); if(!t) return; var a = new Audio(t.url); a.crossOrigin = 'anonymous'; setVol(a, vol); a.play().catch(function(){}); return a; }
+function schedulePad(pad, at){ var room = hearRoom(); var e = room ? eff(room) : null; var vol = Math.max(0.5, e ? (e.vol || 70) / 100 : 0.8) * DJ.local; if(DJ.muted) return;
+  var wait = Math.max(0, (at || now()) - now());
+  setTimeout(function(){
+    if(pad === 'count'){ playSfx('count', vol); var c = padTrack('count'); setTimeout(function(){ playSfx('fanfare', vol); }, ((c && c.seconds) || 11) * 1000); return; }
+    if(pad === 'win'){ playSfx('win', vol); playSfx('fanfare', vol * 0.8); return; }
+    if(pad === 'walkin'){ var s = DJ.state[room] || {}, wt = s.rules && s.rules.walkinTrack && T(s.rules.walkinTrack); if(wt){ var a = new Audio(wt.url); a.crossOrigin = 'anonymous'; setVol(a, vol); a.play().catch(function(){}); setTimeout(function(){ fadeOutEl(a, 2); }, 8000); return; } }
+    playSfx(pad, vol); }, wait); }
+async function firePad(pad){ var room = DJ.sel, at = now() + 700; try{ if(DJ.ch) await DJ.ch.send({ type:'broadcast', event:'pad', payload:{ room:room, pad:pad, at:at } }); }catch(e){}
+  if(hearRoom() === room) schedulePad(pad, at); flash(PADS.find(function(p){ return p[0] === pad; })[2] + ' sent to everyone in ' + roomName(room) + '.'); }
+window.djPad = firePad;
+
+// ───────── owner commands (saved on the server, everyone follows) ─────────
+async function setRoom(patch, msg){ if(!owner()) return; var r = await supaClient.rpc('wmam_dj_set', { p_room:DJ.sel, p_patch:patch });
+  if(r && r.error){ flash('⚠ Not saved: ' + r.error.message); return null; } DJ.state[DJ.sel] = r.data || DJ.state[DJ.sel]; if(msg) flash(msg); tick(); renderDJ(); return r.data; }
+function cumBefore(q, idx){ var s = 0; for(var i = 0; i < idx; i++){ var t = T(q[i]); s += t ? t.seconds : 0; } return s; }
+function curQueue(){ var s = DJ.state[DJ.sel] || {}, e = eff(DJ.sel); return (e && e.queue) || (s.queue && s.queue.length ? s.queue : music().map(function(t){ return t.id; })); }
+window.djPlay = function(){ var e = eff(DJ.sel), s = DJ.state[DJ.sel] || {};
+  if(e && e.src === 'radio' && !e.fadeAt){ var p = position(e); return setRoom({ playing:false, pausedIdx:p ? p.i : 0, pausedOff:p ? p.off : 0, dj:{ live:false } }, 'Paused. Nobody in ' + roomName(DJ.sel) + ' hears music now.'); }
+  var q = curQueue(), idx = s.pausedIdx || 0, off = s.pausedOff || 0; if(e && e.src === 'auto'){ var pa = position(e); if(pa){ idx = pa.i; off = pa.off; } }
+  return setRoom({ playing:true, queue:q, _start:true, _offsetMs:Math.round((cumBefore(q, idx) + off) * 1000), fadeAt:null, fadeSecs:null, xfade:false }, 'Room Radio is playing for everyone in ' + roomName(DJ.sel) + '.'); };
+function jumpTo(idx, xf, q){ q = q || curQueue(); idx = (idx + q.length) % q.length; return setRoom({ playing:true, queue:q, _start:true, _offsetMs:Math.round(cumBefore(q, idx) * 1000), fadeAt:null, fadeSecs:null, xfade:!!xf }); }
+window.djSkip = function(xf){ var e = eff(DJ.sel); var p = e ? position(e) : null; jumpTo(p ? p.i + 1 : 0, xf, e ? e.queue : null).then(function(){ flash(xf ? 'Crossfading into the next song.' : 'Skipped to the next song.'); }); };
+window.djShuffle = function(){ var e = eff(DJ.sel), q = curQueue().slice(), p = e ? position(e) : null, cur = p ? q[p.i] : null;
+  var rest = q.filter(function(id, i){ return !p || i !== p.i; }); for(var i = rest.length - 1; i > 0; i--){ var j = Math.floor(Math.random() * (i + 1)); var x = rest[i]; rest[i] = rest[j]; rest[j] = x; }
+  var nq = cur ? [cur].concat(rest) : rest; if(e && p) return setRoom({ queue:nq, playing:true, _start:true, _offsetMs:Math.round(p.off * 1000) }, 'Shuffled what plays next.'); return setRoom({ queue:nq }, 'Shuffled.'); };
+window.djFade = function(secs){ var e = eff(DJ.sel); if(!e){ flash('Nothing is playing in ' + roomName(DJ.sel) + '.'); return; }
+  if(e.src === 'auto'){ var p = position(e), q = e.queue; setRoom({ playing:true, queue:q, _start:true, _offsetMs:Math.round((cumBefore(q, p.i) + p.off) * 1000), _fade:secs }).then(after); } else setRoom({ _fade:secs }).then(after);
+  function after(){ flash('Fading out over ' + secs + ' seconds for everyone.'); var room = DJ.sel; setTimeout(function(){ var s = DJ.state[room] || {}; if(s.fadeAt) supaClient.rpc('wmam_dj_set', { p_room:room, p_patch:{ playing:false, fadeAt:null, fadeSecs:null, dj:{ live:false } } }).then(function(r){ if(r && r.data){ DJ.state[room] = r.data; tick(); if(onDJ()) renderDJ(); } }); }, secs * 1000 + 600); } };
+window.djVol = function(v){ clearTimeout(DJ._vt); var s = DJ.state[DJ.sel] = DJ.state[DJ.sel] || {}; s.vol = +v; tick(); var l = document.getElementById('djVolV'); if(l) l.textContent = v; DJ._vt = setTimeout(function(){ setRoom({ vol:+v }); }, 350); };
+window.djRule = function(k, on){ var s = DJ.state[DJ.sel] || {}, r = Object.assign({}, s.rules || {}); r[k] = !!on; setRoom({ rules:r }, 'Saved.'); };
+window.djLive = function(){ var s = DJ.state[DJ.sel] || {}, live = !(s.dj && s.dj.live);
+  if(live){ var e = eff(DJ.sel); if(!e || e.src !== 'radio'){ window.djPlay().then(function(){ setRoom({ dj:{ live:true } }, 'You’re live as DJ in ' + roomName(DJ.sel) + '. Hold “talk over” when you speak.'); }); return; } return setRoom({ dj:{ live:true } }, 'You’re live as DJ. Hold “talk over” when you speak.'); }
+  setRoom({ dj:{ live:false } }, 'Handed back to Room Radio. The music keeps going by itself.'); };
+function talk(on){ var s = DJ.state[DJ.sel] || {}; if(!(s.dj && s.dj.live)){ if(on) flash('Tap GO LIVE AS DJ first.'); return; }
+  DJ.talk[DJ.sel] = on; tick(); try{ if(DJ.ch) DJ.ch.send({ type:'broadcast', event:'duck', payload:{ room:DJ.sel, talk:on } }); }catch(e){}
+  var b = document.getElementById('djTalk'); if(b) b.textContent = on ? '🗣 Talking… music at 25%' : '🗣 Hold to talk over'; }
+window.djTalkDown = function(ev){ if(ev) ev.preventDefault(); talk(true); }; window.djTalkUp = function(){ if(DJ.talk[DJ.sel]) talk(false); };
+window.djStopAll = function(){ setRoom({ playing:false, fadeAt:null, fadeSecs:null, dj:{ live:false }, rules:Object.assign({}, (DJ.state[DJ.sel] || {}).rules || {}) }, 'Everything stopped in ' + roomName(DJ.sel) + '.'); DJ.talk[DJ.sel] = false; };
+window.djSel = function(r){ DJ.sel = r; DJ.curKey = ''; tick(); renderDJ(); };
+window.djListen = function(on){ DJ.listen = !!on; DJ.curKey = ''; tick(); renderDJ(); };
+window.djQueueAdd = function(id){ var e = eff(DJ.sel), q = curQueue().slice(), p = e ? position(e) : null; var at = p ? p.i + 1 : q.length; q = q.filter(function(x, i){ return x !== id || (p && i === p.i); }); if(p && at > q.length) at = q.length; q.splice(at, 0, id);
+  if(e && p) return setRoom({ queue:q, playing:true, _start:true, _offsetMs:Math.round((cumBefore(q, q.indexOf(e.queue[p.i]) >= 0 ? q.indexOf(e.queue[p.i]) : 0) + p.off) * 1000) }, '“' + T(id).title + '” plays next.');
+  return setRoom({ queue:q }, '“' + T(id).title + '” added to Room Radio.'); };
+window.djPlayNow = function(id){ var e = eff(DJ.sel), q = curQueue().slice(), p = e ? position(e) : null; q = q.filter(function(x){ return x !== id; }); var at = p ? Math.min(p.i + 1, q.length) : 0; q.splice(at, 0, id);
+  jumpTo(at, true, q).then(function(){ flash('Now playing “' + T(id).title + '” for everyone.'); }); };
+window.djWalkin = function(id){ var s = DJ.state[DJ.sel] || {}, r = Object.assign({}, s.rules || {}); r.walkinTrack = id || null; setRoom({ rules:r }, id ? 'Walk-in now plays the first 8 seconds of “' + T(id).title + '”.' : 'Walk-in is back to the hit sound.'); };
+window.djRemove = async function(id){ var t = T(id); if(!t) return; var c = document.getElementById('djConfirm'); if(c && c.getAttribute('data-id') !== id){ c.remove(); c = null; }
+  if(!c){ var b = document.querySelector('[data-rm="' + id + '"]'); if(b){ b.textContent = 'Tap again to remove'; b.id = 'djConfirm'; b.setAttribute('data-id', id); setTimeout(function(){ if(b.id === 'djConfirm'){ b.textContent = 'Remove'; b.id = ''; } }, 4000); } return; }
+  var r = await supaClient.from('wmam_dj_tracks').update({ active:false }).eq('id', id); if(r && r.error){ flash('⚠ ' + r.error.message); return; } t.active = false; DJ.tracks = DJ.tracks.filter(function(x){ return x.id !== id; }); flash('Removed “' + t.title + '”.'); renderDJ(); };
+window.djTab = function(t){ DJ.tab = t; renderDJ(); };
+window.djUpload = async function(){ var f = (document.getElementById('djFile') || {}).files; f = f && f[0]; var artist = ((document.getElementById('djArtist') || {}).value || '').trim(), nw = ((document.getElementById('djNewArtist') || {}).value || '').trim(), title = ((document.getElementById('djTitle') || {}).value || '').trim();
+  if(artist === '__new') artist = nw; if(!f) return flash('Pick the song file first.'); if(!artist) return flash('Pick the artist.'); if(f.size > 50 * 1024 * 1024) return flash('That file is over 50 MB.');
+  var secs = await new Promise(function(res){ var a = new Audio(), u = URL.createObjectURL(f); a.preload = 'metadata'; a.onloadedmetadata = function(){ res(a.duration || 0); URL.revokeObjectURL(u); }; a.onerror = function(){ res(0); }; a.src = u; });
+  if(!secs) return flash('That file doesn’t play as audio. Use an MP3 or M4A.');
+  var slug = artist.toLowerCase().replace(/[^a-z0-9]+/g, '-'), path = 'artists/' + slug + '/' + Date.now() + '-' + f.name.toLowerCase().replace(/[^a-z0-9.]+/g, '-');
+  var btn = document.getElementById('djUpBtn'); if(btn){ btn.disabled = true; btn.textContent = 'Uploading…'; }
+  var up = await supaClient.storage.from('dj-media').upload(path, f, { contentType:f.type || 'audio/mpeg', upsert:false });
+  if(up && up.error){ if(btn){ btn.disabled = false; btn.textContent = '⬆ Upload song'; } return flash('⚠ Upload failed: ' + up.error.message); }
+  var url = supaClient.storage.from('dj-media').getPublicUrl(path).data.publicUrl;
+  var ins = await supaClient.from('wmam_dj_tracks').insert({ title:title || f.name.replace(/\.[a-z0-9]+$/i, ''), artist:artist, kind:'music', grp:'artist', url:url, seconds:Math.round(secs * 10) / 10, added_by:(me() || {}).name || '' }).select('*').single();
+  if(ins && ins.error){ if(btn){ btn.disabled = false; btn.textContent = '⬆ Upload song'; } return flash('⚠ Saved the file but not the song: ' + ins.error.message); }
+  ins.data.seconds = Number(ins.data.seconds); DJ.tracks.push(ins.data); DJ.tab = 'artists'; flash('Uploaded “' + ins.data.title + '” by ' + artist + '. Tap “+ Radio” to put it on.'); renderDJ(); };
+// the owner's copy measures real song lengths so everyone stays in sync
+async function measure(){ if(!owner()) return; for(var i = 0; i < DJ.tracks.length; i++){ var t = DJ.tracks[i]; if(t._m) continue; t._m = true;
+  var d = await new Promise(function(res){ var a = new Audio(); a.preload = 'metadata'; a.crossOrigin = 'anonymous'; var to = setTimeout(function(){ res(0); }, 8000); a.onloadedmetadata = function(){ clearTimeout(to); res(a.duration || 0); }; a.onerror = function(){ clearTimeout(to); res(0); }; a.src = t.url; });
+  if(d && Math.abs(d - t.seconds) > 0.4){ t.seconds = Math.round(d * 10) / 10; try{ await supaClient.from('wmam_dj_tracks').update({ seconds:t.seconds }).eq('id', t.id); }catch(e){} } } }
+
+// ───────── the DJ Room page (owner) ─────────
+var flashMsg = '';
+function flash(m){ flashMsg = m; var t = document.getElementById('djTip'); if(t) t.textContent = m; }
+function renderAir(){ var b = document.getElementById('djAir'); if(b) b.outerHTML = airHtml(); }
+function airHtml(){ var e = eff(DJ.sel), p = e ? position(e) : null, s = DJ.state[DJ.sel] || {}, L = listeners(DJ.sel), on = !!(p && level(DJ.sel, e) > 0.001);
+  var src = !e ? 'nothing playing' : e.src === 'auto' ? '🔵 Room Radio (started by itself before the call)' : (s.dj && s.dj.live) ? '🟣 You, live as DJ' : '🔵 Room Radio';
+  return '<div id="djAir" class="dj-air"><div class="dj-airL"><span class="dj-lamp' + (on ? ' on' : '') + '">' + (on ? '● ON AIR' : 'OFF AIR') + '</span><div style="min-width:0"><b>' + (on ? 'Everyone in ' + esc(roomName(DJ.sel)) + ' hears: ' + esc(p.t.title) + ' · ' + esc(p.t.artist || '') : 'Silence in ' + esc(roomName(DJ.sel)) + '. Tap ▶ Play on Room Radio to start.') + '</b><small>Source: ' + src + ' · ' + L.w + ' waiting · ' + L.c + ' in the call' + (e && e.fadeAt ? ' · fading out' : '') + '</small></div></div>'
+    + '<div class="dj-row"><select onchange="djSel(this.value)" class="dj-sel" aria-label="Which call">' + ROOMS.map(function(r){ return '<option value="' + r[0] + '"' + (r[0] === DJ.sel ? ' selected' : '') + '>📞 ' + esc(r[1]) + '</option>'; }).join('') + '</select>'
+    + '<label class="dj-chk" title="Play what the room hears on this device"><input type="checkbox" ' + (DJ.listen ? 'checked' : '') + ' onchange="djListen(this.checked)"> Hear it here</label><button class="dj-btn dj-stop" onclick="djStopAll()">■ STOP ALL SOUND</button></div></div>'; }
+function trackRow(t, opts){ var c = ACOL[t.artist] || (t.kind === 'sfx' ? '#475569' : '#0f766e');
+  return '<div class="dj-song"><div class="dj-art" style="background:' + c + '">' + esc((t.artist || '♪').split(' ').map(function(w){ return w[0]; }).join('').slice(0, 2)) + '</div><div class="dj-nm"><b>' + esc(t.title) + '</b><small>' + esc(t.artist || '') + ' · ' + fmt(t.seconds) + '</small></div>'
+    + (t.kind === 'music' ? '<button class="dj-mini" onclick="djQueueAdd(\'' + t.id + '\')">+ Radio</button><button class="dj-mini" onclick="djPlayNow(\'' + t.id + '\')">▶ Play now</button><button class="dj-mini" onclick="djWalkin(\'' + t.id + '\')">Walk-in</button>' : '<button class="dj-mini" onclick="djPreview(\'' + t.id + '\')">🔈 Preview (only you)</button>')
+    + (opts && opts.rm ? '<button class="dj-mini dj-rm" data-rm="' + t.id + '" onclick="djRemove(\'' + t.id + '\')">Remove</button>' : '') + '</div>'; }
+window.djPreview = function(id){ var t = T(id); if(!t) return; if(DJ._pv){ try{ DJ._pv.pause(); }catch(e){} } DJ._pv = new Audio(t.url); setVol(DJ._pv, 0.8); DJ._pv.play().catch(function(){}); flash('Previewing “' + t.title + '” on your device only.'); };
+function renderDJ(){ var b = document.getElementById('djRoot'); if(!b) return; var y = window.scrollY; b.innerHTML = pageInner(); window.scrollTo(0, y); }
+function pageInner(){
+  if(!DJ.loaded) return '<div style="padding:30px;text-align:center;color:#64748b">Loading the DJ Room…</div>';
+  var s = DJ.state[DJ.sel] || {}, e = eff(DJ.sel), p = e ? position(e) : null, rules = s.rules || {}, q = curQueue().map(T).filter(Boolean), live = !!(s.dj && s.dj.live);
+  var start = p ? p.i : (s.pausedIdx || 0), show = []; for(var k = 0; k < Math.min(q.length, 5); k++) show.push({ t:q[(start + k) % q.length], k:k });
+  var h = airHtml();
+  h += '<div class="dj-main"><div class="dj-grid">';
+  // 1 radio
+  h += '<section class="dj-deck" style="--c:#2f6bff"><div class="dj-dh"><div class="dj-t">🔵 1 · ROOM RADIO</div><div class="dj-w">Plays songs for everyone at the same time: while they wait, before you arrive, and after they join. Runs by itself.</div></div><div class="dj-db">'
+    + show.map(function(x){ var t = x.t, now0 = x.k === 0 && p; return '<div class="dj-q"><div class="dj-art" style="background:' + (ACOL[t.artist] || '#0f766e') + '">' + (x.k === 0 && p ? '▶' : (x.k + 1)) + '</div><div class="dj-nm"><b>' + esc(t.title) + '</b><small>' + esc(t.artist || '') + ' · ' + fmt(t.seconds) + '</small>' + (now0 ? '<div class="dj-prog"><i style="width:' + Math.min(100, p.off / t.seconds * 100) + '%"></i></div>' : '') + '</div><span class="dj-tag' + (now0 ? ' now' : '') + '">' + (now0 ? 'NOW' : x.k === 0 ? 'FIRST' : x.k === 1 ? 'NEXT' : '#' + (x.k + 1)) + '</span></div>'; }).join('')
+    + '<div class="dj-row"><button class="dj-btn dj-pri" onclick="djPlay()">' + (e && e.src === 'radio' && !e.fadeAt ? '⏸ Pause' : '▶ Play') + '</button><button class="dj-btn dj-soft" onclick="djSkip()">⏭ Skip</button><button class="dj-btn dj-soft" onclick="djShuffle()">🔀 Shuffle</button><button class="dj-btn dj-soft" onclick="djFade(30)">🌙 Fade out (30 sec)</button></div>'
+    + '<label class="dj-lbl" for="djVolR">Volume for everyone · <span id="djVolV">' + (s.vol == null ? 70 : s.vol) + '</span>%</label><input id="djVolR" type="range" min="0" max="100" value="' + (s.vol == null ? 70 : s.vol) + '" oninput="djVol(this.value)">'
+    + '<div class="dj-lbl">Auto rules</div>'
+    + '<label class="dj-chk"><input type="checkbox" ' + (rules.autoStart !== false ? 'checked' : '') + ' onchange="djRule(\'autoStart\',this.checked)"> Start 15 min before each scheduled call (National Mon · Lifeline Wed &amp; Fri · 9:00 CST)</label>'
+    + '<label class="dj-chk"><input type="checkbox" ' + (rules.keepAfterJoin !== false ? 'checked' : '') + ' onchange="djRule(\'keepAfterJoin\',this.checked)"> Keep playing after I join</label>'
+    + '<label class="dj-chk"><input type="checkbox" ' + (rules.fadeOnUnmute ? 'checked' : '') + ' onchange="djRule(\'fadeOnUnmute\',this.checked)"> Fade out when I unmute in the call</label></div></section>';
+  // 2 dj
+  h += '<section class="dj-deck" style="--c:#8b5cf6"><div class="dj-dh"><div class="dj-t">🟣 2 · DJ MODE (LIVE)</div><div class="dj-w">You run the music live and talk over it like a radio host. Going live takes over from Room Radio.</div></div><div class="dj-db">'
+    + '<div class="dj-row" style="justify-content:space-between"><span class="dj-status' + (live ? ' live' : '') + '">' + (live ? 'LIVE · you are the DJ' : 'OFF · Room Radio is in charge') + '</span><button class="dj-btn dj-pri" onclick="djLive()">' + (live ? '↩ Hand back to Radio' : '🎙 GO LIVE AS DJ') + '</button></div>'
+    + '<label class="dj-lbl" for="djVolD">Music volume · same slider as Room Radio</label><input id="djVolD" type="range" min="0" max="100" value="' + (s.vol == null ? 70 : s.vol) + '" oninput="djVol(this.value)">'
+    + '<div class="dj-row"><button class="dj-btn dj-soft" id="djTalk" onpointerdown="djTalkDown(event)" onpointerup="djTalkUp()" onpointerleave="djTalkUp()" onpointercancel="djTalkUp()">🗣 Hold to talk over</button><button class="dj-btn dj-soft" onclick="djSkip(true)">🎚 Crossfade to next</button></div>'
+    + '<div class="dj-note">Holding “talk over” drops the music to 25% for everyone so your voice comes through. Talk in the call as normal; the music never goes through your mic.</div></div></section>';
+  // 3 pads
+  h += '<section class="dj-deck" style="--c:#f26b1d"><div class="dj-dh"><div class="dj-t">🟠 3 · HYPE PADS</div><div class="dj-w">One tap plays a sound everyone in ' + esc(roomName(DJ.sel)) + ' hears right now, on top of the music.</div></div><div class="dj-db"><div class="dj-pads">'
+    + PADS.map(function(pd){ var sub = pd[0] === 'walkin' && rules.walkinTrack && T(rules.walkinTrack) ? 'now: ' + T(rules.walkinTrack).title : pd[4]; return '<button class="dj-pad" style="background:' + pd[3] + '" onclick="djPad(\'' + pd[0] + '\')"><span>' + pd[1] + '</span>' + pd[2] + '<small>' + esc(sub) + '</small></button>'; }).join('')
+    + '</div><label class="dj-chk"><input type="checkbox" ' + (rules.walkin !== false ? 'checked' : '') + ' onchange="djRule(\'walkin\',this.checked)"> Play the walk-in sound automatically when someone joins the call (while you’re hosting)</label>'
+    + (rules.walkinTrack ? '<button class="dj-mini" onclick="djWalkin(null)">Walk-in back to the hit sound</button>' : '') + '</div></section>';
+  // 4 library
+  var mine = DJ.tracks.filter(function(t){ return t.grp === 'artist' && t.active; }), hype = DJ.tracks.filter(function(t){ return t.grp === 'hype' && t.active; }), sfx = DJ.tracks.filter(function(t){ return t.kind === 'sfx' && t.active; });
+  var artists = ARTISTS.concat(mine.map(function(t){ return t.artist; }).filter(function(a, i, l){ return a && ARTISTS.indexOf(a) < 0 && l.indexOf(a) === i; }));
+  h += '<section class="dj-deck" style="--c:#14a37f"><div class="dj-dh"><div class="dj-t">🟢 4 · MUSIC LIBRARY</div><div class="dj-w">Where songs live. Send a song to Room Radio, play it now, or make it the walk-in. Nothing plays from this box by itself.</div></div><div class="dj-db">'
+    + '<div class="dj-tabs">' + [['artists', '🎤 My Artists'], ['hype', '🔥 Hype Music'], ['sfx', '🔊 Sound Effects'], ['up', '⬆ Upload']].map(function(t){ return '<button class="' + (DJ.tab === t[0] ? 'on' : '') + '" onclick="djTab(\'' + t[0] + '\')">' + t[1] + '</button>'; }).join('') + '</div>';
+  if(DJ.tab === 'artists') h += '<div class="dj-artists">' + artists.map(function(a){ var n = mine.filter(function(t){ return t.artist === a; }).length; return '<div class="dj-ac"><div class="dj-av" style="background:' + (ACOL[a] || '#334155') + '">' + esc(a.split(' ').map(function(w){ return w[0]; }).join('').slice(0, 2)) + '</div><b>' + esc(a) + '</b><small>' + (n ? n + ' song' + (n > 1 ? 's' : '') : 'no songs yet') + '</small></div>'; }).join('') + '</div>'
+    + (mine.length ? mine.map(function(t){ return trackRow(t, { rm:true }); }).join('') : '<div class="dj-note">No artist songs yet. Tap ⬆ Upload to add your first one.</div>');
+  if(DJ.tab === 'hype') h += hype.map(function(t){ return trackRow(t, { rm:true }); }).join('') + '<div class="dj-note">Real recordings from Mixkit (free for business use, no credit needed).</div>';
+  if(DJ.tab === 'sfx') h += sfx.map(function(t){ return trackRow(t); }).join('') + '<div class="dj-note">These play from the Hype Pads. Preview plays on your device only.</div>';
+  if(DJ.tab === 'up') h += '<label class="dj-lbl" for="djArtist">Artist</label><select id="djArtist" class="dj-in" onchange="document.getElementById(\'djNewArtist\').hidden=this.value!==\'__new\'">' + artists.map(function(a){ return '<option>' + esc(a) + '</option>'; }).join('') + '<option value="__new">+ New artist…</option></select><input id="djNewArtist" class="dj-in" placeholder="New artist name" hidden>'
+    + '<label class="dj-lbl" for="djTitle">Song title (optional)</label><input id="djTitle" class="dj-in" placeholder="Uses the file name if blank">'
+    + '<label class="dj-lbl" for="djFile">Song file (MP3 or M4A, up to 50 MB)</label><input id="djFile" type="file" accept="audio/*" class="dj-in"><button class="dj-btn dj-pri" id="djUpBtn" onclick="djUpload()">⬆ Upload song</button>'
+    + '<div class="dj-note">Your own artists = you own the rights. No radio hits; those need a license.</div>';
+  h += '</div></section>';
+  h += '<section class="dj-deck dj-wide" style="--c:#94a3b8"><div class="dj-dh"><div class="dj-t">⚫ 5 · STUDIO · PODCAST <span class="dj-tag">COMING NEXT</span></div><div class="dj-w">Record interviews with agents and managers, let AI clean the sound, write captions and cut promo clips.</div></div><div class="dj-db dj-row" style="justify-content:center"><button class="dj-btn" disabled>⏺ Record interview</button><button class="dj-btn" disabled>✨ AI clean-up</button><button class="dj-btn" disabled>✂ Make promo clips</button></div></section>';
+  h += '</div><aside class="dj-side"><div class="dj-t" style="color:#0b1b3f">WHAT’S HAPPENING</div><div id="djTip" class="dj-tip">' + esc(flashMsg || 'Pick a call at the top, then tap ▶ Play on Room Radio.') + '</div>'
+    + '<div class="dj-lbl">What agents see</div><div class="dj-agent"><b>' + esc(roomName(DJ.sel)) + '</b><div>🔵 WMAM Radio · ' + (p ? esc(p.t.title) + ' · ' + esc(p.t.artist || '') : 'nothing playing') + '</div></div>'
+    + '<div class="dj-note">Agents hear the music in the waiting room and inside the call, each on their own device, perfectly in sync. Each person can turn it down or mute it for themselves.</div></aside></div>';
+  return h;
+}
+var CSS = '.dj-wrap{max-width:1180px;margin:0 auto;padding:4px 0 30px;font-family:Arial,Helvetica,sans-serif;color:#0b1b3f}.dj-air{background:#0b1020;color:#fff;border-radius:14px;padding:12px 14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin:10px 0 14px}.dj-airL{display:flex;gap:12px;align-items:center;min-width:0;flex:1 1 380px}.dj-airL b{display:block;overflow-wrap:anywhere}.dj-airL small{color:#94a3b8}'
+  + '.dj-lamp{font-weight:900;letter-spacing:2px;font-size:.78rem;border-radius:6px;padding:6px 10px;background:#2a2f3a;color:#6b7686;white-space:nowrap}.dj-lamp.on{background:#ef4444;color:#fff;box-shadow:0 0 16px rgba(239,68,68,.6)}.dj-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.dj-sel,.dj-in{border:1px solid #cbd5e1;border-radius:10px;padding:9px 10px;font-weight:700;max-width:100%}.dj-air .dj-sel{background:#1e293b;color:#fff;border-color:#334155}'
+  + '.dj-chk{display:flex;gap:8px;align-items:center;font-size:.86rem}.dj-air .dj-chk{color:#cbd5e1}.dj-btn{border:0;border-radius:10px;padding:10px 14px;font-weight:800;cursor:pointer;font-size:.86rem;background:#e2e8f0;color:#0b1b3f}.dj-btn[disabled]{opacity:.5;cursor:not-allowed}.dj-stop{background:#ef4444;color:#fff}.dj-pri{background:var(--c);color:#fff}.dj-soft{background:color-mix(in srgb,var(--c) 14%,#fff);color:var(--c)}'
+  + '.dj-main{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px;align-items:start}@media(max-width:980px){.dj-main{grid-template-columns:1fr}}.dj-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}@media(max-width:760px){.dj-grid{grid-template-columns:1fr}}.dj-wide{grid-column:1/-1}'
+  + '.dj-deck{background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 2px 10px rgba(15,23,42,.07);min-width:0}.dj-dh{background:var(--c);color:#fff;padding:12px 14px}.dj-t{font-weight:900;letter-spacing:1px}.dj-w{font-size:.82rem;opacity:.95;margin-top:2px}.dj-db{padding:12px 14px;display:flex;flex-direction:column;gap:9px}'
+  + '.dj-q,.dj-song{display:flex;gap:9px;align-items:center;padding:6px 0;border-bottom:1px dashed #e2e8f0;min-width:0;flex-wrap:wrap}.dj-art{width:34px;height:34px;border-radius:8px;flex:0 0 34px;display:grid;place-items:center;color:#fff;font-weight:900;font-size:.8rem}.dj-nm{flex:1 1 140px;min-width:0}.dj-nm b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dj-nm small{color:#64748b}'
+  + '.dj-tag{font-size:.66rem;font-weight:900;letter-spacing:1px;border-radius:99px;padding:3px 8px;background:#f1f5f9;color:#475569}.dj-tag.now{background:#2f6bff;color:#fff}.dj-prog{height:5px;background:#e2e8f0;border-radius:99px;overflow:hidden;margin-top:4px}.dj-prog i{display:block;height:100%;background:#2f6bff}'
+  + '.dj-lbl{font-size:.7rem;font-weight:800;letter-spacing:1.5px;color:#64748b;text-transform:uppercase}.dj-db input[type=range]{width:100%;accent-color:var(--c)}.dj-status{font-size:.8rem;border-radius:8px;padding:6px 9px;background:#f1f5f9;color:#475569;font-weight:700}.dj-status.live{background:#8b5cf6;color:#fff}.dj-note{font-size:.8rem;color:#64748b}'
+  + '.dj-pads{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.dj-pad{border:0;border-radius:12px;padding:12px 6px;color:#fff;font-weight:900;font-size:.84rem;cursor:pointer;line-height:1.2}.dj-pad span{display:block;font-size:1.5rem;margin-bottom:3px}.dj-pad small{display:block;font-weight:600;font-size:.68rem;opacity:.92;margin-top:3px}.dj-pad:active{transform:scale(.97)}'
+  + '.dj-tabs{display:flex;gap:6px;flex-wrap:wrap}.dj-tabs button{border:1px solid #cbd5e1;background:#fff;border-radius:99px;padding:7px 12px;font-weight:800;font-size:.8rem;cursor:pointer}.dj-tabs button.on{background:#0b1b3f;color:#fff;border-color:#0b1b3f}'
+  + '.dj-artists{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px}.dj-ac{border:1px solid #e2e8f0;border-radius:12px;padding:9px 6px;text-align:center;font-size:.8rem;display:flex;flex-direction:column;align-items:center;gap:3px}.dj-ac small{color:#64748b}.dj-av{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;color:#fff;font-weight:900}'
+  + '.dj-mini{border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:6px 9px;font-weight:800;font-size:.74rem;cursor:pointer}.dj-rm{color:#b91c1c;border-color:#fecaca}.dj-side{background:#fff;border-radius:16px;padding:14px;box-shadow:0 2px 10px rgba(15,23,42,.07);display:flex;flex-direction:column;gap:9px;position:sticky;top:12px}'
+  + '.dj-tip{background:#f1f5f9;border-radius:10px;padding:10px;font-size:.88rem;min-height:3em}.dj-agent{background:#0b1020;color:#fff;border-radius:12px;padding:10px;font-size:.86rem}'
+  + '#djRoot .dj-q,#djRoot .dj-song{flex-direction:row!important;text-align:left!important;align-items:center!important;justify-content:flex-start!important}#djRoot .dj-q{flex-wrap:nowrap!important}#djRoot .dj-nm,#djRoot .dj-nm b,#djRoot .dj-nm small{text-align:left!important}#djRoot .dj-art{margin:0!important;width:34px!important;min-width:34px!important;height:34px!important;flex:0 0 34px!important}'
+  + '#djRadioCard .djr-eq{display:flex;gap:3px;align-items:flex-end;height:24px}#djRadioCard .djr-eq i{width:5px;background:#22e39b;border-radius:2px;animation:djeq 1s infinite ease-in-out}#djRadioCard .djr-eq i:nth-child(2){animation-delay:.2s}#djRadioCard .djr-eq i:nth-child(3){animation-delay:.4s}#djRadioCard .djr-eq i:nth-child(4){animation-delay:.1s}@keyframes djeq{0%,100%{height:25%}50%{height:100%}}#djRadioCard.off .djr-eq i{animation:none;height:20%;background:#475569}'
+  + '#djCallChip{position:absolute;left:12px;bottom:12px;z-index:5;background:rgba(11,16,32,.88);color:#fff;border:1px solid rgba(255,255,255,.15);border-radius:999px;padding:6px 10px;display:flex;gap:8px;align-items:center;font:700 .8rem Arial,sans-serif;max-width:calc(100% - 24px)}#djCallChip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:46vw}#djCallChip button{background:#1e293b;color:#fff;border:0;border-radius:999px;padding:4px 9px;cursor:pointer;font-weight:800}';
+function css(){ if(document.getElementById('djCss')) return; var st = document.createElement('style'); st.id = 'djCss'; st.textContent = CSS; document.head.appendChild(st); }
+function panelDJ(){ css(); if(!owner()) return (typeof panelHeader === 'function' ? panelHeader('🎧 DJ Room') : '') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:#888">🔒 Owner only.</div></div>';
+  if(!DJ.loaded){ boot().then(renderDJ); }
+  setTimeout(function(){ measure(); }, 1500);
+  return (typeof panelHeader === 'function' ? panelHeader('🎧 DJ Room') : '') + '<div class="dj-wrap"><div style="text-align:center;color:#475569;font-size:.9rem">Each color box does one job, written under its name. What you do here is heard by everyone in the call you pick.</div><div id="djRoot">' + pageInner() + '</div></div>'; }
+window.panelDJRoom = panelDJ;
+setInterval(function(){ if(onDJ()){ var r = document.getElementById('djRoot'); if(r && !r.contains(document.activeElement)) renderDJ(); else renderAir(); } }, 3000);
+
+// ───────── listeners: waiting room card + in-call chip (replaces the old hold music completely) ─────────
+function paintRadio(room, e, p){
+  var card = document.getElementById('djRadioCard');
+  if(card){ var on = !!(p && level(room, e) > 0.001); card.className = on ? '' : 'off';
+    var t = document.getElementById('djrTitle'), a = document.getElementById('djrArtist'), hint = document.getElementById('djrHint');
+    if(t) t.textContent = on ? p.t.title : (room ? 'Music starts before the call' : '—'); if(a) a.textContent = on ? (p.t.artist || '') : 'The host controls the music';
+    if(hint) hint.hidden = !DJ.needTap; }
+  var m = document.getElementById('videoCallModal'), c = document.getElementById('jitsiContainer'), chip = document.getElementById('djCallChip');
+  var show = !!(DJ.room && inCall() && p && level(room, e) > 0.001);
+  if(show && !chip && c && c.parentNode){ chip = document.createElement('div'); chip.id = 'djCallChip'; c.parentNode.style.position = c.parentNode.style.position || 'relative'; c.parentNode.appendChild(chip); }
+  if(chip){ if(!show){ chip.remove(); } else { var h = '🎵 <span>' + esc(p.t.title) + '</span><button onclick="djMuteMe()">' + (DJ.muted ? '🔈 Music on' : '🔇 Mute music') + '</button>'; if(chip.getAttribute('data-h') !== h){ chip.setAttribute('data-h', h); chip.innerHTML = h; } } }
+}
+window.djMuteMe = function(){ DJ.muted = !DJ.muted; DJ.curKey = ''; tick(); };
+window.djLocalVol = function(v){ DJ.local = Math.max(0, Math.min(1, v / 100)); DJ.muted = false; tick(); try{ localStorage.setItem('wmam_dj_local', String(v)); }catch(e){} };
+try{ var lv = localStorage.getItem('wmam_dj_local'); if(lv != null) DJ.local = Math.max(0, Math.min(1, +lv / 100)); }catch(e){}
+function radioCard(){
+  return '<div id="djRadioCard" class="off" style="background:rgba(255,255,255,.06);border:1px solid rgba(96,165,250,.25);border-radius:14px;padding:16px 18px;width:100%;max-width:480px;margin-bottom:22px;color:#fff;text-align:left;font-family:Arial,Helvetica,sans-serif">'
+    + '<div style="font-size:.66rem;letter-spacing:2.5px;color:#93c5fd;font-weight:800">🔵 WMAM RADIO · EVERYONE HEARS THIS</div>'
+    + '<div style="display:flex;gap:12px;align-items:center;margin-top:8px"><div class="djr-eq"><i></i><i></i><i></i><i></i></div><div style="min-width:0;flex:1"><div id="djrTitle" style="font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">—</div><div id="djrArtist" style="font-size:.8rem;color:#94a3b8">The host controls the music</div></div></div>'
+    + '<div style="display:flex;gap:8px;align-items:center;margin-top:12px"><span style="font-size:.9rem">🔈</span><input type="range" min="0" max="100" value="' + Math.round(DJ.local * 100) + '" oninput="djLocalVol(this.value)" aria-label="Music volume for me" style="flex:1;accent-color:#60A5FA"><button onclick="djMuteMe()" style="background:#1e293b;color:#fff;border:1px solid #334155;border-radius:8px;padding:6px 10px;font-weight:800;cursor:pointer">Mute for me</button></div>'
+    + '<div id="djrHint" hidden style="margin-top:10px;background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.4);border-radius:8px;padding:8px 10px;font-size:.84rem">👆 Tap anywhere to turn the music on</div></div>'; }
+function replaceOldPlayer(){ var np = document.getElementById('wr-now-playing'); if(!np) return !!document.getElementById('djRadioCard'); var card = np.parentNode; if(!card) return false; var d = document.createElement('div'); d.innerHTML = radioCard(); card.parentNode.replaceChild(d.firstChild, card); return true; }
+// the old player is gone: its functions do nothing now
+['wrPlayTrack', 'wrTogglePlay', 'wrNext', 'wrPrev', 'wrSeek', 'wrPlayStream', 'wrAutoStartMusic', 'wrShowTapToPlay', 'wrUserStartMusic'].forEach(function(n){ try{ window[n] = function(){}; }catch(e){} });
+try{ wrPlayTrack = wrTogglePlay = wrNext = wrPrev = wrSeek = wrPlayStream = wrAutoStartMusic = wrShowTapToPlay = wrUserStartMusic = function(){}; }catch(e){}
+try{ WR_PLAYLIST = []; WR_STATIONS = []; }catch(e){}
+// which room this person is in
+if(typeof showWaitingRoom === 'function'){ var oSW = showWaitingRoom; window.showWaitingRoom = showWaitingRoom = function(chId){ replaceOldPlayer(); DJ.room = chId; DJ.curKey = ''; var r = oSW.apply(this, arguments); setTimeout(function(){ tick(); trackMe(); }, 50); return r; }; }
+if(typeof launchJitsi === 'function'){ var oLJ = launchJitsi; window.launchJitsi = launchJitsi = function(chId){ if(chId) DJ.room = chId; var r = oLJ.apply(this, arguments); setTimeout(function(){ tick(); trackMe(); }, 1500); return r; }; }
+if(typeof closeVideoCall === 'function'){ var oCV = closeVideoCall; window.closeVideoCall = closeVideoCall = function(){ DJ.room = null; stopAll(); var ch = document.getElementById('djCallChip'); if(ch) ch.remove(); var r = oCV.apply(this, arguments); trackMe(); return r; }; }
+// host extras inside the call: walk-in sound, keep / fade on join, fade when you unmute
+(function wrapDaily(n){ var D = window.DailyIframe; if(!D || typeof D.createFrame !== 'function'){ if(n < 60) setTimeout(function(){ wrapDaily(n + 1); }, 1000); return; } if(D._djWrap) return; var oc = D.createFrame;
+  D.createFrame = function(){ var f = oc.apply(D, arguments); try{ hookHost(f); }catch(e){} return f; }; D._djWrap = true; })(0);
+function hookHost(f){ if(!f || !f.on) return; var lastWalk = 0, wasMuted = true;
+  f.on('participant-joined', function(){ if(!owner() || !DJ.room) return; var s = DJ.state[DJ.room] || {}, r = s.rules || {}; if(r.walkin === false || Date.now() - lastWalk < 6000) return; lastWalk = Date.now(); var keep = DJ.sel; DJ.sel = DJ.room; firePad('walkin'); DJ.sel = keep; });
+  f.on('joined-meeting', function(){ if(!owner() || !DJ.room) return; var s = DJ.state[DJ.room] || {}, r = s.rules || {}; trackMe(); if(r.keepAfterJoin === false && eff(DJ.room)){ var keep = DJ.sel; DJ.sel = DJ.room; window.djFade(10); DJ.sel = keep; } });
+  f.on('participant-updated', function(ev){ var p = ev && ev.participant; if(!p || !p.local || !owner() || !DJ.room) return; var s = DJ.state[DJ.room] || {}, r = s.rules || {}; var on = !!p.audio;
+    if(on && wasMuted && r.fadeOnUnmute && eff(DJ.room)){ var keep = DJ.sel; DJ.sel = DJ.room; window.djFade(10); DJ.sel = keep; } wasMuted = !on; }); }
+
+// ───────── menu + routing (replaces "Waiting Room Music") ─────────
+try{ (WMAM_NAV || []).forEach(function(sec){ (sec.cards || []).forEach(function(card){ if(!Array.isArray(card.tabs)) return;
+  card.tabs = card.tabs.filter(function(t){ return t[0] !== 'wr-music'; });
+  if(card.title === 'Meetings & Calls' && !card.tabs.some(function(t){ return t[0] === 'dj-room'; })) card.tabs.push(['dj-room', '🎧 DJ Room']); }); }); }catch(e){}
+if(typeof _wmamIdAllowed === 'function'){ var oId = _wmamIdAllowed; _wmamIdAllowed = function(id){ if(id === 'dj-room') return owner(); if(id === 'wr-music') return false; return oId.apply(this, arguments); }; }
+if(typeof _wmamTabAllowed === 'function'){ var oTab = _wmamTabAllowed; _wmamTabAllowed = function(u, id){ if(id === 'dj-room'){ try{ return isOwner(u); }catch(e){ return false; } } if(id === 'wr-music') return false; return oTab.apply(this, arguments); }; }
+if(typeof canAccess === 'function'){ var oCan = canAccess; canAccess = function(u, area){ if(area === 'dj-room'){ try{ return isOwner(u); }catch(e){ return false; } } if(area === 'wr-music') return false; return oCan.apply(this, arguments); }; window.canAccess = canAccess; }
+if(typeof gotoPanel === 'function'){ var oGo = gotoPanel; window.gotoPanel = gotoPanel = function(id){ if(id === 'wr-music') id = 'dj-room'; var a = [].slice.call(arguments); a[0] = id; return oGo.apply(this, a); }; }
+if(typeof panelBO === 'function'){ var oBO = panelBO; panelBO = function(){ if(window._currentPanelId === 'dj-room') return panelDJ(); return oBO.apply(this, arguments); }; window.panelBO = panelBO; }
+
+// ───────── start ─────────
+var booting = null;
+function boot(){ if(booting) return booting; booting = (async function(){ await clock(); await load(); subscribe(); setInterval(clock, 300000); setInterval(load, 120000); tick(); })(); return booting; }
+(function wait(n){ try{ if(me() && typeof supaClient !== 'undefined'){ boot(); return; } }catch(e){} if(n < 120) setTimeout(function(){ wait(n + 1); }, 1000); })(0);
+}catch(e){ console.warn('[dj room]', e); } })();
 
 </script>
 </body>
