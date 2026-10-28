@@ -3888,7 +3888,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.28.2470';
+var BUILD_VERSION = '2026.10.28.2480';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -15540,8 +15540,8 @@ function _invxHolderName(d){
   return d.holderName || 'Warehouse (not assigned)';
 }
 function _invxDaysLeft(d){
-  if(!d.expiryDate) return null;
-  var t = new Date(String(d.expiryDate).slice(0,10)+'T12:00:00'), n = new Date(_ctToday()+'T12:00:00');
+  if(d.needsManualDate || !(d.chargeDate || d.expiryDate)) return null;
+  var t = new Date(String(_gmIso(d.chargeDate || d.expiryDate) || '').slice(0,10)+'T12:00:00'), n = new Date(_ctToday()+'T12:00:00');
   if(isNaN(t)) return null; return Math.round((t - n) / 86400000);
 }
 function _invxRows(){
@@ -17041,7 +17041,7 @@ function wmamTeamInvData(user){
   var mkOf = function(k, name){ return markets[k] = markets[k] || { key:k, name:name || 'No market set', total:0, people:{} }; };
   var local = _wmamMktKey(user.team || user.market || '');
   if(user.role === 'Market Manager' && S.marketBased && !S.markets[local]){ var _mk0 = Object.keys(S.markets)[0]; if(_mk0) local = _mk0; }   // MM's home = their assigned market
-  S.available.forEach(function(d){
+  S.available.concat(S.expiredList || []).forEach(function(d){   /* v2480: expired phones stay listed under the person who holds them */
     try{ if(typeof wmamApplyGMDates === 'function') wmamApplyGMDates(d); }catch(e){}
     var k = _wmamMktKey(d.market) || 'nomarket', M = mkOf(k, (d.market ? wmamMarketNameFor(d.market) : '') || 'No market set');
     var h = _wmamHolderOf(d), hk = h == null ? 'unassigned' : String(h);
@@ -31687,7 +31687,7 @@ function gmGetUnassignedDevices(market){
 }
 function gmDeviceDaysLeft(device){
   if(device && device.needsManualDate) return null;
-  if(device && device.chargeDate && typeof wmamDaysUntil==='function') return wmamDaysUntil(device.chargeDate);
+  if(device && (device.chargeDate || device.expiryDate)) return invDaysRemaining(device.chargeDate || device.expiryDate); /* v2480 */
   var u = DB.current;
   if(!u) return null;
   var expiresAt = null;
@@ -31702,7 +31702,7 @@ function gmDeviceDaysLeft(device){
     expiresAt = device.agentExpiresAt||device.tlExpiresAt||device.mmExpiresAt;
   }
   if(!expiresAt) return null;
-  return Math.ceil((new Date(expiresAt)-new Date())/86400000);
+  return invDaysRemaining(expiresAt); /* v2480: Central days */
 }
 // ── Vendor expiry visibility (Calvin 2026-07-14) ──
 // Devices carry TWO dates: vendorDueDate (the REAL return-by date from the
@@ -32804,7 +32804,7 @@ function inventorySummary(user){
       var x = gmDeviceDaysLeft(d);
       if(x !== null && !isNaN(x)) return x;
     }
-    return invDaysRemaining(d.expiryDate, d.assignedDate);
+    return invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
   }
 
   var sold       = all.filter(_isSoldStatus).length + lg.filter(_isSoldStatus).length;
@@ -32815,6 +32815,7 @@ function inventorySummary(user){
   var activated  = all.filter(function(d){return d.status==='activated';}).length
                  + lg.filter(function(d){return d.status==='activated';}).length;
   function _isExpiringDays(d, lo, hi){
+    if(typeof wmamDevState === 'function' && wmamDevState(d) !== 'available') return false; /* v2480: sold / expired never count as "expiring" */
     var dy = _daysLeft(d);
     return dy!==null && dy>=lo && dy<=hi;
   }
@@ -32823,12 +32824,10 @@ function inventorySummary(user){
   var expiring10 = all.filter(function(d){return _isExpiringDays(d,0,10);}).length
                  + lg.filter(function(d){return _isExpiringDays(d,0,10);}).length;
   var expired    = all.filter(function(d){
-                     var dy = _daysLeft(d);
-                     return dy!==null && dy<0 && d.status==='assigned';
+                     return wmamDevState(d)==='expired'; /* v2480: same rule as every screen */
                    }).length
                  + lg.filter(function(d){
-                     var dy = _daysLeft(d);
-                     return dy!==null && dy<0 && d.status==='assigned';
+                     return wmamDevState(d)==='expired'; /* v2480: same rule as every screen */
                    }).length;
   return {
     total:total, assigned:assigned, unassigned:unassigned, activated:activated, sold:sold,
@@ -32889,7 +32888,7 @@ function inventoryPipelineBreakdown(user){
       var x = gmDeviceDaysLeft(d);
       if(x !== null && !isNaN(x)) return x;
     }
-    return invDaysRemaining(d.expiryDate, d.assignedDate);
+    return invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
   }
 
   // Per-holder accumulator
@@ -33686,7 +33685,7 @@ function devicesHeldBy(agentId, type){
   return out;
 }
 function daysRemaining(device){
-  return Math.ceil((new Date(device.expiryDate) - new Date()) / 86400000);
+  return invDaysRemaining(device && (device.chargeDate || device.expiryDate)); /* v2480: one count everywhere */
 }
 function expiryColor(days){
   if(days<=0)  return '#CC0000';
@@ -53653,14 +53652,9 @@ if(typeof window !== 'undefined') window._normalizeInventoryTypes = _normalizeIn
 function invDaysRemaining(expiryDate, assignedDate){
   if(!expiryDate) return null;
   try{
-    var exp = new Date(expiryDate);
-    if(isNaN(exp.getTime())) return null;
-    var now = new Date();
-    // Zero out time of day so we count whole days, not hours
-    exp.setHours(0,0,0,0);
-    now.setHours(0,0,0,0);
-    var ms  = exp.getTime() - now.getTime();
-    return Math.floor(ms / (1000*60*60*24));
+    /* v2480: same count as every other screen — Central time, the date as written (no UTC shift) */
+    var ymd = (typeof _gmIso === 'function') ? _gmIso(expiryDate) : String(expiryDate).slice(0,10);
+    return ymd ? wmamDaysUntil(ymd) : null;
   }catch(e){ return null; }
 }
 
@@ -53671,8 +53665,9 @@ function invDaysRemaining(expiryDate, assignedDate){
 // which caused "invExpiryBadge is not defined" when Makenzie opened Legacy
 // Dashboard / Inventory Hub.
 function invExpiryBadge(d){
-  if(!d || !d.expiryDate) return '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted2)">—</span>';
-  var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
+  if(d && d.needsManualDate) return '<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:#fee2e2;color:#b91c1c;font-family:Barlow Condensed,sans-serif;font-size:.68rem;letter-spacing:1px;font-weight:700">NEEDS A DATE</span>';
+  if(!d || !(d.chargeDate || d.expiryDate)) return '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted2)">—</span>';
+  var dr = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
   if(dr === null) return '<span style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted2)">—</span>';
   var color, bg, label;
   if(dr < 0){          color='#991B1B'; bg='rgba(153,27,27,.12)';  label='EXPIRED'; }
@@ -53686,11 +53681,12 @@ function invExpiryBadge(d){
 // how much of the device's assigned→expiry window has been used.
 // Returns empty string if either date is missing. Safe on bad dates.
 function invExpiryBar(d){
-  if(!d || !d.expiryDate || !d.assignedDate) return '';
+  if(!d || !(d.chargeDate || d.expiryDate) || !d.assignedDate) return '';
   try{
-    var start = new Date(d.assignedDate); start.setHours(0,0,0,0);
-    var end   = new Date(d.expiryDate);   end.setHours(0,0,0,0);
-    var now   = new Date();               now.setHours(0,0,0,0);
+    var _ymd = function(v){ return new Date(((typeof _gmIso === 'function' ? _gmIso(v) : String(v).slice(0,10)) || '') + 'T12:00:00'); };
+    var start = _ymd(d.assignedDate);
+    var end   = _ymd(d.chargeDate || d.expiryDate);
+    var now   = new Date(_ctToday() + 'T12:00:00');
     var total = end.getTime() - start.getTime();
     var used  = now.getTime() - start.getTime();
     if(total <= 0) return '';
@@ -53716,7 +53712,7 @@ function agentInvSummary(agentId){
     else if(t==='sim') summary[c].sims++;
     else if(t==='upsell') summary[c].upsell++;
     else if(t==='tablet') summary[c].tablets++;
-    var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
+    var dr = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
     if(dr!==null && dr<=10) summary[c].expiringSoon++;
     if(dr!==null && dr<=5)  summary[c].critical++;
   });
@@ -53752,7 +53748,7 @@ function findRedistributableInventory(campaign, excludeAgentId){
     if(devCarrier.toLowerCase()!==(carrier||'').toLowerCase()) return false;
     var holder = DB.agents.find(function(a){return a.id===hid;});
     if(!holder||!holder.active) return false;
-    var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
+    var dr = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
     var isExpiring = dr!==null && dr<=15;
     var isLowPerformer = (holder.sales||0) < 20;
     return isExpiring || isLowPerformer;
@@ -53815,29 +53811,37 @@ function checkInventoryExpiryAlerts(){
   var critical = [], warning = [];
   // Calvin 2026-05-02: union all pools so alerts also fire for devices
   // assigned via campaign-pool path (GM_INVENTORY etc.)
-  unionAllInventoryPools().forEach(function(d){
-    if(d.status!=='assigned') return;
-    var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
-    if(dr===null) return;
-    var hid = d.holderId || d.assignedTo;
-    var holder = DB.agents.find(function(a){return a.id===hid;});
+  var expiredL = [], _scope = {}; _scope[String(u.id)] = 1;
+  try{ (typeof wmamDownline === 'function' ? wmamDownline(u) : []).forEach(function(i){ _scope[String(i)] = 1; }); }catch(e){}
+  (typeof wmamUniqPool === 'function' ? wmamUniqPool() : unionAllInventoryPools()).forEach(function(d){
+    var st = wmamDevState(d); if(st !== 'available' && st !== 'expired') return;   /* v2480: same devices + same count as every screen */
+    var dr = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
+    if(dr===null || d.needsManualDate) return;
+    var hid = _wmamHolderOf(d);
+    var holder = DB.agents.find(function(a){return String(a.id)===String(hid);});
     if(!holder) return;
-    var inScope = isOwner(u)||isInventory(u)||
-      holder.teamLeaderId===u.id||holder.marketManagerId===u.id||
-      holder.campaignManagerId===u.id||holder.id===u.id;
+    var inScope = isOwner(u)||isInventory(u)||!!_scope[String(holder.id)];
     if(!inScope) return;
-    if(dr<=5)  critical.push({d:d, holder:holder, dr:dr});
+    if(dr<0)  expiredL.push({d:d, holder:holder, dr:dr});
+    else if(dr<=5)  critical.push({d:d, holder:holder, dr:dr});
     else if(dr<=10) warning.push({d:d, holder:holder, dr:dr});
   });
 
-  if(critical.length===0 && warning.length===0) return;
+  if(critical.length===0 && warning.length===0 && expiredL.length===0) return;
 
   var bodyLines = '';
+  if(expiredL.length>0){
+    bodyLines += '<div style="color:#7f1d1d;font-weight:700;margin-bottom:8px">\u26d4 EXPIRED — '+expiredL.length+' device(s) already past their date:</div>';
+    var seen0 = {};
+    expiredL.forEach(function(x){ var k = x.holder.name+'|'+(x.d.carrier||x.d.campaign||'Gen Mobile'); seen0[k] = (seen0[k]||0) + 1; });
+    Object.keys(seen0).forEach(function(k){ bodyLines += '<div style="margin-bottom:4px">\u2022 '+_escapeHtml(k.replace('|',' — '))+': '+seen0[k]+' device(s)</div>'; });
+    bodyLines += '<div style="height:8px"></div>';
+  }
   if(critical.length>0){
-    bodyLines += '<div style="color:#CC0000;font-weight:700;margin-bottom:8px">\u26a0\ufe0f CRITICAL — '+critical.length+' device(s) expire in 5 days or less:</div>';
+    bodyLines += '<div style="color:#CC0000;font-weight:700;margin-bottom:8px">\u26a0\ufe0f CRITICAL — '+critical.length+' device(s) expire in 0-5 days:</div>';
     var seen = {};
     critical.forEach(function(x){
-      var k = x.holder.name+'|'+x.d.carrier;
+      var k = x.holder.name+'|'+(x.d.carrier||x.d.campaign||'Gen Mobile');
       if(!seen[k]){ seen[k]=0; }
       seen[k]++;
     });
@@ -53849,7 +53853,7 @@ function checkInventoryExpiryAlerts(){
     bodyLines += '<div style="color:#D97706;font-weight:700;margin:10px 0 8px">\u26a0\ufe0f WARNING — '+warning.length+' device(s) expire in 6-10 days:</div>';
     var seen2 = {};
     warning.forEach(function(x){
-      var k = x.holder.name+'|'+x.d.carrier;
+      var k = x.holder.name+'|'+(x.d.carrier||x.d.campaign||'Gen Mobile');
       if(!seen2[k]){ seen2[k]=0; }
       seen2[k]++;
     });
@@ -54409,7 +54413,7 @@ function _officeTaskDefs(u){
   function pendXfer(){ try{ return (typeof INVENTORY_TRANSFERS!=='undefined'?INVENTORY_TRANSFERS:[]).filter(function(r){return r&&r.status==='pending';}).length; }catch(e){ return 0; } }
   function pendAgents(){ try{ return (DB.agents||[]).filter(function(a){ return a && (String(a.username||'').indexOf('.pending')>=0 || (a._meta&&a._meta.pending)); }).length; }catch(e){ return 0; } }
   function bgQueue(){ try{ return (DB.agents||[]).filter(function(a){ return a && a.active && a.bgStatus==='pending'; }).length; }catch(e){ return 0; } }
-  function expiring(){ try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; var t=new Date(); var soon=new Date(t.getTime()+14*86400000); return pool.filter(function(d){ if(!d||d.deletedAt||d.status==='sold')return false; var e=d.expiryDate?new Date(d.expiryDate):null; return e&&e>t&&e<=soon; }).length; }catch(e){ return 0; } }
+  function expiring(){ try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; var t=new Date(); var soon=new Date(t.getTime()+14*86400000); return pool.filter(function(d){ if(!d||d.deletedAt||d.status==='sold')return false; if(d.needsManualDate)return false; var e=invDaysRemaining(d.chargeDate||d.expiryDate); return e!=null&&e>=0&&e<=14; }).length; }catch(e){ return 0; } }
   var invDefs=[
     {n:pendReq(), l:'Requests to approve', c:'#14b8a6', p:'inv-dashboard', glow:true},
     {n:pendXfer(), l:'Transfers to approve', c:'#14b8a6', p:'inv-dashboard', glow:true},
@@ -54945,7 +54949,7 @@ function panelBO(){
       var topUrgent5 = 0;
       topHeld.forEach(function(d){
         var dy = (typeof gmDeviceDaysLeft === 'function') ? gmDeviceDaysLeft(d) : null;
-        if(dy === null && typeof invDaysRemaining === 'function') dy = invDaysRemaining(d.expiryDate, d.assignedDate);
+        if(dy === null && typeof invDaysRemaining === 'function') dy = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
         if(dy !== null && dy >= 0 && dy <= 5) topUrgent5++;
       });
 
@@ -55098,7 +55102,7 @@ function panelBO(){
     var allBatches   = Object.values(batchMap);
     var totalDevices = _invForUser.total || 0;
     allBatches.sort(function(a,b){
-      var da=invDaysRemaining(a.expiryDate,a.assignedDate),db=invDaysRemaining(b.expiryDate,b.assignedDate);
+      var da=invDaysRemaining(a.chargeDate||a.expiryDate,a.assignedDate),db=invDaysRemaining(b.chargeDate||b.expiryDate,b.assignedDate);
       if(da===null) return 1; if(db===null) return -1; return da-db;
     });
 
@@ -55495,7 +55499,7 @@ function panelBO(){
       var orgIds = []; try{ orgIds = agentIdsInMyOrgEffective(u)||[]; }catch(e){}
       function campSales(a,c,per){ try{ return agentSalesCount(a,{campaign:c,period:per})||0; }catch(e){ return 0; } }
       function orgCamp(c,per){ var t=0; (DB.agents||[]).forEach(function(a){ if(a&&a.active&&orgIds.indexOf(a.id)>=0) t+=campSales(a,c,per); }); return t; }
-      var _sb = {available:0,sold:0,total:0,expired:0,byCampaign:{},expiredWorst:null,expiringSoon:null,_today:new Date().toISOString().slice(0,10)};
+      var _sb = {available:0,sold:0,total:0,expired:0,byCampaign:{},expiredWorst:null,expiringSoon:null,_today:_ctToday()};
       try{ _sb = scoreboardInventory(u); }catch(e){}
       var daysLeftMo = (function(){ var d=new Date(); return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate()-d.getDate(); })();
       var dtStr = (function(){ var d=new Date(); var wd=['SUN','MON','TUE','WED','THU','FRI','SAT'][d.getDay()]; var mo=['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()]; return wd+' '+mo+' '+d.getDate(); })();
@@ -55566,14 +55570,14 @@ function panelBO(){
       });
       b += '</div>';
       if(_sb.expiredWorst){
-        var dEx = Math.round((new Date(((_sb.expiredWorst.expiryDate||'').slice(0,10))+'T00:00:00') - new Date(_sb._today+'T00:00:00'))/86400000);
+        var dEx = Math.round((new Date((_wmamExpYmd(_sb.expiredWorst))+'T00:00:00') - new Date(_sb._today+'T00:00:00'))/86400000);
         var cEx = 0; try{ cEx = Math.round(_deviceChargeCents(_sb.expiredWorst)/100); }catch(e){}
         b += '<div style="margin-top:10px;background:rgba(226,75,74,.16);border:1px solid rgba(226,75,74,.55);border-radius:10px;padding:8px 10px">'
           +'<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:8px;letter-spacing:2px;color:#f7c1c1;text-transform:uppercase;'+LBLF+'">\ud83d\udea8 EXPIRED \u2014 CHARGE PENDING</span><span style="font-size:15px;color:#f09595;font-weight:700;'+NUMF+'">'+dEx+'d</span></div>'
           +'<div style="font-size:10px;color:#ffdada;margin-top:3px;'+LBLF+'">'+_escapeHtml(_sb.expiredWorst.model||'Device')+' \u2026'+_escapeHtml(String(_sb.expiredWorst.imei||'').slice(-4))+(_sb.expiredWorst.holderName?(' \u00b7 '+_escapeHtml(_sb.expiredWorst.holderName)):'')+(cEx?(' \u2014 activate to erase the $'+cEx):'')+'</div></div>';
       }
       if(_sb.expiringSoon){
-        var dSo = Math.round((new Date(((_sb.expiringSoon.expiryDate||'').slice(0,10))+'T00:00:00') - new Date(_sb._today+'T00:00:00'))/86400000);
+        var dSo = Math.round((new Date((_wmamExpYmd(_sb.expiringSoon))+'T00:00:00') - new Date(_sb._today+'T00:00:00'))/86400000);
         if(dSo<=14){
           b += '<div style="margin-top:6px;background:rgba(250,199,117,.1);border:1px solid rgba(250,199,117,.45);border-radius:10px;padding:7px 10px;display:flex;justify-content:space-between;align-items:center">'
             +'<span style="font-size:10px;color:#ffe9c2;'+LBLF+'">\u23f3 '+_escapeHtml(_sb.expiringSoon.model||'Device')+' \u2026'+_escapeHtml(String(_sb.expiringSoon.imei||'').slice(-4))+' \u2014 sell first</span>'
@@ -55683,12 +55687,12 @@ function panelBO(){
       var ahead = _ri2.ahead;
       var gap = _ri2.gap;
       // expiring / expired (my devices)
-      var today = new Date().toISOString().slice(0,10);
+      var today = _ctToday();
       var soon=null, expd=null;
       mine.forEach(function(d){
-        var e=(d.expiryDate||'').slice(0,10); if(!e) return;
-        if(e < today){ if(!expd || e < (expd.expiryDate||'').slice(0,10)) expd=d; }
-        else { if(!soon || e < (soon.expiryDate||'').slice(0,10)) soon=d; }
+        var e=_wmamExpYmd(d); if(!e) return;
+        if(e < today){ if(!expd || e < _wmamExpYmd(expd)) expd=d; }
+        else { if(!soon || e < _wmamExpYmd(soon)) soon=d; }
       });
       function _days(e){ return Math.round((new Date(e+'T00:00:00') - new Date(today+'T00:00:00'))/86400000); }
       var wkGoalLeft = Math.max(0, wkGoal-wkTotal);
@@ -55731,13 +55735,13 @@ function panelBO(){
         b += '<div style="margin:9px 14px 0;background:rgba(226,75,74,.15);border:1px solid rgba(226,75,74,.55);border-radius:12px;padding:8px 13px;display:flex;justify-content:space-between;align-items:center">'
           +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;color:#f7c1c1">\ud83d\udea8 EXPIRED \u2014 CHARGE PENDING</span>'
           +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.72rem;color:#fff;font-weight:700">'+_escapeHtml(expd.model||'Device')+' \u2026'+_escapeHtml(String(expd.imei||'').slice(-4))+(cost?' \u2014 activate to erase the $'+cost:'')+'</span>'
-          +'<span style="'+orb+'font-size:.85rem;color:#f09595;font-weight:700">'+_days((expd.expiryDate||'').slice(0,10))+'d</span></div>';
+          +'<span style="'+orb+'font-size:.85rem;color:#f09595;font-weight:700">'+_days(_wmamExpYmd(expd))+'d</span></div>';
       }
-      if(soon && _days((soon.expiryDate||'').slice(0,10)) <= 14){
+      if(soon && _days(_wmamExpYmd(soon)) <= 14){
         b += '<div style="margin:7px 14px 0;background:rgba(250,199,117,.1);border:1px solid rgba(250,199,117,.45);border-radius:12px;padding:8px 13px;display:flex;justify-content:space-between;align-items:center">'
           +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.5rem;letter-spacing:2px;color:#fac775">\u23f3 EXPIRING SOON</span>'
           +'<span style="font-family:Oswald,Arial,sans-serif;font-size:.72rem;color:#fff;font-weight:700">'+_escapeHtml(soon.model||'Device')+' \u2026'+_escapeHtml(String(soon.imei||'').slice(-4))+' \u2014 sell it first</span>'
-          +'<span style="'+orb+'font-size:.85rem;color:#fac775;font-weight:700">'+_days((soon.expiryDate||'').slice(0,10))+'d</span></div>';
+          +'<span style="'+orb+'font-size:.85rem;color:#fac775;font-weight:700">'+_days(_wmamExpYmd(soon))+'d</span></div>';
       }
       // bottom: devices total + request + points
       var pts = 0; try{ pts = (typeof pointsBalance==='function') ? (pointsBalance(u.id)||0) : 0; }catch(e){}
@@ -56355,7 +56359,7 @@ function panelBO(){
       html += '<th style="padding:8px 12px;text-align:left;font-size:.66rem;letter-spacing:2px;text-transform:uppercase;color:var(--brown)">Days Left</th>';
       html += '</tr></thead><tbody>';
       bulletproofDevices.slice(0, 25).forEach(function(d){
-        var dy = (typeof invDaysRemaining === 'function') ? invDaysRemaining(d.expiryDate, d.assignedDate) : null;
+        var dy = (typeof invDaysRemaining === 'function') ? invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate) : null;
         var dayColor = dy === null ? 'var(--muted)' : (dy < 0 ? '#cc0000' : (dy <= 5 ? '#cc0000' : (dy <= 10 ? '#d97706' : '#059669')));
         var dayText = dy === null ? '—' : (dy < 0 ? 'EXPIRED' : dy + 'd');
         html += '<tr style="border-bottom:1px solid var(--sand)">';
@@ -56844,7 +56848,7 @@ function _briefCounts(){
   var inact=0; try{ inact=(typeof INACTIVITY_FLAGS!=='undefined'?INACTIVITY_FLAGS:[]).filter(function(f){return f&&f.status!=='resolved'&&!f.acknowledgedAt;}).length; }catch(e){}
   var pend=0; try{ pend=(DB.agents||[]).filter(function(a){ return a && (String(a.username||'').indexOf('.pending')>=0||(a._meta&&a._meta.pending)); }).length; }catch(e){}
   var bg=0; try{ bg=(DB.agents||[]).filter(function(a){ return a&&a.active&&a.bgStatus==='pending'; }).length; }catch(e){}
-  var expiring=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; var t=new Date(),soon=new Date(t.getTime()+14*86400000); expiring=pool.filter(function(d){ if(!d||d.deletedAt||d.status==='sold')return false; var e=d.expiryDate?new Date(d.expiryDate):null; return e&&e>t&&e<=soon; }).length; }catch(e){}
+  var expiring=0; try{ var pool=(typeof unionAllInventoryPools==='function')?unionAllInventoryPools():[]; var t=new Date(),soon=new Date(t.getTime()+14*86400000); expiring=pool.filter(function(d){ if(!d||d.deletedAt||d.status==='sold')return false; if(d.needsManualDate)return false; var e=invDaysRemaining(d.chargeDate||d.expiryDate); return e!=null&&e>=0&&e<=14; }).length; }catch(e){}
   return {invReq:invReq,xfer:xfer,inact:inact,pend:pend,bg:bg,expiring:expiring};
 }
 // which desk config a person gets (owner / inventory / onboarding / hr / payroll / office)
@@ -65054,10 +65058,10 @@ function panelInvDashboard(){
   }).length;
   var uploaded = devices.filter(function(d){return d.status==='uploaded';}).length;
   var expired  = devices.filter(function(d){
-    return d.assignedDate && invDaysRemaining(d.expiryDate, d.assignedDate) < 0;
+    return d.assignedDate && invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate) < 0;
   }).length;
   var expiringSoon = devices.filter(function(d){
-    var days = invDaysRemaining(d.expiryDate, d.assignedDate);
+    var days = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
     return days !== null && days >= 0 && days <= 7;
   }).length;
   var pendingReqs = INVENTORY_REQUESTS.filter(function(r){return r.status==='Pending';}).length;
@@ -65331,13 +65335,13 @@ function panelInvDashboard(){
       }
       if(_quickStatusFilter === 'assigned')  return d.status === 'assigned';
       if(_quickStatusFilter === 'awaiting')  return d.status === 'uploaded';
-      if(_quickStatusFilter === 'expired')   return d.assignedDate && invDaysRemaining(d.expiryDate, d.assignedDate) < 0;
+      if(_quickStatusFilter === 'expired')   return d.assignedDate && invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate) < 0;
       return true;
     });
     // Sort by urgency (most urgent first)
     _quickList.sort(function(a,b){
-      var da = invDaysRemaining(a.expiryDate, a.assignedDate);
-      var db = invDaysRemaining(b.expiryDate, b.assignedDate);
+      var da = invDaysRemaining(a.chargeDate||a.expiryDate, a.assignedDate);
+      var db = invDaysRemaining(b.chargeDate||b.expiryDate, b.assignedDate);
       if(da===null && db===null) return 0;
       if(da===null) return 1;
       if(db===null) return -1;
@@ -65368,7 +65372,7 @@ function panelInvDashboard(){
       h += '<th style="font-family:Barlow Condensed,sans-serif;font-size:.66rem;letter-spacing:1.5px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)">Time Left</th>';
       h += '</tr></thead><tbody>';
       _quickList.slice(0, 50).forEach(function(d){
-        var days = invDaysRemaining(d.expiryDate, d.assignedDate);
+        var days = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
         var rowBg = (days !== null && days < 0) ? 'rgba(204,0,0,.04)' : (days !== null && days <= 3) ? 'rgba(204,0,0,.02)' : '';
         var holderLabel = d.holderName ? _escapeHtml(d.holderName)
                         : (d.status === 'uploaded' ? '<em style="color:#D97706">Awaiting MM assignment</em>'
@@ -65517,15 +65521,15 @@ function panelInvDashboard(){
           return d.status === 'uploaded';
         }
         if(_statusFilter === 'expired'){
-          return d.assignedDate && invDaysRemaining(d.expiryDate, d.assignedDate) < 0;
+          return d.assignedDate && invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate) < 0;
         }
         return true;
       });
     }
 
     var sortedDevs = filteredDevs.sort(function(a,b){
-      var da=invDaysRemaining(a.expiryDate,a.assignedDate);
-      var db2=invDaysRemaining(b.expiryDate,b.assignedDate);
+      var da=invDaysRemaining(a.chargeDate||a.expiryDate,a.assignedDate);
+      var db2=invDaysRemaining(b.chargeDate||b.expiryDate,b.assignedDate);
       if(da===null&&db2===null) return 0;
       if(da===null) return 1;
       if(db2===null) return -1;
@@ -65556,7 +65560,7 @@ function panelInvDashboard(){
     if(isInvRole) h += '<th></th>';
     h += '</tr></thead><tbody>';
     sortedDevs.slice(0,50).forEach(function(d){
-      var days = invDaysRemaining(d.expiryDate, d.assignedDate);
+      var days = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
       var rowBg = days!==null && days<0 ? 'rgba(204,0,0,.04)' : days<=3 ? 'rgba(204,0,0,.02)' : '';
       var statusColor = {available:'#059669',assigned:'#2a7de1',uploaded:'#D97706',unassigned:'#D97706',expired:'#CC0000'}[d.status]||'#888';
       h += '<tr style="background:'+rowBg+'">';
@@ -65620,7 +65624,7 @@ function panelInvUpload(){
     h += '<div style="background:rgba(217,119,6,.06);border:2px solid rgba(217,119,6,.3);border-radius:10px;padding:18px;margin-bottom:20px">';
     h += '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:#D97706;letter-spacing:2px;margin-bottom:12px">⏳ UPLOADED — AWAITING ASSIGNMENT ('+pendingBatches.length+' batch'+( pendingBatches.length>1?'es':'')+')</div>';
     pendingBatches.forEach(function(batch){
-      var days = batch.expiryDate ? invDaysRemaining(batch.expiryDate, null) : null;
+      var days = batch.expiryDate ? invDaysRemaining(batch.chargeDate||batch.expiryDate, null) : null;
       h += '<div style="background:white;border:1px solid rgba(217,119,6,.2);border-radius:8px;padding:14px;margin-bottom:10px">';
       h += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">';
       h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-weight:700;font-size:.88rem;color:var(--brown)">'+batch.campaign+' &middot; '+batch.type+' &middot; '+batch.devices.length+' devices</div>';
@@ -65832,7 +65836,7 @@ function panelMyInventory(){
        +'<th>IMEI</th><th>Type</th><th>Campaign</th><th>Market</th><th>Status</th><th>Expiry</th><th>Time Left</th><th>Cost</th><th></th>'
        +'</tr></thead><tbody>';
     myDevices.forEach(function(d){
-      var days = invDaysRemaining(d.expiryDate, d.assignedDate || d.assignedAt);
+      var days = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate || d.assignedAt);
       var rowBg = days!==null&&days<0?'rgba(204,0,0,.04)':'';
       var costNum = (typeof d.devCost === 'number') ? d.devCost
                   : (typeof d.cost === 'number') ? d.cost
@@ -65990,7 +65994,7 @@ function panelDistribute(){
       + '<th style="width:30px"></th><th>IMEI</th><th>Campaign</th><th>Status</th><th>Days Left</th>'
       + '</tr></thead><tbody>';
     myDevices.forEach(function(d){
-      var days = invDaysRemaining(d.expiryDate, d.assignedDate || d.assignedAt);
+      var days = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate || d.assignedAt);
       var rowBg = days!==null && days<=5 ? 'rgba(204,0,0,.05)' : (days!==null && days<=10 ? 'rgba(217,119,6,.05)' : '');
       var dayColor = days===null?'var(--muted)':(days<0?'#CC0000':(days<=5?'#CC0000':(days<=10?'#D97706':'#059669')));
       h += '<tr style="background:'+rowBg+'">'
@@ -73782,7 +73786,7 @@ function _myMarketsDeviceStats(marketName){
         if(d.expiry)      expiryMs = new Date(d.expiry).getTime();
         else if(d.expires) expiryMs = new Date(d.expires).getTime();
       }catch(e){}
-      var isExpired = (status === 'expired') || (expiryMs && expiryMs < todayMs && status !== 'sold' && status !== 'activated');
+      var isExpired = (status === 'expired') || wmamDevState(d) === 'expired'; /* v2480: same rule as every screen */
       var holder = d.assignedTo || d.holderId || d.heldBy || null;
       var holderAgent = holder ? (DB.agents||[]).find(function(a){ return a.id === holder; }) : null;
       var isPoolHeld = !holderAgent || (typeof isOwner === 'function' && isOwner(holderAgent)) || (typeof isInventory === 'function' && isInventory(holderAgent));
@@ -78802,7 +78806,7 @@ function panelDartInventory(){
       else { statusBg='rgba(5,150,105,.12)'; statusFg='#0F6E56'; status='uploaded'; }
       var expiryColor = 'var(--brown)';
       if(d.expiryDate){
-        var daysLeft = typeof invDaysRemaining === 'function' ? invDaysRemaining(d.expiryDate, d.assignedDate) : null;
+        var daysLeft = typeof invDaysRemaining === 'function' ? invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate) : null;
         if(daysLeft !== null && daysLeft < 0) expiryColor = '#A32D2D';
         else if(daysLeft !== null && daysLeft <= 7) expiryColor = '#D97706';
       }
@@ -79674,7 +79678,7 @@ function panelCarrierInventory(campaign){
       else { statusBg='rgba(5,150,105,.12)'; statusFg='#0F6E56'; status='uploaded'; }
       var expiryColor = 'var(--brown)';
       if(d.expiryDate){
-        var daysLeft = typeof invDaysRemaining === 'function' ? invDaysRemaining(d.expiryDate, d.assignedDate) : null;
+        var daysLeft = typeof invDaysRemaining === 'function' ? invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate) : null;
         if(daysLeft !== null && daysLeft < 0) expiryColor = '#A32D2D';
         else if(daysLeft !== null && daysLeft <= 7) expiryColor = '#D97706';
       }
@@ -82374,11 +82378,10 @@ function invTransferPreflightCheck(devices, recipient){
   var t0 = Date.now();
   var blocked = [];
   (devices || []).forEach(function(d){
-    if(!d || !d.expiryDate) return; // can't check, let it through
+    if(!d || !(d.chargeDate || d.expiryDate) || d.needsManualDate) return; // can't check, let it through
     try {
-      var ms = new Date(d.expiryDate).getTime();
-      if(isNaN(ms)) return;
-      var daysLeft = Math.ceil((ms - t0) / 86400000);
+      var daysLeft = invDaysRemaining(d.chargeDate || d.expiryDate);
+      if(daysLeft == null) return;
       if(daysLeft <= GAP){
         blocked.push({ imei: d.imei || d.id || '(unknown)', daysLeft: daysLeft, expiryDate: d.expiryDate });
       }
@@ -100367,7 +100370,7 @@ function submitInvRequest(){
   var minDaysLeft = null;
   INVENTORY_DEVICES.forEach(function(d){
     if(d.status!=='available') return;
-    var dr = invDaysRemaining(d.expiryDate, d.assignedDate);
+    var dr = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
     if(dr!==null && (minDaysLeft===null || dr<minDaysLeft)) minDaysLeft = dr;
   });
   if(!isOwner(u) && u.role!=='Inventory' && u.role!=='admin' && minDaysLeft!==null && minDaysLeft<=5){
@@ -111123,7 +111126,7 @@ var COLORS = { 'gen mobile':'#16a34a', 'truconnect':'#0e7490', 'assurance':'#db2
 var SPARE = ['#2563eb', '#0d9488', '#9333ea', '#c2410c', '#4d7c0f', '#be123c'];
 function colorOf(c){ var k = String(c || '').toLowerCase(); if(COLORS[k]) return COLORS[k]; var n = 0; for(var i = 0; i < k.length; i++) n = (n + k.charCodeAt(i)) % SPARE.length; return COLORS[k] = SPARE[n]; }
 function order(list){ var pri = ['Gen Mobile', 'TruConnect', 'Assurance', 'DART', 'enTouch', 'Assist']; return list.sort(function(a, b){ var ia = pri.findIndex(function(p){ return cc(p) === a; }), ib = pri.findIndex(function(p){ return cc(p) === b; }); ia = ia < 0 ? 99 : ia; ib = ib < 0 ? 99 : ib; return (ia - ib) || a.localeCompare(b); }); }
-function soonDays(d){ try{ return wmamDaysUntil(d.chargeDate || d.expiryDate); }catch(e){ return null; } }
+function soonDays(d){ try{ return (typeof wmamDaysLeft === 'function') ? wmamDaysLeft(d) : wmamDaysUntil(d.chargeDate || d.expiryDate); }catch(e){ return null; } }
 function datePill(d){ try{ if(d.needsManualDate) return '<span style="color:#b91c1c;font-weight:800;font-size:.75rem">needs a date</span>'; return wmamDatePill(d.chargeDate || d.expiryDate); }catch(e){ return esc(d.chargeDate || d.expiryDate || ''); } }
 function chips(stateKey, counts, total, onclick){
   var cur = CAMPSEL[stateKey] || 'all', keys = order(Object.keys(counts));
@@ -111164,8 +111167,8 @@ if(typeof panelMyInventory === 'function'){
           + '<span id="invMineSelCount" style="font-family:Bebas Neue,sans-serif;font-size:1.1rem;color:#003594">' + Object.keys(window._invMineSelected).length + '</span><span style="font-size:.8rem;color:#64748b">selected</span>'
           + '<button onclick="invMineBulkTransfer()" id="invMineBulkBtn" disabled style="background:var(--sand);color:var(--muted);border:none;font-weight:800;letter-spacing:1px;padding:8px 14px;border-radius:8px">📤 TRANSFER SELECTED</button></div>';
         order(Object.keys(by)).filter(function(c){ return sel === 'all' || sel === c; }).forEach(function(c){
-          var list = by[c], due = list.filter(function(d){ var x = soonDays(d); return x != null && x <= 7; }).length;
-          h += '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:12px">' + campHead(c, list.length, [tSub(list), due ? due + ' due within 7 days' : ''].filter(Boolean).join(' · '));
+          var list = by[c], due = list.filter(function(d){ var x = soonDays(d); return x != null && x >= 0 && x <= 7; }).length, gone = list.filter(function(d){ var x = soonDays(d); return x != null && x < 0; }).length;
+          h += '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;margin-bottom:12px">' + campHead(c, list.length, [tSub(list), gone ? gone + ' expired' : '', due ? due + ' due within 7 days' : ''].filter(Boolean).join(' · '));
           var lastG = null;
           list.forEach(function(d, i){
             var g = tGroup(d); if(g && g !== lastG){ lastG = g; h += '<div style="padding:6px 14px;background:' + (/^Upsell/.test(g) ? '#fffbeb' : '#f0fdf4') + ';border-top:1px solid #eef2f7;font-weight:900;font-size:.78rem;color:' + (/^Upsell/.test(g) ? '#92400e' : '#166534') + ';text-align:left">' + esc(g) + '</div>'; i = 1; }
@@ -111210,13 +111213,13 @@ if(typeof wmamTeamInvHtml === 'function' && typeof wmamTeamInvData === 'function
       var held = 0; D.markets.forEach(function(M){ M.list.forEach(function(P){ if(String(P.id) === String(u.id)) held += P.devs.length; }); });
       var h = '<div style="max-width:1100px;margin:18px auto 0;background:#f8fafc;border:1px solid #e5e7eb;border-radius:16px;padding:14px 16px">'
         + '<div style="font-family:Barlow Condensed,sans-serif;font-weight:800;letter-spacing:1.5px;color:#003594;font-size:1.15rem;margin-bottom:8px;text-align:center">📦 ' + (me ? 'MY TEAM’S INVENTORY' : esc(u.name).toUpperCase() + ' — TEAM INVENTORY') + ' <span style="font-size:.8rem;color:#64748b;letter-spacing:0">· sorted by campaign</span></div>'
-        + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">' + card('Total', total) + card('Held by ' + (me ? 'me' : esc(String(u.name).split(' ')[0])), held, '#166534') + (D.multi ? card('Markets', D.markets.length, '#7c3aed') : card('Campaigns', Object.keys(counts).length || 0, '#7c3aed')) + '</div>';
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">' + card('Total', total) + (D.expired ? card('Expired', D.expired, '#b91c1c') : '') + card('Held by ' + (me ? 'me' : esc(String(u.name).split(' ')[0])), held, '#166534') + (D.multi ? card('Markets', D.markets.length, '#7c3aed') : card('Campaigns', Object.keys(counts).length || 0, '#7c3aed')) + '</div>';
       if(!total) return h + '<div style="color:#888;padding:8px 2px;text-align:center">No available devices right now.</div></div>';
       h += chips(bid, counts, total, "WMAM_CAMPSEL['" + bid + "']='%K%';wmamTeamInvRefresh('" + bid + "'," + u.id + ")");
       order(Object.keys(counts)).filter(function(c){ return sel === 'all' || sel === c; }).forEach(function(c){
-        var due = 0; D.markets.forEach(function(M){ M.list.forEach(function(P){ P.devs.forEach(function(d){ if(campOf(d) === c){ var x = soonDays(d); if(x != null && x <= 7) due++; } }); }); });
+        var due = 0, gone = 0; D.markets.forEach(function(M){ M.list.forEach(function(P){ P.devs.forEach(function(d){ if(campOf(d) === c){ var x = (typeof wmamDaysLeft === 'function' ? wmamDaysLeft(d) : soonDays(d)); if(x != null && x < 0) gone++; else if(x != null && x <= 7) due++; } }); }); });
         var cl = []; D.markets.forEach(function(M){ M.list.forEach(function(P){ P.devs.forEach(function(d){ if(campOf(d) === c) cl.push(d); }); }); });
-        h += '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;margin-bottom:12px">' + campHead(c, counts[c], [tSub(cl), due ? due + ' due within 7 days' : ''].filter(Boolean).join(' · '));
+        h += '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;margin-bottom:12px">' + campHead(c, counts[c], [tSub(cl), gone ? gone + ' expired' : '', due ? due + ' due within 7 days' : ''].filter(Boolean).join(' · '));
         D.markets.forEach(function(M){
           var ppl = M.list.map(function(P){ var dv = P.devs.filter(function(d){ return campOf(d) === c; }); return { P:P, devs:dv }; })
             .filter(function(x){ if(x.devs.length) return true; if(sel === 'all' || x.P.id === 'unassigned') return false; try{ return wmamCampaignsOf(x.P.a).some(function(k){ return cc(k) === c; }); }catch(e){ return false; } });
@@ -111228,8 +111231,8 @@ if(typeof wmamTeamInvHtml === 'function' && typeof wmamTeamInvData === 'function
             h += '<div onclick="WMAM_TI_OPEN[\'' + esc(k2) + '\']=!WMAM_TI_OPEN[\'' + esc(k2) + '\'];wmamTeamInvRefresh(\'' + bid + '\',' + u.id + ')" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid #f1f5f9;text-align:left' + (isMe ? ';background:#f0fdf4' : '') + '">'
               + '<div style="width:16px;color:#6b7280">' + (open ? '▾' : '▸') + '</div>'
               + '<div style="flex:1;min-width:0"><div style="font-weight:800;color:#0b1b3f;word-break:break-word">' + esc(P.a.name) + (isMe ? ' (you)' : '') + '</div><div style="font-size:.74rem;color:#6b7280">' + esc(P.a.role || '') + '</div>'
-              + (ups ? '<div style="font-size:.74rem;color:#92400e;font-weight:800">' + (x.devs.length - ups) + ' no cost · ' + ups + ' upsell</div>' : '') + (P.flag ? '<div style="font-size:.74rem;color:#b91c1c;font-weight:800">⚠ No longer active / not coded — reassign these phones</div>' : '') + '</div>'
-              + (soon ? _tiSoonPill(soon) : '') + '<div style="font-weight:900;font-size:1.15rem;color:' + colorOf(c) + ';min-width:40px;text-align:right">' + x.devs.length + '</div></div>';
+              + (ups ? '<div style="font-size:.74rem;color:#92400e;font-weight:800">' + (x.devs.length - ups) + ' no cost · ' + ups + ' upsell</div>' : '') + (P.flag ? '<div style="font-size:.74rem;color:#b91c1c;font-weight:800">⚠ No longer active / not coded — reassign these phones</div>' : '') + (typeof wmamExpSummary === 'function' ? '<div style="margin-top:4px">' + wmamExpSummary(x.devs) + '</div>' : '') + '</div>'
+              + (typeof wmamExpSummary === 'function' ? '' : (soon ? _tiSoonPill(soon) : '')) + '<div style="font-weight:900;font-size:1.15rem;color:' + colorOf(c) + ';min-width:40px;text-align:right">' + x.devs.length + '</div></div>';
             if(open) h += '<div style="background:#fafbfd;border-top:1px solid #f1f5f9;padding:6px 14px 10px 40px;max-height:360px;overflow-y:auto;text-align:left">'
               + (x.devs.length ? x.devs.slice().sort(byTier).map(function(d){ return '<div style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;padding:5px 0;border-bottom:1px dashed #eef0f4;font-size:.84rem"><span style="font-family:monospace">' + esc(d.imei || d.sim || '') + '</span>' + (typeof wmamOwnerChip === 'function' ? wmamOwnerChip(d) : '') + '<span style="flex:1;min-width:90px;color:#374151;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(d.model || '') + '</span>' + tBadge(d) + '<span>' + datePill(d) + '</span></div>'; }).join('') : '<div style="color:#888;font-size:.84rem;padding:4px 0">No ' + esc(c) + ' devices.</div>')
               + '</div>';
@@ -117773,6 +117776,37 @@ setInterval(guardAll, 2000); setTimeout(guardAll, 1500);
     try{ var mgr = (typeof _uniMgr === 'function' && _uniMgr(u)) || (typeof _iboIs === 'function' && _iboIs(u));
       if(mgr && typeof wmamDownline === 'function' && wmamDownline(u).length) return 'inv-my-team'; }catch(e){}
     return fallback; };
+})();
+
+</script>
+<script>
+/* v2480 (Calvin 2026-10-28) — one expiry count everywhere, every campaign.
+   Before: My Inventory counted days from the expiry date read as a UTC date (one day early in Texas) and ignored the
+   charge date, while My Team's Inventory used the charge date in Central time and showed only ONE pill per person
+   (the soonest device) — so Tanita looked like "1 expired" on one page and "4 expired + 1 tomorrow" on the other.
+   Now:
+     • every screen counts days the same way: charge date (or expiry date when there is no charge date), Central time,
+       devices waiting for a date are never counted as expired (wmamDaysLeft);
+     • each person row on My Team's Inventory shows the full counts: "4 EXPIRED · 1 due 2d". */
+(function(){
+  if(window._wmamExp2480) return; window._wmamExp2480 = true;
+  function iso(v){ try{ return typeof _gmIso === 'function' ? _gmIso(v) : (v ? String(v).slice(0,10) : null); }catch(e){ return null; } }
+  window._wmamExpYmd = function(d){ if(!d || d.needsManualDate) return ''; return iso(d.chargeDate || d.expiryDate) || ''; };
+  window.wmamDaysLeft = function(d){ var y = window._wmamExpYmd(d); return y ? wmamDaysUntil(y) : null; };
+  var pill = function(bg, fg, t){ return '<span style="background:' + bg + ';color:' + fg + ';padding:2px 8px;border-radius:999px;font-size:.72rem;font-weight:800;white-space:nowrap">' + t + '</span>'; };
+  // full counts for one person's devices (used on the team inventory rows)
+  window.wmamExpSummary = function(devs){
+    var exp = 0, due = 0, soonest = null, need = 0, next = null;
+    (devs || []).forEach(function(d){ if(!d) return; if(d.needsManualDate){ need++; return; }
+      var dl = window.wmamDaysLeft(d); if(dl == null) return;
+      if(dl < 0) exp++; else { if(dl <= 7){ due++; if(soonest == null || dl < soonest) soonest = dl; } if(next == null || dl < next) next = dl; } });
+    var out = [];
+    if(exp) out.push(pill('#fee2e2', '#991b1b', exp + ' EXPIRED'));
+    if(due) out.push(pill('#ffedd5', '#c2410c', due + ' due ' + (due > 1 ? '· soonest ' : '') + (soonest === 0 ? 'today' : soonest + 'd')));
+    if(need) out.push(pill('#fee2e2', '#b91c1c', need + ' need' + (need > 1 ? '' : 's') + ' a date'));
+    if(!out.length && next != null){ var c = wmamExpColor(next); if(c) out.push(pill(c.bg, c.fg, next + 'd')); }
+    return out.length ? '<span style="display:inline-flex;gap:4px;flex-wrap:wrap;justify-content:flex-start">' + out.join('') + '</span>' : '';
+  };
 })();
 
 </script>
