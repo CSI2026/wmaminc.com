@@ -3888,7 +3888,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.29.2540';
+var BUILD_VERSION = '2026.10.29.2550';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -117975,6 +117975,341 @@ setInterval(guardAll, 2000); setTimeout(guardAll, 1500);
     _obCopyBgPii = function(agentId){ var self = this, args = arguments; return withShown(agentId, function(){ return _copy.apply(self, args); }); };
     window._obCopyBgPii = _obCopyBgPii; }
 })();
+
+</script>
+<script>
+/* v2550 (Calvin 2026-10-29) — PAYCHECK BY CAMPAIGN + PER-PERSON BONUSES & DEDUCTIONS BEFORE FINALIZING
+   "Program / campaign gross then net based on deductions from chargebacks, upsells, etc. Then the next campaign. Before we
+    finalize the entire thing we should be able to go under each agent and do a company bonus, deduction for office expenses,
+    payroll advances, previous loans etc. before we total out the entire payroll."
+   1. Pay stub (replaces the old two-column stub completely): each campaign is its own block — earnings, CAMPAIGN GROSS,
+      that campaign's deductions (chargebacks, upsells, device charges…), CAMPAIGN NET — then the next campaign; then other pay;
+      then COMPANY ADJUSTMENTS (bonus, office expense, payroll advance, previous loan, other + the loans/fees/expired phones the
+      system already takes); then the totals and NET PAY.
+   2. Run Payroll page: "Each person's pay" list for the open Friday — every person, their campaign nets, adjustments and net
+      pay, with a ± button to add a company bonus / office expense / payroll advance / previous loan / other line (reason
+      required). Lines are saved in wmam_payroll_adjustments, go into net pay and the Friday total, and freeze at Finalize.
+      A deduction bigger than what the person has left is taken up to $0 and the rest carries to their next payroll as debt.
+   Nothing already saved is changed: weeks, rows, debt, loans and released stubs stay exactly as they are. */
+(function(){ try{
+if(window._wmamPayAdj2550) return; window._wmamPayAdj2550 = true;
+var esc = function(s){ return (typeof _escapeHtml === 'function') ? _escapeHtml(s == null ? '' : String(s)) : String(s == null ? '' : s); };
+var M = function(c){ c = Number(c) || 0; return (c < 0 ? '−' : '') + '$' + (Math.abs(c) / 100).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','); };
+function me(){ return (typeof DB !== 'undefined' && DB.current) || null; }
+function staff(u){ u = u || me(); if(!u) return false; try{ if(isOwner(u)) return true; }catch(e){} try{ if(typeof wmamIsPayrollStaff === 'function' && wmamIsPayrollStaff(u)) return true; }catch(e){} return u.role === 'Payroll'; }
+function person(id){ return (DB.agents || []).find(function(a){ return a && Number(a.id) === Number(id); }) || null; }
+function longDate(f){ try{ return _payLongDate(f); }catch(e){ return f; } }
+function relStatus(F){ try{ var r = ((window.WMAM_PAYFLOW || {}).rel || {})[F]; return r ? r.status : 'open'; }catch(e){ return 'open'; } }
+function openF(F){ var s = relStatus(F); return s === 'open' || s === 'reopened'; }
+
+var KINDS = {
+  bonus:          { label:'Company bonus',               sign:1,  icon:'🎉' },
+  office_expense: { label:'Office expense',              sign:-1, icon:'🏢' },
+  advance:        { label:'Payroll advance — paid back', sign:-1, icon:'💵' },
+  loan:           { label:'Previous loan — paid back',   sign:-1, icon:'💳' },
+  other_add:      { label:'Other pay',                   sign:1,  icon:'➕' },
+  other_ded:      { label:'Other deduction',             sign:-1, icon:'➖' }
+};
+var ORDER = ['bonus', 'office_expense', 'advance', 'loan', 'other_add', 'other_ded'];
+var ADJ = window.WMAM_PAYADJ = { rows:{}, loaded:{}, loading:{}, short:{}, err:'' };
+
+async function load(F, force){
+  if(!F || (!force && (ADJ.loaded[F] || ADJ.loading[F]))) return ADJ.rows[F] || [];
+  ADJ.loading[F] = true;
+  try{ var r = await supaClient.from('wmam_payroll_adjustments').select('*').eq('pay_date', F).eq('voided', false).order('id', { ascending:true });
+    if(r && r.error) throw new Error(r.error.message);
+    ADJ.rows[F] = (r && r.data) || []; ADJ.loaded[F] = true; ADJ.err = ''; }
+  catch(e){ ADJ.err = String(e && e.message || e); ADJ.rows[F] = ADJ.rows[F] || []; }
+  finally{ ADJ.loading[F] = false; }
+  return ADJ.rows[F];
+}
+window.wmamPayAdjLoad = load;
+function linesFor(aid, F){ return (ADJ.rows[F] || []).filter(function(x){ return Number(x.agent_id) === Number(aid) && !x.voided; }); }
+
+// ═════════ 1. the numbers: adjustments go into the stub (and so into the Friday total, the bank file and the lock) ═════════
+if(typeof payStubData === 'function'){ var oData = payStubData;
+  window.payStubData = payStubData = function(aid, dep){ var S = oData.apply(this, arguments); if(!S || S._adjDone) return S;
+    try{
+      var F = S.payDate; S.adjustments = []; S._adjDone = true;
+      if(!F || !openF(F)) return S;   // a finalized / released payroll keeps its frozen stub exactly as it was
+      var L = linesFor(aid, F); if(!L.length){ delete (ADJ.short[F] || {})[aid]; return S; }
+      var avail = S.netCents || 0, add = 0, taken = 0, short = 0, shortWhy = [];
+      L.filter(function(x){ return (KINDS[x.kind] || {}).sign > 0; }).forEach(function(x){ add += x.amount_cents; S.adjustments.push({ id:x.id, kind:x.kind, label:KINDS[x.kind].label, reason:x.reason || '', cents:x.amount_cents }); });
+      avail += add;
+      L.filter(function(x){ return (KINDS[x.kind] || {}).sign < 0; }).forEach(function(x){ var take = Math.max(0, Math.min(x.amount_cents, avail)), left = x.amount_cents - take; avail -= take; taken += take;
+        var it = { id:x.id, kind:x.kind, label:KINDS[x.kind].label, reason:x.reason || '', cents:-take, askedCents:x.amount_cents };
+        if(left > 0){ it.shortCents = left; short += left; shortWhy.push(KINDS[x.kind].label + (x.reason ? ' (' + x.reason + ')' : '') + ' ' + M(left)); }
+        S.adjustments.push(it); });
+      S.adjAddCents = add; S.adjTakenCents = taken; S.adjShortCents = short;
+      S.grossCents = (S.grossCents || 0) + add; S.dedCents = (S.dedCents || 0) + taken;
+      S.netCents = (S.netCents || 0) + add - taken; S.checkCents = (S.checkCents || 0) + add - taken;
+      ADJ.short[F] = ADJ.short[F] || {};
+      if(short > 0) ADJ.short[F][aid] = { cents:short, why:shortWhy.join('; ') }; else delete ADJ.short[F][aid];
+    }catch(e){ console.warn('[pay adjustments]', e); }
+    return S; };
+}
+// what a deduction couldn't take this week becomes debt for the next payroll (recorded only when the payroll locks)
+if(typeof _payrollCommitObligationsBase === 'function'){ var oBase = _payrollCommitObligationsBase;
+  window._payrollCommitObligationsBase = _payrollCommitObligationsBase = function(key){ var ok = oBase.apply(this, arguments);
+    try{ var F = window._wmamPayF; if(ok && F && ADJ.short[F]) Object.keys(ADJ.short[F]).forEach(function(aid){ var s = ADJ.short[F][aid]; if(s && s.cents > 0) payrollAddDebt(Number(aid), s.cents, 'Not covered on the ' + F + ' payroll — ' + s.why, 'adj-' + F); }); }catch(e){ console.warn('[pay adjustments carry]', e); }
+    return ok; };
+}
+
+// ═════════ 2. the stub — campaign by campaign (replaces the old layout) ═════════
+var CSS = '<style>.pst2{font-family:Arial,Helvetica,sans-serif;background:#fff;color:#111827;max-width:880px;margin:0 auto 18px;box-shadow:0 6px 24px rgba(0,0,0,.18);font-size:12.5px;page-break-inside:avoid;break-inside:avoid;overflow:hidden}'
+  + '.pst2 .hd{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:14px 18px;border-bottom:3px solid #003594}.pst2 .co{display:flex;gap:10px;align-items:center}.pst2 .co img{width:48px;height:48px;border-radius:50%;object-fit:cover}.pst2 .co .n{font-weight:900;font-size:14px}.pst2 .co .a{color:#6b7280;font-size:11px}'
+  + '.pst2 .box{border:1px solid #111827;display:grid;grid-template-columns:auto auto;font-size:11px;align-self:flex-start}.pst2 .box div{padding:3px 8px;border-bottom:1px solid #e5e7eb}.pst2 .box .k{color:#6b7280;text-transform:uppercase;font-weight:700;letter-spacing:.5px}'
+  + '.pst2 .sec{margin:12px 14px;border:1px solid #cbd5e1;border-radius:10px;overflow:hidden}.pst2 .sh{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;background:#003594;color:#fff;padding:7px 12px;font-weight:900;letter-spacing:.5px}.pst2 .sh small{font-weight:600;opacity:.85}'
+  + '.pst2 .sh.oth{background:#0f766e}.pst2 .sh.adj{background:#b45309}'
+  + '.pst2 .gl{background:#f8fafc;color:#475569;font-size:10px;font-weight:900;letter-spacing:1px;text-transform:uppercase;padding:5px 12px;border-top:1px solid #e5e7eb}'
+  + '.pst2 .r{display:grid;grid-template-columns:minmax(0,1fr) 44px 64px 92px;gap:6px;padding:4px 12px;border-top:1px dotted #e2e8f0}.pst2 .r span{min-width:0;overflow-wrap:anywhere}.pst2 .r span:not(:first-child){text-align:right;white-space:nowrap}'
+  + '.pst2 .t{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:6px;padding:6px 12px;font-weight:900;border-top:1px solid #94a3b8}.pst2 .t span:last-child{text-align:right;white-space:nowrap}'
+  + '.pst2 .t.g{background:#eef2ff;color:#1e3a8a}.pst2 .t.n{background:#ecfdf5;color:#065f46;border-top:2px solid #065f46;font-size:13.5px}.pst2 .t.a{background:#fff7ed;color:#9a3412}'
+  + '.pst2 .neg{color:#cc0000}.pst2 .pos{color:#047857}.pst2 .sub{color:#6b7280;font-size:10.5px}'
+  + '.pst2 .tots{margin:12px 14px;border:2px solid #111827;border-radius:10px;overflow:hidden}.pst2 .tots .t{border-top:1px solid #e5e7eb}.pst2 .tots .net{background:#111827;color:#fff;font-size:16px;padding:10px 12px}'
+  + '.pst2 .chk{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;gap:12px;flex-wrap:wrap;border-top:2px dashed #9ca3af;background:repeating-linear-gradient(45deg,#f8fafc,#f8fafc 10px,#eef2ff 10px,#eef2ff 20px)}.pst2 .chk .amt{font-size:26px;font-weight:900;border:2px solid #111827;padding:6px 14px;background:#fff}'
+  + '.pst2 .bad{background:#fee2e2;color:#7f1d1d;font-weight:800;padding:8px 12px;border-top:2px solid #dc2626}'
+  + '.pst2 .pnote{border-top:2px solid #111827;padding:10px 14px;background:#fffbeb}.pst2 .pnote .k{font-size:10px;font-weight:900;letter-spacing:1px;text-transform:uppercase;color:#92400e;margin-bottom:3px}.pst2 .pnote .tx{white-space:pre-wrap;overflow-wrap:anywhere}'
+  + '.pst2 .pbal{border-top:2px solid #111827;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;background:#fef2f2}.pst2 .pbal .k{font-weight:900;color:#7f1d1d;text-transform:uppercase;letter-spacing:.5px}.pst2 .pbal .v{font-size:18px;font-weight:900;color:#b91c1c}'
+  + '@media(max-width:640px){.pst2 .sec,.pst2 .tots{margin:10px 8px}.pst2 .r{grid-template-columns:minmax(0,1fr) 30px 80px}.pst2 .r span:nth-child(3){display:none}.pst2 .t{grid-template-columns:minmax(0,1fr) 92px}.pst2 .chk .amt{font-size:22px}.pst2 .hd{justify-content:center}}'
+  + '@media print{.pst2{box-shadow:none;margin:0 0 12px}}</style>';
+window._PAY_STUB2_CSS = CSS;
+function wk(c){ try{ return _payWkLabel(c); }catch(e){ return ''; } }
+function stubHtml(S){
+  var logo = (typeof WMAM_BUILTIN_LOGO !== 'undefined' && WMAM_BUILTIN_LOGO) || (typeof COMPANY_LOGO !== 'undefined' ? COMPANY_LOGO : '') || '';
+  var ag = person(S.agentId), staffer = false; try{ staffer = !!(ag && typeof wmamIsOfficePosition === 'function' && wmamIsOfficePosition(ag)); }catch(e){}
+  var R = function(l, q, rate, amt, cls){ return '<div class="r"><span>' + l + '</span><span>' + (q || q === 0 ? esc(q) : '') + '</span><span>' + (rate != null ? M(rate) : '') + '</span><span class="' + (cls || '') + '">' + amt + '</span></div>'; };
+  var T = function(l, amt, cls){ return '<div class="t ' + (cls || '') + '"><span>' + l + '</span><span>' + amt + '</span></div>'; };
+  var h = CSS + '<div class="pst2"><div class="hd"><div class="co">' + (logo ? '<img src="' + logo + '" alt="">' : '') + '<div><div class="n">Williams Marketing and Management, Inc.</div><div class="a">' + (staffer ? 'Payroll · Pay statement' : 'Independent contractor · Commission statement') + '</div></div></div>'
+    + '<div class="box"><div class="k">' + (staffer ? 'Office staff' : 'Contractor') + '</div><div>' + esc(S.name) + '</div><div class="k">Position</div><div>' + esc(S.role || '—') + (S.market ? ' · ' + esc(S.market) : '') + '</div><div class="k">Pay date</div><div>' + esc(longDate(S.payDate)) + '</div><div class="k">Pay type</div><div>Direct deposit</div></div></div>';
+  var campNet = 0;
+  (S.campaigns || []).forEach(function(c){
+    campNet += c.netCents || 0;
+    h += '<div class="sec"><div class="sh"><span>' + esc(String(c.carrier || '').toUpperCase()) + '</span><small>' + esc(wk(c)) + '</small></div>';
+    var any = false;
+    [['Personal enrollments', c.own], ['Team overrides', c.team], ['Add-ons', c.addons]].forEach(function(g){ if(!(g[1] || []).length) return; any = true; h += '<div class="gl">' + g[0] + '</div>';
+      g[1].forEach(function(x){ h += R(esc(x.label), x.count || '', x.count ? Math.round((x.rate || 0) * 100) : null, M(x.cents)); }); });
+    (c.credits || []).forEach(function(x){ any = true; h += R('Credit — ' + esc(x.type) + (x.order ? ' <span class="sub">' + esc(x.order) + '</span>' : ''), '', null, '+' + M(x.cents), 'pos'); });
+    if(!any) h += R('<span class="sub">No earnings on this file</span>', '', null, M(0));
+    h += T('CAMPAIGN GROSS', M((c.earnCents || 0) + (c.creditCents || 0)), 'g');
+    var dl = c.deductions || [];
+    if(dl.length || c.priorDebtCents || c.carryoverCents){
+      h += '<div class="gl">Deductions — ' + esc(c.carrier) + '</div>';
+      dl.forEach(function(g){ var who = g.whose ? ' <span class="sub">' + esc(g.whose) + (g.share && !/own enrollment/.test(g.share) && !/^your /.test(g.whose) ? ' (your ' + esc(g.share) + ')' : '') + '</span>' : '';
+        var ord = g.orders && g.orders.length ? '<br><span class="sub">Order' + (g.orders.length === 1 ? '' : 's') + ': ' + esc(g.orders.slice(0, 8).join(', ')) + (g.orders.length > 8 ? '…' : '') + '</span>' : '';
+        h += R(esc(g.type) + who + ord, g.count > 1 ? g.count : '', g.count > 1 ? g.each : null, '−' + M(g.cents), 'neg'); });
+      if(c.priorDebtCents) h += R('Prior debt paid from this pay', '', null, '−' + M(c.priorDebtCents), 'neg');
+      if(c.carryoverCents) h += R('<span class="sub">Charged but not covered this week — carried to the next payroll (+' + M(c.carryoverCents) + ')</span>', '', null, '');
+      h += T('Total deductions — ' + esc(c.carrier), '−' + M((c.dedCents || 0) + (c.priorDebtCents || 0)), '');
+    } else h += '<div class="r"><span class="sub">No deductions on this campaign</span><span></span><span></span><span>$0.00</span></div>';
+    h += T('CAMPAIGN NET — ' + esc(c.carrier), M(c.netCents), 'n') + '</div>';
+  });
+  var oth = (S.other || []).reduce(function(t, x){ return t + (x.cents || 0); }, 0);
+  if((S.other || []).length){ h += '<div class="sec"><div class="sh oth"><span>OTHER PAY</span><small>hourly · Pay Link · overrides</small></div>';
+    S.other.forEach(function(x){ h += R(esc(x.label), x.detail && x.detail.hours ? Number(x.detail.hours).toFixed(2) : '', x.detail && x.detail.rate ? Math.round(x.detail.rate * 100) : null, M(x.cents)); });
+    h += T('OTHER PAY TOTAL', M(oth), 'g') + '</div>'; }
+  var adj = S.adjustments || [], co = S.company || [];
+  var adjTot = adj.reduce(function(t, x){ return t + (x.cents || 0); }, 0) + co.reduce(function(t, x){ return t + (x.cents || 0); }, 0);
+  if(adj.length || co.length){
+    h += '<div class="sec"><div class="sh adj"><span>COMPANY ADJUSTMENTS</span><small>bonuses · office expenses · advances · loans</small></div>';
+    adj.forEach(function(x){ var k = KINDS[x.kind] || { icon:'' };
+      h += R(k.icon + ' ' + esc(x.label) + (x.reason ? '<br><span class="sub">' + esc(x.reason) + '</span>' : '') + (x.shortCents ? '<br><span class="sub">' + M(x.askedCents) + ' asked · ' + M(x.shortCents) + ' not covered this week — carried to the next payroll</span>' : ''), '', null, ((KINDS[x.kind] || {}).sign > 0 ? '+' : '−') + M(Math.abs(x.cents)), (KINDS[x.kind] || {}).sign > 0 ? 'pos' : 'neg'); });
+    co.forEach(function(x){ h += R(esc(x.label) + (x.detail && x.detail.balanceAfterCents != null ? '<br><span class="sub">balance after: ' + M(x.detail.balanceAfterCents) + '</span>' : ''), '', null, '−' + M(Math.abs(x.cents)), 'neg'); });
+    h += T('COMPANY ADJUSTMENTS TOTAL', (adjTot >= 0 ? '+' : '−') + M(Math.abs(adjTot)), 'a') + '</div>';
+  }
+  h += '<div class="tots">' + T('All campaigns — net', M(campNet), '') + ((S.other || []).length ? T('Other pay', M(oth), '') : '') + ((adj.length || co.length) ? T('Company adjustments', (adjTot >= 0 ? '+' : '−') + M(Math.abs(adjTot)), '') : '')
+    + '<div class="t net"><span>NET PAY</span><span>' + M(S.netCents) + '</span></div></div>';
+  if(S.ok === false) h += '<div class="bad">⛔ These lines add up to ' + M(S.checkCents) + ' but the saved pay is ' + M(S.netCents) + '. Do not pay until payroll checks this person.</div>';
+  try{ var d = typeof window.wmamStubDetailHtml === 'function' ? window.wmamStubDetailHtml(S) : ''; if(d) h += (typeof _PAY_STUB_CSS !== 'undefined' ? _PAY_STUB_CSS : '') + '<div class="pstb" style="box-shadow:none;margin:0;max-width:none">' + d + '</div>'; }catch(e){}
+  if(S.payrollNote) h += '<div class="pnote"><div class="k">Payroll note</div><div class="tx">' + esc(S.payrollNote) + '</div></div>';
+  if(S.balanceRemainingCents != null && Number(S.balanceRemainingCents) > 0) h += '<div class="pbal"><span class="k">Outstanding balance remaining</span><span class="v">' + M(S.balanceRemainingCents) + '</span></div>';
+  h += '<div class="chk"><div><div style="font-size:11px;color:#6b7280;letter-spacing:2px;text-transform:uppercase;font-weight:800">Direct deposit advice — non-negotiable</div><div style="font-weight:800;margin-top:4px">Pay to: ' + esc(S.name) + '</div><div style="font-size:11px;color:#6b7280">' + esc(longDate(S.payDate)) + '</div></div><div class="amt">' + M(S.netCents) + '</div></div></div>';
+  return h;
+}
+window.payStubHtml = payStubHtml = stubHtml;
+// the bank file: one line per campaign net, each adjustment, then the deposit
+if(typeof payDepositCSV === 'function'){ window.payDepositCSV = payDepositCSV = function(F){
+  var dep = payrollBuildDeposit(F), q = function(s){ return '"' + String(s == null ? '' : s).replace(/"/g, '""') + '"'; }, D = function(c){ return ((c || 0) / 100).toFixed(2); }, L = ['Pay date,Person,Campaign / line,Gross,Deductions,Net'];
+  Object.keys(dep.rollup.agents).forEach(function(id){ var S = payStubData(id, dep); if(!S) return;
+    S.campaigns.forEach(function(c){ L.push([F, q(S.name), q(c.carrier + ' ' + wk(c)), D(c.earnCents + c.creditCents), D(c.dedCents + c.priorDebtCents), D(c.netCents)].join(',')); });
+    S.other.forEach(function(x){ L.push([F, q(S.name), q(x.label), D(x.cents), '0.00', D(x.cents)].join(',')); });
+    (S.adjustments || []).forEach(function(x){ L.push([F, q(S.name), q(x.label + (x.reason ? ' — ' + x.reason : '')), D(Math.max(0, x.cents)), D(Math.max(0, -x.cents)), D(x.cents)].join(',')); });
+    S.company.forEach(function(x){ L.push([F, q(S.name), q(x.label), '0.00', D(Math.abs(x.cents)), D(x.cents)].join(',')); });
+    L.push([F, q(S.name), q('NET DEPOSIT'), D(S.grossCents), D(S.dedCents), D(S.netCents)].join(',')); });
+  var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([L.join('\n')], { type:'text/csv' })); a.download = 'payroll-' + F + '.csv'; document.body.appendChild(a); a.click(); a.remove(); }; }
+
+// ═════════ 3. Run Payroll page: each person's pay + ± bonus / deduction ═════════
+var BTN = 'border:none;border-radius:8px;padding:10px 14px;font-weight:900;cursor:pointer;font-size:.88rem';
+var LB = 'display:block;font-size:.72rem;font-weight:800;letter-spacing:.5px;text-transform:uppercase;color:#475569;margin:10px 0 4px';
+var IN = 'width:100%;box-sizing:border-box;padding:10px 11px;border:1px solid #cbd5e1;border-radius:8px;font-size:16px;font-family:inherit';
+function liveStubs(F){ try{ var dep = payrollBuildDeposit(F); return Object.keys(dep.rollup.agents).map(function(id){ return payStubData(id, dep); }).filter(Boolean).sort(function(a, b){ return String(a.name).localeCompare(String(b.name)); }); }catch(e){ return []; } }
+function peopleHtml(F){
+  var stubs = liveStubs(F), total = stubs.reduce(function(t, S){ return t + (S.netCents || 0); }, 0), adjAll = 0;
+  var h = '<div id="wmamPayPeople" data-f="' + F + '" style="border-top:2px solid #e2e8f0;margin-top:6px;padding-top:12px;text-align:left">'
+    + '<div style="display:flex;justify-content:space-between;align-items:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:8px"><div><div style="font-weight:900;color:#0b1b3f;font-size:1.02rem">Each person’s pay — before you finalize</div><div style="color:#64748b;font-size:.8rem">Campaign nets, then company bonuses / office expenses / advances / loans. Press ± on a person to add one.</div></div></div>';
+  if(ADJ.err) h += '<div style="background:#fee2e2;color:#7f1d1d;font-weight:800;border-radius:8px;padding:8px 10px;margin-bottom:8px">Bonuses / deductions could not be read: ' + esc(ADJ.err) + '</div>';
+  if(!stubs.length) return h + '<div style="color:#64748b;padding:10px 0">Nobody is on this payroll yet.</div></div>';
+  var cards = '';
+  h += '<style>#wmamPayPeople .wpp-c{display:none}@media(max-width:640px){#wmamPayPeople .wpp-t{display:none}#wmamPayPeople .wpp-c{display:block}}</style><div class="wpp-t" style="overflow-x:auto;-webkit-overflow-scrolling:touch"><table style="width:100%;border-collapse:collapse;font-size:.86rem;min-width:520px"><tr style="background:#f1f5f9;color:#475569;font-size:.68rem;letter-spacing:1px;text-transform:uppercase"><th style="text-align:left;padding:8px">Person</th><th style="text-align:right;padding:8px">Campaigns (net)</th><th style="text-align:right;padding:8px">Other pay</th><th style="text-align:right;padding:8px">Company adj.</th><th style="text-align:right;padding:8px">Net pay</th><th style="padding:8px"></th></tr>';
+  stubs.forEach(function(S){ var camp = S.campaigns.reduce(function(t, c){ return t + (c.netCents || 0); }, 0), oth = S.other.reduce(function(t, x){ return t + (x.cents || 0); }, 0);
+    var adj = (S.adjustments || []).reduce(function(t, x){ return t + x.cents; }, 0) + S.company.reduce(function(t, x){ return t + x.cents; }, 0); adjAll += adj;
+    var n = (S.adjustments || []).length;
+    var bt = '<button type="button" onclick="wmamAdjOpen(' + Number(S.agentId) + ',\'' + F + '\')" style="border:1px solid ' + (n ? '#b45309' : '#cbd5e1') + ';background:' + (n ? '#fff7ed' : '#fff') + ';border-radius:8px;padding:6px 10px;font-weight:900;cursor:pointer">±' + (n ? ' ' + n : '') + '</button> <button type="button" onclick="payStubShow(' + Number(S.agentId) + ',\'' + F + '\')" style="border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:6px 10px;font-weight:800;cursor:pointer">Stub</button>';
+    cards += '<div style="border:1px solid #e2e8f0;border-radius:12px;padding:10px 12px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start"><div style="min-width:0"><b>' + esc(S.name) + '</b><div style="color:#64748b;font-size:.76rem">' + S.campaigns.map(function(c){ return esc(c.carrier) + ' ' + M(c.netCents); }).join(' · ') + (oth ? ' · Other ' + M(oth) : '') + '</div>' + (adj ? '<div style="font-size:.78rem;font-weight:800;color:' + (adj < 0 ? '#cc0000' : '#047857') + '">Company adj. ' + (adj > 0 ? '+' : '−') + M(Math.abs(adj)) + (S.adjShortCents ? ' · ' + M(S.adjShortCents) + ' carries over' : '') + '</div>' : '') + '</div><div style="text-align:right;flex-shrink:0"><div style="font-size:.66rem;color:#64748b;font-weight:800;letter-spacing:.5px">NET PAY</div><div style="font-weight:900;color:#047857;font-size:1.05rem">' + M(S.netCents) + '</div></div></div><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:8px">' + bt + '</div></div>';
+    h += '<tr style="border-top:1px solid #e5e7eb"><td style="padding:8px;font-weight:800">' + esc(S.name) + '<div style="font-weight:600;color:#64748b;font-size:.74rem">' + S.campaigns.map(function(c){ return esc(c.carrier) + ' ' + M(c.netCents); }).join(' · ') + '</div></td>'
+      + '<td style="padding:8px;text-align:right">' + M(camp) + '</td><td style="padding:8px;text-align:right">' + (oth ? M(oth) : '—') + '</td>'
+      + '<td style="padding:8px;text-align:right;font-weight:800;color:' + (adj < 0 ? '#cc0000' : adj > 0 ? '#047857' : '#64748b') + '">' + (adj ? (adj > 0 ? '+' : '−') + M(Math.abs(adj)) : '—') + (S.adjShortCents ? '<div style="font-size:.7rem;color:#b45309">' + M(S.adjShortCents) + ' carries over</div>' : '') + '</td>'
+      + '<td style="padding:8px;text-align:right;font-weight:900;color:#047857">' + M(S.netCents) + '</td>'
+      + '<td style="padding:8px;white-space:nowrap;text-align:right"><button type="button" onclick="wmamAdjOpen(' + Number(S.agentId) + ',\'' + F + '\')" style="border:1px solid ' + (n ? '#b45309' : '#cbd5e1') + ';background:' + (n ? '#fff7ed' : '#fff') + ';border-radius:8px;padding:6px 10px;font-weight:900;cursor:pointer">±' + (n ? ' ' + n : '') + '</button> <button type="button" onclick="payStubShow(' + Number(S.agentId) + ',\'' + F + '\')" style="border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:6px 10px;font-weight:800;cursor:pointer">Stub</button></td></tr>'; });
+  var TD = 'padding:9px 8px;background:#0b1b3f;color:#fff;font-weight:900;';
+  h += '<tr><td style="' + TD + '">Payroll total · ' + stubs.length + ' people</td><td style="' + TD + 'text-align:right">' + M(stubs.reduce(function(t, S){ return t + S.campaigns.reduce(function(a, c){ return a + (c.netCents || 0); }, 0); }, 0)) + '</td><td style="' + TD + 'text-align:right">' + M(stubs.reduce(function(t, S){ return t + S.other.reduce(function(a, x){ return a + (x.cents || 0); }, 0); }, 0)) + '</td><td style="' + TD + 'text-align:right">' + (adjAll >= 0 ? '+' : '−') + M(Math.abs(adjAll)) + '</td><td style="' + TD + 'text-align:right">' + M(total) + '</td><td style="' + TD + '"></td></tr></table></div>'
+    + '<div class="wpp-c">' + cards + '<div style="background:#0b1b3f;color:#fff;border-radius:12px;padding:12px;display:flex;justify-content:space-between;font-weight:900"><span>Payroll total · ' + stubs.length + ' people</span><span>' + M(total) + '</span></div></div></div>';
+  return h;
+}
+function injectPeople(){
+  try{ if(window._currentPanelId !== 'payroll-process' || !staff()) return;
+    document.querySelectorAll('button[onclick^="wmamPayRunFinalize("]').forEach(function(b){ var m = (b.getAttribute('onclick') || '').match(/wmamPayRunFinalize\('(\d{4}-\d{2}-\d{2})'\)/); if(!m) return; var F = m[1];
+      var area = b.closest('div[style*="border-top:2px solid #e2e8f0"]'); if(!area || area.querySelector('#wmamPayPeople')) return;
+      if(!ADJ.loaded[F]){ load(F).then(function(){ if(window._currentPanelId === 'payroll-process' && typeof window.wmamPayRunRender === 'function') window.wmamPayRunRender(); }); }
+      var box = document.createElement('div'); box.innerHTML = peopleHtml(F); area.insertBefore(box.firstChild, area.firstChild); });
+  }catch(e){ console.warn('[pay people]', e); }
+}
+if(typeof window.wmamPayRunRender === 'function'){ var oRender = window.wmamPayRunRender; window.wmamPayRunRender = function(){ var r = oRender.apply(this, arguments); injectPeople(); return r; }; }
+if(typeof gotoPanel === 'function'){ var oGo = gotoPanel; window.gotoPanel = gotoPanel = function(id){ var r = oGo.apply(this, arguments); if(id === 'payroll-process') setTimeout(injectPeople, 60); return r; }; }
+// Finalize (and the old finalize paths) read the newest bonuses / deductions first, so the frozen stubs include them
+['wmamPayRunFinalize', 'wpfFinalize', 'wpfSubmit'].forEach(function(fn){ var o = window[fn]; if(typeof o !== 'function') return; window[fn] = async function(F){ try{ await load(F, true); }catch(e){} if(ADJ.err) return alert('Not sent: the bonuses / deductions could not be read (' + ADJ.err + '). Try again in a minute.'); return o.apply(this, arguments); }; });
+
+function modal(body){ var old = document.getElementById('wmamAdjOv'); if(old) old.remove(); var ov = document.createElement('div'); ov.id = 'wmamAdjOv';
+  ov.style.cssText = 'position:fixed;inset:0;z-index:2147483500;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+  ov.innerHTML = '<div style="background:#fff;border-radius:14px;width:100%;max-width:480px;max-height:calc(100dvh - 32px);overflow-y:auto;box-shadow:0 20px 50px rgba(0,0,0,.3);font-family:Arial,Helvetica,sans-serif"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid #e5e7eb"><div style="font-weight:900;color:#003594">± Company bonus / deduction</div><button type="button" aria-label="Close" onclick="document.getElementById(\'wmamAdjOv\').remove()" style="border:none;background:#f1f5f9;border-radius:50%;width:32px;height:32px;font-weight:900;cursor:pointer">✕</button></div><div style="padding:14px 16px">' + body + '</div></div>';
+  ov.addEventListener('click', function(e){ if(e.target === ov) ov.remove(); }); document.body.appendChild(ov); }
+window.wmamAdjOpen = async function(aid, F, editId){
+  if(!staff()) return alert('Only payroll / the office can add bonuses and deductions.');
+  await load(F, true);
+  if(!openF(F)) return alert('Payroll for ' + longDate(F) + ' is already finalized. Reopen it first.');
+  var ag = person(aid) || { name:'#' + aid }, L = linesFor(aid, F), ed = editId ? L.find(function(x){ return String(x.id) === String(editId); }) : null;
+  var S = null; try{ var dep = payrollBuildDeposit(F); S = payStubData(aid, dep); }catch(e){}
+  var h = '<div style="font-weight:900;font-size:1.02rem">' + esc(ag.name) + '</div><div style="color:#64748b;font-size:.8rem">Payroll for ' + esc(longDate(F)) + '</div>';
+  if(S){ h += '<div style="margin-top:10px;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden">' + S.campaigns.map(function(c){ return '<div style="display:flex;justify-content:space-between;gap:8px;padding:6px 10px;border-bottom:1px solid #f1f5f9"><span>' + esc(c.carrier) + ' <span style="color:#64748b;font-size:.78rem">' + esc(wk(c)) + '</span></span><b>' + M(c.netCents) + '</b></div>'; }).join('')
+    + (S.company || []).concat(S.adjustments || []).map(function(x){ var neg = KINDS[x.kind] ? KINDS[x.kind].sign < 0 : x.cents < 0; return '<div style="display:flex;justify-content:space-between;gap:8px;padding:6px 10px;border-bottom:1px solid #f1f5f9;color:' + (neg ? '#b91c1c' : '#047857') + '"><span>' + esc(x.label) + (x.shortCents ? ' <span style="font-size:.76rem;color:#b45309">(' + M(x.shortCents) + ' carries to next payroll)</span>' : '') + '</span><b style="white-space:nowrap">' + (neg ? '−' : '+') + M(Math.abs(x.cents)) + '</b></div>'; }).join('')
+    + '<div style="display:flex;justify-content:space-between;padding:8px 10px;background:#ecfdf5;font-weight:900;color:#065f46"><span>Net pay now</span><span>' + M(S.netCents) + '</span></div></div>'; }
+  if(L.length) h += '<div style="margin-top:10px;font-size:.72rem;font-weight:900;letter-spacing:.5px;text-transform:uppercase;color:#475569">Added for this payroll</div>' + L.map(function(x){ var k = KINDS[x.kind] || { label:x.kind, sign:-1, icon:'' };
+    return '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;padding:7px 0;border-bottom:1px dashed #e5e7eb"><div style="min-width:0"><b>' + k.icon + ' ' + esc(k.label) + '</b><div style="color:#64748b;font-size:.78rem;overflow-wrap:anywhere">' + esc(x.reason) + ' · ' + esc(x.created_by_name || '') + '</div></div><div style="display:flex;gap:6px;align-items:center;flex-shrink:0"><b style="color:' + (k.sign < 0 ? '#b91c1c' : '#047857') + '">' + (k.sign < 0 ? '−' : '+') + M(x.amount_cents) + '</b><button type="button" onclick="wmamAdjOpen(' + Number(aid) + ',\'' + F + '\',' + Number(x.id) + ')" style="border:1px solid #cbd5e1;background:#fff;border-radius:7px;padding:4px 8px;font-weight:800;cursor:pointer">Edit</button><button type="button" onclick="wmamAdjRemove(' + Number(aid) + ',\'' + F + '\',' + Number(x.id) + ')" style="border:1px solid #fca5a5;background:#fff;color:#b91c1c;border-radius:7px;padding:4px 8px;font-weight:800;cursor:pointer">Remove</button></div></div>'; }).join('');
+  h += '<div style="font-weight:900;margin-top:14px;color:#0b1b3f">' + (ed ? 'Edit line' : 'Add a line') + '</div>';
+  h += '<label style="' + LB + '">Type *</label><select id="waKind" style="' + IN + '">' + ORDER.map(function(k){ return '<option value="' + k + '"' + (ed && ed.kind === k ? ' selected' : '') + '>' + KINDS[k].icon + ' ' + KINDS[k].label + (KINDS[k].sign > 0 ? ' (+ adds to pay)' : ' (− comes out of pay)') + '</option>'; }).join('') + '</select>';
+  h += '<label style="' + LB + '">Amount ($) *</label><input id="waAmt" type="number" inputmode="decimal" step="0.01" min="0" placeholder="0.00" value="' + (ed ? (ed.amount_cents / 100).toFixed(2) : '') + '" style="' + IN + '">';
+  h += '<label style="' + LB + '">Reason / what it’s for *</label><input id="waReason" maxlength="200" placeholder="e.g. Top seller bonus · October office rent share · Advance from 10/20" value="' + esc(ed ? ed.reason : '') + '" style="' + IN + '">';
+  h += '<div id="waErr" style="display:none;margin-top:10px;background:#fee2e2;color:#7f1d1d;font-weight:800;border-radius:8px;padding:9px 11px"></div>';
+  h += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap">' + (ed ? '<button type="button" onclick="wmamAdjOpen(' + Number(aid) + ',\'' + F + '\')" style="' + BTN + ';background:#f1f5f9;color:#0f172a">Cancel edit</button>' : '<button type="button" onclick="document.getElementById(\'wmamAdjOv\').remove()" style="' + BTN + ';background:#f1f5f9;color:#0f172a">Close</button>') + '<button type="button" id="waSave" onclick="wmamAdjSave(' + Number(aid) + ',\'' + F + '\',' + (ed ? Number(ed.id) : 'null') + ')" style="' + BTN + ';background:#003594;color:#fff">' + (ed ? 'Save changes' : 'Add to this payroll') + '</button></div>';
+  h += '<div style="color:#64748b;font-size:.76rem;margin-top:10px">It shows on their pay stub under Company adjustments with this reason, and changes their net pay and the payroll total. If a deduction is more than they have left this week, the rest carries to their next payroll.</div>';
+  modal(h); setTimeout(function(){ var f = document.getElementById('waAmt'); if(f) try{ f.focus(); }catch(e){} }, 50);
+};
+function refresh(aid, F){ try{ if(window._currentPanelId === 'payroll-process' && typeof window.wmamPayRunRender === 'function') window.wmamPayRunRender(); }catch(e){} try{ if(window._currentPanelId === 'payroll-rollup') gotoPanel('payroll-rollup', { payDate:F }); }catch(e){} }
+window.wmamAdjSave = async function(aid, F, editId){
+  var err = function(t){ var e = document.getElementById('waErr'); if(e){ e.textContent = t; e.style.display = 'block'; } var b = document.getElementById('waSave'); if(b) b.disabled = false; };
+  var kind = (document.getElementById('waKind') || {}).value, amt = Math.round(Math.abs(parseFloat((document.getElementById('waAmt') || {}).value)) * 100), reason = String((document.getElementById('waReason') || {}).value || '').trim();
+  if(!KINDS[kind]) return err('Pick the type.'); if(!(amt > 0)) return err('Enter the amount.'); if(!reason) return err('“Reason / what it’s for” is required. Nothing was saved.');
+  var b = document.getElementById('waSave'); if(b) b.disabled = true;
+  var u = me() || {}, ag = person(aid) || {}, r;
+  if(editId) r = await supaClient.from('wmam_payroll_adjustments').update({ kind:kind, amount_cents:amt, reason:reason, updated_by_name:u.name || '' }).eq('id', editId).select().maybeSingle();
+  else r = await supaClient.from('wmam_payroll_adjustments').insert({ pay_date:F, agent_id:Number(aid), agent_name:ag.name || '', kind:kind, amount_cents:amt, reason:reason, created_by_name:u.name || '' }).select().maybeSingle();
+  if(r && r.error) return err('Not saved: ' + r.error.message);
+  await load(F, true); refresh(aid, F); try{ cdFlash('Saved — ' + KINDS[kind].label + ' ' + M(amt)); }catch(e){}
+  window.wmamAdjOpen(aid, F);
+};
+window.wmamAdjRemove = async function(aid, F, id){
+  var x = linesFor(aid, F).find(function(y){ return Number(y.id) === Number(id); }); if(!x) return;
+  if(!confirm('Remove "' + (KINDS[x.kind] || {}).label + ' ' + M(x.amount_cents) + '" from this payroll?')) return;
+  var r = await supaClient.from('wmam_payroll_adjustments').update({ voided:true, voided_by_name:(me() || {}).name || '' }).eq('id', id).select().maybeSingle();
+  if(r && r.error) return alert('Not removed: ' + r.error.message);
+  await load(F, true); refresh(aid, F); window.wmamAdjOpen(aid, F);
+};
+}catch(e){ console.warn('[pay adjustments 2550]', e); } })();
+
+</script>
+<script>
+/* v2550 (Calvin 2026-10-29): "take what she already loaded and read it. stop taking our work away making us do it twice."
+   Every pay file / pasted pay email is saved to the database (wmam_payroll_drafts) the moment "Scan & Detect" reads it.
+   A reload, a new build or a closed page no longer loses it: Payroll Upload shows "Uploads not saved yet" with
+   "Open with the newest fixes", which reads the same text / file again with today's code and goes straight to the preview.
+   It is marked saved only after the payroll week is really in the database. Nothing is ever deleted — "Set aside" hides it. */
+(function(){ try{
+if(window._wmamDrafts2550) return; window._wmamDrafts2550 = true;
+var esc = function(s){ return (typeof _escapeHtml === 'function') ? _escapeHtml(s == null ? '' : String(s)) : String(s == null ? '' : s); };
+function me(){ return (typeof DB !== 'undefined' && DB.current) || null; }
+function can(){ try{ return hasPayrollUploadAccess(me()); }catch(e){ return false; } }
+var PD = window.WMAM_PAYDRAFTS = { list:[], loaded:false, err:'' };
+function b64(ab){ var u = new Uint8Array(ab), s = ''; for(var i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); }
+function unb64(s){ var bin = atob(s), u = new Uint8Array(bin.length); for(var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u.buffer; }
+function summary(dets){ return (dets || []).map(function(d){ var p = d.parsed || {}; return { carrier:d.carrier, periodStart:p.periodStart || '', periodEnd:p.periodEnd || '', rows:d.rowCount || 0, confirmed:d.confirmed !== false }; }); }
+function iso(v){ try{ return _payIso(v); }catch(e){ return String(v || '').slice(0, 10); } }
+function when(t){ var d = new Date(t); return isNaN(d) ? '' : d.toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' }); }
+function label(c){ return (c || []).map(function(x){ return x.carrier + (x.periodStart || x.periodEnd ? ' ' + (x.periodStart || '') + ' – ' + (x.periodEnd || '') : ''); }).join(' · ') || 'Pay file'; }
+
+async function loadList(){ try{ var r = await supaClient.from('wmam_payroll_drafts').select('id,created_at,created_by_name,source,source_ref,file_name,carriers,status,note').eq('status', 'open').order('created_at', { ascending:false }).limit(20);
+  if(r && r.error) throw new Error(r.error.message); PD.list = (r && r.data) || []; PD.err = ''; }catch(e){ PD.err = String(e && e.message || e); } PD.loaded = true; return PD.list; }
+window.wmamPayDraftsLoad = loadList;
+
+// 1. save the moment it is scanned
+if(typeof ppScanAndDetect === 'function'){ var oScan = ppScanAndDetect;
+  window.ppScanAndDetect = ppScanAndDetect = function(){ var r = oScan.apply(this, arguments);
+    try{ var dets = window._ppDetections, text = window._ppRawText || '', ab = window._ppFileBuffer || null;
+      if(dets && (text.trim() || ab)){ var u = me() || {}, fn = ((document.getElementById('pp-file-name') || {}).textContent || '').replace(/^[^\w]*/, '').trim();
+        var row = { created_by:u.id || null, created_by_name:u.name || '', source:ab ? 'file' : 'paste', raw_text:text || null, file_b64:ab && ab.byteLength <= 6000000 ? b64(ab) : null, file_name:fn || null, carriers:summary(dets) };
+        window._ppDraftId = null;
+        supaClient.from('wmam_payroll_drafts').insert(row).select('id').maybeSingle().then(function(x){ if(x && x.data) window._ppDraftId = x.data.id; else if(x && x.error) console.warn('[pay draft save]', x.error.message); });
+      } }catch(e){ console.warn('[pay draft]', e); }
+    return r; };
+}
+// which carriers were kept
+if(typeof ppProceedToPreview === 'function'){ var oGo = ppProceedToPreview;
+  window.ppProceedToPreview = ppProceedToPreview = function(){ var r = oGo.apply(this, arguments);
+    try{ if(window._ppDraftId) supaClient.from('wmam_payroll_drafts').update({ carriers:summary(window._ppDetections) }).eq('id', window._ppDraftId).then(function(){}); }catch(e){}
+    return r; };
+}
+// 2. marked saved only when the week is really in the database
+async function savedOnServer(carriers, since){
+  var r = await supaClient.from('app_settings').select('value').eq('key', 'payroll_weeks').maybeSingle(); var arr = []; try{ arr = JSON.parse((r && r.data && r.data.value) || '[]'); }catch(e){}
+  return (carriers || []).filter(function(c){ return c.confirmed !== false; }).every(function(c){ return arr.some(function(w){ return w && !w.deleted && w.carrier === c.carrier && iso(w.periodStart) === iso(c.periodStart) && iso(w.periodEnd) === iso(c.periodEnd) && Date.parse(w.uploadedAt || 0) >= since - 120000; }); });
+}
+if(typeof ppCommitStaged === 'function'){ var oCommit = ppCommitStaged;
+  window.ppCommitStaged = ppCommitStaged = async function(){ var id = window._ppDraftId, car = summary(window._ppStaged && window._ppStaged.detections), t0 = Date.now(), r = await oCommit.apply(this, arguments);
+    if(id){ (async function(){ for(var i = 0; i < 10; i++){ await new Promise(function(ok){ setTimeout(ok, 3000); }); try{ if(await savedOnServer(car, t0)){ await supaClient.from('wmam_payroll_drafts').update({ status:'saved', status_by_name:(me() || {}).name || '' }).eq('id', id); if(window._ppDraftId === id) window._ppDraftId = null; return; } }catch(e){} } })(); }
+    return r; };
+}
+// 3. open again — read with the newest code
+window.wmamPayDraftOpen = async function(id){
+  var r = await supaClient.from('wmam_payroll_drafts').select('*').eq('id', id).maybeSingle(); var d = r && r.data; if(!d) return alert('That upload was not found.');
+  var ab = null; try{ if(d.file_b64) ab = unb64(d.file_b64); }catch(e){}
+  var dets = []; try{ dets = ppDetectCarriers({ text:d.raw_text || '', arrayBuffer:ab }); }catch(e){ return alert('Could not read it: ' + (e.message || e)); }
+  var keep = {}; (d.carriers || []).forEach(function(c){ keep[c.carrier] = c.confirmed !== false; });
+  dets.forEach(function(x){ x.confirmed = keep[x.carrier] !== undefined ? keep[x.carrier] : true; });
+  window._ppDetections = dets; window._ppRawText = d.raw_text || ''; window._ppFileBuffer = ab; window._ppDraftId = d.id;
+  if(!dets.some(function(x){ return x.confirmed; })){ gotoPanel('payroll-upload-detect'); return; }
+  window._ppStaged = { detections:dets.filter(function(x){ return x.confirmed; }), rawText:d.raw_text || '' };
+  gotoPanel('payroll-upload-preview');
+};
+window.wmamPayDraftAside = async function(id){ if(!confirm('Set this upload aside? It is kept, just no longer listed here.')) return;
+  var r = await supaClient.from('wmam_payroll_drafts').update({ status:'set_aside', status_by_name:(me() || {}).name || '' }).eq('id', id); if(r && r.error) return alert('Not changed: ' + r.error.message);
+  await loadList(); gotoPanel('payroll-upload'); };
+function cardHtml(){
+  if(!PD.list.length) return '';
+  return '<div id="wmamPayDrafts" class="bo-card" style="margin-bottom:18px;border:2px solid #f59e0b"><div class="bo-card-head"><div class="bo-card-title">📂 Uploads not saved yet</div></div><div style="padding:12px 16px">'
+    + '<div style="color:#64748b;font-size:.82rem;margin-bottom:8px">Already loaded — open it to finish. It is read again with the newest fixes; nothing has to be uploaded twice.</div>'
+    + PD.list.map(function(d){ return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0;border-top:1px solid #eef2f7"><div style="min-width:0"><b>' + esc(label(d.carriers)) + '</b><div style="font-size:.78rem;color:#64748b">' + esc(d.source === 'email' ? 'From the pay email' : d.source === 'file' ? 'File' + (d.file_name ? ' ' + d.file_name : '') : 'Pasted') + ' · loaded by ' + esc(d.created_by_name || '—') + ' · ' + esc(when(d.created_at)) + (d.note ? ' · ' + esc(d.note) : '') + '</div></div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" onclick="wmamPayDraftOpen(' + Number(d.id) + ')" style="border:none;border-radius:8px;padding:9px 14px;font-weight:900;cursor:pointer;background:#047857;color:#fff">Open with the newest fixes →</button><button type="button" onclick="wmamPayDraftAside(' + Number(d.id) + ')" style="border:1px solid #cbd5e1;border-radius:8px;padding:9px 12px;font-weight:800;cursor:pointer;background:#fff">Set aside</button></div></div>'; }).join('')
+    + '</div></div>';
+}
+function inject(){ try{ if(window._currentPanelId !== 'payroll-upload' || !can()) return; var b = document.getElementById('boBody'); if(!b || document.getElementById('wmamPayDrafts')) return;
+  var html = cardHtml(); if(!html) return; var card = b.querySelector('.bo-card'); var box = document.createElement('div'); box.innerHTML = html;
+  if(card) card.parentNode.insertBefore(box.firstChild, card); else b.appendChild(box.firstChild); }catch(e){ console.warn('[pay drafts card]', e); } }
+if(typeof gotoPanel === 'function'){ var oNav = gotoPanel; window.gotoPanel = gotoPanel = function(id){
+  // after a reload / new build the preview had nothing to show — bring back the newest unsaved upload instead
+  if((id === 'payroll-upload-preview' || id === 'payroll-upload-detect') && !window._ppStaged && !window._ppDetections && can()){ var r0 = oNav.apply(this, arguments); loadList().then(function(l){ if(l.length) window.wmamPayDraftOpen(l[0].id); }); return r0; }
+  var r = oNav.apply(this, arguments);
+  if(id === 'payroll-upload' && can()){ loadList().then(function(){ if(window._currentPanelId === 'payroll-upload') inject(); }); setTimeout(inject, 60); }
+  return r; }; }
+}catch(e){ console.warn('[pay drafts 2550]', e); } })();
 
 </script>
 </body>
