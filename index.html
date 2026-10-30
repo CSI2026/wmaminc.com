@@ -3891,7 +3891,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.10.30.2590';
+var BUILD_VERSION = '2026.10.30.2600';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -118485,6 +118485,92 @@ window.panelMyMeetings = panelMyMeetings = function(){
       + '</div>'; });
   return h + '</div>'; };
 }catch(e){ console.warn('[calls 2580]', e); } })();
+
+</script>
+<script>
+/* v2600 (Calvin 2026-10-30): "for the payroll on TruConnect the agents need to see their pending orders also, just like they see
+   what they get paid for … the pending needs to be able to be clicked on … it needs the ability to exit out of it as well."
+   On the current pay stub, one orange line under the campaigns: "⏳ TruConnect — Pending orders · N orders · $X expected".
+   Not part of the check (net pay never changes). Tap it → a compact centered window: pending count, expected $, a plain
+   explanation, then every order grouped by sale day (order #, Tribal / NLAD, phone, IMEI, expected $, PENDING).
+   Exit any way: ✕ at the top, the Close button at the bottom, tapping outside the window, or the Esc key.
+   Pending = TruConnect phones the agent sold (TruConnect sales report → inventory "activated") after the last day
+   TruConnect paid on this stub, plus any order TruConnect's "Sold by agent" report lists as Pending. Expected $ uses the
+   agent's own TruConnect rate on this stub (Tribal / NLAD). Shown on the newest stub only (older stubs would be out of date). */
+(function(){ try{
+if(window._wmamTcPend2600) return; window._wmamTcPend2600 = true;
+var esc = function(s){ return (typeof _escapeHtml === 'function') ? _escapeHtml(s == null ? '' : String(s)) : String(s == null ? '' : s); };
+var M = function(c){ c = Number(c) || 0; return (c < 0 ? '−' : '') + '$' + (Math.abs(c) / 100).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','); };
+function iso(v){ try{ return _payIso(v); }catch(e){ return String(v || '').slice(0, 10); } }
+function addDays(ymd, n){ var d = new Date(String(ymd).slice(0, 10) + 'T12:00:00'); d.setDate(d.getDate() + n); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+function today(){ try{ return _ctToday(); }catch(e){ return new Date().toISOString().slice(0, 10); } }
+var CACHE = {}, INFO = {};
+window.wmamTcPendInfo = INFO;
+
+// ── the stub gets a placeholder; it fills itself in (and disappears when there is nothing pending) ──
+function cutoffFor(S){ var c = (S.campaigns || []).find(function(x){ return /truconnect/i.test(x.carrier || ''); });
+  return c && c.periodEnd ? iso(c.periodEnd) : addDays(S.payDate, -5); }
+function ratesFor(S){ var r = { t:0, n:0 }, c = (S.campaigns || []).find(function(x){ return /truconnect/i.test(x.carrier || ''); });
+  (c && c.own || []).forEach(function(x){ var cents = Math.round((x.rate || 0) * 100); if(/tribal/i.test(x.label)) r.t = r.t || cents; else if(/nlad/i.test(x.label)) r.n = r.n || cents; });
+  return r; }
+if(typeof payStubHtml === 'function'){ var oHtml = payStubHtml;
+  window.payStubHtml = payStubHtml = function(S){ var h = oHtml.apply(this, arguments);
+    try{ if(S && S.agentId && S.payDate && S.payDate >= addDays(today(), -6)){
+        var key = S.agentId + '|' + S.payDate; INFO[key] = { aid:S.agentId, name:S.name, cutoff:cutoffFor(S), rates:ratesFor(S) };
+        var ph = '<div class="pst2pend" data-k="' + esc(key) + '"></div>', i = h.indexOf('<div class="tots">');
+        if(i >= 0) h = h.slice(0, i) + ph + h.slice(i); } }catch(e){ console.warn('[tc pending]', e); }
+    return h; }; }
+
+async function loadFor(info){
+  var k = info.aid + '|' + info.cutoff; if(CACHE[k] && Date.now() - CACHE[k].at < 60000) return CACHE[k].rows;
+  var rows = [], seen = {};
+  try{ var q = await supaClient.from('tc_inventory').select('imei,model,activated_at,sold_order_number,tribal,raw,holder_id,status').eq('status', 'activated').gt('activated_at', info.cutoff).order('activated_at', { ascending:true }).limit(1000);
+    ((q && q.data) || []).forEach(function(d){ var by = (d.raw && d.raw.activatedById) || d.holder_id; if(String(by) !== String(info.aid)) return;
+      var im = String(d.imei || ''); if(im && seen[im]) return; seen[im] = 1;
+      rows.push({ day:String(d.activated_at || '').slice(0, 10), order:d.sold_order_number || '', imei:im, model:d.model || '', tribal:!!d.tribal }); }); }catch(e){}
+  try{ var p = await supaClient.from('wmam_pending_orders').select('order_no,imei,sold_on,first_seen,status,campaign,agent_id').eq('agent_id', info.aid).eq('campaign', 'TruConnect').eq('status', 'pending').limit(500);
+    ((p && p.data) || []).forEach(function(d){ var im = String(d.imei || ''); if(im && seen[im]) return; if(im) seen[im] = 1;
+      rows.push({ day:String(d.sold_on || d.first_seen || '').slice(0, 10), order:d.order_no || '', imei:im, model:'', tribal:null }); }); }catch(e){}
+  rows.forEach(function(r){ r.cents = r.tribal === false ? (info.rates.n || info.rates.t || 0) : (info.rates.t || info.rates.n || 0); });
+  rows.sort(function(a, b){ return String(a.day).localeCompare(String(b.day)); });
+  CACHE[k] = { at:Date.now(), rows:rows }; return rows; }
+function lineHtml(key, rows){ var est = rows.reduce(function(t, r){ return t + (r.cents || 0); }, 0);
+  return '<div class="sec" style="border-color:#f59e0b"><div role="button" tabindex="0" onclick="wmamTcPendOpen(\'' + esc(key) + '\')" onkeydown="if(event.key===\'Enter\')wmamTcPendOpen(\'' + esc(key) + '\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 14px;background:#fff7ed">'
+    + '<div style="min-width:0"><div style="font-weight:900;color:#9a3412;letter-spacing:.5px">⏳ TRUCONNECT — PENDING ORDERS</div><div class="sub" style="font-size:11.5px">Sold, not on a TruConnect pay file yet · not part of this check</div></div>'
+    + '<div style="display:flex;align-items:center;gap:10px;margin-left:auto"><div style="text-align:right"><div style="font-weight:900;font-size:15px;color:#b45309">' + rows.length + ' order' + (rows.length === 1 ? '' : 's') + (est ? ' · ' + M(est) : '') + '</div><div class="sub">' + (est ? 'expected when TruConnect pays' : 'waiting on TruConnect') + '</div></div>'
+    + '<span style="background:#b45309;color:#fff;border-radius:999px;padding:7px 12px;font-weight:900;font-size:12px;white-space:nowrap">View ›</span></div></div></div>'; }
+async function fill(el){ el.setAttribute('data-done', '1'); var key = el.getAttribute('data-k'), info = INFO[key]; if(!info) return el.remove();
+  var rows = await loadFor(info); if(!rows.length) return el.remove(); el.innerHTML = lineHtml(key, rows); }
+setInterval(function(){ try{ document.querySelectorAll('.pst2pend:not([data-done])').forEach(fill); }catch(e){} }, 400);
+
+// ── the window (exit: ✕, Close, tap outside, Esc) ──
+function closeWin(){ var o = document.getElementById('wmamTcPendOv'); if(o) o.remove(); document.removeEventListener('keydown', onKey, true); }
+function onKey(e){ if(e.key === 'Escape'){ e.stopPropagation(); closeWin(); } }
+window.wmamTcPendClose = closeWin;
+window.wmamTcPendOpen = async function(key){ var info = INFO[key]; if(!info) return; var rows = await loadFor(info);
+  var est = rows.reduce(function(t, r){ return t + (r.cents || 0); }, 0), by = {};
+  rows.forEach(function(r){ (by[r.day || '—'] = by[r.day || '—'] || []).push(r); });
+  var cut = new Date(info.cutoff + 'T12:00:00'), cutTxt = isNaN(cut) ? info.cutoff : cut.toLocaleDateString('en-US', { weekday:'short', month:'numeric', day:'numeric' });
+  var h = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
+    + '<div style="flex:1;min-width:120px;background:#fff7ed;border-radius:10px;padding:8px 10px;text-align:center"><div style="font-size:10px;font-weight:900;letter-spacing:1px;color:#b45309;text-transform:uppercase">Pending</div><div style="font-size:20px;font-weight:900;color:#b45309">' + rows.length + '</div></div>'
+    + '<div style="flex:1;min-width:120px;background:#ecfdf5;border-radius:10px;padding:8px 10px;text-align:center"><div style="font-size:10px;font-weight:900;letter-spacing:1px;color:#047857;text-transform:uppercase">Expected</div><div style="font-size:20px;font-weight:900;color:#047857">' + (est ? M(est) : '—') + '</div></div></div>';
+  h += '<div style="font-size:12px;color:#64748b;margin-bottom:8px;line-height:1.4">These show as sold on TruConnect’s report but TruConnect has not paid them yet. Each one is paid on the TruConnect pay file once TruConnect approves it — usually within 1–2 weeks. If TruConnect cancels one, it is not paid.</div>';
+  Object.keys(by).sort().forEach(function(k){ var d = new Date(k + 'T12:00:00');
+    h += '<div style="font-size:11px;font-weight:900;letter-spacing:1px;color:#475569;text-transform:uppercase;background:#f8fafc;padding:6px 8px;border-radius:6px;margin-top:8px">Sold ' + (isNaN(d) ? esc(k) : d.toLocaleDateString('en-US', { weekday:'short', month:'short', day:'numeric' })) + ' · ' + by[k].length + '</div>';
+    by[k].forEach(function(x){ h += '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;padding:8px 6px;border-bottom:1px dashed #e5e7eb"><div style="min-width:0"><div style="font-weight:800;font-size:13px">Order #' + esc(x.order || '—')
+      + (x.tribal == null ? '' : ' <span style="background:#ede9fe;color:#5b21b6;border-radius:999px;padding:1px 7px;font-size:10px;font-weight:900">' + (x.tribal ? 'TRIBAL' : 'NLAD') + '</span>') + '</div>'
+      + '<div style="font-size:11.5px;color:#64748b;overflow-wrap:anywhere">' + esc(x.model || 'TruConnect') + (x.imei ? ' · IMEI ' + esc(x.imei) : '') + '</div></div>'
+      + '<div style="text-align:right;flex-shrink:0"><div style="font-weight:900;color:#b45309">' + (x.cents ? M(x.cents) : '—') + '</div><div style="font-size:10px;font-weight:800;color:#b45309;background:#fef3c7;border-radius:999px;padding:1px 7px">PENDING</div></div></div>'; }); });
+  closeWin(); var o = document.createElement('div'); o.id = 'wmamTcPendOv';
+  o.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+  o.innerHTML = '<div role="dialog" aria-label="TruConnect pending orders" style="background:#fff;border-radius:14px;width:100%;max-width:520px;max-height:calc(100dvh - 32px);display:flex;flex-direction:column;box-shadow:0 20px 50px rgba(0,0,0,.35);font-family:Arial,Helvetica,sans-serif;color:#111827">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid #e5e7eb"><div><div style="font-weight:900;color:#9a3412">⏳ TruConnect pending orders</div><div style="font-size:12px;color:#64748b">' + esc(info.name || '') + ' · sold after ' + esc(cutTxt) + '</div></div>'
+    + '<button type="button" aria-label="Close" onclick="wmamTcPendClose()" style="border:none;background:#f1f5f9;border-radius:50%;width:36px;height:36px;font-weight:900;font-size:16px;cursor:pointer;flex-shrink:0">✕</button></div>'
+    + '<div style="padding:12px 16px;overflow-y:auto;-webkit-overflow-scrolling:touch">' + h + '</div>'
+    + '<div style="padding:10px 16px;border-top:1px solid #e5e7eb;display:flex;justify-content:center"><button type="button" onclick="wmamTcPendClose()" style="border:none;background:#0b1b3f;color:#fff;border-radius:10px;padding:11px 28px;font-weight:900;font-size:14px;cursor:pointer;min-width:160px">Close</button></div></div>';
+  o.addEventListener('click', function(e){ if(e.target === o) closeWin(); });
+  document.body.appendChild(o); document.addEventListener('keydown', onKey, true); };
+}catch(e){ console.warn('[tc pending 2600]', e); } })();
 
 </script>
 </body>
