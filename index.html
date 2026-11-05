@@ -3891,7 +3891,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.03.2750';
+var BUILD_VERSION = '2026.11.04.2770';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -120164,6 +120164,59 @@ if(typeof ppComputeAgentCommissions === 'function'){ var _pcc = ppComputeAgentCo
     return out; };
   window.ppComputeAgentCommissions = ppComputeAgentCommissions; }
 }catch(e){ console.warn('[tc prepaid 2750]', e); } })();
+
+</script>
+<script>
+/* v2770 (Calvin 2026-11-04): a TruConnect cancel / chargeback takes back EXACTLY what was paid on that sale — no more, no less.
+   "Whatever we paid them for that sale is what we take back." "For that pay week Chelsie only made $18 per deal and Tanita got the
+   difference ($10) — so $18 comes back from Chelsie and $10 from Tanita, based on the sales that week, not the week we're about to pay."
+   How: the cancelled order is found in the saved TruConnect pay week it was paid in (the order number is on that week's file).
+   From that week's saved pay lines, each person's pay on ONE such sale is read:
+     • the enroller's own line for that kind of sale (Tribal or NLAD) — e.g. Chelsie "Tribal enrollments 25 × $18" → $18
+     • every override paid on that enroller's sales of that kind — e.g. Tanita "CM Tribal diff on Chelsie Mains ($10/each)" → $10
+   Those exact amounts are taken back, from exactly those people. Nobody who wasn't paid on it is charged.
+   Before: when the old per-order record was missing (it only matched agents by their TruConnect code — Chelsie's file name didn't
+   match), the system guessed the tier (31+ → Chelsie $23) and priced Tanita's share as a one-sale week. Orders paid before the
+   system kept pay records still use the old estimate. */
+(function(){ try{
+if(window._wmamTcPaid2770) return; window._wmamTcPaid2770 = true;
+var OV = / override on | diff on | fill on | bonus on | share on |, paid to /i;
+function norm(o){ return String(o == null ? '' : o).trim().replace(/^0+/, '').toLowerCase(); }
+function kindOk(label, tribal){ var l = String(label || ''); return tribal ? /tribal/i.test(l) : (/nlad|non.?tribal/i.test(l) && !/tribal/i.test(l.replace(/non.?tribal/ig, ''))); }
+function perSale(b){ var n = Number(b && b.count) || 0, a = Number(b && b.amount); if(n > 0 && isFinite(a)) return Math.round(a * 100 / n); var r = Number(b && b.rate); return isFinite(r) ? Math.round(r * 100) : 0; }
+function roleOf(label, self){ if(self) return 'agent'; if(/^TL /i.test(label)) return 'tl-diff'; if(/^MM /i.test(label)) return 'mm-diff'; if(/fill on .*consolidated/i.test(label)) return 'cm-fill'; if(/^CM /i.test(label)) return 'cm-fill'; return 'override'; }
+// what each person was paid on this one order, from the saved week it was paid in
+function paidOnOrder(orderNum){
+  var needle = norm(orderNum); if(!needle || typeof PAYROLL_WEEKS === 'undefined' || !Array.isArray(PAYROLL_WEEKS)) return null;
+  var weeks = PAYROLL_WEEKS.filter(function(w){ return w && w.carrier === 'TruConnect' && Array.isArray(w.rows); })
+    .sort(function(a, b){ return String(b.uploadedAt || '').localeCompare(String(a.uploadedAt || '')); });
+  for(var i = 0; i < weeks.length; i++){ var w = weeks[i], er = null, det = null;
+    for(var j = 0; j < w.rows.length && !er; j++){ var r = w.rows[j]; (r.details || []).some(function(d){ if(d && norm(d.orderNum) === needle){ er = r; det = d; return true; } return false; }); }
+    if(!er) continue;
+    var tribal = !!det.tribal, eid = Number(er.agentId), ag = (DB.agents || []).find(function(a){ return a && Number(a.id) === eid; });
+    var names = [er.agentName, ag && ag.name].filter(Boolean).map(function(n){ return String(n).trim(); }), splits = [], seen = {};
+    // the enroller's own pay on this kind of sale
+    (er.commissionBreakdown || []).forEach(function(b){ var l = String(b && b.label || ''); if(OV.test(l) || !kindOk(l, tribal)) return; var c = perSale(b); if(c > 0 && !seen[eid]){ seen[eid] = 1; splits.push({ aid:eid, role:'agent', cents:c, label:l }); } });
+    // everyone paid an override on this enroller's sales of this kind
+    w.rows.forEach(function(r){ var aid = Number(r.agentId); if(!aid || aid === eid) return;
+      (r.commissionBreakdown || []).forEach(function(b){ var l = String(b && b.label || ''); if(!OV.test(l) || !kindOk(l, tribal)) return;
+        if(!names.some(function(n){ return l.indexOf(' on ' + n) >= 0; })) return;
+        var c = perSale(b); if(c > 0){ var k = aid + '|' + l; if(seen[k]) return; seen[k] = 1; splits.push({ aid:aid, role:roleOf(l, false), cents:c, label:l }); } }); });
+    if(!splits.length) return null;   // nothing paid on it that week (e.g. routed to an IBO): fall back to the old way
+    return { date:det.date || '', orderNum:det.orderNum, tribal:tribal, enrollerAid:eid, enrollerName:(ag && ag.name) || er.agentName, splits:splits, weekId:w.id, periodEnd:w.periodEnd, exactPaid:true };
+  }
+  return null;
+}
+window.wmamTcPaidOnOrder = paidOnOrder;
+// the chargeback cascade asks this first
+if(typeof payrollLookupDealPay === 'function'){ var _lk = payrollLookupDealPay;
+  payrollLookupDealPay = function(orderNum, carrier){ if(!carrier || carrier === 'TruConnect'){ try{ var x = paidOnOrder(orderNum); if(x) return x; }catch(e){} } return _lk.apply(this, arguments); };
+  window.payrollLookupDealPay = payrollLookupDealPay; }
+// the "everyone paid on it gives it back" rule uses the same exact amounts (so nobody is charged twice or charged what they weren't paid)
+if(typeof _ovExpectedSplit === 'function'){ var _ov = _ovExpectedSplit;
+  _ovExpectedSplit = function(ag, d){ try{ var x = paidOnOrder(d && d.orderNum); if(x){ var out = {}; x.splits.forEach(function(s){ out[s.aid] = (out[s.aid] || 0) + s.cents; }); return out; } }catch(e){} return _ov.apply(this, arguments); };
+  window._ovExpectedSplit = _ovExpectedSplit; }
+}catch(e){ console.warn('[tc paid 2770]', e); } })();
 
 </script>
 </body>
