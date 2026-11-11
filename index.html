@@ -3891,7 +3891,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.11.3000';
+var BUILD_VERSION = '2026.11.11.3020';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -42011,7 +42011,8 @@ async function _autoRefreshTick(){
     // their own tables — they're stored as monthly_sales JSON on each agent
     // record. Notifications are real. Inventory transfers live in
     // PENDING_TRANSFERS (which syncs through app_settings).
-    var tables = ['agents','notifications','app_settings'];
+    var tables = (typeof window.wmamNotifRefresh === 'function') ? ['agents','app_settings'] : ['agents','notifications','app_settings'];   // v3020: notifications refresh separately (below)
+    if(typeof window.wmamNotifRefresh === 'function'){ try{ await window.wmamNotifRefresh(_force); }catch(e){ console.warn('[autoRefresh notif]', e); } }
     for(var i = 0; i < tables.length; i++){
       var table = tables[i];
       try{
@@ -121453,6 +121454,99 @@ if(typeof bdgUseOnboarding === 'function'){
 if(typeof hsUseOnboarding === 'function'){
   hsUseOnboarding = window.hsUseOnboarding = async function(){ try{ var a = _hsAgent(HS.agentId), p = a && await realPhoto(a); if(p) await _hsSave(p); }catch(e){ say('Could not open the onboarding photo: ' + e.message); } }; }
 }catch(e){ console.warn('[prebg 3000]', e); } })();
+
+</script>
+<script>
+/* v3020 Phase 1 (Calvin 2026-11-11 "go") — NOTIFICATIONS LOAD ONLY WHAT EACH PERSON CAN SEE.
+   Before: login pulled the newest 500 of EVERYONE's notifications, and every refresh pulled up to 1,000 of everyone's in random
+   order and replaced the whole list (so a person's newest could drop off until the next login).
+   Now (server function wmam_notif_list, same who-sees-what rule as the bell):
+   • login: the newest 500 this person can see;
+   • refresh: only notifications newer than the newest one on screen; every 10 minutes a full re-check (also drops ones the
+     office removed, like resolved inventory approvals);
+   • View As: the viewed person's notifications; back to your own when you exit;
+   • live pop-ups (realtime) are unchanged.
+   If the server function ever fails, the page falls back to the old way, so nothing is ever missed. */
+(function(){ try{
+if(window._wmamNotif3020) return; window._wmamNotif3020 = true;
+function mapRow(row){ return { id: row.id, type: row.type || 'info', title: row.title, body: row.body || '', icon: row.icon || 'bell', fromId: row.from_id,
+  fromName: row.from_name || 'System', formType: row.form_type, toIds: row.to_ids || [], toRoles: row.to_roles || [], data: row.data,
+  read: row.read_by || [], clearedBy: row.cleared_by || [], ts: row.ts || new Date().toISOString() }; }
+function asId(){ return (window.IMPERSONATING && DB.current) ? Number(DB.current.id) : null; }
+async function fetchList(since){
+  var a = { p_limit: 500 }; if(since) a.p_since = since; var who = asId(); if(who) a.p_as = who;
+  var r = await supaClient.rpc('wmam_notif_list', a); if(r.error) throw new Error(r.error.message); return Array.isArray(r.data) ? r.data : []; }
+function union(a, b){ return (typeof _notifUnion === 'function') ? _notifUnion(a, b) : Array.from(new Set([].concat(a || [], b || []))); }
+function after(changed, newVisible){
+  try{ if(typeof _notifReapplyLocalState === 'function') _notifReapplyLocalState(); }catch(e){}
+  try{ if(typeof saveNotifications === 'function') saveNotifications(); }catch(e){}
+  try{ if(typeof renderNotifBell === 'function') renderNotifBell(); }catch(e){}
+  if(changed){ try{ if(typeof _smartReRender === 'function') _smartReRender('notifications'); }catch(e){} }
+  if(newVisible && typeof _showUpdateToast === 'function'){ try{ _showUpdateToast('New notification activity', { icon:'🔔', color:'#7c3aed' }); }catch(e){} }
+}
+// overlay server rows onto the list: new rows added, existing rows keep everyone's read/cleared marks (union, like live updates)
+function overlay(rows){
+  var byId = {}, added = 0, addedVisible = 0, changed = false, u = DB && DB.current;
+  WMAM_NOTIFICATIONS.forEach(function(n){ byId[n.id] = n; });
+  rows.forEach(function(row){ var ex = byId[row.id];
+    if(ex){ var r0 = (ex.read || []).length, c0 = (ex.clearedBy || []).length;
+      ex.read = union(ex.read, row.read_by || []); ex.clearedBy = union(ex.clearedBy, row.cleared_by || []);
+      if(ex.read.length !== r0 || ex.clearedBy.length !== c0) changed = true; }
+    else { var n = mapRow(row); byId[n.id] = n; added++; changed = true;
+      try{ if(u && typeof notifVisibleTo === 'function' && notifVisibleTo(n, u)) addedVisible++; }catch(e){} } });
+  if(added) WMAM_NOTIFICATIONS = Object.keys(byId).map(function(k){ return byId[k]; }).sort(function(a, b){ return new Date(b.ts) - new Date(a.ts); });
+  return { changed: changed, added: added, addedVisible: addedVisible };
+}
+var oldLoad = (typeof loadNotificationsFromSupabase === 'function') ? loadNotificationsFromSupabase : null;
+// login (and View As switch): the newest 500 this person can see — merged over what this device already had, server wins (as before)
+var load = async function(){
+  if(typeof supaClient === 'undefined' || !supaClient) return;
+  var rows; try{ rows = await fetchList(null); }catch(e){ console.warn('[notif 3020] falling back to the old load:', e.message); return oldLoad ? oldLoad.apply(this, arguments) : undefined; }
+  var byId = {}; WMAM_NOTIFICATIONS.forEach(function(n){ byId[n.id] = n; });
+  rows.forEach(function(row){ var n = mapRow(row); byId[n.id] = n; });
+  WMAM_NOTIFICATIONS = Object.keys(byId).map(function(k){ return byId[k]; }).sort(function(a, b){ return new Date(b.ts) - new Date(a.ts); }).slice(0, window.IMPERSONATING ? 1500 : 500);   // View As keeps both lists so the viewed person's 500 all show
+  after(true, false);
+  window._wmamNotifFullAt = Date.now();
+  console.log('[notif 3020] loaded ' + rows.length + ' notification(s) for this person');
+};
+loadNotificationsFromSupabase = window.loadNotificationsFromSupabase = load;
+// refresh (called by the auto-refresh): only what is new; a full re-check when forced (every 10 minutes)
+window.wmamNotifRefresh = async function(force){
+  if(typeof supaClient === 'undefined' || !supaClient || !DB || !DB.current) return;
+  try{
+    if(force){
+      var rows = await fetchList(null), res = overlay(rows);
+      // drop ones the server no longer has (e.g. resolved inventory approvals), only inside the window the server returned,
+      // only ones this person could see, never anything newer than 2 minutes (still being sent)
+      var ids = {}; rows.forEach(function(r){ ids[r.id] = 1; });
+      var oldest = rows.length >= 500 ? new Date(rows[rows.length - 1].ts).getTime() : 0, cut = Date.now() - 120000, u = DB.current, before = WMAM_NOTIFICATIONS.length;
+      WMAM_NOTIFICATIONS = WMAM_NOTIFICATIONS.filter(function(n){ var t = new Date(n.ts).getTime();
+        if(ids[n.id] || t < oldest || t > cut) return true;
+        var mine = false; try{ mine = (typeof notifVisibleTo === 'function' && notifVisibleTo(n, u)) || Number(n.fromId) === Number(u.id); }catch(e){}
+        return !mine; });
+      if(WMAM_NOTIFICATIONS.length > 500) WMAM_NOTIFICATIONS = WMAM_NOTIFICATIONS.slice(0, 500);
+      window._wmamNotifFullAt = Date.now();
+      after(res.changed || WMAM_NOTIFICATIONS.length !== before, res.addedVisible > 0);
+    } else {
+      var newest = 0; WMAM_NOTIFICATIONS.forEach(function(n){ var t = new Date(n.ts).getTime(); if(t > newest) newest = t; });
+      var since = newest ? new Date(newest - 5 * 60000).toISOString() : null;   // 5-minute overlap for clock differences
+      var rows2 = await fetchList(since), res2 = overlay(rows2);
+      if(WMAM_NOTIFICATIONS.length > 500) WMAM_NOTIFICATIONS = WMAM_NOTIFICATIONS.slice(0, 500);
+      if(res2.changed) after(true, res2.addedVisible > 0);
+    }
+  }catch(e){
+    console.warn('[notif 3020 refresh]', e.message || e);
+    // fallback = the old way (newest 500 of all, merged), so a server problem never leaves anyone without their notifications
+    try{ var o = await supaClient.from('notifications').select('*').order('ts', { ascending: false }).limit(500);
+      if(o && !o.error && Array.isArray(o.data)){ var r3 = overlay(o.data); if(WMAM_NOTIFICATIONS.length > 500) WMAM_NOTIFICATIONS = WMAM_NOTIFICATIONS.slice(0, 500); after(r3.changed, false); } }catch(e2){}
+  }
+};
+// View As: load the viewed person's notifications; back to your own on exit
+if(typeof startImpersonation === 'function'){ var oS = startImpersonation;
+  startImpersonation = window.startImpersonation = function(){ var r = oS.apply(this, arguments); try{ if(window.IMPERSONATING) load(); }catch(e){} return r; }; }
+if(typeof returnToOwnerView === 'function'){ var oR = returnToOwnerView;
+  returnToOwnerView = window.returnToOwnerView = function(){ var was = !!window.IMPERSONATING; var r = oR.apply(this, arguments); try{ if(was) load(); }catch(e){} return r; }; }
+}catch(e){ console.warn('[notif 3020]', e); } })();
 
 </script>
 </body>
