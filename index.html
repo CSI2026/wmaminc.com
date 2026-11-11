@@ -76,6 +76,14 @@
   // Never stored anywhere as a blob: these already live in their own Supabase tables
   // v2026.10.18 ONE SOURCE OF TRUTH: the shared inventory lists live only in the database (inv_records) — no private copy is read or written
   var TABLE_BACKED = /^wmam_(agents|gm_inventory|tc_inventory|aw_inventory|ex_inventory|inv_devices|inv_batches|inv_transfers|inv_requests|inv_deletion_requests|gm_activations|gm_transfers|aw_activations|aw_transfers|tc_activations|tc_transfers|ex_activations|ex_transfers|dart_transfers|inv_pickups|inv_discrepancies|pending_xfers|sold_reports|sold_report_batches|inv_markets|inv_upsell_pct|supply_inv|inv_tombstones|gm_activation_edits|inv_nextid|inv_pickup_nextid|inv_disc_nextid)$/;
+  // v3080: company lists that live in the server's company settings — read from there at page open, never kept as a personal copy
+  var SERVER_LIST = ['carrier_tickets','applicants_pre_bg','payroll_weeks','expired_device_charges','payroll_debt_ledger','fb_registry','markets','comp_plans',
+    'inactivity_flags','training_sessions','store_items','rank_history','training_completions','weekly_snapshots','contact_directory','agent_status_v1',
+    'contact_call_log','payroll_obligations','ob_pending_actions'];
+  var SERVER_BACKED = new RegExp('^wmam_(' + SERVER_LIST.join('|') + ')$');
+  var MEMORY_ONLY = /^wmam_(notifications|assigned_docs)$/;   // v3080: load from their own server tables
+  function noCopy(k){ return SERVER_BACKED.test(k) || MEMORY_ONLY.test(k); }
+  window.WMAM_NO_COPY = noCopy;
   var INV_KEYS = {gm:'wmam_gm_inventory', tc:'wmam_tc_inventory', aw:'wmam_aw_inventory', ex:'wmam_ex_inventory', legacy:'wmam_inv_devices'};
 
   var cache = {};          // key -> string (the person's cloud data)
@@ -126,7 +134,7 @@
     // v2026.10.05: load in small pages, skipping backup snapshots, so a large saved copy can't time out
     var PAGE = 20, off = 0, okAll = true, g = { status:0 }, loaded = {};
     for(var _pg = 0; _pg < 200; _pg++){
-      var q = '/rest/v1/wmam_store?select=key,value&key=not.like.wmam_backup_*&key=not.in.(wmam_auto_backups,wmam_agents_backup)&order=key.asc&limit=' + PAGE + '&offset=' + off;
+      var q = '/rest/v1/wmam_store?select=key,value&key=not.like.wmam_backup_*&key=not.in.(wmam_auto_backups,wmam_agents_backup,wmam_notifications,wmam_assigned_docs,' + SERVER_LIST.map(function(x){ return 'wmam_' + x; }).join(',') + ')&order=key.asc&limit=' + PAGE + '&offset=' + off;   // v3080: no personal copies of company lists
       g = syncXhr('GET', q, null, sess.access_token);
       if(g.status !== 200){ g = syncXhr('GET', q, null, sess.access_token); }   // one quick retry per page
       if(g.status !== 200){ okAll = false; break; }
@@ -136,6 +144,9 @@
     }
     if(okAll){
       Object.keys(loaded).forEach(function(k){ cache[k] = loaded[k]; sent[k] = loaded[k]; });
+      // v3080: the company lists, straight from the company copy on the server (one request; access rules of the server apply)
+      try{ var sv = syncXhr('GET', '/rest/v1/app_settings?select=key,value&key=in.(' + SERVER_LIST.join(',') + ')', null, sess.access_token);
+        if(sv.status === 200){ (JSON.parse(sv.text) || []).forEach(function(row){ if(row && row.key != null && row.value != null) cache['wmam_' + row.key] = row.value; }); } }catch(e){}
       state.mode = 'cloud';
     } else {
       state.mode = 'readonly';                                          // could not load -> never save over the cloud
@@ -162,6 +173,7 @@
              v = JSON.stringify(_ag); rescueQ.push({ key: k, value: v }); }catch(e){}
         if(k === 'wmam_agents') continue;                               // live list comes from the agents table
       }
+      if(noCopy(k)){ rescueQ.push({ key: k, value: v }); continue; }   // v3080: old device copy archived; the server has the real list
       if(TABLE_BACKED.test(k)){
         rescueQ.push({ key: k, value: v });                             // archive + checked against inventory tables after load
         for(var pk in INV_KEYS){ if(INV_KEYS[pk] === k) deviceInventory[pk] = v; }
@@ -178,6 +190,7 @@
     if(this === LS && BACKUP_KEYS.test(String(k))) return Object.prototype.hasOwnProperty.call(bk, String(k)) ? bk[String(k)] : null;
     if(this === LS && isCloudKey(k = String(k))){
       if(TABLE_BACKED.test(k)) return null;
+      if(noCopy(k)) return Object.prototype.hasOwnProperty.call(cache, k) ? cache[k] : null;   // v3080
       return Object.prototype.hasOwnProperty.call(cache, k) ? cache[k] : null;
     }
     return rGet.apply(this, arguments);
@@ -185,6 +198,7 @@
   P.setItem = function(k, v){
     if(this === LS && isCloudKey(k = String(k))){
       if(TABLE_BACKED.test(k)) return;                                  // lives in its own Supabase table
+      if(noCopy(k)){ cache[k] = String(v); return; }                     // v3080: this visit only; the real save goes to the server as before
       v = String(v);
       if(cache[k] === v) return;
       cache[k] = v; delete dels[k]; dirty[k] = true; schedule();
@@ -196,6 +210,7 @@
   P.removeItem = function(k){
     if(this === LS && BACKUP_KEYS.test(String(k))){ delete bk[String(k)]; return; }
     if(this === LS && isCloudKey(k = String(k))){
+      if(noCopy(k)){ delete cache[k]; return; }                          // v3080: nothing to delete on the server
       if(Object.prototype.hasOwnProperty.call(cache, k)){ delete cache[k]; delete dirty[k]; dels[k] = true; schedule(); }
       return;
     }
@@ -3891,7 +3906,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.11.3070';
+var BUILD_VERSION = '2026.11.11.3080';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
