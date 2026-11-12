@@ -3906,7 +3906,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.11.3110';
+var BUILD_VERSION = '2026.11.11.3120';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -36288,7 +36288,7 @@ async function loadFromSupabase(){
         // Calvin 2026-06-10 — failed-BG cost ledger + weekly invoices
         if(s.key==='failed_bg_costs'      && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) FAILED_BG_COSTS = v;}catch(e){} }
         if(s.key==='payroll_obligations'  && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)){ PAYROLL_OBLIGATIONS.length=0; Array.prototype.push.apply(PAYROLL_OBLIGATIONS, v); window._wmamOblFromServer = true; }}catch(e){} }
-        if(s.key==='expired_device_charges' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)){ EXPIRED_DEVICE_CHARGES.length=0; Array.prototype.push.apply(EXPIRED_DEVICE_CHARGES, v); window._wmamExpFromServer = true; }}catch(e){} }
+        if(s.key==='expired_device_charges' && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)){ EXPIRED_DEVICE_CHARGES.length=0; Array.prototype.push.apply(EXPIRED_DEVICE_CHARGES, v); window._wmamExpFromServer = true; if(typeof window.wmamListBase==='function') window.wmamListBase('expired_device_charges', s.value); }}catch(e){} }
         if(s.key==='obligation_commits'   && s.value){ try{var v=JSON.parse(s.value); if(v && typeof v==='object'){ Object.keys(OBLIGATION_COMMITS).forEach(function(k){delete OBLIGATION_COMMITS[k];}); Object.keys(v).forEach(function(k){OBLIGATION_COMMITS[k]=v[k];}); }}catch(e){} }
         if(s.key==='bg_fail_invoices'     && s.value){ try{var v=JSON.parse(s.value); if(Array.isArray(v)) BG_FAIL_INVOICES = v;}catch(e){} }
         // Calvin 2026-06-10 v1330 — applicants pre-BG
@@ -40730,13 +40730,54 @@ if(typeof window!=='undefined') window.payrollCommitObligations = payrollCommitO
 //    device), on the payroll for the week it was activated.
 // ════════════════════════════════════════════════════════════════════════
 var EXPIRED_DEVICE_CHARGES = [];
+// v3120 (Calvin 2026-11-11): company lists send ONLY the items that changed (server function wmam_list_save) — first: expired charges.
+// Before, every change re-sent all 647 charges (459 KB) and then downloaded them all again. Now only changed charges go up, the
+// server keeps every other charge as it is on the server, and the re-download is skipped when the server kept exactly what was sent.
+// Any problem → the old full save runs instead, so a save is never lost.
+(function(){
+  var BASE = {}, BUSY = {}, PEND = {}; window._wmamListAsSent = window._wmamListAsSent || {};
+  function key(w){ return (w && w.id !== undefined && w.id !== null && w.id !== '') ? String(w.id) : null; }
+  function idsOk(list){ var seen = {}; for(var i = 0; i < list.length; i++){ var k = key(list[i]); if(k === null || typeof list[i] !== 'object' || seen[k]) return false; seen[k] = 1; } return true; }
+  window.wmamListBase = function(k, raw){ try{ var a = typeof raw === 'string' ? JSON.parse(raw) : raw; if(typeof a === 'string') a = JSON.parse(a);
+    if(!Array.isArray(a) || !idsOk(a)){ delete BASE[k]; return; } var m = {}; a.forEach(function(w){ m[key(w)] = JSON.stringify(w); }); BASE[k] = m; }catch(e){ delete BASE[k]; } };
+  async function send(k, snap, fallback){
+    window._wmamListAsSent[k] = false;
+    if(typeof supaClient === 'undefined' || !supaClient || typeof supaClient.rpc !== 'function' || !idsOk(snap.list)) return fallback(snap.full);
+    if(!BASE[k]){ try{ var r0 = await supaClient.from('app_settings').select('value').eq('key', k).maybeSingle(); if(r0 && r0.data && r0.data.value) window.wmamListBase(k, r0.data.value); }catch(e){} }
+    var B = BASE[k]; if(!B) return fallback(snap.full);
+    var ids = snap.list.map(key), changed = [], removed = [];
+    snap.parts.forEach(function(p, i){ if(B[ids[i]] !== p) changed.push(p); });
+    Object.keys(B).forEach(function(id){ if(ids.indexOf(id) < 0) removed.push(id); });
+    if(!changed.length && !removed.length){ window._wmamListAsSent[k] = true; return; }   // nothing changed on this screen
+    var res; try{ res = await supaClient.rpc('wmam_list_save', { p_key:k, p_items:'[' + changed.join(',') + ']', p_removed:removed, p_order:ids }); }catch(e){ res = { error:e }; }
+    if(res && res.error){
+      if(/view only/i.test(String(res.error.message || res.error)) || res.error.code === 'view_only') return;   // View As (view only): nothing saved, as before
+      console.warn('[list save 3120] ' + k + ' — falling back to the full save:', res.error.message || res.error);
+      return fallback(snap.full);
+    }
+    B = BASE[k] || (BASE[k] = {}); snap.list.forEach(function(w, i){ B[ids[i]] = snap.parts[i]; }); removed.forEach(function(id){ delete B[id]; });
+    window._wmamListAsSent[k] = !!(res && res.data && res.data.as_sent);
+  }
+  function run(k, snap, fallback){ BUSY[k] = true; Promise.resolve().then(function(){ return send(k, snap, fallback); }).catch(function(e){ console.warn('[list save 3120]', e); })
+    .then(function(){ BUSY[k] = false; var p = PEND[k]; if(p){ PEND[k] = null; run(k, p.snap, p.fallback); } }); }
+  // the list is captured the moment save is asked for; saves made while one is on its way are sent together right after it
+  window.wmamListSave = function(k, arr, fallback){
+    window._wmamListAsSent[k] = false;
+    var list = (arr || []).slice(), parts = list.map(function(w){ return JSON.stringify(w); });
+    var snap = { list:list, parts:parts, full:'[' + parts.join(',') + ']' };
+    if(BUSY[k]){ PEND[k] = { snap:snap, fallback:fallback }; return; }
+    run(k, snap, fallback);
+  };
+})();
 function saveExpiredCharges(){
   try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
   try{ localStorage.setItem('wmam_expired_device_charges', JSON.stringify(EXPIRED_DEVICE_CHARGES)); }catch(e){}
-  try{ if(typeof supaClient!=='undefined' && supaClient){ supaClient.from('app_settings').upsert([{key:'expired_device_charges', value:JSON.stringify(EXPIRED_DEVICE_CHARGES)}]).then(function(){}).catch(function(){}); } }catch(e){}
+  function _full(v){ try{ if(typeof supaClient!=='undefined' && supaClient){ return supaClient.from('app_settings').upsert([{key:'expired_device_charges', value:(typeof v === 'string' ? v : JSON.stringify(EXPIRED_DEVICE_CHARGES))}]).then(function(r){ if(r && !r.error && typeof window.wmamListBase === 'function') window.wmamListBase('expired_device_charges', v); }).catch(function(){}); } }catch(e){} }
+  if(typeof window.wmamListSave === 'function'){ try{ window.wmamListSave('expired_device_charges', EXPIRED_DEVICE_CHARGES, _full); return; }catch(e){ console.warn('[list save 3120]', e); } }   // v3120
+  _full();
 }
 function loadExpiredChargesFromLocal(){
-  try{ var c = localStorage.getItem('wmam_expired_device_charges'); if(c){ var arr=JSON.parse(c)||[]; EXPIRED_DEVICE_CHARGES.length=0; Array.prototype.push.apply(EXPIRED_DEVICE_CHARGES, arr); } }catch(e){}
+  try{ var c = localStorage.getItem('wmam_expired_device_charges'); if(c){ var arr=JSON.parse(c)||[]; EXPIRED_DEVICE_CHARGES.length=0; Array.prototype.push.apply(EXPIRED_DEVICE_CHARGES, arr); if(typeof window.wmamListBase === 'function') window.wmamListBase('expired_device_charges', c); } }catch(e){}
 }
 if(typeof window!=='undefined'){ window.EXPIRED_DEVICE_CHARGES=EXPIRED_DEVICE_CHARGES; window.saveExpiredCharges=saveExpiredCharges; window.loadExpiredChargesFromLocal=loadExpiredChargesFromLocal; }
 
@@ -115058,7 +115099,9 @@ setInterval(function(){ try{ rvPopupCheck(); }catch(e){} }, 30 * 60000);
 
 // ── (4) the database merges every save (it never loses a paid/waived charge); read the merged copy back so this screen shows it ──
 (function(){ var o = window.saveExpiredCharges; if(typeof o !== 'function' || o._pf) return; var t = null;
-  var w = function(){ var r = o.apply(this, arguments); clearTimeout(t); t = setTimeout(async function(){ try{ var g = await supaClient.from('app_settings').select('value').eq('key', 'expired_device_charges').maybeSingle(); var v = g && g.data && JSON.parse(g.data.value);
+  var w = function(){ var r = o.apply(this, arguments); clearTimeout(t); t = setTimeout(async function(){ try{ if(window._wmamListAsSent && window._wmamListAsSent.expired_device_charges === true) return;   // v3120: the server kept exactly what was sent — nothing to download
+      var g = await supaClient.from('app_settings').select('value').eq('key', 'expired_device_charges').maybeSingle(); var v = g && g.data && JSON.parse(g.data.value);
+      if(Array.isArray(v) && v.length && typeof window.wmamListBase === 'function') window.wmamListBase('expired_device_charges', g.data.value);   // v3120
       if(Array.isArray(v) && v.length){ EXPIRED_DEVICE_CHARGES.length = 0; Array.prototype.push.apply(EXPIRED_DEVICE_CHARGES, v); try{ localStorage.setItem('wmam_expired_device_charges', JSON.stringify(v)); }catch(e){} if(window._currentPanelId === 'invoice-center') icRender(); } }catch(e){} }, 2500); return r; };
   w._pf = true; window.saveExpiredCharges = w; try{ saveExpiredCharges = w; }catch(e){} })();
 // ── (5) mark a charge PAID — the agent paid it, or it was already taken on a payroll before payroll ran in this system ──
