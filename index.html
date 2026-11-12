@@ -3906,7 +3906,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.12.3180';
+var BUILD_VERSION = '2026.11.12.3190';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -121791,6 +121791,345 @@ _notifPushReadState = window._notifPushReadState = function(n){
 };
 }catch(e){ console.warn('[notif marks 3070]', e); } })();
 
+</script>
+<script>
+/* v3190 CONTRACT AI (Calvin 2026-11-12: "does the contracts have ai to help me with contracts built in now since i have so many
+   updates that are needed especially with IBO contracts ect. for individuals ect … also my agent and manager contracts as well"
+   → "1- all of them, 2- i rather have the contract or contract updated in the system and not here. signed contracts are fine we
+   just do addemdums to those as needed.")
+
+   Where: Onboarding → Documents → Campaign Documents (Campaign Document Manager), card "🤖 CONTRACT AI" — owner only.
+   1. Pick which contracts (one campaign or all; Field Agent / Tribal / IBO / Team Leader / Market Manager / Campaign Manager /
+      everyone / one person) and type the update in plain words.
+   2. The AI reads the LIVE contract text for that scope and writes the exact section changes. Nothing changes yet: Calvin sees
+      each section before → after, and can preview the whole contract.
+   3. Approve → the change is saved on the server (table wmam_contract_changes, owner-only writes, history kept, never deleted)
+      and every contract made from then on uses it — the signing page, the preview, the AI employee's contract reader.
+   4. Signed contracts are never changed. A contract signed before a change keeps the wording it was signed with
+      (changes apply by date). For people already working under the contract: "Send an addendum" — the AI writes it, Calvin edits
+      it, picks the people, and it goes to their My Documents to sign.
+   5. Undo = the change stops applying from now on (kept in history).
+   Pay amounts are NOT edited here: they come from the approved pay plans (Payroll → Comp Plans), the AI says so. */
+(function(){ try{
+if(window._wmamContractAI3190) return; window._wmamContractAI3190 = true;
+var esc = function(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]; }); };
+function me(){ return (typeof DB !== 'undefined' && DB.current) || null; }
+function owner(u){ u = u || me(); try{ return !!u && (Number(u.id) === 1 || (typeof isOwner === 'function' && isOwner(u))); }catch(e){ return false; } }
+function agentById(id){ return ((typeof DB !== 'undefined' && DB.agents) || []).find(function(a){ return a && String(a.id) === String(id); }) || null; }
+var ROLES = ['Field Agent', 'Team Leader', 'Market Manager', 'Campaign Manager'];
+function normRole(r){ r = String(r || '').trim().toLowerCase();
+  if(/^ibo$|independent business/.test(r)) return 'IBO'; if(/campaign manager/.test(r)) return 'Campaign Manager'; if(/market manager/.test(r)) return 'Market Manager';
+  if(/team lead/.test(r)) return 'Team Leader'; return 'Field Agent'; }
+function baseType(t){ t = String(t || 'standard'); if(t === 'ibo') return 'ibo'; if(/tribal/.test(t)) return 'tribal'; return 'standard'; }
+function campRec(name){ return (typeof WMAM_CAMPAIGNS !== 'undefined' ? WMAM_CAMPAIGNS : []).find(function(c){ return c && c.name === name; }) || null; }
+function progType(name){ var c = campRec(name); var p = c && (typeof WMAM_PROGRAMS !== 'undefined' ? WMAM_PROGRAMS : []).find(function(x){ return x.id === c.programId; }); return (p && p.type) || 'lifeline'; }
+function activeCamps(){ return (typeof WMAM_CAMPAIGNS !== 'undefined' ? WMAM_CAMPAIGNS : []).filter(function(c){ return c && c.active; }); }
+
+// ═════════ the saved changes ═════════
+var CA = window.WMAM_CA = { rows:null, loading:null, at:0 };
+async function loadRows(force){
+  if(!force && CA.rows && Date.now() - CA.at < 300000) return CA.rows;
+  if(CA.loading) return CA.loading;
+  CA.loading = (async function(){ try{ var r = await supaClient.from('wmam_contract_changes').select('*').order('approved_at', { ascending:true }).limit(2000);
+      if(!r.error && Array.isArray(r.data)){ CA.rows = r.data; CA.at = Date.now(); } }catch(e){} CA.loading = null; return CA.rows; })();
+  return CA.loading; }
+window.wmamContractChangesLoad = loadRows;
+setTimeout(function(){ if(me()) loadRows(); }, 3500); setInterval(function(){ if(me()) loadRows(true); }, 600000);
+
+function scopeMatches(sc, ctx){ sc = sc || {};
+  if(sc.campaign && sc.campaign !== '*' && sc.campaign !== ctx.campaign) return false;
+  if(sc.type && sc.type !== '*' && sc.type !== ctx.type) return false;
+  if(sc.role && sc.role !== '*' && sc.role !== ctx.role) return false;
+  if(sc.agent_id != null && String(sc.agent_id) !== String(ctx.agentId || '')) return false;
+  return true; }
+function appliesAt(row, asOf){ var ap = Date.parse(row.approved_at || row.created_at || 0); if(!(ap <= asOf)) return false;
+  if(row.status === 'undone'){ var un = Date.parse(row.undone_at || 0); return un > asOf; } return row.status === 'live'; }
+function asOfFrom(effectiveDate){ var t = Date.parse(String(effectiveDate || '')); if(isNaN(t)) return Date.now();
+  var d = new Date(t); d.setHours(23, 59, 59, 999); var now = Date.now(); return Math.min(d.getTime(), now); }
+
+// ── a contract as sections ──
+var HEAD = /<p style="margin-top:14px"><strong>(\d+)\. ([\s\S]*?)<\/strong><\/p>/g;
+var BLOCK = /(?=<div style="margin-top:(?:14|20|22)px;padding)/;
+function parse(html){
+  var open = html.indexOf('>') + 1, close = html.lastIndexOf('</div>'); if(open <= 0 || close < open) return null;
+  var inner = html.slice(open, close), wrapOpen = html.slice(0, open), wrapClose = html.slice(close);
+  var m, heads = []; HEAD.lastIndex = 0; while((m = HEAD.exec(inner))) heads.push({ at:m.index, end:HEAD.lastIndex, title:m[2] });
+  if(!heads.length) return null;
+  var out = { wrapOpen:wrapOpen, wrapClose:wrapClose, pre:inner.slice(0, heads[0].at), sections:[] }, blocks = [];
+  heads.forEach(function(h, i){ var body = inner.slice(h.end, i + 1 < heads.length ? heads[i + 1].at : inner.length);
+    if(i === heads.length - 1){ var k = body.search(BLOCK); if(k >= 0){ var tail = body.slice(k); body = body.slice(0, k);
+        tail.split(BLOCK).forEach(function(blk){ if(!blk) return;
+          var t = (blk.match(/<p><strong>([\s\S]*?)<\/strong><\/p>/) || [])[1] || 'Note';
+          var o = blk.indexOf('>') + 1, c = blk.lastIndexOf('</div>'); var bodyB = blk.slice(o, c).replace(/^\s*<p><strong>[\s\S]*?<\/strong><\/p>/, '');
+          blocks.push({ title:t.replace(/<[^>]+>/g, ''), body:bodyB, block:blk.slice(0, o), blockEnd:blk.slice(c) }); }); } }
+    out.sections.push({ title:h.title.replace(/<[^>]+>/g, ''), body:body, numbered:true }); });
+  out.sections = out.sections.concat(blocks);   // numbered sections first, then Addendum A / B and the Acknowledgment
+  return out; }
+function key(t){ return String(t || '').toLowerCase().replace(/^\s*\d+\.\s*/, '').replace(/&amp;/g, '&').replace(/[^a-z0-9]+/g, ''); }
+function findSec(P, title){ var k = key(title); if(!k) return -1;
+  for(var i = 0; i < P.sections.length; i++) if(key(P.sections[i].title) === k) return i;
+  // "Compensation Breakdown" must find "Compensation Breakdown (TruConnect — IBO Contract)", never the shorter "Compensation"
+  var best = -1, bl = 1e9; for(var j = 0; j < P.sections.length; j++){ var kk = key(P.sections[j].title); if(kk.indexOf(k) === 0 && kk.length < bl){ best = j; bl = kk.length; } }
+  if(best >= 0) return best;
+  var b2 = -1, l2 = 0; for(var q = 0; q < P.sections.length; q++){ var k2 = key(P.sections[q].title); if(k2.length >= 6 && k.indexOf(k2) === 0 && k2.length > l2){ b2 = q; l2 = k2.length; } }
+  return b2; }
+function locked(s){ return /^compensationbreakdown/.test(key(s.title)); }
+// only plain, safe tags from the AI (no attributes, no scripts)
+var OK = { p:1, ul:1, ol:1, li:1, strong:1, b:1, em:1, i:1, u:1, br:1, table:1, thead:1, tbody:1, tr:1, th:1, td:1 };
+function clean(html){ var s = String(html || '').replace(/<(script|style|iframe|object)[\s\S]*?<\/\1>/gi, '').replace(/<!--[\s\S]*?-->/g, '');
+  s = s.replace(/<\/?([a-z0-9]+)(\s[^>]*)?>/gi, function(t, n){ n = n.toLowerCase(); if(!OK[n]) return ''; var cl = t.charAt(1) === '/';
+    if(cl) return '</' + n + '>';
+    if(n === 'table') return '<table style="width:100%;border-collapse:collapse;margin:10px 0 6px">';
+    if(n === 'th') return '<th style="border:1px solid #ccc;padding:8px 12px;background:#f0f0f0;text-align:left">';
+    if(n === 'td') return '<td style="border:1px solid #ccc;padding:8px 12px">';
+    if(n === 'ul' || n === 'ol') return '<' + n + ' style="margin:6px 0 6px 20px">';
+    return '<' + n + '>'; });
+  return s.trim(); }
+function apply(P, edits, prog){ (edits || []).forEach(function(e){
+    if(!e || (e.program && e.program !== 'all' && e.program !== prog)) return;
+    if(/^compensationbreakdown/.test(key(e.title))) return;   // the pay table always comes from the pay plans
+    var i = findSec(P, e.title);
+    if(e.mode === 'replace'){ if(i < 0 || locked(P.sections[i])) return; P.sections[i].body = clean(e.html); P.sections[i].changed = true; }
+    else if(e.mode === 'remove'){ if(i < 0 || locked(P.sections[i])) return; P.sections.splice(i, 1); }
+    else if(e.mode === 'add'){ if(findSec(P, e.title) >= 0 && key(P.sections[findSec(P, e.title)].title) === key(e.title)) return;   // already there
+      var s = { title:String(e.title || '').replace(/^\s*\d+\.\s*/, ''), body:clean(e.html), numbered:true, changed:true }, a = e.after ? findSec(P, e.after) : -1;
+      if(a >= 0 && !P.sections[a].block) P.sections.splice(a + 1, 0, s);
+      else { var firstBlock = P.sections.findIndex(function(x){ return x.block; }); P.sections.splice(firstBlock < 0 ? P.sections.length : firstBlock, 0, s); } } }); }
+function assemble(P){ var n = 0, h = P.wrapOpen + P.pre;
+  P.sections.forEach(function(s){ if(s.block) h += s.block + '<p><strong>' + s.title + '</strong></p>' + s.body + s.blockEnd;
+    else { n++; h += '<p style="margin-top:14px"><strong>' + n + '. ' + s.title + '</strong></p>' + s.body; } });
+  return h + P.wrapClose; }
+function tokens(h, v){ return h.replace(/\{\{PARTY\}\}/g, v.party).replace(/\{\{CAMPAIGN\}\}/g, esc(v.campaign)).replace(/\{\{NAME\}\}/g, esc(v.name)).replace(/\{\{DATE\}\}/g, esc(v.date))
+  .replace(/\{\{COMPANY\}\}/g, 'Williams Marketing and Management, Inc.'); }
+function ctxOf(campaignName, contractType, agentId){ var t = baseType(contractType), ag = agentId ? agentById(agentId) : null;
+  return { campaign:campaignName, type:t, role:t === 'ibo' ? 'IBO' : normRole(ag && ag.role), agentId:agentId || null, prog:progType(campaignName) }; }
+// the contract with every change that applies to it on that date (rows = the saved changes, or a list to preview)
+function withChanges(base, ctx, rows, asOf, vals){
+  var L = (rows || []).filter(function(r){ return r && appliesAt(r, asOf) && scopeMatches(r.scope, ctx); });
+  if(!L.length) return base; var P = parse(base); if(!P) return base;
+  L.forEach(function(r){ apply(P, r.edits, ctx.prog); });
+  return tokens(assemble(P), vals); }
+
+if(typeof buildContractHTML === 'function' && !buildContractHTML._ca){ var oB = buildContractHTML;
+  var wB = function(campaignName, agentName, effectiveDate, contractType, agentId){
+    var base = oB.apply(this, arguments);
+    try{ if(!CA.rows || !CA.rows.length) return base;
+      var ctx = ctxOf(campaignName, contractType, agentId);
+      return withChanges(base, ctx, CA.rows, asOfFrom(effectiveDate), { party:baseType(contractType) === 'ibo' ? 'Business' : 'Contractor', campaign:campaignName, name:agentName || '', date:effectiveDate || '' });
+    }catch(e){ console.warn('[contract AI] change not applied', e); return base; } };
+  wB._ca = true; window.buildContractHTML = buildContractHTML = wB; }
+// make sure the changes are loaded before anyone signs
+if(typeof openStepSignModal === 'function'){ var oS = openStepSignModal;
+  window.openStepSignModal = openStepSignModal = function(){ var a = arguments, t = this; if(CA.rows) return oS.apply(t, a); loadRows().then(function(){ oS.apply(t, a); }); }; }
+
+// ═════════ the AI ═════════
+async function callAI(body){
+  var token = null; try{ var ses = await supaClient.auth.getSession(); token = ses && ses.data && ses.data.session && ses.data.session.access_token; }catch(e){}
+  var ctl = typeof AbortController !== 'undefined' ? new AbortController() : null, to = ctl ? setTimeout(function(){ try{ ctl.abort(); }catch(e){} }, 150000) : null;
+  try{ var r = await fetch(SUPA_URL + '/functions/v1/contract-reader', { method:'POST', headers:{ 'Content-Type':'application/json', apikey:SUPA_KEY, Authorization:'Bearer ' + (token || SUPA_KEY) }, body:JSON.stringify(body), signal:ctl ? ctl.signal : undefined });
+    var d = null; try{ d = await r.json(); }catch(e){} if(!r.ok || !d || d.error) throw new Error((d && d.error) || ('The AI did not answer (' + r.status + ')')); return d;
+  }catch(e){ if(e && e.name === 'AbortError') throw new Error('The AI took too long. Try again, or make the request smaller.'); throw e; }
+  finally{ if(to) clearTimeout(to); } }
+window._wmamContractAICall = callAI;   // for tests
+
+// ═════════ the screen ═════════
+var S = window.WMAM_CA_UI = { step:'ask', camp:'*', kind:'all', person:'', text:'', plan:null, busy:'', err:'', saved:null, add:null, addPeople:null, view:null };
+var KINDS = [['all', 'All contracts (everyone)'], ['agent', 'Field Agents — standard'], ['tribal', 'Tribal contracts'], ['ibo', 'IBO contracts'],
+  ['tl', 'Team Leaders'], ['mm', 'Market Managers'], ['cm', 'Campaign Managers'], ['person', 'One person']];
+function scopeOf(){ var sc = { campaign:S.camp || '*', type:'*', role:'*', agent_id:null };
+  if(S.kind === 'agent'){ sc.type = 'standard'; sc.role = 'Field Agent'; }
+  else if(S.kind === 'tribal') sc.type = 'tribal';
+  else if(S.kind === 'ibo'){ sc.type = 'ibo'; sc.role = 'IBO'; }
+  else if(S.kind === 'tl') sc.role = 'Team Leader'; else if(S.kind === 'mm') sc.role = 'Market Manager'; else if(S.kind === 'cm') sc.role = 'Campaign Manager';
+  else if(S.kind === 'person') sc.agent_id = Number(S.person) || null;
+  return sc; }
+function scopeLabel(sc){ sc = sc || {}; var who = 'all contracts';
+  if(sc.agent_id != null){ var a = agentById(sc.agent_id); who = (a ? a.name : 'person #' + sc.agent_id) + '’s contract'; }
+  else if(sc.type === 'ibo') who = 'IBO contracts'; else if(sc.type === 'tribal' && sc.role === '*') who = 'Tribal contracts';
+  else if(sc.role && sc.role !== '*') who = sc.role + (sc.type === 'standard' ? ' (standard)' : '') + ' contracts';
+  return (sc.campaign && sc.campaign !== '*' ? sc.campaign + ' — ' : 'All campaigns — ') + who; }
+// the contracts in this scope, one of each kind of wording (so the AI sees every version it will change)
+function samples(sc){ var camps = sc.campaign && sc.campaign !== '*' ? [sc.campaign] : activeCamps().map(function(c){ return c.name; });
+  var person = sc.agent_id != null ? agentById(sc.agent_id) : null;
+  var types = sc.type && sc.type !== '*' ? [sc.type] : (person ? [normRole(person.role) === 'IBO' ? 'ibo' : 'standard', 'tribal'] : ['standard', 'tribal', 'ibo']);
+  var role = sc.role && sc.role !== '*' ? sc.role : (person ? normRole(person.role) : 'Field Agent');
+  var seen = {}, out = [];
+  camps.forEach(function(cn){ var rec = campRec(cn); if(!rec) return; var st = rec.settings || {};
+    types.forEach(function(t){ if(t === 'tribal' && !st.hasTribal) return; if(t === 'ibo' && sc.type !== 'ibo' && (sc.role === 'Field Agent' || /Manager|Leader/.test(sc.role))) return;
+      var r = t === 'ibo' ? 'IBO' : role; if(person && t !== 'ibo') r = normRole(person.role);
+      var ctx = { campaign:cn, type:t, role:r, agentId:person ? person.id : null, prog:progType(cn) };
+      var html; try{ html = buildContractHTML(cn, person ? person.name : '[Name]', new Date().toLocaleDateString('en-US', { month:'long', day:'numeric', year:'numeric' }), t, person ? person.id : 0); }catch(e){ return; }
+      var P = parse(html); if(!P) return;
+      var sig = ctx.prog + '|' + t + '|' + P.sections.map(function(s){ return key(s.title); }).join(',');
+      if(seen[sig]){ seen[sig].campaigns.push(cn); return; }
+      var item = { ctx:ctx, html:html, P:P, campaigns:[cn] }; seen[sig] = item; out.push(item); }); });
+  return out; }
+function plainSec(s){ return { title:s.title, locked:locked(s), html:String(s.body || '').replace(/\sstyle="[^"]*"/g, '').replace(/\s+/g, ' ').trim() }; }
+
+function modalShell(inner){ var o = document.getElementById('caOv');
+  if(!o){ o = document.createElement('div'); o.id = 'caOv'; o.style.cssText = 'position:fixed;inset:0;z-index:100500;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:12px';
+    o.addEventListener('click', function(e){ if(e.target === o && !S.busy) window.wmamCAClose(); }); document.body.appendChild(o); }
+  o.innerHTML = '<div role="dialog" aria-label="Contract AI" style="background:#fff;border-radius:14px;width:100%;max-width:820px;max-height:calc(100dvh - 24px);display:flex;flex-direction:column;box-shadow:0 20px 50px rgba(0,0,0,.35);font-family:Barlow,Arial,sans-serif;color:#111827">'
+    + '<div style="position:relative;padding:12px 56px 12px 16px;border-bottom:1px solid #e5e7eb;text-align:left"><div style="font-weight:900;color:#003594;letter-spacing:.5px">🤖 CONTRACT AI</div><div style="font-size:.78rem;color:#64748b">Tell it what to change — you approve before anything changes</div>'
+    + '<button type="button" aria-label="Close" onclick="wmamCAClose()" style="position:absolute;top:10px;right:12px;border:none;background:#f1f5f9;border-radius:50%;width:36px;height:36px;font-weight:900;font-size:16px;cursor:pointer">✕</button></div>'
+    + '<div id="caBody" style="padding:14px 16px;overflow-y:auto;-webkit-overflow-scrolling:touch;text-align:left">' + inner + '</div></div>'; }
+var inp = 'width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #cbd5e1;border-radius:9px;font-size:.92rem;font-family:inherit;background:#fff';
+var lbl = 'display:block;font-size:.72rem;font-weight:900;letter-spacing:1px;color:#475569;text-transform:uppercase;margin:10px 0 4px';
+function btn(t, on, kind){ var c = kind === 'go' ? 'background:#003594;color:#fff;border:none' : kind === 'ok' ? 'background:#059669;color:#fff;border:none' : kind === 'bad' ? 'background:#fff;color:#b91c1c;border:1px solid #fecaca' : 'background:#fff;color:#0f172a;border:1px solid #cbd5e1';
+  return '<button type="button" onclick="' + on + '" ' + (S.busy ? 'disabled ' : '') + 'style="' + c + ';border-radius:10px;padding:11px 16px;font-weight:900;font-size:.88rem;cursor:pointer;flex:1;min-width:140px">' + t + '</button>'; }
+function busyBox(){ return S.busy ? '<div style="background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;border-radius:10px;padding:10px 12px;margin-bottom:10px;font-weight:800">⏳ ' + esc(S.busy) + '</div>' : ''; }
+function errBox(){ return S.err ? '<div style="background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:10px;padding:10px 12px;margin-bottom:10px;font-weight:700">' + esc(S.err) + '</div>' : ''; }
+
+function askHtml(){ var camps = activeCamps(), people = ((typeof DB !== 'undefined' && DB.agents) || []).filter(function(a){ return a && a.active !== false && Number(a.id) !== 1; }).sort(function(a, b){ return String(a.name).localeCompare(String(b.name)); });
+  return busyBox() + errBox()
+    + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">'
+    + '<div><label style="' + lbl + '">Campaign</label><select id="caCamp" style="' + inp + '" onchange="WMAM_CA_UI.camp=this.value"><option value="*">All campaigns</option>' + camps.map(function(c){ return '<option' + (S.camp === c.name ? ' selected' : '') + '>' + esc(c.name) + '</option>'; }).join('') + '</select></div>'
+    + '<div><label style="' + lbl + '">Which contracts</label><select id="caKind" style="' + inp + '" onchange="WMAM_CA_UI.kind=this.value;wmamCARender()">' + KINDS.map(function(k){ return '<option value="' + k[0] + '"' + (S.kind === k[0] ? ' selected' : '') + '>' + esc(k[1]) + '</option>'; }).join('') + '</select></div></div>'
+    + (S.kind === 'person' ? '<label style="' + lbl + '">Person</label><select id="caPerson" style="' + inp + '" onchange="WMAM_CA_UI.person=this.value"><option value="">Choose the person…</option>' + people.map(function(a){ return '<option value="' + a.id + '"' + (String(S.person) === String(a.id) ? ' selected' : '') + '>' + esc(a.name) + ' — ' + esc(a.role || 'Field Agent') + '</option>'; }).join('') + '</select>' : '')
+    + '<label style="' + lbl + '">What do you want changed?</label><textarea id="caText" rows="6" style="' + inp + ';resize:vertical;min-height:130px" placeholder="Example: Add a section to the IBO contract that the IBO must carry general liability insurance of at least $1,000,000 and send proof each year." oninput="WMAM_CA_UI.text=this.value">' + esc(S.text) + '</textarea>'
+    + '<div style="font-size:.78rem;color:#64748b;margin-top:6px">Pay amounts come from the pay plans (Payroll → Comp Plans), not from here — the AI will tell you if your change needs a pay plan update.</div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' + btn('✍ Write the changes', 'wmamCAWrite()', 'go') + '</div>'
+    + historyHtml(); }
+function secText(h){ var d = document.createElement('div'); d.innerHTML = h || ''; return d.innerHTML; }
+function planHtml(){ var p = S.plan || {}, sc = p.scope, h = busyBox() + errBox();
+  h += '<div style="font-size:.78rem;font-weight:900;color:#475569;letter-spacing:1px;text-transform:uppercase">' + esc(scopeLabel(sc)) + '</div>';
+  if(p.summary) h += '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin:8px 0;line-height:1.45">' + esc(p.summary) + '</div>';
+  (p.notes || []).forEach(function(n){ h += '<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:10px;padding:9px 12px;margin:6px 0;font-size:.86rem">⚠ ' + esc(n) + '</div>'; });
+  if((p.questions || []).length){ h += '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:10px 12px;margin:8px 0"><div style="font-weight:900;color:#1e3a8a;margin-bottom:4px">The AI needs to know:</div>' + p.questions.map(function(q){ return '<div style="margin:3px 0">• ' + esc(q) + '</div>'; }).join('') + '<div style="font-size:.8rem;color:#475569;margin-top:6px">Add the answer to your request and write it again.</div></div>'; }
+  if(!(p.edits || []).length){ h += '<div style="color:#64748b;margin:10px 0">No changes were written.</div>'; }
+  (p.edits || []).forEach(function(e, i){ var before = e.before; var tag = { replace:['CHANGED', '#1d4ed8', '#dbeafe'], add:['NEW SECTION', '#047857', '#d1fae5'], remove:['REMOVED', '#b91c1c', '#fee2e2'] }[e.mode] || ['', '#334155', '#e2e8f0'];
+    h += '<div style="border:1px solid #e2e8f0;border-radius:12px;margin:10px 0;overflow:hidden">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px;background:#f8fafc;flex-wrap:wrap"><div style="font-weight:900">' + esc(e.title) + (e.program && e.program !== 'all' ? ' <span style="font-size:.72rem;color:#64748b">(' + esc(e.program) + ' only)</span>' : '') + '</div><span style="font-size:.7rem;font-weight:900;border-radius:99px;padding:2px 9px;color:' + tag[1] + ';background:' + tag[2] + '">' + tag[0] + '</span></div>'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:0">'
+      + (e.mode !== 'add' ? '<div style="padding:10px 12px;border-right:1px solid #f1f5f9;background:#fff7f7"><div style="font-size:.68rem;font-weight:900;color:#b91c1c;letter-spacing:1px">NOW</div><div style="font-family:Georgia,serif;font-size:.84rem;line-height:1.6;color:#475569">' + (before == null ? '<em>(not in every contract)</em>' : secText(before)) + '</div></div>' : '')
+      + (e.mode !== 'remove' ? '<div style="padding:10px 12px;background:#f0fdf4"><div style="font-size:.68rem;font-weight:900;color:#047857;letter-spacing:1px">' + (e.mode === 'add' ? 'NEW' : 'AFTER') + '</div><div style="font-family:Georgia,serif;font-size:.84rem;line-height:1.6">' + clean(e.html).replace(/\{\{PARTY\}\}/g, sc && sc.type === 'ibo' ? 'Business' : 'Contractor').replace(/\{\{CAMPAIGN\}\}/g, '[Campaign]').replace(/\{\{NAME\}\}/g, '[Name]') + '</div></div>' : '')
+      + '</div></div>'; });
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">'
+    + ((p.edits || []).length ? btn('✓ Approve — make it live', 'wmamCAApprove()', 'ok') + btn('👁 Preview the whole contract', 'wmamCAPreview()') : '')
+    + btn('↻ Change my request', 'wmamCABack()') + btn('Cancel', 'wmamCAClose()', 'bad') + '</div>';
+  return h; }
+function previewHtml(){ var v = S.view || {}; return '<div style="font-size:.78rem;font-weight:900;color:#475569;letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">' + esc(v.label || '') + '</div>'
+  + '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:16px 18px;background:#fff">' + (v.html || '') + '</div>'
+  + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' + btn('‹ Back', v.back || 'wmamCABack()') + '</div>'; }
+function savedHtml(){ var r = S.saved || {}, h = busyBox() + errBox();
+  h += '<div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:12px;padding:12px 14px;font-weight:800">✔ Live now: ' + esc(scopeLabel(r.scope)) + '. Every contract sent from now on uses the new wording. Contracts already signed keep the wording they were signed with.</div>';
+  var A = S.add;
+  if(!A){ h += '<div style="margin-top:12px;line-height:1.45">' + (r.material === false ? 'This looks like a wording fix. ' : '<b>People already working under this contract</b> should sign an addendum for it. ') + 'Do you want to send one?</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' + btn('✍ Write the addendum', 'wmamCAAddendum()', 'go') + btn('No addendum — done', 'wmamCADone()') + '</div>'; return h; }
+  var people = S.addPeople || [];
+  h += '<label style="' + lbl + '">The addendum (you can edit it)</label><div id="caAdd" contenteditable="true" style="border:1px solid #cbd5e1;border-radius:10px;padding:14px 16px;font-family:Georgia,serif;line-height:1.6;max-height:340px;overflow:auto;background:#fff">' + A.html + '</div>'
+    + '<div style="font-size:.76rem;color:#64748b;margin-top:4px">{{NAME}}, {{DATE}} and {{CAMPAIGN}} fill in for each person when they open it.</div>'
+    + '<label style="' + lbl + '">Send it to (' + people.filter(function(p){ return p.on; }).length + ' of ' + people.length + ')</label>'
+    + '<div style="border:1px solid #e2e8f0;border-radius:10px;max-height:220px;overflow:auto">' + (people.length ? people.map(function(p, i){ return '<label style="display:flex;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid #f1f5f9;cursor:pointer"><input type="checkbox" ' + (p.on ? 'checked ' : '') + 'onchange="WMAM_CA_UI.addPeople[' + i + '].on=this.checked;wmamCARender()"><span style="flex:1;min-width:0"><b>' + esc(p.name) + '</b> <span style="color:#64748b;font-size:.82rem">' + esc(p.role) + ' · ' + esc(p.camps.join(', ')) + '</span></span></label>'; }).join('') : '<div style="padding:12px;color:#64748b">No one is working under this contract right now.</div>') + '</div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' + btn('📨 Send to sign (' + people.filter(function(p){ return p.on; }).length + ')', 'wmamCASend()', 'ok') + btn('No addendum — done', 'wmamCADone()') + '</div>';
+  return h; }
+function historyHtml(){ var L = (CA.rows || []).slice().reverse(); if(!L.length) return '';
+  return '<div style="margin-top:18px;border-top:1px solid #e5e7eb;padding-top:10px"><div style="font-size:.72rem;font-weight:900;letter-spacing:1px;color:#475569;text-transform:uppercase;margin-bottom:6px">Contract changes (newest first)</div>'
+    + L.slice(0, 40).map(function(r){ var live = r.status === 'live';
+      return '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:9px 12px;margin-bottom:6px;' + (live ? '' : 'opacity:.6') + '"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><b style="font-size:.86rem">' + esc(scopeLabel(r.scope)) + '</b><span style="font-size:.74rem;color:#64748b">' + esc(new Date(r.approved_at).toLocaleString()) + (live ? '' : ' · undone') + (r.addendum && r.addendum.sentAt ? ' · addendum sent to ' + (r.addendum.agentIds || []).length : '') + '</span></div>'
+        + '<div style="font-size:.84rem;color:#334155;margin-top:3px">' + esc(r.summary || r.instruction || '') + '</div>'
+        + '<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><button type="button" onclick="wmamCAViewRow(' + r.id + ')" style="border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:5px 10px;font-weight:800;font-size:.78rem;cursor:pointer">View</button>'
+        + (live && !(r.addendum && r.addendum.sentAt) ? '<button type="button" onclick="wmamCAAddFor(' + r.id + ')" style="border:1px solid #bfdbfe;color:#1d4ed8;background:#fff;border-radius:8px;padding:5px 10px;font-weight:800;font-size:.78rem;cursor:pointer">Send addendum</button>' : '')
+        + (live ? '<button type="button" onclick="wmamCAUndo(' + r.id + ')" style="border:1px solid #fecaca;color:#b91c1c;background:#fff;border-radius:8px;padding:5px 10px;font-weight:800;font-size:.78rem;cursor:pointer">Undo</button>' : '') + '</div></div>'; }).join('') + '</div>'; }
+window.wmamCARender = function(){ var body = S.step === 'plan' ? planHtml() : S.step === 'view' ? previewHtml() : S.step === 'saved' ? savedHtml() : askHtml(); modalShell(body);
+  var t = document.getElementById('caText'); if(t && S.step === 'ask' && !S.busy) try{ t.focus(); t.setSelectionRange(t.value.length, t.value.length); }catch(e){} };
+window.wmamCAOpen = async function(){ if(!owner()) return alert('Contract AI is for the owner.'); S.step = 'ask'; S.err = ''; S.busy = ''; window.wmamCARender(); await loadRows(true); if(S.step === 'ask') window.wmamCARender(); };
+window.wmamCAClose = function(){ if(S.busy) return; var o = document.getElementById('caOv'); if(o) o.remove(); S.step = 'ask'; S.plan = null; S.add = null; S.addPeople = null; S.err = ''; };
+window.wmamCABack = function(){ S.step = S.plan && S.view && S.view.back === 'wmamCABackPlan()' ? 'plan' : 'ask'; S.err = ''; window.wmamCARender(); };
+window.wmamCABackPlan = function(){ S.step = 'plan'; window.wmamCARender(); };
+window.wmamCAWrite = async function(){
+  var t = (document.getElementById('caText') || {}).value; if(t != null) S.text = t; S.err = '';
+  if(String(S.text || '').trim().length < 6){ S.err = 'Type what you want changed.'; return window.wmamCARender(); }
+  if(S.kind === 'person' && !S.person){ S.err = 'Choose the person.'; return window.wmamCARender(); }
+  var sc = scopeOf(), list = samples(sc);
+  if(!list.length){ S.err = 'There is no contract for that choice yet (check the campaign is set up in the Campaign Document Manager).'; return window.wmamCARender(); }
+  S.busy = 'The AI is reading ' + list.length + ' contract' + (list.length === 1 ? '' : 's') + ' and writing the changes…'; window.wmamCARender();
+  try{ var d = await callAI({ action:'contract_edit', instruction:S.text, scope:scopeLabel(sc),
+      contracts:list.map(function(x){ return { label:x.campaigns.join(', ') + ' — ' + (x.ctx.type === 'ibo' ? 'IBO' : x.ctx.type === 'tribal' ? 'Tribal' : 'Standard') + ' — ' + x.ctx.role, program:x.ctx.prog, sections:x.P.sections.map(plainSec) }; }) });
+    var plan = d.plan || {}; plan.scope = sc; plan.instruction = S.text; plan.samples = list;
+    (plan.edits || []).forEach(function(e){ if(e.mode === 'add') return; var hit = null; list.some(function(x){ if(e.program && e.program !== 'all' && e.program !== x.ctx.prog) return false; var i = findSec(x.P, e.title); if(i >= 0){ hit = x.P.sections[i]; return true; } return false; });
+      e.before = hit ? hit.body : null; if(hit && locked(hit)) e.locked = true; });
+    plan.edits = (plan.edits || []).filter(function(e){ if(e.locked){ (plan.notes = plan.notes || []).push('The AI tried to change “' + e.title + '”. That section shows the pay from the pay plans, so it was left as is — change the pay plan in Payroll → Comp Plans.'); return false; } return true; });
+    S.plan = plan; S.step = 'plan'; }catch(e){ S.err = 'The AI could not write it: ' + (e && e.message || e); }
+  S.busy = ''; window.wmamCARender(); };
+window.wmamCAPreview = function(){ var p = S.plan; if(!p || !p.samples || !p.samples.length) return;
+  var x = p.samples[0], html = x.html;
+  // x.html already has every live change in it; put only the new one on top
+  var P = parse(x.html); if(P){ apply(P, p.edits, x.ctx.prog); html = tokens(assemble(P), { party:x.ctx.type === 'ibo' ? 'Business' : 'Contractor', campaign:x.ctx.campaign, name:'[Name]', date:'' }); }
+  S.view = { label:'Preview — ' + x.campaigns[0] + ' · ' + (x.ctx.type === 'ibo' ? 'IBO' : x.ctx.type === 'tribal' ? 'Tribal' : 'Standard') + ' · ' + x.ctx.role, html:html, back:'wmamCABackPlan()' }; S.step = 'view'; window.wmamCARender(); };
+window.wmamCAApprove = async function(){ var p = S.plan; if(!p || !(p.edits || []).length) return;
+  if(!confirm('Make this change live for ' + scopeLabel(p.scope) + '?\n\nContracts already signed keep their wording.')) return;
+  S.busy = 'Saving…'; S.err = ''; window.wmamCARender(); var u = me();
+  try{ var row = { scope:p.scope, agent_id:p.scope.agent_id, instruction:p.instruction, summary:p.summary || '', created_by:u && u.id, created_by_name:u && u.name,
+      edits:p.edits.map(function(e){ return { mode:e.mode, title:e.title, after:e.after || '', program:e.program || 'all', html:e.mode === 'remove' ? '' : clean(e.html), before:e.before == null ? null : String(e.before).slice(0, 20000) }; }), material:p.material !== false };
+    var r = await supaClient.from('wmam_contract_changes').insert(row).select('*').single(); if(r.error) throw r.error;
+    S.saved = r.data; S.add = null; S.addPeople = null; S.step = 'saved'; await loadRows(true);
+    try{ wmamLogActivity('contract_changed', { label:(u && u.name) + ' changed ' + scopeLabel(p.scope) + ': ' + (p.summary || p.instruction || '').slice(0, 300) }); }catch(e){}
+  }catch(e){ S.err = 'Not saved: ' + (e && e.message || e); }
+  S.busy = ''; window.wmamCARender(); };
+window.wmamCADone = function(){ S.plan = null; S.saved = null; S.add = null; S.addPeople = null; S.text = ''; S.step = 'ask'; window.wmamCARender(); };
+window.wmamCAUndo = async function(id){ var r = (CA.rows || []).find(function(x){ return x.id === id; }); if(!r) return;
+  if(!confirm('Undo this change?\n\n' + scopeLabel(r.scope) + '\n' + (r.summary || '') + '\n\nContracts sent from now on go back to the wording before it. It stays in the history.')) return;
+  var u = me(); try{ var q = await supaClient.from('wmam_contract_changes').update({ status:'undone', undone_at:new Date().toISOString(), undone_by:u && u.name }).eq('id', id); if(q.error) throw q.error;
+    try{ wmamLogActivity('contract_change_undone', { label:(u && u.name) + ' undid a contract change: ' + scopeLabel(r.scope) }); }catch(e){} await loadRows(true); window.wmamCARender(); }catch(e){ alert('Not undone: ' + (e && e.message || e)); } };
+window.wmamCAAddFor = function(id){ var r = (CA.rows || []).find(function(x){ return x.id === id; }); if(!r) return; S.saved = r; S.add = null; S.addPeople = null; S.err = ''; S.step = 'saved'; window.wmamCARender(); };
+window.wmamCAViewRow = function(id){ var r = (CA.rows || []).find(function(x){ return x.id === id; }); if(!r) return;
+  var h = '<div style="margin-bottom:8px;color:#334155">' + esc(r.summary || '') + '</div><div style="font-size:.8rem;color:#64748b;margin-bottom:8px">Asked: “' + esc(r.instruction || '') + '” — ' + esc(r.created_by_name || '') + ', ' + esc(new Date(r.approved_at).toLocaleString()) + '</div>';
+  (r.edits || []).forEach(function(e){ h += '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin:8px 0"><div style="font-weight:900;margin-bottom:4px">' + esc(e.title) + ' <span style="font-size:.72rem;color:#64748b">(' + esc(e.mode) + ')</span></div><div style="font-family:Georgia,serif;font-size:.86rem;line-height:1.6">' + (e.mode === 'remove' ? '<em>Removed</em>' : clean(e.html)) + '</div></div>'; });
+  S.view = { label:scopeLabel(r.scope), html:h, back:'wmamCABack()' }; S.step = 'view'; window.wmamCARender(); };
+
+// ── addendum ──
+function peopleIn(sc){ var camps = sc.campaign && sc.campaign !== '*' ? [sc.campaign] : null;
+  return ((typeof DB !== 'undefined' && DB.agents) || []).filter(function(a){ if(!a || a.active === false || Number(a.id) === 1) return false;
+      if(sc.agent_id != null) return String(a.id) === String(sc.agent_id);
+      var r = normRole(a.role); if(sc.type === 'ibo' && r !== 'IBO') return false; if(sc.role && sc.role !== '*' && sc.role !== r) return false;
+      var mine = (typeof wmamCampaignsOf === 'function' ? wmamCampaignsOf(a) : (a.campaigns || [])) || []; a._caCamps = camps ? mine.filter(function(c){ return camps.indexOf(c) >= 0 || (typeof _cc === 'function' && camps.map(_cc).indexOf(_cc(c)) >= 0); }) : mine;
+      return a._caCamps.length > 0; })
+    .sort(function(a, b){ return String(a.name).localeCompare(String(b.name)); })
+    .map(function(a){ return { id:a.id, name:a.name, role:a.role || 'Field Agent', camps:a._caCamps, on:true }; }); }
+window.wmamCAAddendum = async function(){ var r = S.saved; if(!r) return; S.busy = 'The AI is writing the addendum…'; S.err = ''; window.wmamCARender();
+  try{ var d = await callAI({ action:'addendum', scope:scopeLabel(r.scope), summary:r.summary || r.instruction,
+      changes:(r.edits || []).map(function(e){ var div = document.createElement('div'); div.innerHTML = e.before || ''; var d2 = document.createElement('div'); d2.innerHTML = e.html || ''; return { title:e.title, mode:e.mode, before:div.textContent.trim(), after:d2.textContent.trim() }; }) });
+    S.add = { html:clean(d.html) }; S.addPeople = peopleIn(r.scope); }catch(e){ S.err = 'The AI could not write the addendum: ' + (e && e.message || e); }
+  S.busy = ''; window.wmamCARender(); };
+function htmlToText(h){ var d = document.createElement('div'); d.innerHTML = String(h || '').replace(/<li>/gi, '\n• ').replace(/<\/(p|li|ul|ol|tr)>/gi, '\n').replace(/<br\s*\/?>/gi, '\n');
+  return d.textContent.replace(/\n{3,}/g, '\n\n').trim(); }
+window.wmamCASend = async function(){ var r = S.saved, el = document.getElementById('caAdd'); if(!r || !el) return;
+  var to = (S.addPeople || []).filter(function(p){ return p.on; }); if(!to.length) return alert('Pick at least one person.');
+  var text = htmlToText(el.innerHTML); if(text.length < 40) return alert('The addendum is empty.');
+  if(!confirm('Send this addendum to ' + to.length + ' ' + (to.length === 1 ? 'person' : 'people') + ' to sign?')) return;
+  S.busy = 'Sending…'; window.wmamCARender(); var u = me();
+  try{ var reg = getFBRegistry(), id = 'ca-addendum-' + r.id, today = new Date().toLocaleDateString('en-US', { month:'long', day:'numeric', year:'numeric' });
+    var camp = r.scope && r.scope.campaign && r.scope.campaign !== '*' ? r.scope.campaign : 'Independent Contractor';
+    var form = reg.find(function(f){ return f.id === id; });
+    var body = 'ADDENDUM TO THE ' + camp.toUpperCase() + ' AGREEMENT\n\n' + text.replace(/\{\{DATE\}\}/g, today).replace(/\{\{CAMPAIGN\}\}/g, camp).replace(/\{\{NAME\}\}/g, 'the undersigned').replace(/\{\{COMPANY\}\}/g, 'Williams Marketing and Management, Inc.');
+    var ids = to.map(function(p){ return p.id; });
+    if(!form){ form = { id:id, name:'Addendum — ' + scopeLabel(r.scope), subtitle:'Contract change approved ' + new Date(r.approved_at).toLocaleDateString() + ' — read and sign', docMode:'signature',
+        documentBody:body, fields:[], active:true, requiredForOnboarding:false, assignedTo:{ mode:'individuals', agentIds:ids, campaigns:[] }, createdAt:new Date().toISOString(), createdBy:u && u.name, contractChangeId:r.id };
+      reg.push(form); }
+    else { form.documentBody = body; form.assignedTo = { mode:'individuals', agentIds:Array.from(new Set((form.assignedTo && form.assignedTo.agentIds || []).concat(ids))), campaigns:[] }; }
+    await saveFBRegistry(reg);
+    ids.forEach(function(aid){ if(!ASSIGNED_DOC_STATUS[aid]) ASSIGNED_DOC_STATUS[aid] = {};
+      if(!ASSIGNED_DOC_STATUS[aid][id]) ASSIGNED_DOC_STATUS[aid][id] = { assignedAt:new Date().toISOString(), assignedBy:u ? { id:u.id, name:u.name } : null, scope:'individuals', required:false, signed:false, signedAt:null, signature:'', responses:{} }; });
+    for(var i = 0; i < ids.length; i++){ try{ await saveAssignedDocs(ids[i]); }catch(e){} }
+    ids.forEach(function(aid){ try{ pushNotification({ toIds:[aid], toRoles:[], icon:'📄', priority:'high', panel:'my-documents', title:'Please sign — contract addendum', body:'There is a change to your ' + camp + ' agreement. Open My Documents to read and sign the addendum.' }); }catch(e){} });
+    var q = await supaClient.from('wmam_contract_changes').update({ addendum:{ formId:id, sentAt:new Date().toISOString(), agentIds:ids, by:u && u.name } }).eq('id', r.id); if(q.error) throw q.error;
+    try{ wmamLogActivity('contract_addendum_sent', { label:(u && u.name) + ' sent a contract addendum (' + scopeLabel(r.scope) + ') to ' + ids.length + ' people' }); }catch(e){}
+    await loadRows(true); S.busy = ''; try{ showToast('✔ Addendum sent to ' + ids.length + ' to sign'); }catch(e){} window.wmamCADone();
+  }catch(e){ S.busy = ''; S.err = 'Not sent: ' + (e && e.message || e); window.wmamCARender(); } };
+
+// ── the card on the Campaign Document Manager (owner only) ──
+if(typeof panelCampaignDocs === 'function'){ var oP = panelCampaignDocs;
+  window.panelCampaignDocs = panelCampaignDocs = function(){ var h = oP.apply(this, arguments); if(!owner()) return h;
+    var n = (CA.rows || []).filter(function(r){ return r.status === 'live'; }).length;
+    var card = '<div class="bo-card" style="padding:16px 20px;margin-bottom:18px;border-left:4px solid #003594"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">'
+      + '<div style="min-width:0;flex:1 1 260px"><div style="font-family:Bebas Neue,sans-serif;font-size:1.15rem;letter-spacing:2px;color:#003594">🤖 CONTRACT AI</div>'
+      + '<div style="font-family:Barlow Condensed,sans-serif;font-size:.82rem;color:var(--muted)">Update any contract in plain words — agent, Tribal, IBO, Team Leader, Market Manager, Campaign Manager, or one person. You see the changes and approve them first. Signed contracts never change; send an addendum instead.' + (n ? ' <b>' + n + ' change' + (n === 1 ? '' : 's') + ' live.</b>' : '') + '</div></div>'
+      + '<button type="button" onclick="wmamCAOpen()" class="btn-fire" style="font-size:.78rem;padding:11px 22px;white-space:nowrap">🤖 Update contracts</button></div></div>';
+    var i = h.indexOf('<div style="background:rgba(0,53,148,.06)'); return i > 0 ? h.slice(0, i) + card + h.slice(i) : h + card; };
+}
+window._wmamCA = { parse:parse, apply:apply, assemble:assemble, withChanges:withChanges, clean:clean, scopeMatches:scopeMatches, samples:samples, peopleIn:peopleIn, ctxOf:ctxOf };   // for tests
+}catch(e){ console.warn('[contract AI 3190]', e); } })();
 </script>
 </body>
 </html>
