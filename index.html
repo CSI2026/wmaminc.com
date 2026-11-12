@@ -3906,7 +3906,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.11.3130';
+var BUILD_VERSION = '2026.11.11.3160';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -33610,7 +33610,7 @@ function wmamInvScope(user){
   };
   var out = { user:user, seeAll:seeAll, marketBased:marketBased, markets:mk, available:[], sold:0, expired:0, expiredList:[], total:0 };
   pool.forEach(function(d){
-    if(!inScope(d)) return; var st = wmamDevState(d, today); if(st === 'deleted' || st === 'none') return;
+    if(!inScope(d)) return; var st = wmamDevState(d, today); if(st === 'deleted' || st === 'none' || st === 'paid') return;   // v3160: paid-for = not stock
     out.total++;
     if(st === 'sold') out.sold++;
     else if(st === 'expired'){ out.expired++; out.expiredList.push(d); }
@@ -53795,20 +53795,25 @@ function agentInvSummary(agentId){
   // Calvin 2026-05-02: union all pools so devices assigned via the
   // campaign-pool path (GM_INVENTORY etc.) also count.
   var summary = {};
+  // v3160: the same rule as every dashboard — held by this person, not sold / deleted (sold phones were counted as on hand)
+  var _st = function(d){ try{ return wmamDevState(d); }catch(e){ return (d.status==='sold'||d.status==='activated'||d.soldAt) ? 'sold' : 'available'; } };
   unionAllInventoryPools().filter(function(d){
-    return (d.holderId===agentId || d.assignedTo===agentId)
-        && (d.status==='assigned' || d.status==='activated');
+    if(!d || d.deletedAt) return false;
+    var h = null; try{ h = _wmamHolderOf(d); }catch(e){ h = (d.assignedTo != null ? d.assignedTo : d.holderId); }
+    if(h == null || String(h) !== String(agentId)) return false;
+    var st = _st(d); return st === 'available' || st === 'expired';
   }).forEach(function(d){
-    var c = d.carrier || d.campaign || 'Unknown';
-    if(!summary[c]) summary[c]={phones:0,sims:0,upsell:0,tablets:0,expiringSoon:0,critical:0};
+    var c = d.carrier || d.campaign || 'Unknown'; try{ c = _wmamCampKey(c) || c; }catch(e){}
+    if(!summary[c]) summary[c]={phones:0,sims:0,upsell:0,tablets:0,expiringSoon:0,critical:0,expired:0};
+    if(_st(d) === 'expired'){ summary[c].expired++; }
     var t = (d.type||'phone').toLowerCase();
     if(t==='phone')   summary[c].phones++;
     else if(t==='sim') summary[c].sims++;
     else if(t==='upsell') summary[c].upsell++;
     else if(t==='tablet') summary[c].tablets++;
     var dr = invDaysRemaining(d.chargeDate||d.expiryDate, d.assignedDate);
-    if(dr!==null && dr<=10) summary[c].expiringSoon++;
-    if(dr!==null && dr<=5)  summary[c].critical++;
+    if(dr!==null && dr>=0 && dr<=10) summary[c].expiringSoon++;   // v3160: already-expired phones are not "expiring soon"
+    if(dr!==null && dr>=0 && dr<=5)  summary[c].critical++;
   });
   return summary;
 }
@@ -55760,8 +55765,13 @@ function panelBO(){
       var myCamps = (typeof assignedCampaigns==='function') ? assignedCampaigns(u) : (Array.isArray(u.campaigns)?u.campaigns.slice():[]);
       // my devices (personal only)
       var pool = (typeof unionAllInventoryPools==='function') ? unionAllInventoryPools() : [];
-      var mine = pool.filter(function(d){ return d && !d.deletedAt && (d.holderId===u.id || d.assignedTo===u.id) && d.status!=='sold' && !d.activatedAt; });
-      var stockBy = {}; mine.forEach(function(d){ var c=d.campaign||d.carrier||''; stockBy[c]=(stockBy[c]||0)+1; });
+      // v3160: one rule for every dashboard — held by me (same holder rule as My Team's Inventory), not sold / deleted; campaigns matched
+      //        the same way ("TC (TruConnect)" = TruConnect); "in hand" = still sellable, expired counted on its own
+      var _st3160 = function(d){ try{ return wmamDevState(d); }catch(e){ return (d.status==='sold'||d.status==='activated'||d.soldAt) ? 'sold' : 'available'; } };
+      var _hold3160 = function(d){ var h = null; try{ h = _wmamHolderOf(d); }catch(e){ h = (d.assignedTo != null ? d.assignedTo : d.holderId); } return h != null && String(h) === String(u.id); };
+      var _ck3160 = function(c){ try{ return _wmamCampKey(c); }catch(e){ return String(c||''); } };
+      var mine = pool.filter(function(d){ if(!d || d.deletedAt || !_hold3160(d)) return false; var st = _st3160(d); return st === 'available' || st === 'expired'; });
+      var stockBy = {}, expBy = {}; mine.forEach(function(d){ var c=_ck3160(d.campaign||d.carrier||''); if(_st3160(d) === 'expired') expBy[c]=(expBy[c]||0)+1; else stockBy[c]=(stockBy[c]||0)+1; });
       // weekly totals + goal
       var wkTotal=0, wkGoal=0;
       var campRows = myCamps.map(function(c){
@@ -55769,7 +55779,7 @@ function panelBO(){
         wkTotal += sold;
         var g = 0; try{ g = progGoal(campaignProgram(c),'week')||0; }catch(e){}
         wkGoal += g;
-        return {c:c, sold:sold, inHand:stockBy[c]||0, col:progColor(campaignProgram(c))};
+        return {c:c, sold:sold, inHand:stockBy[_ck3160(c)]||0, expired:expBy[_ck3160(c)]||0, col:progColor(campaignProgram(c))};
       });
       if(!wkGoal) wkGoal = 30;
       var pct = Math.min(100, Math.round((wkTotal/Math.max(1,wkGoal))*100));
@@ -55789,7 +55799,7 @@ function panelBO(){
       var soon=null, expd=null;
       mine.forEach(function(d){
         var e=_wmamExpYmd(d); if(!e) return;
-        if(e < today){ if(!expd || e < _wmamExpYmd(expd)) expd=d; }
+        if(_st3160(d) === 'expired' || e < today){ if(!expd || e < _wmamExpYmd(expd)) expd=d; }
         else { if(!soon || e < _wmamExpYmd(soon)) soon=d; }
       });
       function _days(e){ return Math.round((new Date(e+'T00:00:00') - new Date(today+'T00:00:00'))/86400000); }
@@ -55822,8 +55832,8 @@ function panelBO(){
           +'<div style="font-family:Oswald,Arial,sans-serif;font-size:.48rem;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.6)">'+_escapeHtml(r.c)+'</div>'
           +'<div style="font-size:1.15rem;color:#fff;font-weight:700;'+orb+'line-height:1.25">'+r.sold+' <span style="font-size:.45rem;color:rgba(255,255,255,.4);letter-spacing:1px;font-family:Oswald,Arial,sans-serif">SOLD</span></div>'
           +(zero
-            ? '<div onclick="gotoPanel(\'inv-request\')" style="margin-top:6px;background:rgba(226,75,74,.16);border:1px solid rgba(240,149,149,.35);border-radius:100px;padding:3px 0;font-family:Oswald,Arial,sans-serif;font-size:.55rem;color:#f7c1c1;cursor:pointer">\ud83d\udce6 <b style="'+orb+'color:#f09595">0</b> \u2014 request more</div>'
-            : '<div style="margin-top:6px;background:rgba(255,255,255,.07);border-radius:100px;padding:3px 0;font-family:Oswald,Arial,sans-serif;font-size:.55rem;color:rgba(255,255,255,.7)">\ud83d\udce6 <b style="'+orb+'color:#fff">'+r.inHand+'</b> in hand</div>')
+            ? '<div onclick="gotoPanel(\'inv-request\')" style="margin-top:6px;background:rgba(226,75,74,.16);border:1px solid rgba(240,149,149,.35);border-radius:100px;padding:3px 0;font-family:Oswald,Arial,sans-serif;font-size:.55rem;color:#f7c1c1;cursor:pointer">\ud83d\udce6 <b style="'+orb+'color:#f09595">0</b> \u2014 request more'+(r.expired?' \u00b7 '+r.expired+' expired':'')+'</div>'
+            : '<div style="margin-top:6px;background:rgba(255,255,255,.07);border-radius:100px;padding:3px 0;font-family:Oswald,Arial,sans-serif;font-size:.55rem;color:rgba(255,255,255,.7)">\ud83d\udce6 <b style="'+orb+'color:#fff">'+r.inHand+'</b> in hand'+(r.expired?' \u00b7 <span style="color:#f7c1c1">'+r.expired+' expired</span>':'')+'</div>')
           +'</div>';
       });
       b += '</div>';
@@ -100320,6 +100330,7 @@ function panelInvRequest(){
            + '<div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--brown);text-align:right">'+s.sims+'</div>'
            + (s.upsell>0?'<div style="font-family:Barlow Condensed,sans-serif;font-size:.75rem;color:var(--muted)">Upsell</div><div style="font-family:Bebas Neue,sans-serif;font-size:1rem;color:var(--brown);text-align:right">'+s.upsell+'</div>':'')
            + '</div>'
+           + (s.expired>0?'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:#991B1B;margin-top:6px;font-weight:700">\u26d4 '+s.expired+' expired \u2014 activate or turn in</div>':'')   // v3160
            + (s.expiringSoon>0?'<div style="font-family:Barlow Condensed,sans-serif;font-size:.65rem;color:'+(s.critical>0?'#CC0000':'#D97706')+';margin-top:6px;font-weight:700">\u26a0 '+s.expiringSoon+' expiring soon</div>':'')
            + '</div>';
       });
