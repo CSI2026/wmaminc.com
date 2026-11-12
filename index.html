@@ -3906,7 +3906,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.11.3080';
+var BUILD_VERSION = '2026.11.11.3110';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -5966,6 +5966,7 @@ function loadPayrollWeeks(){
   try{
     var raw = localStorage.getItem('wmam_payroll_weeks');
     PAYROLL_WEEKS = raw ? (JSON.parse(raw) || []) : [];
+    if(raw && typeof window.wmamPayBaseFrom === 'function') window.wmamPayBaseFrom(raw);   // v3110: what the server holds
   }catch(e){ PAYROLL_WEEKS = []; }
 }
 
@@ -8508,9 +8509,52 @@ function payrollPLSnapshot(periodEnd){
   return snap;
 }
 
+// v3110 (Calvin 2026-11-11): payroll saves send ONLY the pay weeks that changed (server function wmam_payroll_save_weeks).
+// Before, every payroll click re-sent all weeks (519 KB) and the last screen to save won — a second office person's save
+// quietly put back the week the first person had just changed. Now only changed / removed weeks go up and the server keeps
+// every other week as it is. Any problem → the old full save runs instead, so a save is never lost.
+(function(){
+  var BASE = null, busy = false, pending = null;
+  function idsOk(list){ var seen = {}; for(var i = 0; i < list.length; i++){ var w = list[i]; if(!w || typeof w.id !== 'string' || !w.id || seen[w.id]) return false; seen[w.id] = 1; } return true; }
+  // what the server holds, week by week (set whenever the list is loaded from the server, and after each save)
+  window.wmamPayBaseFrom = function(raw){ try{ var a = typeof raw === 'string' ? JSON.parse(raw) : raw; if(!Array.isArray(a) || !idsOk(a)){ BASE = null; return; }
+    var m = {}; a.forEach(function(w){ m[w.id] = JSON.stringify(w); }); BASE = m; }catch(e){ BASE = null; } };
+  function viewOnly(err){ return /view only/i.test(String(err && (err.message || err) || '')) || (err && err.code === 'view_only'); }
+  async function fullSave(snap){   // the old way, unchanged
+    if(typeof saveAppSettingToSupabase !== 'function') return;
+    try{ var r = await saveAppSettingToSupabase('payroll_weeks', snap.full); if(r && r.ok !== false && idsOk(snap.list)){ var m = {}; snap.list.forEach(function(w, i){ m[w.id] = snap.parts[i]; }); BASE = m; } }catch(e){}
+  }
+  async function send(snap){
+    if(typeof supaClient === 'undefined' || !supaClient || typeof supaClient.rpc !== 'function' || !idsOk(snap.list)) return fullSave(snap);
+    if(!BASE){ try{ var r0 = await supaClient.from('app_settings').select('value').eq('key', 'payroll_weeks').maybeSingle(); if(r0 && r0.data && r0.data.value) window.wmamPayBaseFrom(r0.data.value); }catch(e){} }
+    if(!BASE) return fullSave(snap);
+    var ids = snap.list.map(function(w){ return w.id; }), changed = [], removed = [];
+    snap.parts.forEach(function(p, i){ if(BASE[ids[i]] !== p) changed.push(p); });
+    Object.keys(BASE).forEach(function(id){ if(ids.indexOf(id) < 0) removed.push(id); });
+    if(!changed.length && !removed.length) return;   // nothing changed on this screen — nothing to send
+    var res; try{ res = await supaClient.rpc('wmam_payroll_save_weeks', { p_weeks:'[' + changed.join(',') + ']', p_removed:removed, p_order:ids }); }catch(e){ res = { error:e }; }
+    if(res && res.error){
+      if(viewOnly(res.error)) return;   // View As (view only): nothing is saved, as before
+      console.warn('[payroll save 3110] falling back to the full save:', res.error.message || res.error);
+      return fullSave(snap);
+    }
+    if(!BASE) BASE = {};
+    snap.list.forEach(function(w, i){ BASE[w.id] = snap.parts[i]; }); removed.forEach(function(id){ delete BASE[id]; });
+  }
+  function run(snap){ busy = true; Promise.resolve().then(function(){ return send(snap); }).catch(function(e){ console.warn('[payroll save 3110]', e); })
+    .then(function(){ busy = false; if(pending){ var p = pending; pending = null; run(p); } }); }
+  // the list is captured the moment save is asked for; saves made while one is on its way are sent together right after it
+  window.wmamPaySaveWeeks = function(){
+    var list = (PAYROLL_WEEKS || []).slice(), parts = list.map(function(w){ return JSON.stringify(w); });
+    var snap = { list:list, parts:parts, full:'[' + parts.join(',') + ']' };
+    if(busy){ pending = snap; return; }
+    run(snap);
+  };
+})();
 // Save helpers (mirror the existing pattern)
 function savePayrollWeeks(){
   try{ localStorage.setItem('wmam_payroll_weeks', JSON.stringify(PAYROLL_WEEKS)); }catch(e){}
+  if(typeof window.wmamPaySaveWeeks === 'function'){ try{ window.wmamPaySaveWeeks(); return; }catch(e){ console.warn('[payroll save 3110]', e); } }   // v3110
   if(typeof saveAppSettingToSupabase === 'function'){
     saveAppSettingToSupabase('payroll_weeks', JSON.stringify(PAYROLL_WEEKS)).catch(function(){});
   }
@@ -36200,7 +36244,7 @@ async function loadFromSupabase(){
         if(s.value && {payroll_access:1,payroll_upload_access:1,payroll_weeks:1,payroll_debt_ledger:1,comp_plans:1,comp_assignments:1,comp_templates:1,onboard_templates:1,onboard_packages:1,onboard_assignments:1,store_items:1}[s.key] === 1){ try{ localStorage.setItem('wmam_' + s.key, s.value); }catch(e){} }
         if(s.key==='payroll_access' && s.value){ try{var pa=JSON.parse(s.value);if(Array.isArray(pa))PAYROLL_ACCESS=pa;}catch(e){} }
         if(s.key==='payroll_upload_access' && s.value){ try{var pua=JSON.parse(s.value);if(Array.isArray(pua))PAYROLL_UPLOAD_ACCESS=pua;}catch(e){} }
-        if(s.key==='payroll_weeks' && s.value){ try{var pw=JSON.parse(s.value);if(Array.isArray(pw))PAYROLL_WEEKS=pw;}catch(e){} }
+        if(s.key==='payroll_weeks' && s.value){ try{var pw=JSON.parse(s.value);if(Array.isArray(pw)){PAYROLL_WEEKS=pw;if(typeof window.wmamPayBaseFrom==='function')window.wmamPayBaseFrom(s.value);}}catch(e){} }
         if(s.key==='payroll_debt_ledger' && s.value){ try{var pdl=JSON.parse(s.value);if(typeof pdl==='object'&&pdl)PAYROLL_DEBT_LEDGER=pdl;}catch(e){} }
         if(s.key==='comp_plans' && s.value){ try{var cp=JSON.parse(s.value);if(Array.isArray(cp))COMP_PLANS=cp;}catch(e){} }
         if(s.key==='comp_assignments' && s.value){ try{var ca=JSON.parse(s.value);if(Array.isArray(ca))COMP_ASSIGNMENTS=ca;}catch(e){} }
