@@ -3906,7 +3906,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.11.3120';
+var BUILD_VERSION = '2026.11.11.3130';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -12448,6 +12448,42 @@ var ASSIGNED_DOC_STATUS = {};
 // ensures saves run sequentially, so each one sees the previous write.
 var _saveAssignedDocsQueue = Promise.resolve();
 
+// v3130 (Calvin 2026-11-11): a person's documents are saved ONE DOCUMENT AT A TIME (server function wmam_doc_save).
+// Before, every save re-sent the person's whole folder (up to 300 KB with ID photos) and some saves re-sent all 87 folders.
+// Now only documents that changed go up; the server keeps every other document as it is (another phone's signature on a
+// different form is never undone) and puts back any file the screen only had as a "kept on the server" marker.
+// Any problem → the old whole-folder save runs instead, so a signature is never lost.
+(function(){
+  var BASE = {};
+  function canon(v){ if(Array.isArray(v)) return '[' + v.map(function(x){ return x === undefined || typeof x === 'function' ? 'null' : canon(x); }).join(',') + ']';
+    if(v && typeof v === 'object'){ return '{' + Object.keys(v).sort().filter(function(k){ return v[k] !== undefined && typeof v[k] !== 'function'; }).map(function(k){ return JSON.stringify(k) + ':' + canon(v[k]); }).join(',') + '}'; }
+    return JSON.stringify(v); }
+  // what the server holds for this person, document by document (set only from what the server returned or confirmed)
+  window.wmamDocBase = function(aid, raw){ try{ var o = typeof raw === 'string' ? JSON.parse(raw) : raw; if(!o || typeof o !== 'object' || Array.isArray(o)){ delete BASE[aid]; return; }
+    var m = {}; Object.keys(o).forEach(function(f){ m[f] = canon(o[f]); }); BASE[String(aid)] = m; }catch(e){ delete BASE[String(aid)]; } };
+  window.wmamDocWrite = async function(aid, perVal){
+    aid = String(aid); var key = 'assigned_doc_status_' + aid;
+    function full(){ return supaClient.from('app_settings').upsert({key:key, value:perVal}, {onConflict:'key'}).then(function(r){ if(r && !r.error) window.wmamDocBase(aid, perVal); return r; }); }
+    try{
+      var docs = JSON.parse(perVal);
+      if(!docs || typeof docs !== 'object' || Array.isArray(docs) || !/^\d+$/.test(aid) || typeof supaClient.rpc !== 'function') return full();
+      if(!BASE[aid]){ var r0 = await supaClient.from('app_settings').select('value').eq('key', key).maybeSingle(); if(r0 && r0.error) return full(); window.wmamDocBase(aid, (r0 && r0.data && r0.data.value) || '{}'); }
+      var B = BASE[aid]; if(!B) return full();
+      var ch = {}, n = 0, rem = [];
+      Object.keys(docs).forEach(function(f){ if(docs[f] === undefined) return; if(B[f] !== canon(docs[f])){ ch[f] = docs[f]; n++; } });
+      Object.keys(B).forEach(function(f){ if(!Object.prototype.hasOwnProperty.call(docs, f) || docs[f] === undefined) rem.push(f); });
+      if(!n && !rem.length) return { data:null, error:null };   // nothing changed for this person — nothing to send
+      var res; try{ res = await supaClient.rpc('wmam_doc_save', { p_agent:Number(aid), p_docs:JSON.stringify(ch), p_removed:rem }); }catch(e){ res = { error:e }; }
+      if(res && res.error){
+        if(/view only/i.test(String(res.error.message || res.error)) || res.error.code === 'view_only') return res;   // View As (view only): nothing saved, as before
+        console.warn('[doc save 3130] falling back to the whole-folder save for ' + aid + ':', res.error.message || res.error);
+        return full();
+      }
+      Object.keys(ch).forEach(function(f){ B[f] = canon(ch[f]); }); rem.forEach(function(f){ delete B[f]; });
+      return { data:null, error:null };
+    }catch(e){ console.warn('[doc save 3130]', e); return full(); }
+  };
+})();
 function saveAssignedDocs(agentIdHint){
   // Always update localStorage immediately so the current user's UI is correct
   try{ localStorage.setItem('wmam_assigned_docs', JSON.stringify(ASSIGNED_DOC_STATUS)); }catch(e){}
@@ -12532,10 +12568,7 @@ function saveAssignedDocs(agentIdHint){
         if(agentIdHint != null && ASSIGNED_DOC_STATUS[agentIdHint]){
           var perKey = 'assigned_doc_status_'+agentIdHint;
           var perVal = JSON.stringify(ASSIGNED_DOC_STATUS[agentIdHint]);
-          var perRes = await supaClient.from('app_settings').upsert(
-            {key:perKey, value:perVal},
-            {onConflict:'key'}
-          );
+          var perRes = await window.wmamDocWrite(agentIdHint, perVal);   // v3130: only the documents that changed
           if(perRes && perRes.error){
             console.error('[saveAssignedDocs] PER-AGENT WRITE FAILED for '+perKey+':', perRes.error);
             throw new Error('per-agent write failed: '+(perRes.error.message||'unknown'));
@@ -12545,10 +12578,7 @@ function saveAssignedDocs(agentIdHint){
           var agentIds = Object.keys(ASSIGNED_DOC_STATUS);
           for(var i = 0; i < agentIds.length; i++){
             var aid = agentIds[i];
-            var perRes2 = await supaClient.from('app_settings').upsert(
-              {key:'assigned_doc_status_'+aid, value:JSON.stringify(ASSIGNED_DOC_STATUS[aid])},
-              {onConflict:'key'}
-            );
+            var perRes2 = await window.wmamDocWrite(aid, JSON.stringify(ASSIGNED_DOC_STATUS[aid]));   // v3130: people with no changes send nothing
             if(perRes2 && perRes2.error){
               console.error('[saveAssignedDocs] BULK PER-AGENT WRITE FAILED for agent '+aid+':', perRes2.error);
             }
@@ -12586,6 +12616,7 @@ function saveAssignedDocs(agentIdHint){
             if(refresh && refresh.data && refresh.data.value){
               try {
                 var fresh = JSON.parse(refresh.data.value);
+                if(fresh && typeof fresh === 'object' && typeof window.wmamDocBase === 'function') window.wmamDocBase(agentIdHint, fresh);   // v3130: what the server holds
                 if(fresh && typeof fresh === 'object'){
                   if(!ASSIGNED_DOC_STATUS[agentIdHint]) ASSIGNED_DOC_STATUS[agentIdHint] = {};
                   Object.keys(fresh).forEach(function(formId){
@@ -36225,6 +36256,7 @@ async function loadFromSupabase(){
             var aId = parseInt(s.key.replace('assigned_doc_status_', ''), 10);
             var perAgent = JSON.parse(s.value);
             if(aId && perAgent && typeof perAgent === 'object'){
+              if(typeof window.wmamDocBase === 'function') window.wmamDocBase(aId, perAgent);   // v3130: what the server holds
               if(!ASSIGNED_DOC_STATUS[aId]) ASSIGNED_DOC_STATUS[aId] = {};
               Object.keys(perAgent).forEach(function(formId){
                 var cloud = perAgent[formId];
@@ -113132,7 +113164,7 @@ async function hydrate(){
     var ids = Object.keys(ASSIGNED_DOC_STATUS).filter(function(aid){ return hasMark(JSON.stringify(ASSIGNED_DOC_STATUS[aid])) && (office || String(aid) === String(u.id)); });
     for(var i = 0; i < ids.length; i++){ var aid = ids[i];
       var c = await supaClient.from('app_settings').select('value').eq('key', 'assigned_doc_status_' + aid).maybeSingle();
-      if(c && c.data && c.data.value){ var merged = mergeFull(JSON.stringify(ASSIGNED_DOC_STATUS[aid]), c.data.value); try{ ASSIGNED_DOC_STATUS[aid] = JSON.parse(merged); }catch(e){} } }
+      if(c && c.data && c.data.value){ var merged = mergeFull(JSON.stringify(ASSIGNED_DOC_STATUS[aid]), c.data.value); try{ ASSIGNED_DOC_STATUS[aid] = JSON.parse(merged); if(typeof window.wmamDocBase === 'function') window.wmamDocBase(aid, c.data.value); }catch(e){} } }
   }catch(e){ console.warn('[doc files]', e); }
 }
 window.wmamDocHydrate = hydrate;
