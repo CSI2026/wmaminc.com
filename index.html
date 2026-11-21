@@ -3454,6 +3454,23 @@ function initReveal() {
   }), { threshold: 0.05, rootMargin: '0px 0px -40px 0px' });
   document.querySelectorAll('.reveal:not(.vis)').forEach(el => io.observe(el));
 }
+
+// v3404 (Calvin 2026-11-21): lists that live in their own database tables. Pages read them through wmam_bundle_read (rebuilt from the
+// tables, same shape as before); saving is unchanged so every server safety rule still runs. If the read fails, the old copy is used.
+var WMAM_DB_LISTS = ['payroll_weeks','payroll_debt_ledger','payroll_obligations','obligation_commits','payroll_office_salaries',
+  // v3405: every other company list — one database row per record (wmam_db_records)
+  'expired_device_charges','carrier_tickets','gm_sale_markets','gm_sale_pricing','gm_pricelist','applications_handled','inactivity_flags',
+  'agent_status_v1','training_sessions','training_completions','markets','markets_audit_log','wmam_programs','campaign_docs','comp_plans',
+  'fb_registry','lifeline_teams','store_items','contact_directory','contact_call_log','wmam_partners','rank_history','weekly_snapshots',
+  'applicants_pre_bg','agent_contracts','ob_pending_actions','onboarding_records','upload_submissions','prog_goals','gm_org_chart',
+  'device_cost_rules','aw_device_cost','report_name_map','call_reminder_settings','operating_costs','pl_company_payments'];
+async function wmamDbLists(keys){
+  keys = keys || WMAM_DB_LISTS;
+  try{ var r = await supaClient.rpc('wmam_bundle_read', { p_keys:keys }); if(r && !r.error && Array.isArray(r.data) && (r.data.length || keys.length < 3)) return r.data; }catch(e){}
+  try{ var f = await supaClient.from('app_settings').select('key,value').in('key', keys); if(f && !f.error && Array.isArray(f.data)) return f.data; }catch(e){}
+  return [];
+}
+async function wmamDbList(key){ var rows = await wmamDbLists([key]); var x = rows.find(function(r){ return r && r.key === key; }); return { data:x ? { value:x.value } : null, error:null }; }
 var BREVO_API_KEY = '';  // Set via Settings → Brevo (NEVER hardcode here — gets caught by GitHub secret scanning)
 var BREVO_SENDER_EMAIL = 'noreply@wmaminc.com';   // v2026.10.25: company email is never sent as info@ (Calvin's own box)
 var BREVO_SENDER_NAME  = 'WMAMinc';
@@ -3642,9 +3659,9 @@ function brevoSaveSettings(){
       if(!confirm('That key does not start with "xkeysib-". Save anyway?')) return;
     }
     BREVO_API_KEY = newKey;
-    try { localStorage.setItem('wmam_brevo', newKey); } catch(e){}
+
     if(typeof supaClient !== 'undefined' && supaClient){
-      supaClient.from('app_settings').upsert({key:'brevo_key', value:newKey},{onConflict:'key'}).then(function(){}).catch(function(){});
+      supaClient.rpc('wmam_brevo_key_set', { p_key:newKey }).then(function(r){ if(r && r.error) alert(r.error.message); }).catch(function(){});   // v3403: write only, kept on the server
     }
   }
   if(senderName){
@@ -3906,7 +3923,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.21.3401';
+var BUILD_VERSION = '2026.11.21.3405';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -8526,7 +8543,7 @@ function payrollPLSnapshot(periodEnd){
   }
   async function send(snap){
     if(typeof supaClient === 'undefined' || !supaClient || typeof supaClient.rpc !== 'function' || !idsOk(snap.list)) return fullSave(snap);
-    if(!BASE){ try{ var r0 = await supaClient.from('app_settings').select('value').eq('key', 'payroll_weeks').maybeSingle(); if(r0 && r0.data && r0.data.value) window.wmamPayBaseFrom(r0.data.value); }catch(e){} }
+    if(!BASE){ try{ var r0 = await wmamDbList('payroll_weeks'); if(r0 && r0.data && r0.data.value) window.wmamPayBaseFrom(r0.data.value); }catch(e){} }
     if(!BASE) return fullSave(snap);
     var ids = snap.list.map(function(w){ return w.id; }), changed = [], removed = [];
     snap.parts.forEach(function(p, i){ if(BASE[ids[i]] !== p) changed.push(p); });
@@ -36112,9 +36129,12 @@ async function loadFromSupabase(){
       try{
         var _q = supaClient.from('app_settings').select('key,value');
         GIANT_BLOB_KEYS.forEach(function(k){ _q = _q.neq('key', k); });
-        _q = _q.not('key', 'like', 'assigned_doc_status_%'); _q = _q.not('key', 'like', 'backup%');   // v3000: saved backups stay on the server   // v2026.10.22.1720: per-agent document rows come below WITHOUT their files (one agent's ID photos were 12.5 MB of every login)
+        _q = _q.not('key', 'like', 'assigned_doc_status_%'); _q = _q.not('key', 'like', 'backup%');
+        var _dbl = !window._wmamAuthed || window._wmamAuthed();   // logged-out pages keep reading the few public lists the old way
+        if(_dbl) _q = _q.not('key', 'in', '(' + WMAM_DB_LISTS.join(',') + ')');   // v3404/3405: these lists are read from their database rows (wmam_bundle_read)   // v3000: saved backups stay on the server   // v2026.10.22.1720: per-agent document rows come below WITHOUT their files (one agent's ID photos were 12.5 MB of every login)
         var _sres = await _q;
         if(_sres && !_sres.error && _sres.data){ settings = _sres.data; if(typeof window._sbNoteResult==='function') window._sbNoteResult(null);
+          if(_dbl) try{ settings = settings.concat(await wmamDbLists()); }catch(e){ console.warn('[loadFromSupabase] database lists load failed:', e); }
           if(!window._wmamAuthed || window._wmamAuthed()) try{ var _lt = await supaClient.rpc('wmam_doc_status_light');
             if(_lt && !_lt.error && Array.isArray(_lt.data)) settings = settings.concat(_lt.data);
             else { var _fd = await supaClient.from('app_settings').select('key,value').like('key', 'assigned_doc_status_%'); if(_fd && !_fd.error && _fd.data) settings = settings.concat(_fd.data.filter(function(r){ return /^assigned_doc_status_\d+$/.test(r.key); })); }
@@ -47129,8 +47149,8 @@ function saveBrevoKey(){
   var key=document.getElementById('brevoApiKey')?document.getElementById('brevoApiKey').value.trim():'';
   if(!key){ alert('Please enter your Brevo API key.'); return; }
   BREVO_API_KEY=key;
-  if(supaClient){(async function(){try{await supaClient.from('app_settings').upsert({key:'brevo_key',value:key},{onConflict:'key'});}catch(e){console.warn(e);}})();}
-  try{ localStorage.setItem('wmam_brevo',key); }catch(e){}
+  if(supaClient){(async function(){try{ var r = await supaClient.rpc('wmam_brevo_key_set', { p_key:key }); if(r && r.error) alert(r.error.message); }catch(e){console.warn(e);}})();}   // v3403: write only, kept on the server
+
   closeModal('brevoSetupModal');
   setTimeout(function(){ sendLoginInvite(); },300);
 }
@@ -53344,7 +53364,10 @@ function panelAgentMasterProfile(agentId){
     h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Account Holder</div><div style="font-family:Barlow Condensed,sans-serif;font-size:.88rem;font-weight:700;color:var(--brown)">'+bk.accountHolderName+'</div></div>';
     h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Routing Number</div><div style="font-family:monospace;font-size:.88rem;color:var(--brown)">'+bk.routingNumber+'</div></div>';
     h += '<div><div style="font-family:Barlow Condensed,sans-serif;font-size:.58rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Account Number</div><div style="font-family:monospace;font-size:.88rem;color:var(--brown)">'+bk.accountNumber+'</div></div>';
-    h += '</div></div>';
+    h += '</div>';
+    // v3402: only the last 4 digits live in the shared bundle now; the full numbers are in the locked vault (Calvin + office)
+    h += '<div style="padding:0 20px 14px"><button onclick="wmamBankShow('+agentId+',this)" style="background:white;border:1px solid var(--border);color:var(--brown);font-family:Barlow Condensed,sans-serif;font-size:.72rem;letter-spacing:1px;padding:6px 12px;border-radius:6px;cursor:pointer">🔒 Show full numbers (office only)</button></div>';
+    h += '</div>';
   }
   h += '</div>'; // end documents pane
 
@@ -118163,7 +118186,7 @@ if(typeof ppProceedToPreview === 'function'){ var oGo = ppProceedToPreview;
 }
 // 2. marked saved only when the week is really in the database
 async function savedOnServer(carriers, since){
-  var r = await supaClient.from('app_settings').select('value').eq('key', 'payroll_weeks').maybeSingle(); var arr = []; try{ arr = JSON.parse((r && r.data && r.data.value) || '[]'); }catch(e){}
+  var r = await wmamDbList('payroll_weeks'); var arr = []; try{ arr = JSON.parse((r && r.data && r.data.value) || '[]'); }catch(e){}
   return (carriers || []).filter(function(c){ return c.confirmed !== false; }).every(function(c){ return arr.some(function(w){ return w && !w.deleted && w.carrier === c.carrier && iso(w.periodStart) === iso(c.periodStart) && iso(w.periodEnd) === iso(c.periodEnd) && Date.parse(w.uploadedAt || 0) >= since - 120000; }); });
 }
 if(typeof ppCommitStaged === 'function'){ var oCommit = ppCommitStaged;
@@ -124338,6 +124361,49 @@ try{ wmamViewAgreement = window.wmamViewAgreement; }catch(e){}
 })(0);
 }catch(e){ console.warn('[contracts 3401]', e); } })();
 
+</script>
+<script>
+/* v3402 (Calvin 2026-11-21): bank numbers are kept in a locked vault, not in the shared onboarding bundle that every logged-in
+   person's page loads. The bundle keeps only the last 4 digits (the server masks every save). Calvin + office: "Show full numbers". */
+(function(){ try{
+if(window._wmamBank3402) return; window._wmamBank3402 = true;
+window.wmamBankShow = async function(agentId, btn){
+  var r = null; try{ r = await supaClient.rpc('wmam_bank_get', { p_agent:Number(agentId) }); }catch(e){ r = { error:e }; }
+  if(!r || r.error){ alert((r && r.error && (r.error.message || r.error)) || 'Could not load.'); return; }
+  if(!r.data){ alert('No bank details on file.'); return; }
+  var d = r.data, esc = function(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]; }); };
+  var box = document.createElement('div'); box.style.cssText = 'margin-top:8px;font-family:monospace;font-size:.9rem;color:#0f172a;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:8px 10px';
+  box.innerHTML = esc(d.holder || '') + '<br>Routing ' + esc(d.routing || '—') + '<br>Account ' + esc(d.account || '—') + '<div style="font-family:Arial;font-size:11px;color:#92400e;margin-top:4px">Hidden again when you leave this page.</div>';
+  if(btn && btn.parentNode){ btn.parentNode.appendChild(box); btn.remove(); }
+  try{ if(typeof wmamLogActivity === 'function') wmamLogActivity('bank_view', { label:((DB.current || {}).name || '') + ' viewed bank details for agent #' + agentId }); }catch(e){}
+};
+// this browser's saved copy of the onboarding bundle: keep only the last 4 digits there too
+function mask(v){ var d = String(v || '').replace(/\D/g, ''); return d.length > 4 ? '••••' + d.slice(-4) : v; }
+function scrub(o){ try{ if(o && o.banking) Object.keys(o.banking).forEach(function(k){ var b = o.banking[k]; if(b){ b.routingNumber = mask(b.routingNumber); b.accountNumber = mask(b.accountNumber); } });
+    if(o && o.status) Object.keys(o.status).forEach(function(a){ var c = o.status[a] || {}; Object.keys(c).forEach(function(k){ var s3 = c[k] && c[k].steps && c[k].steps[3]; if(s3){ s3.routingNumber = mask(s3.routingNumber); s3.accountNumber = mask(s3.accountNumber); } }); }); }catch(e){} return o; }
+try{ var raw = localStorage.getItem('wmam_contracts'); if(raw && /\d{5,}/.test(raw)){ localStorage.setItem('wmam_contracts', JSON.stringify(scrub(JSON.parse(raw)))); } }catch(e){}
+setTimeout(function(){ try{ if(typeof AGENT_BANKING_INFO !== 'undefined') scrub({ banking:AGENT_BANKING_INFO, status:(typeof AGENT_ONBOARDING_STATUS !== 'undefined' ? AGENT_ONBOARDING_STATUS : {}) }); }catch(e){} }, 4000);
+}catch(e){ console.warn('[bank 3402]', e); } })();
+</script>
+<script>
+/* v3403 (Calvin 2026-11-21): the Brevo email/SMS password is never in a browser any more. Every send to api.brevo.com from any page
+   goes through the brevo-relay server function, which adds the key on the server and only works for signed-in WMAMinc people. */
+(function(){ try{
+if(window._wmamBrevo3403) return; window._wmamBrevo3403 = true;
+var clean = function(){ try{ localStorage.removeItem('wmam_brevo'); }catch(e){} try{ if(typeof BREVO_API_KEY !== 'undefined' && BREVO_API_KEY !== 'server') BREVO_API_KEY = 'server'; }catch(e){} };
+clean(); setInterval(clean, 5000);
+var of = window.fetch.bind(window);
+window.fetch = async function(input, init){
+  var url = typeof input === 'string' ? input : ((input && input.url) || '');
+  if(/^https:\/\/api\.brevo\.com\//i.test(url)){
+    var path = url.replace(/^https:\/\/api\.brevo\.com/i, '').split('?')[0], method = String((init && init.method) || 'GET').toUpperCase(), body = null;
+    try{ body = init && init.body ? JSON.parse(init.body) : null; }catch(e){ body = null; }
+    var tok = ''; try{ var s = await supaClient.auth.getSession(); tok = (s && s.data && s.data.session && s.data.session.access_token) || ''; }catch(e){}
+    return of(SUPA_URL + '/functions/v1/brevo-relay', { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + (tok || SUPA_KEY), 'apikey':SUPA_KEY }, body:JSON.stringify({ path:path, method:method, body:body }) });
+  }
+  return of(input, init);
+};
+}catch(e){ console.warn('[brevo 3403]', e); } })();
 </script>
 </body>
 </html>
