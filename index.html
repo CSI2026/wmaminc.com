@@ -26917,7 +26917,9 @@ function canAccess(u, area){
       return isOwner(u);
     // Mass email + SMS — Calvin 2026-06-03 v2: bulletproof gate. Mirrors
     // the buildNav Comms visibility check exactly so menu and panel match.
+    // v3425: the new Mass Email (Email Blasts) is for Calvin, K-Anna and Makenzie only (Calvin 2026-11-22) — the server checks too
     case 'mass-email':
+      return _blCan(u);
     case 'mass-sms': {
       if(!u) return false;
       if(isOwner(u)) return true;
@@ -52243,7 +52245,7 @@ function buildNav(u){
   } catch(e) {}
   if(_commsShow){
     mcItems += '<div style="border-top:1px solid rgba(0,53,148,.15);margin:4px 0"></div>'
-             + boDropBtn('mass-email','📤 Mass Email')
+             + (_blCan(u) ? boDropBtn('mass-email','📣 Mass Email') : '')
              + boDropBtn('mass-sms','📱 Mass SMS');
     if(_commsRole === 'owner' || (typeof isOwner === 'function' && isOwner(u))){
       mcItems += boDropBtn('brevo-settings','⚙️ Brevo Settings');
@@ -97090,371 +97092,465 @@ var ME_ROLES = [
   {key:'Field Agent',     label:'Field Agent',     icon:'🎯'}
 ];
 
+// ════════════════════════════════════════════════════════════════════════
+//  📣 MASS EMAIL — EMAIL BLASTS  (v3425, Calvin 2026-11-22)
+//  "we need to be able to mass email like mailchimp even to other people not currently inside our company that were here
+//   before … we need to be able to add images and also we need a working ai to help with wording and even imaging"
+//  Replaces the old Brevo Mass Email screen completely. For Calvin, K-Anna and Makenzie (Calvin's choice) — the server checks too.
+//  • Who gets it: current agents & managers, past agents, past applicants, uploaded lists (Excel / CSV / pasted "name, email").
+//    Duplicates, unsubscribed people and addresses that bounced before are left out automatically.
+//  • The email: Classic (WMAMinc blue) or Holiday look, blocks (headline, text, picture, pay box, button, line), the real logo
+//    always on top, unsubscribe + company address always at the bottom (the law for people outside the company).
+//  • ✨ AI helper: writes the email from a plain-words request, makes it more exciting / shorter / Spanish / fixes spelling,
+//    and makes pictures (never logos, never words in the picture). Pictures can also be uploaded from the phone or computer.
+//  • Preview, send a test to yourself, then Send: it goes out in waves of 30 a minute from alerts@ (replies to onboarding@)
+//    and pauses by itself if too many old addresses bounce, so every other WMAMinc email stays out of spam.
+//  • Past blasts: sent / delivered / opened / tapped / not opened / bounced / unsubscribed, name by name; pause, resume, stop,
+//    copy, and "re-send to the people who did not open".
+//  Works the same on phone, tablet and computer (app-ready: no pop-up windows, no browser-only features required).
+// ════════════════════════════════════════════════════════════════════════
+var BL = window.BL || { tab:'new', draft:null, lists:null, count:null, report:null, past:null, busy:'', contacts:null, cList:'', cSearch:'' };
+window.BL = BL;
+function _blCan(u){ return !!(u && [1,3,4].indexOf(Number(u.id)) >= 0); }
+function _blE(s){ return _escapeHtml(s == null ? '' : String(s)); }
+function _blA(s){ return _escapeAttr(s == null ? '' : String(s)); }
+function _blToast(msg, bad){
+  try{ document.querySelectorAll('.bl-toast').forEach(function(x){ x.remove(); }); var t = document.createElement('div'); t.className = 'bl-toast' + (bad ? ' bad' : ''); t.textContent = msg; document.body.appendChild(t);
+    setTimeout(function(){ t.style.opacity = '0'; }, 3200); setTimeout(function(){ try{ t.remove(); }catch(e){} }, 3800); }catch(e){}
+}
+function _blNewDraft(){
+  return { id:null, subject:'', preheader:'', theme:'classic', audience:{ current:true },
+    blocks:[ { type:'headline', text:'' }, { type:'text', text:'Hi {first},\n\n' }, { type:'button', text:'', url:'https://wmaminc.com/' } ] };
+}
+function _blSaveLocal(){ try{ localStorage.setItem('wmam_blast_draft', JSON.stringify(BL.draft)); }catch(e){} }
+function _blLoadLocal(){ try{ var d = JSON.parse(localStorage.getItem('wmam_blast_draft') || 'null'); if(d && Array.isArray(d.blocks)) return d; }catch(e){} return null; }
+async function _blRpc(fn, args){
+  var r = await supaClient.rpc(fn, args || {});
+  if(r.error) throw new Error(r.error.message || 'Something went wrong.');
+  return r.data;
+}
+// edge calls (own timeout — AI pictures can take up to a minute, and must never be asked for twice)
+async function _blCall(action, body, ms){
+  var token = null; try{ var ses = await supaClient.auth.getSession(); token = ses && ses.data && ses.data.session && ses.data.session.access_token; }catch(e){}
+  var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null; var to = ctl ? setTimeout(function(){ try{ ctl.abort(); }catch(e){} }, ms || 45000) : null;
+  try{
+    var r = await fetch(SUPA_URL + '/functions/v1/mail-open', { method:'POST', headers:{ 'Content-Type':'application/json', apikey:SUPA_KEY, Authorization:'Bearer ' + (token || SUPA_KEY) },
+      body: JSON.stringify(Object.assign({ action:action }, body || {})), signal: ctl ? ctl.signal : undefined });
+    var d = null; try{ d = await r.json(); }catch(e){}
+    if(!d || d.ok === false) throw new Error((d && d.error) || ('Server returned ' + r.status));
+    return d;
+  } catch(e){ if(e && e.name === 'AbortError') throw new Error('That took too long. Try again.'); throw e; }
+  finally { if(to) clearTimeout(to); }
+}
+
 function panelMassEmail(){
   var u = DB.current;
-  // Calvin 2026-06-03: opened from Owner-only to all office staff
-  // (Owner, admin, HR, Payroll, Onboarding, Inventory, Office Staff).
-  if(!isOfficeRole(u)){
-    return panelHeader('🔒 Mass Email / Text') +
-      '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted);font-family:Barlow Condensed,sans-serif">🔒 Office staff only (Owner, admin, HR, Payroll, Onboarding, Inventory).</div></div>';
-  }
-  var h = panelHeader('📧 Mass Email / Text — Send to Team');
-  h += '<div style="background:rgba(0,53,148,.06);border:1px solid rgba(0,53,148,.2);border-radius:8px;padding:14px 18px;margin-bottom:18px;font-family:Barlow Condensed,sans-serif;font-size:.78rem;color:var(--brown);line-height:1.6">';
-  h += '<strong>Send to a hierarchy: Program → Campaign → Role.</strong> Pick one or more programs (or "All Programs"), then pick campaigns within them (or "All Campaigns"), then pick which roles. Recipient count updates live. Click <strong>Show recipient list</strong> before sending to verify.';
+  if(!_blCan(u)) return panelHeader('📣 Mass Email') + '<div class="bo-card"><div style="padding:40px;text-align:center;color:var(--muted)">🔒 Mass Email is for Calvin, K-Anna and Makenzie.</div></div>';
+  if(!BL.draft) BL.draft = _blLoadLocal() || _blNewDraft();
+  setTimeout(_blInit, 0);
+  return panelHeader('📣 Mass Email') + _blStyle() + '<div id="blBox" class="bl-wrap"><div style="padding:30px;text-align:center;color:#6b7280">Loading…</div></div>';
+}
+async function _blInit(){ _blRender(); _blLoadLists(); if(BL.tab === 'past') _blLoadPast(); if(BL.tab === 'contacts') _blLoadContacts(); }
+async function _blLoadLists(){
+  try{ BL.lists = await _blRpc('wmam_blast_lists'); }catch(e){ BL.lists = { error: e.message }; }
+  _blRender(); _blCountSoon();
+}
+var _blCountT = null;
+function _blCountSoon(){ clearTimeout(_blCountT); _blCountT = setTimeout(async function(){ try{ var d = await _blRpc('wmam_blast_count', { p_audience: BL.draft.audience }); BL.count = d.count; }catch(e){ BL.count = null; } var el = document.getElementById('blCount'); if(el) el.textContent = BL.count == null ? '—' : BL.count; var b = document.getElementById('blSendN'); if(b) b.textContent = BL.count == null ? '' : ' (' + BL.count + ')'; }, 350); }
+
+function _blStyle(){
+  return '<style id="blStyle">'
+  + '.bl-wrap{max-width:1150px;margin:0 auto;padding:4px 0 40px;font-family:Arial,Helvetica,sans-serif;color:#111827;text-align:left}'
+  + '.bl-card,.bl-card *{text-align:left !important}.bl-st,.bl-st *,.bl-theme button{text-align:center !important}.bl-tbl th{letter-spacing:.3px !important}'
+  + '.bl-tabs{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin:4px 0 14px}'
+  + '.bl-tab{padding:10px 16px;border-radius:999px;background:#fff;border:1px solid #d1d5db;font-weight:800;font-size:14px;cursor:pointer;color:#111827}'
+  + '.bl-tab.on{background:#003594;border-color:#003594;color:#fff}'
+  + '.bl-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr);gap:14px;align-items:start}'
+  + '.bl-card{background:#fff;border-radius:16px;padding:16px;box-shadow:0 2px 10px rgba(0,0,0,.06);border:1px solid #eef0f4}'
+  + '.bl-card h3{font-size:16px;margin:0 0 12px;font-weight:800}'
+  + '.bl-row{display:flex !important;width:100%;box-sizing:border-box;justify-content:space-between !important;align-items:center;gap:10px;padding:11px 2px;border-top:1px solid #f1f5f9;font-size:15px;cursor:pointer;margin:0}'
+  + '.bl-row:first-of-type{border-top:0}.bl-row input{width:20px;height:20px;accent-color:#003594;flex:0 0 auto}'
+  + '.bl-row .n{font-weight:900;color:#003594}'
+  + '.bl-note{font-size:12.5px;color:#4b5563;background:#f8fafc;border-radius:12px;padding:11px 12px;margin-top:10px;line-height:1.5}'
+  + '.bl-big{font-size:15px;font-weight:900;color:#111827;margin-top:4px}'
+  + '.bl-in{display:block;width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #d1d5db;border-radius:11px;font-size:15px;margin:4px 0 10px;font-family:inherit;background:#fff;color:#111827}'
+  + 'textarea.bl-in{min-height:90px;resize:vertical;line-height:1.5}'
+  + '.bl-lab{font-size:12px;font-weight:800;color:#374151;text-transform:uppercase;letter-spacing:.5px}'
+  + '.bl-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:11px 15px;border-radius:11px;font-weight:800;font-size:14px;border:1px solid #d1d5db;background:#fff;color:#111827;cursor:pointer;line-height:1.1}'
+  + '.bl-btn:disabled{opacity:.5;cursor:wait}.bl-btn.p{background:#003594;border-color:#003594;color:#fff}.bl-btn.r{background:#b91c1c;border-color:#b91c1c;color:#fff}'
+  + '.bl-btn.ai{background:#6d28d9;border-color:#6d28d9;color:#fff}.bl-btn.s{padding:7px 10px;font-size:12.5px;border-radius:9px}'
+  + '.bl-btns{display:flex;gap:8px;flex-wrap:wrap}'
+  + '.bl-ai{background:#f5f3ff;border:1px solid #ddd6fe;border-radius:14px;padding:12px;margin:2px 0 14px}'
+  + '.bl-ai .t{font-weight:900;color:#6d28d9;margin-bottom:6px}'
+  + '.bl-ai .st{font-size:13px;color:#5b21b6;margin-top:8px;font-weight:700;min-height:1em}'
+  + '.bl-blk{border:1px solid #e5e7eb;background:#f8fafc;border-radius:13px;padding:10px 12px;margin-bottom:10px}'
+  + '.bl-blk .hd{display:flex;align-items:center;gap:6px;font-weight:800;font-size:14px;margin-bottom:6px}'
+  + '.bl-blk .hd .sp{flex:1}.bl-blk .bl-in{margin-bottom:6px;font-size:14px}'
+  + '.bl-img{display:block;width:100%;max-height:220px;object-fit:cover;border-radius:10px;border:1px solid #e5e7eb;background:#fff;margin:4px 0 8px}'
+  + '.bl-theme{display:flex;gap:8px;margin:4px 0 12px}.bl-theme button{flex:1;padding:12px;border-radius:12px;border:2px solid #e5e7eb;font-weight:900;cursor:pointer;background:#fff}'
+  + '.bl-theme button.on{border-color:#003594;box-shadow:0 0 0 2px rgba(0,53,148,.15)}'
+  + '.bl-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:10px 0}'
+  + '.bl-st{background:#f8fafc;border-radius:12px;padding:10px 6px;text-align:center;cursor:pointer;border:2px solid transparent}.bl-st.on{border-color:#003594}'
+  + '.bl-st b{display:block;font-size:22px}.bl-st span{font-size:11px;color:#6b7280;font-weight:800;text-transform:uppercase}'
+  + '.bl-tbl{width:100%;border-collapse:collapse;font-size:13.5px}.bl-tbl td,.bl-tbl th{padding:9px 6px;border-top:1px solid #f1f5f9;text-align:left;vertical-align:top}'
+  + '.bl-tbl th{color:#6b7280;font-size:11px;text-transform:uppercase}'
+  + '.bl-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:11.5px;font-weight:800;white-space:nowrap}'
+  + '.pg{background:#dcfce7;color:#166534}.py{background:#fef9c3;color:#854d0e}.pr{background:#fee2e2;color:#991b1b}.pb{background:#dbeafe;color:#1e40af}.px{background:#f1f5f9;color:#475569}.pp{background:#ede9fe;color:#5b21b6}'
+  + '.bl-past{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;padding:12px 2px;border-top:1px solid #f1f5f9}'
+  + '.bl-past:first-of-type{border-top:0}.bl-past .s{font-weight:800;font-size:15px}.bl-past .m{font-size:12.5px;color:#6b7280;margin-top:3px}'
+  + '.bl-modal{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:100000;display:flex;align-items:center;justify-content:center;padding:16px}'
+  + '.bl-modal .c{background:#fff;border-radius:18px;width:100%;max-width:680px;max-height:92vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 50px rgba(0,0,0,.3)}'
+  + '.bl-modal .c.sm{max-width:420px}.bl-modal .h{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid #eef0f4;font-weight:900}'
+  + '.bl-modal .h .sp{flex:1}.bl-modal iframe{border:0;width:100%;flex:1;min-height:60vh;background:#eef2f7}'
+  + '.bl-toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111827;color:#fff;padding:12px 18px;border-radius:12px;font-weight:700;font-size:14px;z-index:100001;transition:opacity .4s;max-width:90vw;text-align:center}'
+  + '.bl-toast.bad{background:#b91c1c}'
+  + '@media(max-width:860px){.bl-grid{grid-template-columns:1fr}.bl-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.bl-hide-m{display:none}}'
+  + '</style>';
+}
+
+function _blRender(){
+  var box = document.getElementById('blBox'); if(!box) return;
+  var tabs = [['new','✍️ New blast'],['past','📊 Past blasts'],['contacts','👥 Contacts'],['upload','⬆ Upload list']];
+  var h = '<div class="bl-tabs">' + tabs.map(function(t){ return '<button class="bl-tab' + (BL.tab === t[0] || (BL.tab === 'report' && t[0] === 'past') ? ' on' : '') + '" onclick="_blTab(\'' + t[0] + '\')">' + t[1] + '</button>'; }).join('') + '</div>';
+  if(BL.tab === 'new') h += _blNewHtml();
+  else if(BL.tab === 'past') h += _blPastHtml();
+  else if(BL.tab === 'report') h += _blReportHtml();
+  else if(BL.tab === 'contacts') h += _blContactsHtml();
+  else if(BL.tab === 'upload') h += _blUploadHtml();
+  box.innerHTML = h;
+}
+function _blTab(t){ BL.tab = t; clearInterval(window._blRepT); _blRender(); if(t === 'past') _blLoadPast(); if(t === 'contacts') _blLoadContacts(); if(t === 'new') _blCountSoon(); }
+
+// ───────────── NEW BLAST ─────────────
+function _blNewHtml(){
+  var d = BL.draft, L = BL.lists || {}, a = d.audience || {};
+  var row = function(key, label, n, checked, onclick){ return '<label class="bl-row"><span style="display:flex;align-items:center;gap:10px"><input type="checkbox"' + (checked ? ' checked' : '') + ' onchange="' + onclick + '"> ' + label + '</span><span class="n">' + (n == null ? '…' : n) + '</span></label>'; };
+  var h = '<div class="bl-grid"><div class="bl-card"><h3>1 · Who gets it</h3>';
+  if(L.error) h += '<div class="bl-note" style="color:#b91c1c">' + _blE(L.error) + '</div>';
+  h += row('current', 'Current agents &amp; managers', L.current, a.current, "_blAud('current',this.checked)");
+  h += row('past_agents', 'Past agents (no longer active)', L.past_agents, a.past_agents, "_blAud('past_agents',this.checked)");
+  h += row('past_applicants', 'Past applicants', L.past_applicants, a.past_applicants, "_blAud('past_applicants',this.checked)");
+  (L.lists || []).forEach(function(x){ h += row('', '📄 ' + _blE(x.name), x.count, (a.lists || []).indexOf(x.name) >= 0, "_blAudList(" + _blA(JSON.stringify(x.name)) + ",this.checked)"); });
+  if(Array.isArray(a.emails) && a.emails.length) h += row('', '🎯 Chosen people (from an earlier blast)', a.emails.length, true, "_blAudEmails(this.checked)");
+  h += '<div class="bl-note">✔ One email per person (duplicates removed) · ✔ People who unsubscribed are skipped · ✔ Addresses that bounced before are left out'
+    + (L.unsubscribed ? ' · ' + L.unsubscribed + ' unsubscribed' : '') + '<div class="bl-big">Sending to <span id="blCount">' + (BL.count == null ? '…' : BL.count) + '</span> people</div></div>';
+  h += '<div style="margin-top:10px" class="bl-btns"><button class="bl-btn s" onclick="_blTab(\'upload\')">⬆ Upload a list</button></div>';
   h += '</div>';
 
-  if(!BREVO_API_KEY){
-    h += '<div class="bo-card" style="margin-bottom:18px;border-left:4px solid #dc2626"><div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif"><strong style="color:#dc2626">⚠ Brevo not configured.</strong> Go to <a href="javascript:void(0)" onclick="gotoPanel(\'brevo-settings\')" style="color:var(--blue);font-weight:700">Brevo Settings</a> first.</div></div>';
-    return h;
-  }
-
-  // ── 1. PROGRAM PICKER ──
-  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">1. Program(s)</div></div>';
-  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
-  h += '<div style="margin-bottom:10px"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:700;color:var(--blue)"><input type="checkbox" id="mePgmAll" checked onchange="meTogglePgmAll(this.checked)" style="width:16px;height:16px;accent-color:#003594"> All programs</label></div>';
-  h += '<div style="display:flex;gap:14px;flex-wrap:wrap">';
-  Object.keys(PROGRAM_CAMPAIGNS).forEach(function(pgm){
-    h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown)"><input type="checkbox" name="mePgm" value="'+_escapeAttr(pgm)+'" checked onchange="meRefreshCampaigns()" style="width:16px;height:16px;accent-color:#003594"> '+_escapeHtml(pgm)+'</label>';
-  });
-  h += '</div></div></div>';
-
-  // ── 2. CAMPAIGN PICKER (dynamic based on programs) ──
-  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">2. Campaign(s)</div></div>';
-  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
-  h += '<div style="margin-bottom:10px"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:700;color:var(--blue)"><input type="checkbox" id="meCampAll" checked onchange="meToggleCampAll(this.checked)" style="width:16px;height:16px;accent-color:#003594"> All campaigns (in selected programs)</label></div>';
-  h += '<div id="meCampaignList" style="display:flex;gap:14px;flex-wrap:wrap"></div>';
+  h += '<div class="bl-card"><h3>2 · The email</h3>';
+  h += '<div class="bl-lab">Look</div><div class="bl-theme"><button class="' + (d.theme !== 'holiday' ? 'on' : '') + '" style="color:#003594" onclick="_blSet(\'theme\',\'classic\')">🔵 Classic blue</button><button class="' + (d.theme === 'holiday' ? 'on' : '') + '" style="color:#b91c1c" onclick="_blSet(\'theme\',\'holiday\')">🎄 Holiday</button></div>';
+  h += '<div class="bl-lab">Subject</div><input class="bl-in" maxlength="200" value="' + _blA(d.subject) + '" placeholder="e.g. 🎄 We want you back — ACA is open" oninput="_blSet(\'subject\',this.value,1)">';
+  h += '<div class="bl-lab">Preview line <span style="text-transform:none;font-weight:600;color:#6b7280">(shows next to the subject in their inbox)</span></div><input class="bl-in" maxlength="200" value="' + _blA(d.preheader) + '" placeholder="e.g. $42 per qualified application — start before Christmas" oninput="_blSet(\'preheader\',this.value,1)">';
+  h += '<div class="bl-ai"><div class="t">✨ AI helper</div>'
+    + '<textarea id="blAiAsk" class="bl-in" style="min-height:64px;margin:0 0 8px" oninput="BL.aiAsk=this.value" placeholder="Tell it what you want in plain words — e.g. Invite past agents back for ACA, $42 per qualified application, holiday feel, short">' + _blE(BL.aiAsk || '') + '</textarea>'
+    + '<div class="bl-btns"><button class="bl-btn ai" onclick="_blAiWrite(\'write\')"' + (BL.busy ? ' disabled' : '') + '>✍️ Write it for me</button><button class="bl-btn ai" onclick="_blAiImage(-1)"' + (BL.busy ? ' disabled' : '') + '>🎨 Make a picture</button>'
+    + '<button class="bl-btn s" onclick="_blAiWrite(\'exciting\')"' + (BL.busy ? ' disabled' : '') + '>🔥 More exciting</button><button class="bl-btn s" onclick="_blAiWrite(\'shorter\')"' + (BL.busy ? ' disabled' : '') + '>✂️ Shorter</button>'
+    + '<button class="bl-btn s" onclick="_blAiWrite(\'spanish\')"' + (BL.busy ? ' disabled' : '') + '>🌎 Spanish</button><button class="bl-btn s" onclick="_blAiWrite(\'fix\')"' + (BL.busy ? ' disabled' : '') + '>✔ Fix spelling</button></div>'
+    + '<div class="st" id="blAiSt">' + _blE(BL.busy || '') + '</div>'
+    + '<div style="font-size:12px;color:#6b7280;margin-top:4px">The AI only uses the facts and pay numbers you give it. Pictures never have words or logos — your real WMAMinc logo is always at the top.</div></div>';
+  h += '<div class="bl-lab" style="margin-bottom:6px">Email blocks</div>';
+  (d.blocks || []).forEach(function(k, i){ h += _blBlockHtml(k, i, d.blocks.length); });
+  h += '<div class="bl-btns" style="margin:4px 0 14px">'
+    + [['headline','🔠 Headline'],['text','📝 Text'],['image','🖼 Picture'],['paybox','💰 Pay box'],['button','🔴 Button'],['divider','➖ Line']].map(function(x){ return '<button class="bl-btn s" onclick="_blAdd(\'' + x[0] + '\')">＋ ' + x[1] + '</button>'; }).join('') + '</div>';
+  h += '<div class="bl-btns"><button class="bl-btn" onclick="_blPreview()">👁 Preview</button><button class="bl-btn" onclick="_blTest()"' + (BL.busy ? ' disabled' : '') + '>✉ Send test to me</button><button class="bl-btn" onclick="_blSaveDraft(true)">💾 Save draft</button>'
+    + '<button class="bl-btn r" onclick="_blSendAsk()"' + (BL.busy ? ' disabled' : '') + '>🚀 Send blast<span id="blSendN">' + (BL.count == null ? '' : ' (' + BL.count + ')') + '</span></button>'
+    + '<button class="bl-btn s" style="margin-left:auto" onclick="_blStartOver()">↺ Start over</button></div>';
+  h += '<div class="bl-note">Goes out from <b>alerts@wmaminc.com</b> (replies go to onboarding@) in waves of 30 a minute. If too many old addresses bounce it <b>pauses by itself</b>, so your everyday company emails stay out of spam. Every email ends with an Unsubscribe link and the company address.' + (d.id ? ' · Draft #' + d.id + ' saved' : '') + '</div>';
   h += '</div></div>';
-
-  // ── 3. ROLE PICKER ──
-  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">3. Role(s)</div></div>';
-  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
-  h += '<div style="margin-bottom:10px"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-weight:700;color:var(--blue)"><input type="checkbox" id="meRoleAll" checked onchange="meToggleRoleAll(this.checked)" style="width:16px;height:16px;accent-color:#003594"> All roles</label></div>';
-  h += '<div style="display:flex;gap:14px;flex-wrap:wrap">';
-  ME_ROLES.forEach(function(r){
-    h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown)"><input type="checkbox" name="meRole" value="'+_escapeAttr(r.key)+'" checked onchange="meUpdateCount()" style="width:16px;height:16px;accent-color:#003594"> '+r.icon+' '+_escapeHtml(r.label)+'</label>';
-  });
-  h += '</div>';
-  h += '</div></div>';
-
-  // ── LIVE COUNT ──
-  h += '<div id="meCountBanner" style="background:linear-gradient(135deg,#003594,#001e52);color:white;border-radius:8px;padding:14px 18px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;font-family:Barlow Condensed,sans-serif">';
-  h += '<div><div style="font-size:.66rem;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.7)">Will send to</div><div id="meRecipientCount" style="font-family:Bebas Neue,sans-serif;font-size:1.6rem;letter-spacing:1.5px">— recipients</div></div>';
-  h += '<button onclick="meRefreshPreview()" style="padding:9px 16px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;font-family:Barlow Condensed,sans-serif;font-size:.7rem;letter-spacing:1.5px;text-transform:uppercase;border-radius:5px;cursor:pointer">🔍 Show list</button>';
-  h += '</div>';
-  h += '<div id="mePreviewBox" style="margin-bottom:14px"></div>';
-
-  // ── COMPOSE ──
-  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">4. Compose</div></div>';
-  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif">';
-  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Send from</label><select id="meFrom" class="f-input"><option value="noreply@wmaminc.com">noreply@wmaminc.com — no replies</option><option value="onboarding@wmaminc.com">onboarding@wmaminc.com — replies go to Onboarding</option><option value="pay@wmaminc.com">pay@wmaminc.com — replies go to Payroll</option><option value="inv@wmaminc.com">inv@wmaminc.com — replies go to Inventory</option></select></div>';
-  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Subject</label>';
-  h += '<input id="meSubject" type="text" class="f-input" placeholder="e.g. Important: National call Monday at 9am CST"></div>';
-  h += '<div class="f-field" style="margin-bottom:10px"><label class="f-label">Message body (plain text — auto-wrapped in branded template)</label>';
-  h += '<textarea id="meBody" class="f-input" rows="10" placeholder="Hi {{name}},&#10;&#10;Reminder that we have a national call Monday at 9am CST. Be on time — points are on the line.&#10;&#10;— Calvin" style="font-family:Arial,sans-serif;line-height:1.6"></textarea>';
-  h += '<div style="font-size:.66rem;color:var(--muted);margin-top:4px">Use blank lines for paragraph breaks. URLs auto-link. <code>{{name}}</code> gets replaced with each recipient\'s first name.</div></div>';
-  h += '</div></div>';
-
-  // ── DELIVERY MODE (Calvin 2026-06-03) ──
-  h += '<div class="bo-card" style="margin-bottom:14px"><div class="bo-card-head"><div class="bo-card-title">Delivery method</div></div>';
-  h += '<div style="padding:14px 18px;font-family:Barlow Condensed,sans-serif;display:flex;gap:18px;flex-wrap:wrap">';
-  h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown);font-weight:700"><input type="radio" name="meMode" value="email"  checked style="width:16px;height:16px"> 📧 Email only</label>';
-  h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown);font-weight:700"><input type="radio" name="meMode" value="text"           style="width:16px;height:16px"> 📱 Text only</label>';
-  h += '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown);font-weight:700"><input type="radio" name="meMode" value="both"           style="width:16px;height:16px"> 📧📱 Both</label>';
-  h += '</div>';
-  h += '<div style="padding:0 18px 14px;font-family:Barlow Condensed,sans-serif;font-size:.72rem;color:var(--muted)">Text uses Brevo SMS. Recipients without a valid US phone number are silently skipped for text. Same for missing email.</div>';
-  h += '</div>';
-
-  // ── SEND ──
-  h += '<div class="bo-card"><div style="padding:14px 18px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">';
-  h += '<button onclick="meSendNow()" class="btn-fire" style="padding:11px 22px;background:#16a34a;border-color:#16a34a">📤 SEND</button>';
-  h += '<div style="font-family:Barlow Condensed,sans-serif;font-size:.7rem;color:var(--muted)">Brevo handles delivery. Batched 50 at a time, ~80ms between messages. Agents without an email or phone are silently skipped.</div>';
-  h += '</div></div>';
-
-  // Initial render of campaigns + count (deferred so the DOM is ready)
-  setTimeout(function(){ try { meRefreshCampaigns(); } catch(e){} }, 50);
-
   return h;
 }
-
-// ── Picker handlers ──
-
-// Master toggle: "All programs" — checks/unchecks all program checkboxes
-function meTogglePgmAll(checked){
-  document.querySelectorAll('input[name="mePgm"]').forEach(function(cb){ cb.checked = checked; });
-  meRefreshCampaigns();
-}
-
-// Master toggle: "All campaigns" — checks/unchecks all campaign checkboxes
-function meToggleCampAll(checked){
-  document.querySelectorAll('input[name="meCamp"]').forEach(function(cb){ cb.checked = checked; });
-  meUpdateCount();
-}
-
-// Master toggle: "All roles"
-function meToggleRoleAll(checked){
-  document.querySelectorAll('input[name="meRole"]').forEach(function(cb){ cb.checked = checked; });
-  meUpdateCount();
-}
-
-// Re-render the campaign checkboxes based on selected programs
-function meRefreshCampaigns(){
-  var box = document.getElementById('meCampaignList');
-  if(!box) return;
-  // Read selected programs
-  var selectedPgms = [];
-  document.querySelectorAll('input[name="mePgm"]:checked').forEach(function(cb){ selectedPgms.push(cb.value); });
-  // Sync the "All programs" checkbox state
-  var pgmAllCb = document.getElementById('mePgmAll');
-  if(pgmAllCb) pgmAllCb.checked = (selectedPgms.length === Object.keys(PROGRAM_CAMPAIGNS).length);
-  // Build the list of campaigns under those programs
-  var campaigns = [];
-  selectedPgms.forEach(function(p){
-    (PROGRAM_CAMPAIGNS[p]||[]).forEach(function(c){ if(campaigns.indexOf(c) < 0) campaigns.push(c); });
-  });
-  if(!campaigns.length){
-    box.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:.78rem">Pick at least one program above.</div>';
-    meUpdateCount();
-    return;
+function _blBlockHtml(k, i, n){
+  var icons = { headline:'🔠 Headline', text:'📝 Text', image:'🖼 Picture', paybox:'💰 Pay box', button:'🔴 Button', divider:'➖ Line' };
+  var h = '<div class="bl-blk"><div class="hd">' + (icons[k.type] || k.type) + '<span class="sp"></span>'
+    + '<button class="bl-btn s" title="Move up" onclick="_blMove(' + i + ',-1)"' + (i === 0 ? ' disabled' : '') + '>↑</button>'
+    + '<button class="bl-btn s" title="Move down" onclick="_blMove(' + i + ',1)"' + (i === n - 1 ? ' disabled' : '') + '>↓</button>'
+    + '<button class="bl-btn s" title="Remove" onclick="_blDel(' + i + ')">✕</button></div>';
+  var f = function(key, ph, ta, max){ return ta ? '<textarea class="bl-in" placeholder="' + _blA(ph) + '" oninput="_blBlk(' + i + ',\'' + key + '\',this.value)">' + _blE(k[key] || '') + '</textarea>'
+    : '<input class="bl-in" maxlength="' + (max || 300) + '" value="' + _blA(k[key] || '') + '" placeholder="' + _blA(ph) + '" oninput="_blBlk(' + i + ',\'' + key + '\',this.value)">'; };
+  if(k.type === 'headline') h += f('text', 'WE WANT YOU BACK', false, 80) + '<label style="font-size:13px;display:flex;gap:6px;align-items:center"><input type="checkbox"' + (k.alt ? ' checked' : '') + ' onchange="_blBlk(' + i + ',\'alt\',this.checked)"> Second color</label>';
+  else if(k.type === 'text') h += f('text', 'Hi {first},\n\nWrite your message. {first} becomes each person\'s first name. **words** are bold.', true).replace('<textarea class="bl-in"', '<textarea class="bl-in" style="min-height:190px"');
+  else if(k.type === 'image'){
+    h += k.url ? '<img class="bl-img" src="' + _blA(k.url) + '" alt="">' : '<div class="bl-note" style="margin:2px 0 8px">No picture yet — upload one or let the AI make one.</div>';
+    h += '<div class="bl-btns" style="margin-bottom:8px"><label class="bl-btn s" style="cursor:pointer">⬆ Upload picture<input type="file" accept="image/*" style="display:none" onchange="_blUpload(' + i + ',this)"></label>'
+      + '<button class="bl-btn s ai" onclick="_blAiImage(' + i + ')"' + (BL.busy ? ' disabled' : '') + '>🎨 AI picture</button></div>';
+    h += f('alt', 'What the picture shows (for people whose email hides pictures)', false, 120) + f('link', 'Optional: open this web page when they tap the picture (https://…)', false, 400);
   }
-  box.innerHTML = campaigns.map(function(c){
-    return '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--brown)"><input type="checkbox" name="meCamp" value="'+_escapeAttr(c)+'" checked onchange="meUpdateCount()" style="width:16px;height:16px;accent-color:#003594"> '+_escapeHtml(c)+'</label>';
-  }).join('');
-  // Re-tick "All campaigns" since we just rebuilt and all are checked
-  var campAllCb = document.getElementById('meCampAll');
-  if(campAllCb) campAllCb.checked = true;
-  meUpdateCount();
+  else if(k.type === 'paybox') h += f('label', 'Top line, e.g. YOUR HOLIDAY PAYDAY', false, 60) + f('amount', 'Big number, e.g. $42', false, 20) + f('line', 'e.g. per qualified application', false, 80) + f('small', 'Small print, e.g. even more for active managers · ($35 in 3 states)', false, 160);
+  else if(k.type === 'button') h += f('text', 'Button words, e.g. CLAIM MY SPOT →', false, 40) + f('url', 'Where it goes (https://…)', false, 400) + f('note', 'Optional line under the button, e.g. ⏰ Only 33 days until Christmas!', false, 120);
+  else if(k.type === 'divider') h += '<div style="font-size:12.5px;color:#6b7280">A thin line between sections.</div>';
+  return h + '</div>';
+}
+function _blChanged(rerender){ _blSaveLocal(); if(rerender) _blRender(); }
+function _blSet(k, v, quiet){ BL.draft[k] = v; _blChanged(!quiet); }
+function _blBlk(i, k, v){ var b = BL.draft.blocks[i]; if(!b) return; b[k] = v; _blChanged(false); }
+function _blAdd(t){ var b = { type:t }; if(t === 'button') b.url = 'https://wmaminc.com/'; if(t === 'text') b.text = ''; BL.draft.blocks.push(b); _blChanged(true); }
+function _blMove(i, d){ var a = BL.draft.blocks, j = i + d; if(j < 0 || j >= a.length) return; var t = a[i]; a[i] = a[j]; a[j] = t; _blChanged(true); }
+function _blDel(i){ BL.draft.blocks.splice(i, 1); _blChanged(true); }
+function _blAud(k, on){ BL.draft.audience[k] = !!on; _blSaveLocal(); _blCountSoon(); }
+function _blAudList(name, on){ var L = BL.draft.audience.lists = (BL.draft.audience.lists || []).filter(function(x){ return x !== name; }); if(on) L.push(name); _blSaveLocal(); _blCountSoon(); }
+function _blAudEmails(on){ if(!on){ delete BL.draft.audience.emails; _blSaveLocal(); _blRender(); _blCountSoon(); } }
+function _blStartOver(){ if(!confirm('Start a new blank email? (Saved drafts stay in Past blasts.)')) return; BL.draft = _blNewDraft(); BL.aiAsk = ''; _blChanged(true); _blCountSoon(); }
+function _blCheck(){
+  var d = BL.draft; if(!String(d.subject || '').trim()) return 'Add a subject first.';
+  var has = (d.blocks || []).some(function(k){ return (k.type === 'text' || k.type === 'headline') && String(k.text || '').trim() || (k.type === 'image' && k.url); });
+  if(!has) return 'Add some words or a picture to the email first.';
+  var bad = (d.blocks || []).filter(function(k){ return (k.type === 'button' && (!/^https?:\/\/\S+$/i.test(String(k.url || '').trim()) || !String(k.text || '').trim())) || (k.type === 'image' && k.link && !/^https?:\/\/\S+$/i.test(String(k.link).trim())); });
+  if(bad.length) return 'A button needs words and a web address that starts with https:// (or remove it).';
+  return '';
+}
+async function _blSaveDraft(loud){
+  var d = BL.draft;
+  try{ var id = await _blRpc('wmam_blast_save', { p_id: d.id || null, p_subject: d.subject || '', p_preheader: d.preheader || '', p_theme: d.theme || 'classic', p_blocks: d.blocks || [], p_audience: d.audience || {} });
+    d.id = Number(id) || d.id; _blSaveLocal(); if(loud){ _blToast('💾 Draft saved'); _blRender(); } return d.id; }
+  catch(e){ if(/already sent/i.test(e.message)){ d.id = null; return _blSaveDraft(loud); } _blToast(e.message, true); throw e; }
 }
 
-// Update the live recipient count in the banner
-function meUpdateCount(){
-  var recipients = _meResolveRecipients();
-  var el = document.getElementById('meRecipientCount');
-  if(el) el.textContent = recipients.length + ' recipient' + (recipients.length===1?'':'s');
-  // Sync "All campaigns" checkbox
-  var allCamp = document.getElementById('meCampAll');
-  var totalCamps = document.querySelectorAll('input[name="meCamp"]').length;
-  var checkedCamps = document.querySelectorAll('input[name="meCamp"]:checked').length;
-  if(allCamp) allCamp.checked = (totalCamps > 0 && totalCamps === checkedCamps);
-  // Sync "All roles" checkbox
-  var allRole = document.getElementById('meRoleAll');
-  var totalRoles = document.querySelectorAll('input[name="meRole"]').length;
-  var checkedRoles = document.querySelectorAll('input[name="meRole"]:checked').length;
-  if(allRole) allRole.checked = (totalRoles > 0 && totalRoles === checkedRoles);
-  // Live update of preview box if it's showing
-  var preview = document.getElementById('mePreviewBox');
-  if(preview && preview.innerHTML.trim()) meRefreshPreview();
+// ───────────── AI ─────────────
+function _blCurText(){
+  var d = BL.draft, hl = (d.blocks || []).filter(function(k){ return k.type === 'headline'; })[0], tx = (d.blocks || []).filter(function(k){ return k.type === 'text'; })[0], bt = (d.blocks || []).filter(function(k){ return k.type === 'button'; })[0];
+  return { subject: d.subject || '', preheader: d.preheader || '', headline: hl ? hl.text || '' : '', text: tx ? tx.text || '' : '', button_text: bt ? bt.text || '' : '' };
 }
-
-// Resolve picker state to a recipient list. Filters: campaigns ∩ roles.
-//   - Agent must have an active code in AT LEAST ONE selected campaign
-//   - Agent's role must match AT LEAST ONE selected role
-//   - Agent must be active and have an email
-//
-// Calvin 2026-06-03: special handling for the new "Office" role bucket —
-// office staff usually don't have agentCodes for sales campaigns, so the
-// campaign filter would exclude them entirely. When "Office" is in the
-// selected roles, we ALSO include any agent that passes isOfficeRole(),
-// regardless of campaign match.
-function _meResolveRecipients(){
-  var agents = (DB.agents||[]).filter(function(a){ return a.active && a.email && /@/.test(a.email); });
-  // Read selected campaigns
-  var selectedCamps = [];
-  document.querySelectorAll('input[name="meCamp"]:checked').forEach(function(cb){ selectedCamps.push(cb.value); });
-  // Read selected roles
-  var selectedRoles = [];
-  document.querySelectorAll('input[name="meRole"]:checked').forEach(function(cb){ selectedRoles.push(cb.value); });
-  if(!selectedRoles.length) return [];
-  var officeSelected = selectedRoles.indexOf('Office') >= 0;
-  // If only Office is selected and no campaigns, that's fine — return all office staff
-  if(officeSelected && !selectedCamps.length){
-    return agents.filter(function(a){ return isOfficeRole(a); })
-      .map(function(a){ return {agent:a, email:a.email, name:a.name}; });
-  }
-  if(!selectedCamps.length) return [];
-  // Build matched set
-  var matched = {};
-  agents.forEach(function(a){
-    // Office bypass — any office staff is in when Office role is checked
-    if(officeSelected && isOfficeRole(a)){
-      matched[a.id] = a; return;
-    }
-    // Role match (skip 'Office' meta-role for normal agents)
-    var roleMatches = selectedRoles.some(function(r){ return r !== 'Office' && r === a.role; });
-    if(!roleMatches) return;
-    // Campaign match
-    var ac = a.agentCodes || {};
-    var hasCamp = selectedCamps.some(function(c){
-      return Object.prototype.hasOwnProperty.call(ac, c) && ac[c];
-    });
-    if(hasCamp) matched[a.id] = a;
-  });
-  return Object.keys(matched).map(function(k){
-    var a = matched[k];
-    return {agent:a, email:a.email, name:a.name};
+function _blBusy(msg){ BL.busy = msg || ''; var st = document.getElementById('blAiSt'); if(st) st.textContent = BL.busy; document.querySelectorAll('#blBox .bl-btn.ai, #blBox .bl-btn.r').forEach(function(b){ b.disabled = !!BL.busy; }); }
+async function _blAiWrite(mode){
+  var ask = (document.getElementById('blAiAsk') || {}).value || ''; BL.aiAsk = ask;
+  var cur = _blCurText();
+  if(mode === 'write' && !ask.trim()) return _blToast('Tell the AI what the email is about first (the purple box).', true);
+  if(mode !== 'write' && !cur.text.trim() && !cur.headline.trim()) return _blToast('Write the email first (or tap Write it for me).', true);
+  _blBusy('✨ The AI is writing…');
+  try{
+    var r = await _blCall('ai_write', { mode: mode, prompt: ask, current: cur }, 60000);
+    var d = BL.draft, B = d.blocks;
+    if(r.subject) d.subject = r.subject; if(r.preheader) d.preheader = r.preheader;
+    var put = function(type, key, val, at){ if(!val) return; var k = B.filter(function(x){ return x.type === type; })[0]; if(k) k[key] = val; else { var nb = { type:type }; nb[key] = val; if(type === 'button') nb.url = 'https://wmaminc.com/'; if(at === 'top') B.unshift(nb); else B.push(nb); } };
+    put('headline', 'text', r.headline, 'top'); put('text', 'text', r.text); put('button', 'text', r.button_text);
+    BL.busy = ''; _blChanged(true); _blToast('✨ Done — read it over before you send');
+  }catch(e){ BL.busy = ''; _blRender(); _blToast(e.message, true); }
+}
+async function _blAiImage(i){
+  var ask = ((document.getElementById('blAiAsk') || {}).value || '').trim(); BL.aiAsk = ask;
+  if(!ask){ var bx = document.getElementById('blAiAsk'); if(bx){ bx.focus(); bx.placeholder = 'Describe the picture — e.g. money falling over a Christmas tree, warm and festive'; } return _blToast('Describe the picture in the purple AI box first, then tap the picture button again.', true); }
+  _blBusy('🎨 The AI is making your picture… (about 30–60 seconds)');
+  try{
+    var r = await _blCall('ai_image', { prompt: ask }, 150000);
+    var B = BL.draft.blocks;
+    if(i >= 0 && B[i] && B[i].type === 'image'){ B[i].url = r.url; if(!B[i].alt) B[i].alt = ask.slice(0, 120); }
+    else { var at = B.findIndex(function(k){ return k.type === 'headline'; }); B.splice(at >= 0 ? at + 1 : 0, 0, { type:'image', url:r.url, alt:ask.slice(0, 120) }); }
+    BL.busy = ''; _blChanged(true); _blToast('🎨 Picture added');
+  }catch(e){ BL.busy = ''; _blRender(); _blToast(e.message, true); }
+}
+function _blShrinkFile(file){
+  return new Promise(function(res, rej){
+    if(file.type === 'image/gif'){ if(file.size > 3000000) return rej(new Error('That GIF is too big (3 MB max).')); var fr = new FileReader(); fr.onload = function(){ res(fr.result); }; fr.onerror = function(){ rej(new Error('Could not read the picture.')); }; return fr.readAsDataURL(file); }
+    var url = URL.createObjectURL(file), img = new Image();
+    img.onload = function(){ try{ var w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, 1200 / w); var c = document.createElement('canvas'); c.width = Math.round(w * s); c.height = Math.round(h * s);
+      var g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url); res(c.toDataURL('image/jpeg', 0.85)); }catch(e){ rej(e); } };
+    img.onerror = function(){ URL.revokeObjectURL(url); rej(new Error('That file is not a picture.')); }; img.src = url;
   });
 }
-
-function meRefreshPreview(){
-  var box = document.getElementById('mePreviewBox');
-  if(!box) return;
-  var recipients = _meResolveRecipients();
-  if(!recipients.length){
-    box.innerHTML = '<div style="padding:14px;background:#fef3c7;border:1px solid #fde68a;border-radius:6px;font-family:Barlow Condensed,sans-serif;color:#92400e">⚠ No recipients in that group.</div>';
-    return;
-  }
-  var rows = recipients.map(function(r){
-    return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-size:.78rem"><strong>'+_escapeHtml(r.name)+'</strong></td><td style="padding:5px 8px;font-size:.78rem;color:var(--muted)">'+_escapeHtml(r.email)+'</td><td style="padding:5px 8px;font-size:.7rem;color:var(--muted)">'+_escapeHtml(r.agent.role||'—')+'</td></tr>';
-  }).join('');
-  box.innerHTML = '<div style="background:#f9fafb;border:1px solid var(--border);border-radius:6px;overflow:hidden">'
-    +'<div style="padding:10px 14px;background:#003594;color:white;font-family:Barlow Condensed,sans-serif;font-size:.74rem;letter-spacing:1.5px;text-transform:uppercase">'+recipients.length+' recipient(s)</div>'
-    +'<div style="max-height:280px;overflow-y:auto"><table style="width:100%;border-collapse:collapse;font-family:Barlow Condensed,sans-serif">'+rows+'</table></div></div>';
+async function _blUpload(i, input){
+  var file = input && input.files && input.files[0]; if(!file) return;
+  _blBusy('⬆ Uploading your picture…');
+  try{ var data = await _blShrinkFile(file); var r = await _blCall('upload_image', { data: data }, 60000);
+    var B = BL.draft.blocks; if(B[i]){ B[i].url = r.url; if(!B[i].alt) B[i].alt = file.name.replace(/\.[a-z0-9]+$/i, '').slice(0, 120); }
+    BL.busy = ''; _blChanged(true); _blToast('🖼 Picture added'); }
+  catch(e){ BL.busy = ''; _blRender(); _blToast(e.message, true); }
 }
 
-// Wraps the user's plain text body in our branded HTML template.
-function _meBuildHtmlBody(plainText, recipientName){
-  // Replace {{name}} with first name
-  var firstName = (recipientName||'').split(/\s+/)[0] || '';
-  var personalized = plainText.replace(/\{\{name\}\}/gi, firstName || 'there');
-  // Convert URLs to links
-  personalized = personalized.replace(/https?:\/\/[^\s<]+/g, function(url){
-    return '<a href="'+url+'" style="color:#003594;font-weight:700">'+url+'</a>';
-  });
-  // Paragraph breaks
-  var paragraphs = personalized.split(/\n\s*\n/).map(function(p){
-    return '<p style="margin:0 0 14px;line-height:1.6;color:#333;font-size:14px">'+p.replace(/\n/g,'<br>')+'</p>';
-  }).join('');
-  return '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:white">'
-    +'<div style="background:#003594;padding:20px;text-align:center"><h1 style="color:white;margin:0;letter-spacing:1.5px;font-size:18px">WMAMinc</h1></div>'
-    +'<div style="padding:28px;background:#f8f9fa">'+paragraphs+'</div>'
-    +'<div style="background:#002268;padding:14px;text-align:center;color:rgba(255,255,255,.7);font-size:12px">WMAMinc. &nbsp;|&nbsp; ONE TEAM. ONE DREAM.</div>'
-    +'</div>';
+// ───────────── PREVIEW / TEST / SEND ─────────────
+function _blModal(inner, small){ _blCloseModal(); var m = document.createElement('div'); m.className = 'bl-modal'; m.id = 'blModal'; m.innerHTML = '<div class="c' + (small ? ' sm' : '') + '">' + inner + '</div>'; m.addEventListener('click', function(e){ if(e.target === m) _blCloseModal(); }); document.body.appendChild(m); return m; }
+function _blCloseModal(){ var m = document.getElementById('blModal'); if(m) m.remove(); }
+async function _blPreview(){
+  var m = _blModal('<div class="h">👁 Preview<span class="sp"></span><button class="bl-btn s" onclick="_blPrevW(390)">📱 Phone</button><button class="bl-btn s" onclick="_blPrevW(0)">💻 Computer</button><button class="bl-btn s" onclick="_blCloseModal()">✕</button></div>'
+    + '<div style="padding:8px 14px;font-size:13px;border-bottom:1px solid #eef0f4"><b>' + _blE(BL.draft.subject || '(no subject)') + '</b><div style="color:#6b7280">' + _blE(BL.draft.preheader || '') + '</div></div>'
+    + '<div style="flex:1;display:flex;justify-content:center;background:#eef2f7;overflow:auto"><iframe id="blPrevF" title="Preview" style="max-width:100%"></iframe></div>');
+  try{ var d = BL.draft; var r = await _blCall('render', { subject:d.subject, preheader:d.preheader, theme:d.theme, blocks:d.blocks }, 30000); var f = document.getElementById('blPrevF'); if(f) f.srcdoc = r.html; }
+  catch(e){ _blCloseModal(); _blToast(e.message, true); }
+}
+function _blPrevW(w){ var f = document.getElementById('blPrevF'); if(f) f.style.width = w ? w + 'px' : '100%'; }
+async function _blTest(){
+  var err = _blCheck(); if(err) return _blToast(err, true);
+  _blBusy('✉ Sending you a test…');
+  try{ var d = BL.draft; var r = await _blCall('test', { subject:d.subject, preheader:d.preheader, theme:d.theme, blocks:d.blocks }, 45000); BL.busy = ''; _blBusy(''); _blToast('✉ Test sent to ' + r.to); }
+  catch(e){ BL.busy = ''; _blBusy(''); _blToast(e.message, true); }
+}
+async function _blSendAsk(){
+  var err = _blCheck(); if(err) return _blToast(err, true);
+  var n = BL.count; if(!n) return _blToast('Nobody to send to — pick at least one list on the left.', true);
+  _blModal('<div class="h">🚀 Send this blast?<span class="sp"></span><button class="bl-btn s" onclick="_blCloseModal()">✕</button></div><div style="padding:16px;font-size:15px;line-height:1.55">'
+    + '<div style="font-weight:900;font-size:17px;margin-bottom:6px">' + _blE(BL.draft.subject) + '</div>'
+    + 'Goes to <b>' + n + ' people</b> from alerts@wmaminc.com in waves of 30 a minute (about ' + Math.max(1, Math.ceil(n / 30)) + ' min). You can pause or stop it in Past blasts.'
+    + '<div class="bl-btns" style="margin-top:16px;justify-content:flex-end"><button class="bl-btn" onclick="_blCloseModal()">Not yet</button><button class="bl-btn r" id="blGo" onclick="_blSend()">🚀 Yes, send to ' + n + '</button></div></div>', true);
+}
+async function _blSend(){
+  var g = document.getElementById('blGo'); if(g){ g.disabled = true; g.textContent = 'Sending…'; }
+  try{ var id = await _blSaveDraft(false); var r = await _blRpc('wmam_blast_queue', { p_id: id });
+    _blCloseModal(); _blToast('🚀 Sending to ' + r.total + ' people — watch it in Past blasts');
+    BL.draft = _blNewDraft(); BL.aiAsk = ''; _blSaveLocal(); BL.reportId = id; BL.tab = 'report'; _blRender(); _blLoadReport(id); }
+  catch(e){ if(g){ g.disabled = false; g.textContent = '🚀 Try again'; } _blToast(e.message, true); }
 }
 
-// SEND THE EMAIL/TEXT — batched 50 at a time, sequential to avoid throttling.
-// Calvin 2026-06-03: honors the new email/text/both delivery mode toggle.
-function meSendNow(){
-  var u = DB.current;
-  if(!isOfficeRole(u)){ alert('Office staff only.'); return; }
-  // Read mode toggle
-  var mode = 'email';
-  document.querySelectorAll('input[name="meMode"]:checked').forEach(function(r){ mode = r.value; });
-  var sendEmail = (mode === 'email' || mode === 'both');
-  var sendText  = (mode === 'text'  || mode === 'both');
-  var subject = (document.getElementById('meSubject')||{value:''}).value.trim();
-  var body = (document.getElementById('meBody')||{value:''}).value.trim();
-  if(sendEmail && !subject){ alert('Subject is required when sending email.'); return; }
-  if(!body){ alert('Message body is required.'); return; }
-  var recipients = _meResolveRecipients();
-  if(!recipients.length){ alert('No valid recipients.'); return; }
+// ───────────── PAST BLASTS + REPORT ─────────────
+var _BL_ST = { draft:['Draft','px'], queued:['Starting','pb'], sending:['Sending','pb'], sent:['Sent','pg'], paused:['Paused','py'], stopped:['Stopped','pr'] };
+async function _blLoadPast(){ try{ BL.past = await _blRpc('wmam_blast_list'); }catch(e){ BL.past = { error:e.message }; } if(BL.tab === 'past') _blRender(); }
+function _blWhen(t){ if(!t) return ''; try{ return new Date(t).toLocaleString('en-US', { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' }); }catch(e){ return ''; } }
+function _blPastHtml(){
+  var P = BL.past; var h = '<div class="bl-card"><h3>📊 Past blasts</h3>';
+  if(!P) return h + '<div style="color:#6b7280">Loading…</div></div>';
+  if(P.error) return h + '<div style="color:#b91c1c">' + _blE(P.error) + '</div></div>';
+  if(!P.length) return h + '<div style="color:#6b7280">No blasts yet. Make one in ✍️ New blast.</div></div>';
+  P.forEach(function(b){ var st = _BL_ST[b.status] || [b.status, 'px'];
+    h += '<div class="bl-past"><div style="min-width:0;flex:1 1 260px"><div class="s">' + _blE(b.subject || '(no subject)') + ' <span class="bl-pill ' + st[1] + '">' + st[0] + '</span></div>'
+      + '<div class="m">' + (b.status === 'draft' ? 'Draft' : (b.sent + ' of ' + b.total + ' sent · ' + b.opened + ' opened · ' + b.clicked + ' tapped')) + ' · ' + _blE(b.by || '') + ' · ' + _blWhen(b.queued_at || b.created_at) + '</div>'
+      + (b.stop_reason ? '<div class="m" style="color:#92400e">' + _blE(b.stop_reason) + '</div>' : '') + '</div><div class="bl-btns">';
+    if(b.status === 'draft') h += '<button class="bl-btn s p" onclick="_blOpenDraft(' + b.id + ')">✏️ Open</button><button class="bl-btn s" onclick="_blDelDraft(' + b.id + ')">🗑 Delete</button>';
+    else h += '<button class="bl-btn s p" onclick="_blOpenReport(' + b.id + ')">📊 Report</button>';
+    if(b.status === 'sending' || b.status === 'queued') h += '<button class="bl-btn s" onclick="_blCtl(' + b.id + ',\'pause\')">⏸ Pause</button>';
+    if(b.status === 'paused') h += '<button class="bl-btn s" onclick="_blCtl(' + b.id + ',\'resume\')">▶ Resume</button>';
+    if(['sending','queued','paused'].indexOf(b.status) >= 0) h += '<button class="bl-btn s" onclick="_blCtl(' + b.id + ',\'stop\')">⏹ Stop</button>';
+    if(b.status !== 'draft') h += '<button class="bl-btn s" onclick="_blCopy(' + b.id + ',false)">⧉ Copy</button>';
+    h += '</div></div>'; });
+  return h + '</div>';
+}
+async function _blOpenDraft(id){ try{ var b = await _blRpc('wmam_blast_get', { p_id:id }); if(!b) return; BL.draft = { id:b.id, subject:b.subject, preheader:b.preheader, theme:b.theme, blocks:b.blocks || [], audience:b.audience || {} }; _blSaveLocal(); _blTab('new'); }catch(e){ _blToast(e.message, true); } }
+async function _blDelDraft(id){ if(!confirm('Delete this draft?')) return; try{ await _blRpc('wmam_blast_delete_draft', { p_id:id }); if(BL.draft && BL.draft.id === id){ BL.draft = _blNewDraft(); _blSaveLocal(); } _blLoadPast(); }catch(e){ _blToast(e.message, true); } }
+async function _blCtl(id, a){ if(a === 'stop' && !confirm('Stop this blast? The people not reached yet will not get it.')) return; try{ await _blRpc('wmam_blast_control', { p_id:id, p_action:a }); _blToast(a === 'pause' ? '⏸ Paused' : a === 'resume' ? '▶ Sending again' : '⏹ Stopped'); if(BL.tab === 'report') _blLoadReport(id); else _blLoadPast(); }catch(e){ _blToast(e.message, true); } }
+async function _blCopy(id, unopened){ try{ var nid = await _blRpc('wmam_blast_copy', { p_id:id, p_unopened:!!unopened }); await _blOpenDraft(Number(nid)); _blToast(unopened ? '🎯 New draft for the people who did not open it — change the subject and send' : '⧉ Copied into a new draft'); }catch(e){ _blToast(e.message, true); } }
+function _blOpenReport(id){ BL.reportId = id; BL.report = null; BL.rFilter = ''; BL.tab = 'report'; _blRender(); _blLoadReport(id); }
+async function _blLoadReport(id){
+  try{ BL.report = await _blRpc('wmam_blast_results', { p_id:id }); }catch(e){ BL.report = { error:e.message }; }
+  if(BL.tab === 'report' && BL.reportId === id) _blRender();
+  clearInterval(window._blRepT);
+  var b = BL.report && BL.report.blast; if(b && ['queued','sending'].indexOf(b.status) >= 0 || (b && b.status === 'sent' && Date.now() - new Date(b.finished_at || 0).getTime() < 3600e3))
+    window._blRepT = setInterval(function(){ if(BL.tab !== 'report' || !document.getElementById('blBox')){ clearInterval(window._blRepT); return; } _blLoadReport(id); }, 20000);
+}
+function _blRowState(r){
+  if(r.unsub_at) return ['Unsubscribed','pr'];
+  if(r.status === 'skipped') return ['Skipped', 'px'];
+  if(r.status === 'failed') return ['Not sent','pr'];
+  if(r.status === 'queued' || r.status === 'sending') return ['Waiting','pb'];
+  if(['bounced','suppressed','complained'].indexOf(r.event) >= 0) return ['Bounced','pr'];
+  if(r.clicked_at) return ['Tapped','pg'];
+  if(r.opened_at) return ['Opened','py'];
+  if(r.delivered_at || r.event === 'delivered') return ['Delivered','pp'];
+  return ['Sent','px'];
+}
+function _blReportHtml(){
+  var R = BL.report; var h = '<div class="bl-card"><div class="bl-btns" style="margin-bottom:8px"><button class="bl-btn s" onclick="_blTab(\'past\')">← Past blasts</button></div>';
+  if(!R) return h + '<div style="color:#6b7280">Loading…</div></div>';
+  if(R.error) return h + '<div style="color:#b91c1c">' + _blE(R.error) + '</div></div>';
+  var b = R.blast || {}, rows = R.rows || [], st = _BL_ST[b.status] || [b.status, 'px'];
+  var c = { sent:0, delivered:0, opened:0, tapped:0, notopened:0, bounced:0, unsub:0, skipped:0, waiting:0 };
+  rows.forEach(function(r){ var s = _blRowState(r)[0];
+    if(r.status === 'sent'){ c.sent++; if(r.delivered_at || ['delivered'].indexOf(r.event) >= 0 || r.opened_at || r.clicked_at) c.delivered++; if(r.opened_at) c.opened++; else if(s !== 'Bounced') c.notopened++; if(r.clicked_at) c.tapped++; }
+    if(s === 'Bounced') c.bounced++; if(r.unsub_at) c.unsub++; if(r.status === 'skipped' || r.status === 'failed') c.skipped++; if(s === 'Waiting') c.waiting++; });
+  h += '<h3 style="margin-bottom:4px">' + _blE(b.subject || '') + ' <span class="bl-pill ' + st[1] + '">' + st[0] + '</span></h3>';
+  h += '<div style="font-size:12.5px;color:#6b7280">' + _blWhen(b.queued_at) + (b.finished_at ? ' → finished ' + _blWhen(b.finished_at) : '') + ' · ' + rows.length + ' people</div>';
+  if(b.stop_reason) h += '<div class="bl-note" style="color:#92400e;background:#fffbeb">' + _blE(b.stop_reason) + '</div>';
+  var tile = function(k, n, label){ return '<div class="bl-st' + (BL.rFilter === k ? ' on' : '') + '" onclick="_blRF(\'' + k + '\')"><b>' + n + '</b><span>' + label + '</span></div>'; };
+  h += '<div class="bl-stats">' + tile('', c.sent, 'Sent') + tile('Delivered', c.delivered, 'Delivered') + tile('Opened', c.opened, 'Opened') + tile('Tapped', c.tapped, 'Tapped')
+    + tile('Not opened', c.notopened, 'Not opened') + tile('Bounced', c.bounced, 'Bounced') + tile('Unsubscribed', c.unsub, 'Unsubscribed') + tile(c.waiting ? 'Waiting' : 'Skipped', c.waiting || c.skipped, c.waiting ? 'Waiting' : 'Skipped') + '</div>';
+  h += '<div class="bl-btns" style="margin-bottom:10px">';
+  if(['sending','queued'].indexOf(b.status) >= 0) h += '<button class="bl-btn s" onclick="_blCtl(' + b.id + ',\'pause\')">⏸ Pause</button>';
+  if(b.status === 'paused') h += '<button class="bl-btn s" onclick="_blCtl(' + b.id + ',\'resume\')">▶ Resume</button>';
+  if(['sending','queued','paused'].indexOf(b.status) >= 0) h += '<button class="bl-btn s" onclick="_blCtl(' + b.id + ',\'stop\')">⏹ Stop</button>';
+  if(c.notopened && b.status === 'sent') h += '<button class="bl-btn s p" onclick="_blCopy(' + b.id + ',true)">🎯 Re-send to the ' + c.notopened + ' who did not open</button>';
+  h += '<button class="bl-btn s" onclick="_blCopy(' + b.id + ',false)">⧉ Copy</button><button class="bl-btn s" onclick="_blLoadReport(' + b.id + ')">↻ Refresh</button></div>';
+  var F = BL.rFilter || '';
+  var list = rows.filter(function(r){ var s = _blRowState(r)[0]; if(!F) return true; if(F === 'Delivered') return r.status === 'sent' && s !== 'Bounced' && s !== 'Sent'; if(F === 'Opened') return !!r.opened_at; if(F === 'Tapped') return !!r.clicked_at;
+    if(F === 'Not opened') return r.status === 'sent' && !r.opened_at && s !== 'Bounced'; if(F === 'Unsubscribed') return !!r.unsub_at; if(F === 'Skipped') return r.status === 'skipped' || r.status === 'failed'; return s === F; });
+  h += '<table class="bl-tbl"><tr><th>Name</th><th>Status</th><th class="bl-hide-m">Opened</th><th class="bl-hide-m">Tapped</th></tr>';
+  list.slice(0, 1000).forEach(function(r){ var s = _blRowState(r);
+    h += '<tr><td><div style="font-weight:700">' + _blE(r.name || '—') + '</div><div style="font-size:12px;color:#6b7280;word-break:break-all">' + _blE(r.email) + '</div>' + (r.skip ? '<div style="font-size:11.5px;color:#92400e">' + _blE(r.skip) + '</div>' : '') + '</td>'
+      + '<td><span class="bl-pill ' + s[1] + '">' + s[0] + '</span></td><td class="bl-hide-m">' + (r.opened_at ? _blWhen(r.opened_at) + (r.opens > 1 ? ' (' + r.opens + '×)' : '') : '—') + '</td><td class="bl-hide-m">' + (r.clicked_at ? _blWhen(r.clicked_at) : '—') + '</td></tr>'; });
+  if(!list.length) h += '<tr><td colspan="4" style="color:#6b7280">Nobody here.</td></tr>';
+  h += '</table><div style="font-size:12px;color:#6b7280;margin-top:10px">Opens are close, not exact: some phones hide pictures (no open shows) and iPhone Mail can open mail by itself. Taps are exact. Delivered and bounced update every few minutes.</div>';
+  return h + '</div>';
+}
+function _blRF(k){ BL.rFilter = (BL.rFilter === k ? '' : k); _blRender(); }
 
-  // Pre-filter recipients for SMS — needs valid phone, not just email
-  var smsRecipients = sendText ? recipients.filter(function(r){
-    var phone = r.agent && r.agent.phone;
-    return phone && _phoneIsLikelyValid(phone);
-  }) : [];
-  var emailRecipients = sendEmail ? recipients : [];
-
-  var modeStr = sendEmail && sendText
-    ? 'EMAIL + TEXT'
-    : (sendEmail ? 'EMAIL' : 'TEXT');
-  var confirmMsg = 'SEND VIA '+modeStr+'?\n\n';
-  if(sendEmail) confirmMsg += '📧 '+emailRecipients.length+' email recipient(s)\n';
-  if(sendText)  confirmMsg += '📱 '+smsRecipients.length+' text recipient(s)\n';
-  if(sendEmail) confirmMsg += '\nSubject: '+subject+'\n';
-  confirmMsg += '\nThis CANNOT be undone.';
-  if(!confirm(confirmMsg)) return;
-
-  var BATCH_SIZE = 50;
-  var DELAY_BETWEEN_BATCHES = 1500;
-  var emailSent = 0, emailFailed = 0, smsSent = 0, smsFailed = 0;
-
-  // Show progress modal
-  var prog = document.createElement('div');
-  prog.id = 'meSendProgress';
-  prog.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:white;border:2px solid var(--blue);border-radius:10px;padding:24px 32px;box-shadow:0 8px 32px rgba(0,0,0,.25);z-index:10000;min-width:340px;font-family:Barlow Condensed,sans-serif;text-align:center';
-  prog.innerHTML = '<div style="font-family:Bebas Neue,sans-serif;font-size:1.3rem;letter-spacing:1.5px;color:var(--brown);margin-bottom:8px">📤 Sending...</div><div id="meProgText" style="color:var(--muted);font-size:.84rem">Starting...</div>';
-  var bd = document.createElement('div');
-  bd.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999';
-  document.body.appendChild(bd); document.body.appendChild(prog);
-  function updateProg(text){ var el = document.getElementById('meProgText'); if(el) el.textContent = text; }
-
-  // ─── Email send loop ───
-  function runEmailLoop(then){
-    if(!sendEmail || !emailRecipients.length){ then(); return; }
-    var batches = [];
-    for(var i=0; i<emailRecipients.length; i+=BATCH_SIZE){
-      batches.push(emailRecipients.slice(i, i+BATCH_SIZE));
-    }
-    function sendBatch(idx){
-      if(idx >= batches.length){ then(); return; }
-      var batch = batches[idx];
-      updateProg('📧 Email batch '+(idx+1)+' of '+batches.length+' — '+batch.length+' recipient(s)...');
-      function nextInBatch(j){
-        if(j >= batch.length){
-          setTimeout(function(){ sendBatch(idx+1); }, DELAY_BETWEEN_BATCHES);
-          return;
-        }
-        var r = batch[j];
-        var html = _meBuildHtmlBody(body, r.name);
-        brevoSend({
-          to: [{email: r.email, name: r.name}],
-          subject: subject,
-          htmlContent: html,
-          senderEmail: _meFrom(), replyTo: _meFrom() === 'noreply@wmaminc.com' ? undefined : { email: _meFrom() }
-        }).then(function(res){
-          if(res && res.ok) emailSent++; else emailFailed++;
-          setTimeout(function(){ nextInBatch(j+1); }, 80);
-        }).catch(function(){ emailFailed++; setTimeout(function(){ nextInBatch(j+1); }, 80); });
-      }
-      nextInBatch(0);
-    }
-    sendBatch(0);
-  }
-
-  // ─── SMS send loop ───
-  function runSmsLoop(then){
-    if(!sendText || !smsRecipients.length){ then(); return; }
-    var batches = [];
-    for(var i=0; i<smsRecipients.length; i+=BATCH_SIZE){
-      batches.push(smsRecipients.slice(i, i+BATCH_SIZE));
-    }
-    function sendBatch(idx){
-      if(idx >= batches.length){ then(); return; }
-      var batch = batches[idx];
-      updateProg('📱 SMS batch '+(idx+1)+' of '+batches.length+' — '+batch.length+' recipient(s)...');
-      function nextInBatch(j){
-        if(j >= batch.length){
-          setTimeout(function(){ sendBatch(idx+1); }, DELAY_BETWEEN_BATCHES);
-          return;
-        }
-        var r = batch[j];
-        // Personalize SMS body with {{name}}
-        var smsBody = body.replace(/\{\{\s*name\s*\}\}/g, (r.name||'').split(' ')[0] || 'team');
-        brevoSendSms({
-          to: r.agent.phone,
-          message: smsBody,
-          name: r.name
-        }).then(function(res){
-          if(res && res.ok) smsSent++; else smsFailed++;
-          setTimeout(function(){ nextInBatch(j+1); }, 80);
-        }).catch(function(){ smsFailed++; setTimeout(function(){ nextInBatch(j+1); }, 80); });
-      }
-      nextInBatch(0);
-    }
-    sendBatch(0);
-  }
-
-  // Run email first, then SMS, then done
-  runEmailLoop(function(){
-    runSmsLoop(function(){
-      prog.remove(); bd.remove();
-      var summary = '✓ Send complete!\n\n';
-      if(sendEmail) summary += '📧 Email: '+emailSent+' sent, '+emailFailed+' failed\n';
-      if(sendText)  summary += '📱 Text:  '+smsSent+' sent, '+smsFailed+' failed\n';
-      summary += '\nFailures (if any) are logged in the browser console — check for [brevoSend] / [brevoSendSms] entries.';
-      alert(summary);
-    });
+// ───────────── CONTACTS + UPLOAD ─────────────
+async function _blLoadContacts(){ try{ BL.contacts = await _blRpc('wmam_blast_contacts_page', { p_list: BL.cList || '', p_search: BL.cSearch || '', p_offset: 0 }); }catch(e){ BL.contacts = { error:e.message }; } if(BL.tab === 'contacts') _blRender(); }
+var _blCT = null;
+function _blCSearch(v){ BL.cSearch = v; clearTimeout(_blCT); _blCT = setTimeout(_blLoadContacts, 350); }
+function _blContactsHtml(){
+  var L = BL.lists || {}, C = BL.contacts;
+  var h = '<div class="bl-card"><h3>👥 Contacts</h3>';
+  h += '<div class="bl-note" style="margin:0 0 12px">Current agents (' + (L.current == null ? '…' : L.current) + '), past agents (' + (L.past_agents == null ? '…' : L.past_agents) + ') and past applicants (' + (L.past_applicants == null ? '…' : L.past_applicants) + ') come straight from the back office — nothing to upload. Below are the people you uploaded.' + (L.unsubscribed ? ' · ' + L.unsubscribed + ' people unsubscribed (they are never emailed again).' : '') + '</div>';
+  h += '<div class="bl-btns" style="margin-bottom:8px"><select class="bl-in" style="width:auto;margin:0" onchange="BL.cList=this.value;_blLoadContacts()"><option value="">All uploaded lists</option>' + (L.lists || []).map(function(x){ return '<option' + (BL.cList === x.name ? ' selected' : '') + ' value="' + _blA(x.name) + '">' + _blE(x.name) + ' (' + x.count + ')</option>'; }).join('') + '</select>'
+    + '<input class="bl-in" style="flex:1;min-width:160px;margin:0" placeholder="Search name or email" value="' + _blA(BL.cSearch) + '" oninput="_blCSearch(this.value)"><button class="bl-btn s p" onclick="_blTab(\'upload\')">⬆ Upload list</button></div>';
+  if(!C) return h + '<div style="color:#6b7280">Loading…</div></div>';
+  if(C.error) return h + '<div style="color:#b91c1c">' + _blE(C.error) + '</div></div>';
+  if(!C.length) return h + '<div style="color:#6b7280;padding:10px 0">No uploaded people yet.</div></div>';
+  h += '<table class="bl-tbl"><tr><th>Name</th><th>List</th><th></th></tr>';
+  C.forEach(function(r){ h += '<tr><td><div style="font-weight:700">' + _blE(r.name || '—') + '</div><div style="font-size:12px;color:#6b7280;word-break:break-all">' + _blE(r.email) + '</div></td><td>' + _blE(r.list_name) + '</td><td>'
+    + (r.unsub ? '<span class="bl-pill pr">Unsubscribed</span>' : r.dead ? '<span class="bl-pill pr">Bounced</span>' : '<span class="bl-pill pg">OK</span>') + '</td></tr>'; });
+  return h + '</table>' + (C.length >= 200 ? '<div style="font-size:12px;color:#6b7280;margin-top:8px">Showing the newest 200 — search to find someone.</div>' : '') + '</div>';
+}
+function _blUploadHtml(){
+  var h = '<div class="bl-card" style="max-width:760px;margin:0 auto"><h3>⬆ Upload a list</h3>';
+  h += '<div class="bl-lab">List name</div><input id="blUpName" class="bl-in" maxlength="60" oninput="BL.upName=this.value" placeholder="e.g. Past ACA agents 2025" value="' + _blA(BL.upName || '') + '">';
+  h += '<div class="bl-lab">Excel or CSV file</div><label class="bl-btn" style="cursor:pointer;margin:4px 0 12px">📄 Choose file (.xlsx, .xls, .csv)<input type="file" accept=".xlsx,.xls,.csv,.txt" style="display:none" onchange="_blReadFile(this)"></label>';
+  h += '<div class="bl-lab">…or paste people <span style="text-transform:none;font-weight:600;color:#6b7280">(one per line: Name, email)</span></div><textarea id="blUpPaste" class="bl-in" style="min-height:130px" oninput="BL.upPaste=this.value" placeholder="Jane Smith, jane@gmail.com&#10;John Doe, john@yahoo.com">' + _blE(BL.upPaste || '') + '</textarea>';
+  h += '<div class="bl-btns"><button class="bl-btn" onclick="_blParsePaste()">👀 Check</button></div>';
+  var P = BL.upParsed;
+  if(P){ h += '<div class="bl-note" style="margin-top:12px"><b>' + P.rows.length + ' people found</b>' + (P.bad ? ' · ' + P.bad + ' lines without a good email were left out' : '') + (P.dup ? ' · ' + P.dup + ' duplicates removed' : '') + '</div>';
+    if(P.rows.length){ h += '<table class="bl-tbl" style="margin-top:8px"><tr><th>Name</th><th>Email</th></tr>' + P.rows.slice(0, 8).map(function(r){ return '<tr><td>' + _blE(r.name || '—') + '</td><td style="word-break:break-all">' + _blE(r.email) + '</td></tr>'; }).join('') + '</table>' + (P.rows.length > 8 ? '<div style="font-size:12px;color:#6b7280;margin-top:4px">…and ' + (P.rows.length - 8) + ' more</div>' : '');
+      h += '<div class="bl-btns" style="margin-top:12px"><button class="bl-btn p" id="blUpGo" onclick="_blImport()">✔ Add ' + P.rows.length + ' people</button></div>'; } }
+  h += '<div class="bl-note" style="margin-top:14px">Only add people who gave WMAMinc their email (past agents, applicants, people who worked with you). Every blast has an Unsubscribe link and anyone who unsubscribes is never emailed again.</div>';
+  return h + '</div>';
+}
+var _BL_EM = /^[^\s@<>,;]+@[^\s@<>,;]+\.[a-z]{2,}$/i;
+function _blRowsFromTable(rows){
+  // finds the email column and the name column(s) by header or by content
+  var out = [], bad = 0, seen = {}, dup = 0;
+  if(!rows.length) return { rows:out, bad:0, dup:0 };
+  var head = rows[0].map(function(x){ return String(x == null ? '' : x).toLowerCase().trim(); });
+  var ei = head.findIndex(function(x){ return /e-?mail/.test(x); }), ni = head.findIndex(function(x){ return /^(full )?name$|^contact|^agent/.test(x); });
+  var fi = head.findIndex(function(x){ return /first/.test(x); }), li = head.findIndex(function(x){ return /last/.test(x); });
+  var start = (ei >= 0 || ni >= 0 || fi >= 0) ? 1 : 0;
+  rows.slice(start).forEach(function(r){
+    r = r.map(function(x){ return String(x == null ? '' : x).trim(); }); if(!r.join('')) return;
+    var em = ei >= 0 ? r[ei] : (r.find(function(x){ return _BL_EM.test(x); }) || '');
+    em = em.replace(/^mailto:/i, '').toLowerCase();
+    if(!_BL_EM.test(em)){ bad++; return; }
+    if(seen[em]){ dup++; return; } seen[em] = 1;
+    var nm = ni >= 0 ? r[ni] : (fi >= 0 ? [r[fi], li >= 0 ? r[li] : ''].join(' ').trim() : (r.find(function(x){ return x && !_BL_EM.test(x) && !/^[\d\s()+.-]+$/.test(x); }) || ''));
+    out.push({ name: nm.slice(0, 120), email: em });
   });
+  return { rows:out, bad:bad, dup:dup };
+}
+function _blSplit(line){   // one CSV line → cells (handles "quoted, cells")
+  var out = [], cur = '', q = false;
+  for(var i = 0; i < line.length; i++){ var ch = line[i];
+    if(q){ if(ch === '"'){ if(line[i + 1] === '"'){ cur += '"'; i++; } else q = false; } else cur += ch; }
+    else if(ch === '"') q = true; else if(ch === ',' || ch === ';' || ch === '\t'){ out.push(cur); cur = ''; } else cur += ch; }
+  out.push(cur); return out;
+}
+function _blParsePaste(){
+  BL.upName = (document.getElementById('blUpName') || {}).value || BL.upName || ''; BL.upPaste = (document.getElementById('blUpPaste') || {}).value || '';
+  var rows = BL.upPaste.split(/\r?\n/).map(_blSplit);
+  BL.upParsed = _blRowsFromTable(rows); _blRender();
+}
+async function _blReadFile(input){
+  var file = input && input.files && input.files[0]; if(!file) return;
+  BL.upName = (document.getElementById('blUpName') || {}).value || BL.upName || file.name.replace(/\.[a-z0-9]+$/i, '');
+  try{
+    var rows = [];
+    if(/\.xlsx?$/i.test(file.name) && typeof XLSX !== 'undefined'){ var wb = XLSX.read(await file.arrayBuffer(), { type:'array' }); wb.SheetNames.forEach(function(n){ rows = rows.concat(XLSX.utils.sheet_to_json(wb.Sheets[n], { header:1, raw:false, defval:'' })); }); }
+    else { var txt = await file.text(); rows = txt.split(/\r?\n/).map(_blSplit); }
+    BL.upParsed = _blRowsFromTable(rows); _blRender();
+  }catch(e){ _blToast('Could not read that file: ' + e.message, true); }
+}
+async function _blImport(){
+  var P = BL.upParsed; if(!P || !P.rows.length) return;
+  var name = ((document.getElementById('blUpName') || {}).value || BL.upName || '').trim(); if(!name) return _blToast('Give the list a name first.', true);
+  var g = document.getElementById('blUpGo'); if(g){ g.disabled = true; g.textContent = 'Adding…'; }
+  try{ var tot = { added:0, already:0, bad:0 };
+    for(var i = 0; i < P.rows.length; i += 2000){ var r = await _blRpc('wmam_blast_import', { p_list:name, p_rows:P.rows.slice(i, i + 2000) }); tot.added += r.added; tot.already += r.already; tot.bad += r.bad; }
+    _blToast('✔ ' + tot.added + ' added to "' + name + '"' + (tot.already ? ' · ' + tot.already + ' were already in your contacts' : ''));
+    BL.upParsed = null; BL.upPaste = ''; BL.upName = ''; await _blLoadLists();
+    BL.draft.audience.lists = (BL.draft.audience.lists || []).filter(function(x){ return x !== name; }).concat([name]); _blSaveLocal(); BL.tab = 'new'; _blRender(); _blCountSoon(); }
+  catch(e){ if(g){ g.disabled = false; g.textContent = '✔ Try again'; } _blToast(e.message, true); }
 }
 
 // Helper: quick phone validator. Looks for 10+ digits.
