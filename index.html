@@ -3923,7 +3923,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.23.3429';
+var BUILD_VERSION = '2026.11.23.3430';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -116947,7 +116947,7 @@ function invDept(u){ u = u || me(); if(!u) return false; try{ if(isOwner(u)) ret
 window.wmamIsInvDept = invDept;
 var PEND = { 'pending-agent-signature':1, 'pending-inv-dept-approval':1, 'pending-mm-approval':1, 'pending-holder-approval':1 };
 function all(){ var out = []; try{ Object.keys(CAMPAIGN_REGISTRY).forEach(function(k){ var cfg = CAMPAIGN_REGISTRY[k]; if(!cfg || !cfg.transfers) return; var L = []; try{ L = cfg.transfers() || []; }catch(e){}
-  L.forEach(function(t){ if(t && t.kind !== 'market-move' && t.source !== 'upload' && t.toId != null) out.push({ camp:k, cfg:cfg, t:t }); }); }); }catch(e){} return out; }
+  L.forEach(function(t){ if(t && t.kind !== 'market-move' && (t.source !== 'upload' || t.status === 'rejected') && t.toId != null) out.push({ camp:k, cfg:cfg, t:t }); }); }); }catch(e){} return out; }   // v3430: a DENIED upload invoice shows too, so the office can handle it
 function waitingFor(toId, exceptId){ return all().filter(function(x){ return x.t.status === 'pending-agent-signature' && String(x.t.toId) === String(toId) && String(x.t.id) !== String(exceptId); }); }
 window.wmamWaitingFor = waitingFor;
 function ct(t){ if(!t) return ''; var d = new Date(t); if(isNaN(d)) return ''; return d.toLocaleString('en-US', { timeZone:'America/Chicago', month:'numeric', day:'numeric', hour:'numeric', minute:'2-digit' }); }
@@ -117018,6 +117018,7 @@ window.panelInvSent = function(){ var u = me(); if(!u) return '';
       h += '<div style="max-height:240px;overflow:auto;margin-top:8px;font-size:.8rem"><table style="width:100%;border-collapse:collapse"><tr style="color:#64748b"><th style="text-align:left;padding:3px 6px">IMEI</th><th style="text-align:left;padding:3px 6px">Model</th><th style="text-align:right;padding:3px 6px">Cost</th></tr>'
         + Ls.map(function(d){ return '<tr><td style="padding:3px 6px;font-family:monospace;border-top:1px solid #eef2f7">' + esc(d.imei) + '</td><td style="padding:3px 6px;border-top:1px solid #eef2f7">' + esc(d.model) + '</td><td style="padding:3px 6px;text-align:right;border-top:1px solid #eef2f7">' + money(d.cost) + '</td></tr>'; }).join('') + '</table></div>';
       h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button onclick="wmamSentReceipt(' + esc(JSON.stringify(x.camp)) + ',' + esc(JSON.stringify(String(t.id))) + ')" style="border:1px solid #003594;background:#fff;color:#003594;border-radius:9px;padding:8px 12px;font-weight:800;cursor:pointer">🧾 Receipt</button>'
+        + (office && t.status === 'rejected' && typeof window.wmamSentResend === 'function' && window.wmamSentResendable(x.camp, t) ? '<button onclick="wmamSentResend(' + esc(JSON.stringify(x.camp)) + ',' + esc(JSON.stringify(String(t.id))) + ')" style="border:1px solid #059669;background:#fff;color:#047857;border-radius:9px;padding:8px 12px;font-weight:800;cursor:pointer">📨 Send the invoice again</button>' : '')
         + (canCancel ? '<button onclick="wmamSentCancel(' + esc(JSON.stringify(x.camp)) + ',' + esc(JSON.stringify(String(t.id))) + ')" style="border:1px solid #dc2626;background:#fff;color:#b91c1c;border-radius:9px;padding:8px 12px;font-weight:800;cursor:pointer">🚫 ' + (office && String(t.fromId) !== String(u.id) ? 'Clear (cancel) this transfer' : 'Cancel this transfer') + '</button>' : '') + '</div></div>'; }
     h += '</div>'; });
   return h + '</div>'; };
@@ -120679,7 +120680,7 @@ var DONE = { 'sold':1, 'activated':1, 'deleted':1, 'returned':1, 'lost':1, 'stol
 function holderOf(d){ var h = (d.assignedTo != null && d.assignedTo !== '') ? d.assignedTo : (d.holderId != null && d.holderId !== '' ? d.holderId : d.dateHolderId); return h == null ? '' : String(h); }
 function openIds(arr){ var s = {}; (arr || []).forEach(function(t){ if(t && t.id && t.status === 'pending-agent-signature' && t.agentSigned !== true) s[t.id] = t; }); return s; }
 function reissue(user, onlyCamp){
-  var made = 0;
+  var made = 0, cleanedAny = false;
   try{
     if(!user || !user.id || typeof CAMPAIGN_REGISTRY !== 'object') return 0;
     var uid = String(user.id), now = new Date().toISOString();
@@ -120689,7 +120690,16 @@ function reissue(user, onlyCamp){
       var arr, pool; try{ arr = cfg.transfers(); pool = cfg.inventory(); }catch(e){ return; }
       if(!Array.isArray(arr) || !Array.isArray(pool)) return;
       var open = openIds(arr);
-      var stuck = pool.filter(function(d){ return d && d.acceptancePending === true && holderOf(d) === uid && !DONE[String(d.status || '').toLowerCase()] && !(d.acceptanceTransfer && open[d.acceptanceTransfer]); });
+      // v3430 (Calvin 2026-11-23 "it's the same device that keep popping up. I even denied it once and it's still back"):
+      // an invoice that was already ANSWERED is never sent again. Signed (or canceled by the office) → the leftover "not signed"
+      // flag is just cleared. Denied → the phone stays in their name and waits for the office (they were told); no new invoice.
+      var byId = {}; arr.forEach(function(t){ if(t && t.id) byId[t.id] = t; });
+      var cleared = 0;
+      pool.forEach(function(d){ if(!d || d.acceptancePending !== true || holderOf(d) !== uid || !d.acceptanceTransfer) return; var t0 = byId[d.acceptanceTransfer];
+        if(t0 && String(t0.toId) === uid && (t0.status === 'completed' || /cancel/.test(String(t0.status || '')))){ delete d.acceptancePending; delete d.acceptanceTransfer; cleared++; } });
+      if(cleared) cleanedAny = true;
+      var stuck = pool.filter(function(d){ return d && d.acceptancePending === true && holderOf(d) === uid && !DONE[String(d.status || '').toLowerCase()] && !(d.acceptanceTransfer && open[d.acceptanceTransfer])
+        && !(d.acceptanceTransfer && byId[d.acceptanceTransfer] && byId[d.acceptanceTransfer].status === 'rejected'); });
       if(!stuck.length) return;
       var t = { id:(cfg.id || camp) + 't-upload-' + Date.now() + '-' + uid, campaign:camp, fromId:null, fromName:'Inventory Office', fromRole:'Inventory',
         toId:user.id, toName:user.name || '', toRole:user.role || '', imeis:stuck.map(function(d){ return d.imei; }).filter(Boolean),
@@ -120701,7 +120711,7 @@ function reissue(user, onlyCamp){
       stuck.forEach(function(d){ d.acceptanceTransfer = t.id; if(!Array.isArray(d.chainOfCustody)) d.chainOfCustody = []; d.chainOfCustody.push({ type:'invoice-resent', at:now, from:'Inventory Office', to:user.name || '', toId:user.id, transferId:t.id, reason:'No open invoice behind the "not signed" flag — fresh invoice sent' }); });
       made += t.imeis.length;
     });
-    if(made){ try{ saveInventory(); }catch(e){ console.warn('[invoice resend] save', e); } }
+    if(made || cleanedAny){ try{ saveInventory(); }catch(e){ console.warn('[invoice resend] save', e); } }
   }catch(e){ console.warn('[invoice resend]', e); }
   return made;
 }
@@ -120718,6 +120728,74 @@ if(typeof invValidateTransfer === 'function'){ var _val = invValidateTransfer;
     return _val.apply(this, arguments); };
   window.invValidateTransfer = invValidateTransfer; }
 }catch(e){ console.warn('[invoice resend 2820]', e); } })();
+
+</script>
+<script>
+/* v3430 (Calvin 2026-11-23): "I even denied it once and it's still back again and it won't let me do nothing on the site."
+   Deny used to mark the invoice denied but leave the phone flagged "not signed" in their name, so the invoice-resend check made a
+   brand-new invoice right away. Calvin: a denied phone stays in the name of the person who denied it, the office is told, and the
+   office handles it from there. So now, on Deny:
+   • the phone stays in their name and is marked denied (with their reason) — it never asks them to sign that invoice again;
+   • the Inventory Dept gets a bell right away (who, which phones, why);
+   • the office sees it in Inventory → 📤 Sent Transfers → ❌ Denied, and can move the phones, or tap "📨 Send the invoice again"
+     if the person really has them.
+   A phone that never left the sender (a person-to-person transfer) just stays with the sender, as before. */
+(function(){ try{
+if(window._wmamDeny3430) return; window._wmamDeny3430 = true;
+function me(){ return (typeof DB !== 'undefined' && DB.current) || null; }
+function holderOf(d){ var h = (d.assignedTo != null && d.assignedTo !== '') ? d.assignedTo : (d.holderId != null && d.holderId !== '' ? d.holderId : d.dateHolderId); return h == null ? '' : String(h); }
+function officeIds(){ try{ var a = window.WMAM_SENT && window.WMAM_SENT.approvers; if(Array.isArray(a) && a.length) return a.map(Number); }catch(e){} return [3]; }
+function cfgOf(camp){ try{ return (typeof campaignCfg === 'function' && campaignCfg(camp)) || (typeof CAMPAIGN_REGISTRY === 'object' && CAMPAIGN_REGISTRY[camp]) || null; }catch(e){ return null; } }
+function devOf(pool, im){ return (pool || []).find(function(x){ return x && (x.imei === im || (x.sim && x.sim === im)); }); }
+var orig = (typeof invRejectTransfer === 'function') ? invRejectTransfer : null;
+if(orig){
+  var wrap = function(campaign, transferId, reason){
+    var cfg = cfgOf(campaign), req = null; try{ req = cfg && (cfg.transfers() || []).find(function(t){ return t && t.id === transferId; }); }catch(e){}
+    var before = req ? req.status : null;
+    var r = orig.apply(this, arguments);
+    try{
+      if(req && before !== 'rejected' && req.status === 'rejected'){
+        var pool = cfg.inventory() || [], now = new Date().toISOString(), kept = [];
+        (req.imeis || []).forEach(function(im){ var d = devOf(pool, im); if(!d) return;
+          if(holderOf(d) === String(req.toId)){
+            if(d.acceptanceTransfer === req.id || d.acceptancePending === true){
+              d.acceptancePending = true; d.acceptanceTransfer = req.id;
+              d.acceptanceDenied = { transferId:req.id, at:now, by:req.rejectedBy || '', byId:req.rejectedById, reason:req.denyReason || '' };
+              if(!Array.isArray(d.chainOfCustody)) d.chainOfCustody = [];
+              d.chainOfCustody.push({ type:'invoice-denied', at:now, by:req.rejectedBy || '', byId:req.rejectedById, transferId:req.id, reason:req.denyReason || '', note:'Kept in their name — waiting for the office' });
+              kept.push(im); }
+          } else if(d.acceptanceTransfer === req.id){ delete d.acceptancePending; delete d.acceptanceTransfer; }   // never left the sender
+        });
+        try{ saveInventory(); }catch(e){ console.warn('[deny 3430] save', e); }
+        var n = (req.imeis || []).length, label = (cfg && cfg.label) || campaign;
+        var to = officeIds().filter(function(id){ return String(id) !== String(req.rejectedById); });
+        if(to.length) try{ pushNotification({ toIds:to, toRoles:[], icon:'❌', priority:'high', title:'Phones denied — ' + (req.rejectedBy || req.toName || ''),
+          body:(req.rejectedBy || req.toName || 'Someone') + ' denied ' + n + ' ' + label + ' phone' + (n === 1 ? '' : 's') + ' from ' + (req.fromName || 'the Inventory Office') + ': “' + (req.denyReason || '') + '”. '
+            + (kept.length ? 'The phone' + (kept.length === 1 ? ' stays' : 's stay') + ' in their name and won’t ask them to sign again until the office handles it. ' : '')
+            + 'Open Inventory → 📤 Sent Transfers → ❌ Denied.', panel:'inv-sent' }); }catch(e){}
+      }
+    }catch(e){ console.warn('[deny 3430]', e); }
+    return r; };
+  window.invRejectTransfer = wrap; try{ invRejectTransfer = wrap; }catch(e){}
+}
+// the office: the person really has the phones → send them a fresh invoice for exactly the denied phones still in their name
+window.wmamSentResendable = function(camp, t){ try{ var cfg = cfgOf(camp); if(!cfg || !t || t.status !== 'rejected') return false; var pool = cfg.inventory() || [];
+  return (t.imeis || []).some(function(im){ var d = devOf(pool, im); return d && holderOf(d) === String(t.toId) && d.acceptanceTransfer === t.id; }); }catch(e){ return false; } };
+window.wmamSentResend = function(camp, id){
+  var u = me(); if(!u || !(typeof window.wmamIsInvDept === 'function' && window.wmamIsInvDept(u))){ alert('Only the Inventory Dept can send it again.'); return; }
+  var cfg = cfgOf(camp); if(!cfg) return; var t = (cfg.transfers() || []).find(function(x){ return String(x.id) === String(id); }); if(!t) return;
+  var pool = cfg.inventory() || [], ds = (t.imeis || []).map(function(im){ return devOf(pool, im); }).filter(function(d){ return d && holderOf(d) === String(t.toId) && d.acceptanceTransfer === t.id; });
+  if(!ds.length){ alert('These phones are no longer in ' + (t.toName || 'their') + '’s name — nothing to send.'); return; }
+  var who = (DB.agents || []).find(function(a){ return a && String(a.id) === String(t.toId); });
+  if(!who){ alert('Could not find ' + (t.toName || 'that person') + '.'); return; }
+  if(!confirm('Send ' + who.name + ' a new invoice to sign for ' + ds.length + ' phone' + (ds.length === 1 ? '' : 's') + '?\n\nThey denied it: “' + (t.denyReason || '') + '”.\nThey will be asked to sign again the next time they open the back office.')) return;
+  ds.forEach(function(d){ delete d.acceptanceDenied; d.acceptancePending = true; d.acceptanceTransfer = null; });
+  var made = 0; try{ made = window.wmamReissueInvoices(who, camp) || 0; }catch(e){ console.warn('[resend 3430]', e); }
+  if(!made){ try{ saveInventory(); }catch(e){} alert('The invoice was not made. Refresh the page and try again.'); return; }
+  try{ pushNotification({ toIds:[who.id], toRoles:[], icon:'📦', priority:'high', title:'Please sign for ' + made + ' phone' + (made === 1 ? '' : 's'), body:u.name + ' (Inventory Dept) checked and sent your invoice again. Open the back office to sign.', panel:'inv-my-inventory' }); }catch(e){}
+  try{ showToast('New invoice sent to ' + who.name); }catch(e){}
+  gotoPanel('inv-sent'); };
+}catch(e){ console.warn('[deny 3430]', e); } })();
 
 </script>
 <script>
