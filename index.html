@@ -3923,7 +3923,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.23.3439';
+var BUILD_VERSION = '2026.11.24.3440';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -27845,6 +27845,7 @@ async function invDbLoadPool(poolKey){
       if(res.data.length < PAGE) break;
       offset += PAGE;
     }
+    try{ _wmamInvNoteSince(table, all, true); }catch(e){}   // v3440: remember the newest change, so the next check only asks for what changed after it
     return all.map(_invRowToDevice);
   }catch(e){
     window._invPathBLastError = e;
@@ -27901,11 +27902,61 @@ async function wmamInvReloadLive(rerender){
     return false;
   }catch(e){ return false; } finally { _wmamInvLiveBusy = false; }
 }
+// ══════════════════════════════════════════════════════════════════════
+// v3440 (Calvin 2026-11-24: "fix the database usage issue. it needs to be able to hold over 1k active agents")
+// ROOT CAUSE: every logged-in screen re-downloaded the WHOLE inventory (all 5 device tables ~6 MB + the inventory
+// records ~3.5 MB) every 2 minutes and every time the window got focus — about 1,150 full downloads a day with today's
+// ~100 people, ~10 GB a day, and the cost grows with (people × devices), so 1,000 agents would multiply it ~10×.
+// FIX: load everything ONCE at login; after that ask the database only "what changed since the last change I saw"
+// (by the updated_at stamp every inventory table already keeps). Nothing changed = a few bytes. A device removed outright
+// (count no longer matches) or a big batch (500+ changes) still triggers one full reload, so the screen can never drift.
+// ══════════════════════════════════════════════════════════════════════
+var _wmamInvSince = {}, _wmamInvSeen = {}, _wmamInvRawN = {}, _wmamInvGap = {}, _wmamInvCatchBusy = false;
+function _wmamInvNoteSince(table, rows, full){
+  var seen = _wmamInvSeen[table] || (_wmamInvSeen[table] = {}); if(full){ seen = _wmamInvSeen[table] = {}; _wmamInvRawN[table] = (rows || []).length; }
+  (rows || []).forEach(function(r){ var u = r && r.updated_at; if(!u) return; u = String(u); if(r.id != null) seen[String(r.id)] = u; if(!_wmamInvSince[table] || u > _wmamInvSince[table]) _wmamInvSince[table] = u; });
+}
+async function wmamInvCatchUp(){
+  if(_wmamInvCatchBusy || _wmamInvLiveBusy) return true;
+  if(typeof supaClient === 'undefined' || !supaClient) return false;
+  if(!window._invPathBReady) return wmamInvReloadLive(false);                       // never fully loaded on this screen yet
+  _wmamInvCatchBusy = true; var needFull = false, changed = 0;
+  try{
+    try{ await _wmamInvFlushSaves(); }catch(e){}
+    if(window._invUnsaved){ try{ window._invCloudLast = 0; if(typeof saveInventory === 'function') saveInventory(); }catch(e){} return false; }
+    for(var i = 0; i < INV_SYNC_POOLS.length && !needFull; i++){
+      var p = INV_SYNC_POOLS[i], t = p.tableName, arr = _poolArrayFor(p.key); if(!arr) continue;
+      var since = _wmamInvSince[t], from = since ? new Date(Date.parse(since) - 120000).toISOString() : '1970-01-01T00:00:00Z';   // 2-minute overlap: a save that finished late is never missed
+      var r = await supaClient.from(t).select('*').gt('updated_at', from).order('updated_at', { ascending:true }).limit(500);
+      if(r && r.error) return false;
+      var rows = (r && r.data) || [], seen = _wmamInvSeen[t] || (_wmamInvSeen[t] = {});
+      if(rows.length >= 500){ needFull = true; break; }
+      rows.forEach(function(row){ if(!row || row.id == null) return; if(seen[String(row.id)] === String(row.updated_at)) return;   // already have this exact version
+        try{ _applyRealtimeInventoryEvent({ eventType:'UPDATE', new:row }, t, true); changed++; }catch(e){} });
+      _wmamInvNoteSince(t, rows, false);
+      var c = await supaClient.from(t).select('id', { count:'exact', head:true });     // a device removed outright shows up as a count change
+      if(!c || c.error || typeof c.count !== 'number') return false;
+      if(c.count - arr.length !== (_wmamInvGap[t] || 0)) needFull = true;
+    }
+    if(!needFull){
+      _wmamInvLiveAt = new Date();
+      if(changed){ try{ if(typeof saveInventory === 'function') saveInventory(true); }catch(e){}
+        try{ if(typeof _invContentSignature === 'function') _invAutoSaveSig = _invContentSignature(); }catch(e){}   // what we just pulled is not a change to send back
+        try{ if(document.getElementById('invxBox') && typeof invxRender === 'function') invxRender(); }catch(e){} }
+      return true;
+    }
+  }catch(e){ return false; }
+  finally { _wmamInvCatchBusy = false; }
+  return wmamInvReloadLive(false);                                                  // rare: a removal or a big batch — one full reload
+}
 if(typeof window!=='undefined'){
+  window.wmamInvCatchUp = wmamInvCatchUp;
   window.wmamInvReloadLive = wmamInvReloadLive;
   // keep every screen current: reload when the window comes back into focus and every 2 minutes
-  window.addEventListener('focus', function(){ if(window._wmamAuthed && window._wmamAuthed() && (!_wmamInvLiveAt || Date.now()-_wmamInvLiveAt > 30000)) wmamInvReloadLive(false); });
-  setInterval(function(){ if(window._wmamAuthed && window._wmamAuthed() && document.visibilityState !== 'hidden') wmamInvReloadLive(false); }, 120000);
+  // v3440: these used to re-download ALL inventory (every device, every campaign) every 2 minutes and on every focus, on every open screen.
+  // Now they ask only for what changed since the last check (usually nothing = a few bytes). Live updates still arrive instantly.
+  window.addEventListener('focus', function(){ if(window._wmamAuthed && window._wmamAuthed() && (!_wmamInvLiveAt || Date.now()-_wmamInvLiveAt > 30000)) wmamInvCatchUp(); });
+  setInterval(function(){ if(window._wmamAuthed && window._wmamAuthed() && document.visibilityState !== 'hidden') wmamInvCatchUp(); }, 120000);
 }
 // v2026.09.29: PROOF, not assumption. Count every table in the database and compare
 // with what this screen has loaded. Any difference -> reload automatically.
@@ -27948,6 +27999,7 @@ async function invDbLoadAllFromTables(){
     // Replace the in-memory array in place to preserve any closures
     _invSyncReplacePool(p.key, devices);
     counts[p.key] = devices.length;
+    try{ var _pa = _poolArrayFor(p.key); _wmamInvGap[p.tableName] = (_wmamInvRawN[p.tableName] || 0) - ((_pa && _pa.length) || 0); }catch(e){}   // v3440
   }
   if(!failed){ window._invPathBReady = true; _wmamInvLiveAt = new Date();
     try{ if(typeof wmamGMRulesLoad==='function') wmamGMRulesLoad().then(function(){ try{ wmamNormalizeAllDates(); }catch(e){} }); }catch(e){} }
@@ -28239,7 +28291,7 @@ async function _invRecFetchAll(){
   for(var pg = 0; pg < 500; pg++){
     var r = null;
     for(var t = 0; t < 4; t++){
-      r = await supaClient.from('inv_records').select('list_key,rec_id,data,ord,rid,ver,deleted_at').gt('rid', last).order('rid', { ascending:true }).limit(1000);
+      r = await supaClient.from('inv_records').select('list_key,rec_id,data,ord,rid,ver,deleted_at,updated_at').gt('rid', last).order('rid', { ascending:true }).limit(1000);
       if(!(r && r.error)) break; await new Promise(function(res){ setTimeout(res, 400 * (t + 1)); });
     }
     if(r && r.error) throw r.error;
@@ -28326,6 +28378,7 @@ function _invRecLoadOnce(){
     }
     INVREC.queue = INVREC.queue || [];
     var rows = await _invRecFetchAll(), by = {}, gone = {};
+    rows.forEach(function(r){ var u = r.updated_at && String(r.updated_at); if(u && (!INVREC.since || u > INVREC.since)) INVREC.since = u; });   // v3440
     rows.forEach(function(r){ if(r.deleted_at) (gone[r.list_key] = gone[r.list_key] || []).push(r); else (by[r.list_key] = by[r.list_key] || []).push(r); });
     var first = !INVREC.ready;
     INV_REC_LISTS.forEach(function(l){ try{ _invRecApplyList(l, by[l[0]] || [], gone[l[0]] || [], first); }catch(e){ console.warn('[inv records] ' + l[0], e); } });
@@ -28337,6 +28390,22 @@ function _invRecLoadOnce(){
     if(first) setTimeout(invRecSync, 300);
     return true;
   });
+}
+// v3440: only what changed since the newest change this screen has (live updates still arrive instantly; this is the safety net)
+async function invRecCatchUp(){
+  if(!INVREC.ready || INVREC.loading || INVREC.catching || typeof supaClient === 'undefined' || !supaClient) return false;
+  if(!INVREC.since) return invRecLoadAll();
+  INVREC.catching = true; var big = false;
+  try{
+    try{ await invRecSync(); }catch(e){}
+    var from = new Date(Date.parse(INVREC.since) - 120000).toISOString();
+    var r = await supaClient.from('inv_records').select('list_key,rec_id,data,ord,rid,ver,deleted_at,updated_at').gt('updated_at', from).order('updated_at', { ascending:true }).limit(500);
+    if(!r || r.error) return false;
+    var rows = r.data || []; if(rows.length >= 500){ big = true; return false; }
+    rows.forEach(function(row){ try{ _invRecOnEvent(row); }catch(e){} var u = row.updated_at && String(row.updated_at); if(u && u > INVREC.since) INVREC.since = u; });
+    INVREC.lastLoad = Date.now(); return true;
+  }catch(e){ return false; }
+  finally { INVREC.catching = false; if(big) invRecLoadAll(); }
 }
 async function invRecLoadAll(){
   if(typeof supaClient === 'undefined' || !supaClient) return false;
@@ -28462,7 +28531,10 @@ function _invRecOnEvent(row){
   if(!row) return; var l = _invRecKeys[row.list_key]; if(!l) return;
   if(INVREC.queue){ INVREC.queue.push(row); return; }                               // a load is reading right now: apply after it
   if(!INVREC.ready) return;
-  if(row.data === undefined && !row.deleted_at){ invRecLoadAll(); return; }          // too large to arrive live: fetch it
+  if(row.data === undefined && !row.deleted_at){                                     // too large to arrive live: fetch just that one record (v3440 — it used to reload all of them)
+    if(row.list_key && row.rec_id && typeof supaClient !== 'undefined' && supaClient){ supaClient.from('inv_records').select('list_key,rec_id,data,ord,rid,ver,deleted_at,updated_at').eq('list_key', row.list_key).eq('rec_id', row.rec_id).maybeSingle().then(function(r){ if(r && r.data && r.data.data !== undefined) _invRecOnEvent(r.data); else invRecLoadAll(); }, function(){ invRecLoadAll(); }); }
+    else invRecLoadAll();
+    return; }
   var key = l[0], cur = _invRecGet(l[1]), snap = _invRecS(INVREC.snap, key), ord = _invRecS(INVREC.ord, key), fps = _invRecS(INVREC.fps, key), ver = _invRecS(INVREC.ver, key), pend = _invRecS(INVREC.pend, key);
   var id = row.rec_id, gone = !!row.deleted_at;
   if(cur == null || typeof cur !== 'object') return;
@@ -28500,10 +28572,10 @@ function invRecSubscribe(){
     .subscribe(function(st){ if(st === 'SUBSCRIBED') console.log('[inv records] live updates on'); }); }catch(e){ console.warn('[inv records] live updates unavailable', e); }
 }
 if(typeof window !== 'undefined'){
-  Object.assign(window, { invRecLoadAll:invRecLoadAll, invRecSync:invRecSync, invRecSoon:invRecSoon, _invRecOnEvent:_invRecOnEvent, _invRecSig:_invRecSig });
+  Object.assign(window, { invRecLoadAll:invRecLoadAll, invRecCatchUp:invRecCatchUp, invRecSync:invRecSync, invRecSoon:invRecSoon, _invRecOnEvent:_invRecOnEvent, _invRecSig:_invRecSig });
   setInterval(function(){ try{ if(INVREC.ready && (document.visibilityState !== 'hidden' || INVREC.unsaved)) invRecSync(); }catch(e){} }, 15000);   // catches any change that forgot to save
-  setInterval(function(){ try{ if((INVREC.ready || INVREC.on === false || INVREC.loadErr) && document.visibilityState !== 'hidden' && Date.now() - INVREC.lastLoad > (INVREC.loadErr ? 25000 : 110000) && window._wmamAuthed && window._wmamAuthed()){ INVREC.lastLoad = Date.now(); invRecLoadAll().then(function(ok){ if(ok) _invRecRerender(); }); } }catch(e){} }, 30000);
-  window.addEventListener('focus', function(){ try{ if(INVREC.ready && Date.now() - INVREC.lastLoad > 30000) invRecLoadAll().then(function(ok){ if(ok) _invRecRerender(); }); }catch(e){} });
+  setInterval(function(){ try{ if((INVREC.ready || INVREC.on === false || INVREC.loadErr) && document.visibilityState !== 'hidden' && Date.now() - INVREC.lastLoad > (INVREC.loadErr ? 25000 : 110000) && window._wmamAuthed && window._wmamAuthed()){ INVREC.lastLoad = Date.now(); (INVREC.ready && !INVREC.loadErr ? invRecCatchUp() : invRecLoadAll().then(function(ok){ if(ok) _invRecRerender(); return ok; })); } }catch(e){} }, 30000);   // v3440: changes only, never the whole list again
+  window.addEventListener('focus', function(){ try{ if(INVREC.ready && Date.now() - INVREC.lastLoad > 30000){ INVREC.lastLoad = Date.now(); invRecCatchUp(); } }catch(e){} });
   window.addEventListener('beforeunload', function(e){ try{
     if(INVREC.ready){ invRecSync(); if(INVREC.unsaved || INVREC.busy){ e.preventDefault(); e.returnValue = ''; return ''; } }
     else if(INVREC.on !== false && INVREC.loadErr){ e.preventDefault(); e.returnValue = ''; return ''; }   // could not reach the records yet: changes on this screen are not saved
