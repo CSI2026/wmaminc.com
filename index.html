@@ -3923,7 +3923,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.23.3438';
+var BUILD_VERSION = '2026.11.23.3439';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -125188,6 +125188,93 @@ window.addEventListener('scroll', sync, { passive:true });
 window.addEventListener('resize', sync);
 setInterval(sync, 500); sync();
 }catch(e){ console.warn('[aca hire banner 3420]', e); } })();
+// ══════════════════════════════════════════════════════════════════════
+// v3439 (Calvin 2026-11-23: "tanita is unable scan those devices into the system to transfer them to a agent")
+// A Gen Mobile carton label holds 60 barcodes (20 × IMEI · S/N · ICCID). From a phone photo the barcode
+// readers only got 2 IMEIs + 5 SIMs (the rest came back as serial numbers, SKU and UPC), so Scan & Send
+// had almost nothing to send. "Photo of a label" now:
+//   1. reads the barcodes the same way as before, PLUS piece by piece (a grid of tiles, enlarged),
+//   2. reads the PRINTED numbers too (OCR) — only numbers that pass the check digit AND are already in our inventory,
+//   3. turns each SIM number into its phone (the SIM on that phone's inventory record) → 1 phone, 1 kit,
+//   4. skips serial numbers, SKU and UPC quietly instead of filling the list with red "not usable" lines.
+// Tested on Calvin's photo of carton P4GBC2630066: before 7 of 20 phones, after 19 of 20.
+// ══════════════════════════════════════════════════════════════════════
+(function(){ try{
+if(window._wmamPhotoV3439) return; window._wmamPhotoV3439 = true;
+if(typeof wmamScanPhoto !== 'function' || typeof WSCAN === 'undefined') return;
+var oPhoto = wmamScanPhoto;
+var digits = function(x){ return String(x || '').replace(/\D/g, ''); };
+function loadImg(file){ return new Promise(function(res, rej){ var url = URL.createObjectURL(file), img = new Image(); img.onload = function(){ res(img); }; img.onerror = rej; img.src = url; }); }
+function crop(img, x0, y0, x1, y1, up, maxW){ var W = img.naturalWidth || img.width, H = img.naturalHeight || img.height;
+  var sx = Math.max(0, Math.floor(W * x0)), sy = Math.max(0, Math.floor(H * y0)), sw = Math.min(W, Math.ceil(W * x1)) - sx, sh = Math.min(H, Math.ceil(H * y1)) - sy;
+  var k = Math.min(up, maxW / sw), cv = document.createElement('canvas'); cv.width = Math.max(1, Math.round(sw * k)); cv.height = Math.max(1, Math.round(sh * k));
+  var cx = cv.getContext('2d', { willReadFrequently:true }); cx.imageSmoothingQuality = 'high'; cx.drawImage(img, sx, sy, sw, sh, 0, 0, cv.width, cv.height); return cv; }
+// 1) barcodes, tile by tile (zxing-cpp WebAssembly — the reader the site already uses)
+async function barcodeTiles(img){
+  var Z = null; try{ Z = window.ZXingWASM && window.ZXingWASM.readBarcodes ? window.ZXingWASM : (typeof window.wmamLoadWasmReader === 'function' ? await window.wmamLoadWasmReader() : null); }catch(e){}
+  if(!Z) return [];
+  var out = [], R = 6, C = 3;
+  for(var r = 0; r < R; r++) for(var c = 0; c < C; c++){
+    try{ var cv = crop(img, c / C - .04, r / R - .03, (c + 1) / C + .04, (r + 1) / R + .03, 1.5, 1600), cx = cv.getContext('2d');
+      var rs = await Z.readBarcodes(cx.getImageData(0, 0, cv.width, cv.height), { tryHarder:true, tryRotate:true, tryInvert:false, maxNumberOfSymbols:40, formats:['Code128', 'Code39', 'ITF'] });
+      (rs || []).forEach(function(x){ if(x && x.isValid !== false && x.text) out.push(x.text); }); }catch(e){}
+  }
+  return out; }
+// 2) the printed numbers (Tesseract is already on the page) — IMEI column and ICCID column, 4 pieces each
+var ocrWorker = null;
+async function printedNumbers(img, step){
+  if(typeof Tesseract === 'undefined' || !Tesseract.createWorker) return [];
+  try{ if(!ocrWorker){ ocrWorker = await Tesseract.createWorker('eng', 1); await ocrWorker.setParameters({ tessedit_char_whitelist:'0123456789IMEISNCDLO:/ \n' }); } }catch(e){ ocrWorker = null; return []; }
+  var out = [], cols = [[0, .42], [.25, .7], [.55, 1]], R = 4, n = 0, total = cols.length * R;
+  for(var ci = 0; ci < cols.length; ci++) for(var r = 0; r < R; r++){
+    step && step(++n, total);
+    try{ var cv = crop(img, cols[ci][0], r / R - .04, cols[ci][1], (r + 1) / R + .04, 2, 1800);
+      var res = await ocrWorker.recognize(cv), txt = (res && res.data && res.data.text) || '';
+      txt.split(/\n+/).forEach(function(line){ (line.replace(/\s/g, '').match(/\d{15,20}/g) || []).forEach(function(m){ var c = wmamCheckId(m); if(c.ok) out.push(c.value); }); }); }catch(e){}
+  }
+  return out; }
+// 3) add to the scanner list: valid IMEIs / SIMs only; a SIM that belongs to a phone in inventory becomes that phone (kitted)
+function addAll(list){ var added = 0, skipped = 0, have = {};
+  WSCAN.list.forEach(function(x){ have[x.value] = x; });
+  list.forEach(function(t){ var c = wmamCheckId(t); if(!c.ok || (WSCAN.simsOnly && c.kind !== 'sim')){ skipped++; return; }
+    if(have[c.value]) return;
+    if(c.kind === 'sim' && !WSCAN.simsOnly && typeof window.wmamFindAnywhere === 'function'){
+      var f = null; try{ f = window.wmamFindAnywhere(c.value); }catch(e){}
+      var d = f && f.dev, im = d && d.type !== 'sim' ? digits(d.imei) : '';
+      if(im && (digits(d.sim) === c.value || digits(d.kitSim) === c.value)){
+        var p = have[im]; if(!p){ p = { ok:true, kind:'imei', value:im }; WSCAN.list.push(p); have[im] = p; added++; }
+        if(!p.kitSim){ var s = { ok:true, kind:'sim', value:c.value, kitOf:im }; p.kitSim = c.value; WSCAN.list.push(s); have[c.value] = s; }
+        return; } }
+    var e = { ok:true, kind:c.kind, value:c.value }; WSCAN.list.push(e); have[c.value] = e; added++;
+    if(c.kind === 'imei'){   // its SIM already in the list → pair them
+      var s2 = WSCAN.list.find(function(x){ return x.ok && x.kind === 'sim' && !x.kitOf && (function(){ var f2 = null; try{ f2 = window.wmamFindAnywhere && window.wmamFindAnywhere(x.value); }catch(er){} return f2 && f2.dev && digits(f2.dev.imei) === c.value; })(); });
+      if(s2){ e.kitSim = s2.value; s2.kitOf = c.value; } }
+  });
+  return { added:added, skipped:skipped }; }
+function phonesNow(){ return WSCAN.list.filter(function(x){ return x.ok && x.kind === 'imei'; }).length; }
+wmamScanPhoto = async function(file){
+  if(!file) return; if(WSCAN.anyCode) return oPhoto.apply(this, arguments);
+  var busy = function(t){ _wscanStatus(t, '#374151'); };
+  busy('Reading the photo…');
+  var img; try{ img = await loadImg(file); }catch(e){ _wscanStatus('Could not read that photo.', '#b91c1c'); return; }
+  var before = phonesNow(), skipped = 0;
+  var b1 = []; try{ b1 = ((await _decodeMultipleBarcodesFromImage(img)) || []).map(function(b){ return b && (b.text || b); }); }catch(e){}
+  busy('Reading the label piece by piece…');
+  var b2 = await barcodeTiles(img);
+  var r1 = addAll(b1.concat(b2)); skipped += r1.skipped; _wscanRender();
+  busy((phonesNow() - before) + ' found so far — now reading the printed numbers…');
+  var t = await printedNumbers(img, function(i, n){ busy((phonesNow() - before) + ' found so far — reading the printed numbers (' + i + ' of ' + n + ')…'); });
+  // a printed number only counts when it is already in our inventory (a misread digit can still pass the check digit, so OCR never adds new stock)
+  var bset = {}; b1.concat(b2).forEach(function(x){ var c = wmamCheckId(x); if(c.ok) bset[c.value] = 1; });
+  t = t.filter(function(v){ if(bset[v]) return true; try{ return !!(window.wmamFindAnywhere && window.wmamFindAnywhere(v)); }catch(e){ return false; } });
+  var r2 = addAll(t); _wscanRender();
+  var got = phonesNow() - before, sims = WSCAN.list.filter(function(x){ return x.ok && x.kind === 'sim' && !x.kitOf; }).length;
+  try{ _wscanBeep(got > 0 || sims > 0); }catch(e){}
+  _wscanStatus(got || sims ? '📷 Photo read: ' + got + ' new phone' + (got === 1 ? '' : 's') + (sims ? ' + ' + sims + ' SIM' + (sims === 1 ? '' : 's') : '') + ' · ' + phonesNow() + ' in the list. Check it matches the box (Carton Qty) — if one is missing, take a closer photo of that part or scan it with the camera.'
+    : 'No IMEIs or SIM numbers found in that photo — hold the phone flat over the label, fill the frame, and keep it in focus.', got || sims ? '#166534' : '#b91c1c');
+};
+window.wmamScanPhoto = wmamScanPhoto;
+}catch(e){ console.warn('[label photo 3439]', e); } })();
 </script>
 <script>
 /* v3427 (Calvin 2026-11-22): email buttons must land on the sign-up they talk about, not just the home page.
