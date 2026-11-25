@@ -62,6 +62,11 @@ button{font-family:inherit}
 .th small{display:block;color:var(--mut);font-size:12px}
 .df{padding:10px 14px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line);display:flex;flex-direction:column;gap:6px}.df a,.df button{display:block;text-align:left;border:0;background:transparent;padding:8px 6px;font-size:14px;color:var(--ink);text-decoration:none;cursor:pointer;border-radius:8px}.df a:hover,.df button:hover{background:#f3f1ed}
 .login{max-width:380px;margin:18vh auto 0;padding:0 20px;text-align:center}.login h1{font-size:28px;margin:0 0 6px}.login p{color:var(--mut);margin:0 0 20px}
+.brain{border:1px solid #dedad4;background:#faf9f7;border-radius:999px;padding:6px 8px;font-size:13px;color:var(--ink);max-width:104px}
+.ib.rec{background:#fee2e2}.ib.del{width:auto;padding:0 8px;font-size:12px;color:#b91c1c;background:#fee2e2}
+.trow{display:flex;align-items:center;gap:2px}.trow .th{flex:1;min-width:0}
+.a .b pre{position:relative}.cpy{position:absolute;top:6px;right:6px;border:0;background:#fff;border-radius:8px;padding:3px 8px;font-size:12px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+@media(max-width:400px){.row .ib.sm{width:32px;min-width:32px}.brain{max-width:84px}}
 @media(max-width:700px){.hello{margin-top:10vh}.hello h1{font-size:22px}}
 </style>
 </head>
@@ -112,7 +117,7 @@ async function afterLogin(){
   await loadThreads();
   if(S.threads.length && Date.now() - Date.parse(S.threads[0].updated_at) < 6 * 3600000) S.thread = S.threads[0].id;
   if(S.thread) await loadMsgs();
-  render(); prepVoice();
+  render(); prepVoice(); loadBrains();
 }
 async function logout(){ endVoice(); await supaClient.auth.signOut(); location.reload(); }
 
@@ -142,7 +147,7 @@ async function loadFiles(ids){
   var r = await supaClient.from('wmam_ai_files').select('id,path,name,mime').in('id', ids);
   for(var f of ((r && r.data) || [])){ var u = await supaClient.storage.from('ai-files').createSignedUrl(f.path, 6 * 3600); S.files[f.id] = { name:f.name, mime:f.mime || '', url:u && u.data && u.data.signedUrl }; }
 }
-function startPoll(){ if(S.poll) return; var n = 0; S.poll = setInterval(async function(){ n++; if(n > 400){ stopPoll(); return; } var before = S.msgs.length + ':' + S.waiting; await loadMsgs(); if(before !== S.msgs.length + ':' + S.waiting) render(); }, 2500); }
+function startPoll(){ if(S.poll) return; var n = 0; S.poll = setInterval(async function(){ n++; if(n > 400){ stopPoll(); return; } if(S.stream) return; var before = S.msgs.length + ':' + S.waiting; await loadMsgs(); if(before !== S.msgs.length + ':' + S.waiting) render(); }, 2500); }
 function stopPoll(){ clearInterval(S.poll); S.poll = null; }
 async function openThread(id){ S.thread = id; S.side = false; S.msgs = []; render(); await loadMsgs(); render(); }
 function newChat(){ S.thread = null; S.msgs = []; S.side = false; S.waiting = false; stopPoll(); render(); focusBox(); }
@@ -155,23 +160,68 @@ async function submit(text){
   if(d && d.thread_id && d.thread_id !== S.thread){ S.thread = d.thread_id; loadThreads().then(render); }
   nudge(); return d;
 }
+// v3458: answers stream live, word by word, from the brain he picks (calvin-chat); heavy jobs go to the work brain
+var BRAINS = []; try{ S.brain = localStorage.getItem('calvin_brain') || 'auto'; }catch(e){ S.brain = 'auto'; }
+async function loadBrains(){ try{ var r = await fetch(SUPA_URL + '/functions/v1/calvin-chat', { method:'POST', headers:{ 'Content-Type':'application/json', apikey:SUPA_KEY }, body:JSON.stringify({ action:'brains' }) }); var j = await r.json(); BRAINS = (j.brains || []).filter(function(b){ return b.on; }); render(); }catch(e){} }
+function setBrain(v){ S.brain = v; try{ localStorage.setItem('calvin_brain', v); }catch(e){} toast(v === 'auto' ? 'Auto: Calvin picks the best brain' : 'Using ' + (BRAINS.filter(function(b){ return b.id === v; })[0] || {}).label); }
+function paintStream(){ var el = $('streamB'); if(!el || !S.stream) return; el.innerHTML = (S.stream.text ? md(S.stream.text) : '') + (S.stream.status ? '<div class="working"><span class="dots"><i></i><i></i><i></i></span> ' + esc(S.stream.status) + '</div>' : (!S.stream.text ? '<div class="working"><span class="dots"><i></i><i></i><i></i></span></div>' : ''));
+  var l = $('list'); if(l && l.scrollHeight - l.scrollTop - l.clientHeight < 220) l.scrollTop = l.scrollHeight; }
+async function chat(text, opts){
+  opts = opts || {}; var jobs = false;
+  S.sending = true; S.stream = { text:'', status:'', label:'' }; render();
+  var ctl = new AbortController(); S.abort = ctl;
+  try{
+    var tok = (await supaClient.auth.getSession()).data.session.access_token;
+    var r = await fetch(SUPA_URL + '/functions/v1/calvin-chat', { method:'POST', signal:ctl.signal, headers:{ 'Content-Type':'application/json', apikey:SUPA_KEY, Authorization:'Bearer ' + tok }, body:JSON.stringify({ text:text, thread_id:S.thread, brain:S.brain, regenerate:!!opts.regenerate }) });
+    if(!r.ok){ var j = {}; try{ j = await r.json(); }catch(x){} throw new Error(j.error || ('Server returned ' + r.status)); }
+    var rd = r.body.getReader(), dec = new TextDecoder(), buf = '';
+    while(true){ var x = await rd.read(); if(x.done) break; buf += dec.decode(x.value, { stream:true }); var i;
+      while((i = buf.indexOf('\n\n')) >= 0){ var line = buf.slice(0, i); buf = buf.slice(i + 2); if(line.indexOf('data:') !== 0) continue; var d; try{ d = JSON.parse(line.slice(5)); }catch(e){ continue; }
+        if(d.type === 'start'){ S.stream.label = d.label; if(!S.thread){ S.thread = d.thread_id; loadThreads().then(render); } }
+        else if(d.type === 'delta'){ S.stream.text += d.text; S.stream.status = ''; paintStream(); }
+        else if(d.type === 'status'){ S.stream.status = d.text; paintStream(); }
+        else if(d.type === 'job'){ jobs = true; }
+        else if(d.type === 'error'){ throw new Error(d.error); } } }
+  }catch(e){ if(e.name !== 'AbortError') S.err = 'Not sent: ' + (e.message || e); }
+  S.abort = null; S.stream = null; S.sending = false;
+  await loadMsgs(); await loadThreads(); if(jobs){ S.waiting = true; startPoll(); } render();
+}
 async function send(textIn){
   if(S.sending) return; var box = $('box'); var text = String(textIn != null ? textIn : (box ? box.value : '')).trim();
   if(S.attach.some(function(a){ return a.busy; })){ S.err = 'Still uploading your file…'; render(); return; }
   var files = S.attach.filter(function(a){ return a.fileId; });
   if(!text && files.length) text = 'Please look at this.';
-  if(!text) return;
+  if(!text) return; stopDictate();
   if(files.length){ text += '\n' + files.map(function(a){ return '[file #' + a.fileId + ': ' + a.name + ']'; }).join(' '); S.attach = []; }
-  S.sending = true; if(box && textIn == null) box.value = '';
-  S.msgs.push({ id:'tmp', role:'user', content:text }); S.waiting = true; render();
-  try{ await submit(text); await loadMsgs(); }
-  catch(e){ S.msgs = S.msgs.filter(function(m){ return m.id !== 'tmp'; }); S.waiting = false; S.err = 'Not sent: ' + (e.message || e); if(box && textIn == null) box.value = text; }
-  S.sending = false; render(); startPoll();
+  if(box && textIn == null){ box.value = ''; grow(box); }
+  S.msgs.push({ id:'tmp', role:'user', content:text }); S.lastText = text;
+  await chat(text);
 }
+function regen(){ var u = S.msgs.filter(function(m){ return m.role === 'user'; }).slice(-1)[0]; if(!u || S.sending) return; chat(u.content, { regenerate:true }); }
+function editMsg(i){ var m = S.msgs[i]; if(!m) return; var b = $('box'); if(!b) return; b.value = clean(m.content).replace(/\n?\[file #\d+[^\]]*\]/g, '').trim(); grow(b); b.focus(); toast('Edit it and send'); }
+function stopAll(){ if(S.abort){ try{ S.abort.abort(); }catch(e){} return; } stopJob(); }
+// dictation: speak instead of typing (separate from the live call)
+var DICT = null;
+function toggleDictate(){ if(DICT){ stopDictate(); return; }
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition; if(!SR){ toast('Dictation is not available in this browser'); return; }
+  var b = $('box'), base = b ? b.value : ''; var r = new SR(); r.lang = 'en-US'; r.interimResults = true; r.continuous = true;
+  r.onresult = function(ev){ var t = ''; for(var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript; var bx = $('box'); if(bx){ bx.value = (base ? base + ' ' : '') + t; grow(bx); } };
+  r.onend = function(){ DICT = null; render(); }; r.onerror = function(){ DICT = null; render(); };
+  try{ r.start(); DICT = r; render(); }catch(e){ toast('Could not start dictation'); } }
+function stopDictate(){ if(DICT){ try{ DICT.stop(); }catch(e){} DICT = null; } }
+function takePhoto(){ var inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'; inp.setAttribute('capture', 'environment'); inp.onchange = function(){ if(inp.files && inp.files[0]) attach(inp.files[0]); }; inp.click(); }
+// conversations: search, rename, delete
+async function searchChats(q){ S.sq = q; clearTimeout(S.sqT); if(String(q || '').trim().length < 2){ S.sres = null; paintSearch(); return; }
+  S.sqT = setTimeout(async function(){ try{ var r = await supaClient.rpc('wmam_ai_search', { p_employee:EMP, p_q:q }); S.sres = r.data || []; }catch(e){ S.sres = []; } paintSearch(); }, 300); }
+function paintSearch(){ var el = $('sres'); if(!el) return; el.innerHTML = !S.sres ? '' : (S.sres.length ? S.sres.map(function(x){ return '<button type="button" class="th" onclick="openThread(' + x.thread_id + ')">' + esc(clean(x.title) || 'Conversation') + '<small>' + esc(String(x.snip || '').slice(0, 90)) + '</small></button>'; }).join('') : '<div class="sys">Nothing found</div>'); }
+async function renameChat(id){ var t = S.threads.filter(function(x){ return x.id === id; })[0]; var v = prompt('Rename this conversation', t ? clean(t.title) : ''); if(v == null || !v.trim()) return;
+  var r = await supaClient.rpc('wmam_ai_thread_rename', { p_thread:id, p_title:v.trim().slice(0, 80) }); if(r.error) toast(r.error.message); await loadThreads(); render(); }
+async function deleteChat(id){ if(S.delAsk !== id){ S.delAsk = id; render(); return; } S.delAsk = null;
+  var r = await supaClient.rpc('wmam_ai_thread_delete', { p_thread:id }); if(r.error){ toast(r.error.message); return; } if(S.thread === id) newChat(); await loadThreads(); render(); }
 async function stopJob(){ try{ var q = await supaClient.from('wmam_ai_tasks').select('id').eq('thread_id', S.thread).in('status', ['queued', 'running']); var ids = ((q && q.data) || []).map(function(x){ return x.id; });
-  for(var i of ids) await supaClient.rpc('wmam_ai_task_stop', { p_task:i }); }catch(e){} toast('Stopping…'); }
+  for(var i of ids) await supaClient.rpc('wmam_ai_cancel', { p_task:i }).catch(function(){}); }catch(e){} toast('Stopping…'); }
 async function decide(apId, yes){ var r = await supaClient.rpc('wmam_ai_decide', { p_approval:apId, p_approve:!!yes }); if(r.error){ S.err = r.error.message; } else { S.appr[apId] = yes ? 'approved' : 'rejected'; nudge(); startPoll(); } render(); }
-async function idea(sid, yes){ try{ await supaClient.rpc('wmam_ai_suggestion_decide', { p_suggestion:sid, p_accept:!!yes, p_note:null }); S.sugg[sid] = yes ? 'accepted' : 'declined'; }catch(e){} render(); }
+async function idea(sid, yes){ try{ await supaClient.rpc('wmam_ai_suggestion_decide', { p_id:sid, p_yes:!!yes }); S.sugg[sid] = yes ? 'accepted' : 'declined'; }catch(e){} render(); }
 async function loginSend(wid){
   var g = function(k){ var el = $(k + wid); return el ? el.value : ''; };
   var L = S.lw[wid] || {}, rem = $('lgRem' + wid);
@@ -236,7 +286,7 @@ function loginCard(m){
 }
 function msgHtml(m, i){
   var t = String(m.content || '');
-  if(m.role === 'user') return '<div class="msg u"><div><div class="b">' + withFiles(esc(clean(t))) + '</div><div class="acts"><button type="button" onclick="copyMsg(' + i + ')">Copy</button></div></div></div>';
+  if(m.role === 'user') return '<div class="msg u"><div><div class="b">' + withFiles(esc(clean(t))) + '</div><div class="acts"><button type="button" onclick="copyMsg(' + i + ')">Copy</button><button type="button" onclick="editMsg(' + i + ')">Edit</button></div></div></div>';
   if(m.role === 'status'){ var v = t.match(/^🎙 (You|AI):\s*([\s\S]*)/); if(v) return '<div class="vline ' + (v[1] === 'You' ? 'you' : 'ai') + '"><span>🎙 ' + esc(v[2]) + '</span></div>'; return '<div class="sys">' + esc(t.slice(0, 300)) + '</div>'; }
   if(/^🔐 \[login #\d+/.test(t)) return '<div class="msg a">' + loginCard(m) + '</div>';
   var ap = '';
@@ -246,7 +296,7 @@ function msgHtml(m, i){
   var body = withFiles(md(t.replace(/\[\[choice:\s*[^\]]+\]\]/g, '').trim()));
   return '<div class="msg a"><div class="b">' + body + '</div>' + (ap ? '<div class="card">' + ap + '</div>' : '')
     + (ch.length ? '<div class="choices">' + ch.map(function(c){ return '<button type="button" data-c="' + esc(c) + '" onclick="send(this.getAttribute(\'data-c\'))">' + esc(c) + '</button>'; }).join('') + '</div>' : '')
-    + '<div class="acts"><button type="button" onclick="copyMsg(' + i + ')">Copy</button><button type="button" onclick="speak(' + i + ')">🔊</button></div></div>';
+    + '<div class="acts"><button type="button" onclick="copyMsg(' + i + ')">Copy</button><button type="button" onclick="speak(' + i + ')" aria-label="Read out loud">🔊</button>' + (isLast && !S.sending ? '<button type="button" onclick="regen()">↻ Try again</button>' : '') + '</div></div>';
 }
 function copyMsg(i){ var m = S.msgs[i]; if(!m) return; try{ navigator.clipboard.writeText(clean(m.content).replace(/\[\[choice:[^\]]*\]\]/g, '')); toast('Copied'); }catch(e){} }
 function speak(i){ var m = S.msgs[i]; if(!m || !window.speechSynthesis) return; speechSynthesis.cancel(); var u = new SpeechSynthesisUtterance(clean(m.content).replace(/[#*_`|>\[\]]/g, ' ')); speechSynthesis.speak(u); }
@@ -267,19 +317,26 @@ function render(){
     + '<button type="button" class="ib" aria-label="Control panel" title="Control panel" onclick="cloneOpen()">🎛️</button></div>';
   if(V){ var st = V.status || 'Connecting…'; h += '<div class="live"><div class="orb' + (/Talking/.test(st) ? ' talk' : /Working/.test(st) ? ' work' : V.muted ? ' mute' : '') + '"></div><div class="ls">' + esc(st) + '</div><div class="lb"><button type="button" class="pill" onclick="toggleMute()">' + (V.muted ? '🎙 Unmute' : '🔇 Mute') + '</button><button type="button" class="pill end" onclick="endVoice()">End</button></div></div>'; }
   var body = S.msgs.map(msgHtml).join('');
-  if(S.waiting) body += '<div class="working"><span class="dots"><i></i><i></i><i></i></span> Working on it…</div>';
-  if(!S.msgs.length && !S.waiting) body = '<div class="hello"><h1>What are we doing, Calvin?</h1><p>Tap the mic and just talk — walking, driving, wherever. Or type below.<br>Anything: your businesses, your life, research, plans, writing, bills, trainings.</p></div>';
+  if(S.stream) body += '<div class="msg a"><div class="b" id="streamB"></div></div>';
+  else if(S.waiting) body += '<div class="working"><span class="dots"><i></i><i></i><i></i></span> Calvin\'s work brain is on it…</div>';
+  if(!S.msgs.length && !S.waiting && !S.stream) body = '<div class="hello"><h1>What are we doing, Calvin?</h1><p>Tap the mic and just talk — walking, driving, wherever. Or type below.<br>Anything: your businesses, your life, research, plans, writing, bills, trainings.</p></div>';
   h += '<div class="list" id="list"><div class="col">' + body + '</div></div>';
   h += '<div class="comp"><div class="col">' + (S.attach.length ? '<div class="chips">' + S.attach.map(function(a, k){ return '<span class="chip">📎 ' + esc(a.name) + ' <button type="button" aria-label="Remove" onclick="unattach(' + k + ')">✕</button></span>'; }).join('') + '</div>' : '')
     + (S.err ? '<div class="err">' + esc(S.err) + '</div>' : '')
     + '<div class="box"><textarea id="box" rows="1" placeholder="Message Calvin…" spellcheck="true" autocapitalize="sentences" oninput="grow(this)" onkeydown="keyDown(event)"></textarea>'
-    + '<div class="row"><button type="button" class="ib sm" aria-label="Attach" title="Attach files or photos" onclick="pickFiles()">📎</button>' + (S.waiting ? '<button type="button" class="ib sm" aria-label="Stop" title="Stop" onclick="stopJob()">■</button>' : '')
-    + '<span style="flex:1"></span><button type="button" class="send" aria-label="Send" onclick="send()"' + (S.sending ? ' disabled' : '') + '>↑</button>'
-    + '<button type="button" class="talkb' + (V ? ' on' : '') + '" aria-label="' + (V ? 'End the voice call' : 'Talk') + '" onclick="toggleVoice()">' + (V ? '■' : '🎙') + '</button></div></div></div></div>';
+    + '<div class="row"><button type="button" class="ib sm" aria-label="Attach" title="Attach files or photos" onclick="pickFiles()">📎</button><button type="button" class="ib sm" aria-label="Take a photo" title="Take a photo" onclick="takePhoto()">📷</button>'
+    + '<button type="button" class="ib sm' + (DICT ? ' rec' : '') + '" aria-label="Dictate" title="Speak instead of typing" onclick="toggleDictate()">' + (DICT ? '⏺' : '🎤') + '</button>'
+    + '<select class="brain" aria-label="Brain" title="Which brain answers" onchange="setBrain(this.value)"><option value="auto"' + (S.brain === 'auto' ? ' selected' : '') + '>Auto</option>' + BRAINS.map(function(b){ return '<option value="' + b.id + '"' + (S.brain === b.id ? ' selected' : '') + '>' + esc(b.label) + '</option>'; }).join('') + '</select>'
+    + '<span style="flex:1"></span>' + (S.sending || S.waiting ? '<button type="button" class="send" aria-label="Stop" title="Stop" onclick="stopAll()">■</button>' : '<button type="button" class="send" aria-label="Send" onclick="send()">↑</button>')
+    + '<button type="button" class="talkb' + (V ? ' on' : '') + '" aria-label="' + (V ? 'End the voice call' : 'Talk live with Calvin') + '" title="Talk live with Calvin" onclick="toggleVoice()">' + (V ? '■' : '<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="3" y="9" width="2.6" height="6" rx="1.3"/><rect x="7.5" y="5" width="2.6" height="14" rx="1.3"/><rect x="12" y="2" width="2.6" height="20" rx="1.3"/><rect x="16.5" y="6" width="2.6" height="12" rx="1.3"/><rect x="21" y="10" width="2.6" height="4" rx="1.3"/></svg>') + '</button></div></div></div></div>';
   if(S.side) h += '<div class="drawer"><div class="pane"><div class="dh"><b>Conversations</b><button type="button" class="ib sm" aria-label="Close" onclick="S.side=false;render()">✕</button></div>'
-    + '<div class="dl"><button type="button" class="th" onclick="newChat()">✎ New conversation</button>' + S.threads.map(function(t){ return '<button type="button" class="th' + (t.id === S.thread ? ' on' : '') + '" onclick="openThread(' + t.id + ')">' + esc(clean(t.title) || 'Conversation') + '<small>' + esc(new Date(t.updated_at).toLocaleString('en-US', { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })) + '</small></button>'; }).join('') + '</div>'
+    + '<div class="dl"><input class="inp" id="sq" placeholder="Search your conversations" value="' + esc(S.sq || '') + '" oninput="searchChats(this.value)"><div id="sres"></div><button type="button" class="th" onclick="newChat()">✎ New conversation</button>'
+    + S.threads.map(function(t){ return '<div class="trow"><button type="button" class="th' + (t.id === S.thread ? ' on' : '') + '" onclick="openThread(' + t.id + ')">' + esc(clean(t.title) || 'Conversation') + '<small>' + esc(new Date(t.updated_at).toLocaleString('en-US', { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })) + '</small></button>'
+      + '<button type="button" class="ib sm" aria-label="Rename" title="Rename" onclick="renameChat(' + t.id + ')">✏</button><button type="button" class="ib sm' + (S.delAsk === t.id ? ' del' : '') + '" aria-label="Delete" title="' + (S.delAsk === t.id ? 'Tap again to delete' : 'Delete') + '" onclick="deleteChat(' + t.id + ')">' + (S.delAsk === t.id ? 'Delete?' : '🗑') + '</button></div>'; }).join('') + '</div>'
     + '<div class="df"><button type="button" onclick="cloneOpen()">🎛️ Control panel</button><a href="/" target="_blank" rel="noopener">🏢 Open the WMAMinc back office</a><button type="button" onclick="logout()">Sign out</button></div></div><div class="shade" onclick="S.side=false;render()"></div></div>';
   app.innerHTML = h;
+  if(S.stream) paintStream(); if(S.side) paintSearch();
+  app.querySelectorAll('.a .b pre').forEach(function(pre){ if(pre.querySelector('.cpy')) return; var bt = document.createElement('button'); bt.type = 'button'; bt.className = 'cpy'; bt.textContent = 'Copy'; bt.onclick = function(){ try{ navigator.clipboard.writeText(pre.innerText.replace(/Copy$/, '')); toast('Copied'); }catch(e){} }; pre.appendChild(bt); });
   var nb = $('box'); if(nb){ nb.value = keep; grow(nb); if(focused){ nb.focus(); } }
   S.err = S.err && /^Not sent/.test(S.err) ? S.err : '';
   var l = $('list'); if(l) l.scrollTop = l.scrollHeight;
