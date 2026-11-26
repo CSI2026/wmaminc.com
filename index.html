@@ -3936,7 +3936,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.25.3473';
+var BUILD_VERSION = '2026.11.25.3474';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -41231,8 +41231,23 @@ function loadInactivityFlags(){
 if(typeof window!=='undefined'){ window.loadInactivityFlags=loadInactivityFlags; }
 function saveInactivityFlags(){
   try{ localStorage.setItem('wmam_inactivity_flags', JSON.stringify(INACTIVITY_FLAGS)); }catch(e){}
-  try{ if(typeof supaClient!=='undefined' && supaClient){ supaClient.from('app_settings').upsert({key:'inactivity_flags',value:JSON.stringify(INACTIVITY_FLAGS)},{onConflict:'key'}).then(function(){}).catch(function(){}); } }catch(e){}
-  try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){}
+  // v3474 (Calvin 2026-11-25): merge with the shared ledger before writing, so a
+  // browser holding an old copy can never re-open a flag the office already
+  // acknowledged or cleared. Same id: the acknowledged/cleared version wins.
+  try{
+    if(typeof supaClient!=='undefined' && supaClient){
+      supaClient.from('app_settings').select('value').eq('key','inactivity_flags').maybeSingle().then(function(r){
+        var cloud = []; try{ cloud = (r && r.data && r.data.value) ? (JSON.parse(r.data.value)||[]) : []; }catch(e){ cloud = []; }
+        var byId = {}, order = [];
+        function put(f){ if(!f || !f.id) return; var o = byId[f.id]; if(!o){ byId[f.id] = f; order.push(f.id); return; } if(o.status!=='open' && f.status==='open') return; if(f.status!=='open' && o.status==='open'){ byId[f.id] = f; return; } if((f.ackAt||'') > (o.ackAt||'')) byId[f.id] = f; }
+        cloud.forEach(put); INACTIVITY_FLAGS.forEach(put);
+        var merged = order.map(function(id){ return byId[id]; });
+        INACTIVITY_FLAGS.length = 0; merged.forEach(function(f){ INACTIVITY_FLAGS.push(f); });
+        try{ localStorage.setItem('wmam_inactivity_flags', JSON.stringify(INACTIVITY_FLAGS)); }catch(e){}
+        return supaClient.from('app_settings').upsert({key:'inactivity_flags',value:JSON.stringify(INACTIVITY_FLAGS)},{onConflict:'key'});
+      }).then(function(){ try{ if(typeof sbBumpDataVersion==='function') setTimeout(sbBumpDataVersion, 50); }catch(e){} }).catch(function(){});
+    }
+  }catch(e){}
 }
 loadInactivityFlags();
 
@@ -41271,21 +41286,115 @@ function _inactBaseline(a){
   return earliest; // null → cannot evaluate, skip (no false flags)
 }
 
+// ── v3474 (Calvin 2026-11-25): PER-CARRIER, CENTRAL-TIME, SALES-LOADED RULE ──
+// "If an agent has inventory with the company and they're not doing any sales
+// two days in a row, that warrants an email." Three root causes of wrong flags
+// (Chelsie Mains flagged 9 times while selling daily) are fixed here:
+//  1. Days are counted in Central time and only once the day is OVER.
+//  2. A day only counts after that carrier's sales for it are in the system
+//     (TruConnect / Gen Mobile sales arrive a day or more late by upload).
+//  3. Each carrier is judged on its own: phones held for a carrier are
+//     measured against sales for THAT carrier. A carrier the agent holds no
+//     phones for never counts against them.
+function _inactCT(dt){
+  try{
+    var p = new Intl.DateTimeFormat('en-US',{timeZone:'America/Chicago',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(dt||new Date());
+    var g = function(t){ for(var i=0;i<p.length;i++) if(p[i].type===t) return p[i].value; return ''; };
+    return g('year')+'-'+g('month')+'-'+g('day');
+  }catch(e){ return (dt||new Date()).toISOString().slice(0,10); }
+}
+function _inactPrevDay(iso){ var d = new Date(iso+'T12:00:00Z'); d.setUTCDate(d.getUTCDate()-1); return d.toISOString().slice(0,10); }
+function _inactCarrier(c){
+  var s = String(c||'').toLowerCase();
+  if(!s) return '';
+  if(s.indexOf('gen')>=0) return 'Gen Mobile';
+  if(s.indexOf('tru')>=0) return 'TruConnect';
+  if(s.indexOf('assur')>=0) return 'Assurance Wireless';
+  if(s.indexOf('excess')>=0) return 'Excess';
+  if(s.indexOf('dart')>=0) return 'DART';
+  if(s.indexOf('entouch')>=0 || s.indexOf('assist')>=0) return 'enTouch';
+  return String(c);
+}
+// {carrier: earliest date a still-held phone was given to the agent}
+function _inactHeldByCarrier(a){
+  var out = {};
+  var pools = [
+    [typeof INVENTORY_DEVICES!=='undefined'?INVENTORY_DEVICES:[], ''],
+    [typeof GM_INVENTORY!=='undefined'?GM_INVENTORY:[], 'Gen Mobile'],
+    [typeof TC_INVENTORY!=='undefined'?TC_INVENTORY:[], 'TruConnect'],
+    [typeof AW_INVENTORY!=='undefined'?AW_INVENTORY:[], 'Assurance Wireless'],
+    [typeof EX_INVENTORY!=='undefined'?EX_INVENTORY:[], 'Excess']
+  ];
+  pools.forEach(function(pl){
+    (Array.isArray(pl[0])?pl[0]:[]).forEach(function(d){
+      if(!d || d.deletedAt || d.status==='deleted') return;
+      if(d.status==='sold' || d.status==='activated' || d.soldAt) return;
+      if(d.holderId!==a.id && d.assignedTo!==a.id) return;
+      var c = _inactCarrier(d.campaign || d.carrier || pl[1]);
+      if(!c) return;
+      var t = String(d.assignedAt || d.receivedAt || d.createdAt || '').slice(0,10);
+      if(!(c in out)) out[c] = t || null;
+      else if(t && (!out[c] || t < out[c])) out[c] = t;
+    });
+  });
+  return out;
+}
+// Latest sale date per carrier across the whole company = how far that
+// carrier's sales are loaded into the system.
+function _inactLoadedThrough(){
+  var m = {};
+  (DB.agents||[]).forEach(function(a){
+    (a && a.monthlySales || []).forEach(function(ms){
+      (ms && ms.entries || []).forEach(function(e){
+        if(!e || !e.date || !((e.count||1)>0)) return;
+        var c = _inactCarrier(e.campaign); if(!c) return;
+        var d = String(e.date).slice(0,10);
+        if(!m[c] || d > m[c]) m[c] = d;
+      });
+    });
+  });
+  return m;
+}
+function _inactLastSaleFor(a, carrier){
+  var last = null;
+  (a && a.monthlySales || []).forEach(function(ms){
+    (ms && ms.entries || []).forEach(function(e){
+      if(!e || !e.date || !((e.count||1)>0)) return;
+      if(_inactCarrier(e.campaign)!==carrier) return;
+      var d = String(e.date).slice(0,10);
+      if(!last || d > last) last = d;
+    });
+  });
+  return last;
+}
+if(typeof window!=='undefined'){ window._inactCT=_inactCT; window._inactHeldByCarrier=_inactHeldByCarrier; window._inactLoadedThrough=_inactLoadedThrough; window._inactLastSaleFor=_inactLastSaleFor; }
+
 function inactivitySweep(){
   var out = {flagged:0};
   try{
-    var today = new Date().toISOString().slice(0,10);
+    var lastFullDay = _inactPrevDay(_inactCT());         // today (Central) is never counted until it is over
+    var loaded = _inactLoadedThrough();
     (DB.agents||[]).forEach(function(a){
       if(!a || !a.active || a.role!=='Field Agent') return;
-      if(!agentHoldsDevices(a)) return;                  // rule applies to device holders only
-      var base = _inactBaseline(a);
-      if(!base) return;
-      // after an acknowledgment, the clock restarts from the ack date
+      var held = _inactHeldByCarrier(a);
+      var carriers = Object.keys(held);
+      if(!carriers.length) return;                       // rule applies to device holders only
+      // after an acknowledgment, the clock restarts from the ack date (Central)
       var lastAck = null;
-      INACTIVITY_FLAGS.forEach(function(f){ if(f && f.agentId===a.id && f.status==='acked' && f.ackAt){ var d=f.ackAt.slice(0,10); if(!lastAck||d>lastAck) lastAck=d; } });
-      var clockStart = (lastAck && lastAck > base) ? lastAck : base;
-      var wd = workingDaysBetween(clockStart, today);
-      if(wd < 2) return;
+      INACTIVITY_FLAGS.forEach(function(f){ if(f && f.agentId===a.id && f.status==='acked' && f.ackAt){ var d=_inactCT(new Date(f.ackAt)); if(!lastAck||d>lastAck) lastAck=d; } });
+      var worst = null;
+      carriers.forEach(function(c){
+        if(!loaded[c]) return;                           // no sales data for this carrier in the system: cannot judge, never guess
+        var cutoff = loaded[c] < lastFullDay ? loaded[c] : lastFullDay;
+        var lastSale = _inactLastSaleFor(a, c);
+        var base = lastSale || held[c];
+        if(!base) return;
+        var clockStart = (lastAck && lastAck > base) ? lastAck : base;
+        var n = workingDaysBetween(clockStart, cutoff);
+        if(n >= 2 && (!worst || n > worst.wd)) worst = {carrier:c, wd:n, lastSale:lastSale};
+      });
+      if(!worst) return;
+      var wd = worst.wd;
       // one OPEN flag per agent at a time
       var open = INACTIVITY_FLAGS.find(function(f){ return f && f.agentId===a.id && f.status==='open'; });
       if(open) return;
@@ -41295,7 +41404,8 @@ function inactivitySweep(){
         agentId: a.id, agentName: a.name,
         managerId: mgr ? mgr.id : null, managerName: mgr ? mgr.name : null,
         flaggedAt: new Date().toISOString(),
-        lastSaleDate: agentLastSaleDate(a) || null,
+        lastSaleDate: worst.lastSale || null,
+        carrier: worst.carrier,
         workingDays: wd,
         status: 'open', ackBy: null, ackAt: null, ackAction: null
       };
@@ -41312,7 +41422,7 @@ function inactivitySweep(){
           pushNotification({
             toIds: [mid],
             title: '\u26a0\ufe0f Agent Inactivity \u2014 Action Required',
-            body: a.name+' has devices in hand and no sales in '+wd+' working days. '+(mgr&&mid===mgr.id?'Your back office is locked until you acknowledge and act \u2014 collect the inventory or get it activated.':'Heads up \u2014 '+(mgr?mgr.name:'the direct manager')+' must acknowledge.'),
+            body: a.name+' has '+worst.carrier+' phones in hand and no '+worst.carrier+' sales in '+wd+' working days. '+(mgr&&mid===mgr.id?'Your back office is locked until you acknowledge and act \u2014 collect the inventory or get it activated.':'Heads up \u2014 '+(mgr?mgr.name:'the direct manager')+' must acknowledge.'),
             panel: 'dashboard'
           });
         });
@@ -41341,7 +41451,7 @@ function inactivityAcknowledge(flagId, action){
     saveInactivityFlags();
     try{
       pushNotification({ toIds: [f.agentId], title: '\u26a0\ufe0f Inventory Warning',
-        body: 'You have devices and no sales in '+f.workingDays+' working days. Your manager will '+(f.ackAction==='collect'?'collect the inventory':'work with you to activate it')+' \u2014 sell or activate now to keep your devices.', panel: 'dashboard' });
+        body: 'You have '+(f.carrier?f.carrier+' phones':'devices')+' and no '+(f.carrier?f.carrier+' ':'')+'sales in '+f.workingDays+' working days. Your manager will '+(f.ackAction==='collect'?'collect the inventory':'work with you to activate it')+' \u2014 sell or activate now to keep your devices.', panel: 'dashboard' });
     }catch(e){}
     var overlay = document.getElementById('inactLockOverlay');
     if(overlay){
