@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Calvin</title>
+<title>kalvina</title>
 <meta name="description" content="Calvin's own AI: talk or type, for everything">
 <meta name="robots" content="noindex">
 <meta name="theme-color" content="#faf9f7">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="Calvin">
+<meta name="apple-mobile-web-app-title" content="kalvina">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <link rel="manifest" href="/calvin.webmanifest">
 <link rel="apple-touch-icon" href="/wmam-icon-192.png">
@@ -148,7 +148,7 @@ async function afterLogin(){
   await loadThreads();
   if(S.threads.length && Date.now() - Date.parse(S.threads[0].updated_at) < 6 * 3600000) S.thread = S.threads[0].id;
   if(S.thread) await loadMsgs();
-  render(); prepVoice(); loadBrains();
+  render(); prepVoice();
 }
 async function logout(){ endVoice(); await supaClient.auth.signOut(); location.reload(); }
 
@@ -192,7 +192,7 @@ async function submit(text){
   nudge(); return d;
 }
 // v3458: answers stream live, word by word, from the brain he picks (calvin-chat); heavy jobs go to the work brain
-var BRAINS = []; try{ S.brain = localStorage.getItem('calvin_brain') || 'auto'; }catch(e){ S.brain = 'auto'; }
+var BRAINS = []; S.brain = 'auto';   // v3496: no picker — kalvina chooses the strongest brain for each message herself
 async function loadBrains(){ try{ var tk = (await supaClient.auth.getSession()).data.session.access_token; var r = await fetch(SUPA_URL + '/functions/v1/calvin-chat', { method:'POST', headers:{ 'Content-Type':'application/json', apikey:SUPA_KEY, Authorization:'Bearer ' + tk }, body:JSON.stringify({ action:'brains' }) }); var j = await r.json(); BRAINS = (j.brains || []).filter(function(b){ return b.on; }); render(); }catch(e){} }
 function setBrain(v){ S.brain = v; try{ localStorage.setItem('calvin_brain', v); }catch(e){} toast(v === 'auto' ? 'Auto: fast answers, deep thinking only for big jobs' : v === 'think' ? 'Think: the deepest brain on every answer' : 'Using ' + (BRAINS.filter(function(b){ return b.id === v; })[0] || {}).label); }
 function paintStream(){ var el = $('streamB'); if(!el || !S.stream) return; el.innerHTML = (S.stream.text ? mdCards(S.stream.text, true) : '') + (S.stream.status ? '<div class="working"><span class="dots"><i></i><i></i><i></i></span> ' + esc(S.stream.status) + '</div>' : (!S.stream.text ? '<div class="working"><span class="dots"><i></i><i></i><i></i></span></div>' : ''));
@@ -231,15 +231,37 @@ async function send(textIn){
 function regen(){ var u = S.msgs.filter(function(m){ return m.role === 'user'; }).slice(-1)[0]; if(!u || S.sending) return; chat(u.content, { regenerate:true }); }
 function editMsg(i){ var m = S.msgs[i]; if(!m) return; var b = $('box'); if(!b) return; b.value = clean(m.content).replace(/\n?\[file #\d+[^\]]*\]/g, '').trim(); grow(b); b.focus(); toast('Edit it and send'); }
 function stopAll(){ if(S.abort){ try{ S.abort.abort(); }catch(e){} return; } stopJob(); }
-// dictation: speak instead of typing (separate from the live call)
+// v3496 (Calvin 2026-11-26 "she constantly asked for permission to my mic … if my phone dims she stops"):
+// one microphone for the whole visit (calls and typing-by-voice share it, kept 2 minutes after you finish so the phone does not ask
+// again right away), the screen stays awake while she listens or works, and a call cut off by the phone locking reconnects by itself.
+var MIC = { stream:null, users:0, t:0 };
+async function getMic(){ clearTimeout(MIC.t);
+  if(MIC.stream && MIC.stream.getAudioTracks().some(function(t){ return t.readyState === 'live'; })){ MIC.stream.getAudioTracks().forEach(function(t){ t.enabled = true; }); MIC.users++; return MIC.stream; }
+  MIC.stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1 } }); MIC.users = 1; return MIC.stream; }
+function releaseMic(){ MIC.users = Math.max(0, MIC.users - 1); if(MIC.users) return; if(MIC.stream) MIC.stream.getAudioTracks().forEach(function(t){ t.enabled = false; });
+  clearTimeout(MIC.t); MIC.t = setTimeout(function(){ if(!MIC.users && MIC.stream){ MIC.stream.getTracks().forEach(function(t){ t.stop(); }); MIC.stream = null; } }, 120000); }
+var WAKE = { lock:null, want:false };
+async function keepAwake(on){ WAKE.want = !!on; try{ if(on && navigator.wakeLock && !WAKE.lock){ WAKE.lock = await navigator.wakeLock.request('screen'); WAKE.lock.addEventListener('release', function(){ WAKE.lock = null; }); }
+  if(!on && WAKE.lock){ var l = WAKE.lock; WAKE.lock = null; await l.release(); } }catch(e){} }
+function awakeNeeded(){ return !!(S.voice || DICT || S.sending || S.waiting); }
+setInterval(function(){ var need = awakeNeeded(); if(need !== WAKE.want || (need && !WAKE.lock && document.visibilityState === 'visible')) keepAwake(need); }, 2000);
+document.addEventListener('visibilitychange', function(){ if(document.visibilityState !== 'visible') return; if(awakeNeeded()) keepAwake(true);
+  // the phone locked during a call: start it again so you can keep talking
+  if(S.callWanted){ var v = S.voice, dead = !v || !v.pc || /failed|closed|disconnected/.test(v.pc.connectionState || ''); if(dead){ if(v) endVoice(true); toast('Reconnecting the call…'); startVoice(); } } });
+// typing by voice: records with the same mic, then writes it out (no second permission)
 var DICT = null;
-function toggleDictate(){ if(DICT){ stopDictate(); return; }
-  var SR = window.SpeechRecognition || window.webkitSpeechRecognition; if(!SR){ toast('Dictation is not available in this browser'); return; }
-  var b = $('box'), base = b ? b.value : ''; var r = new SR(); r.lang = 'en-US'; r.interimResults = true; r.continuous = true;
-  r.onresult = function(ev){ var t = ''; for(var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript; var bx = $('box'); if(bx){ bx.value = (base ? base + ' ' : '') + t; grow(bx); } };
-  r.onend = function(){ DICT = null; render(); }; r.onerror = function(){ DICT = null; render(); };
-  try{ r.start(); DICT = r; render(); }catch(e){ toast('Could not start dictation'); } }
-function stopDictate(){ if(DICT){ try{ DICT.stop(); }catch(e){} DICT = null; } }
+async function toggleDictate(){ if(DICT){ stopDictate(); return; }
+  if(!window.MediaRecorder){ toast('Typing by voice is not available here'); return; }
+  try{ var st = await getMic(); var mime = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].filter(function(m){ try{ return MediaRecorder.isTypeSupported(m); }catch(e){ return false; } })[0] || '';
+    var rec = new MediaRecorder(st, mime ? { mimeType:mime } : undefined), parts = []; DICT = { rec:rec, at:Date.now() };
+    rec.ondataavailable = function(e){ if(e.data && e.data.size) parts.push(e.data); };
+    rec.onstop = async function(){ releaseMic(); var d = DICT; DICT = null; render(); if(!parts.length) return; var blob = new Blob(parts, { type:rec.mimeType || mime || 'audio/webm' });
+      toast('Writing it out…'); try{ var b64 = await new Promise(function(ok, no){ var fr = new FileReader(); fr.onload = function(){ ok(String(fr.result).split(',')[1] || ''); }; fr.onerror = no; fr.readAsDataURL(blob); });
+        var r = await invoke('wmam-ai-voice', { action:'transcribe', employee:EMP, audio:b64, mime:blob.type }); var t = r && r.data && r.data.text;
+        if(r && r.error) throw new Error(r.error.message || 'failed'); if(!t){ toast('I didn’t catch anything'); return; }
+        var bx = $('box'); if(bx){ bx.value = (bx.value ? bx.value.replace(/\s+$/, '') + ' ' : '') + t; grow(bx); bx.focus(); } }catch(e){ toast('Could not write that out: ' + (e.message || e)); } };
+    rec.start(); render(); keepAwake(true); }catch(e){ DICT = null; releaseMic(); render(); toast(/Permission|NotAllowed/i.test(String(e && e.message || e)) ? 'Allow the microphone to talk instead of typing' : 'Could not start: ' + (e.message || e)); } }
+function stopDictate(){ if(DICT && DICT.rec && DICT.rec.state !== 'inactive'){ try{ DICT.rec.stop(); }catch(e){} } else DICT = null; }
 function takePhoto(){ S.amenu = false; render(); openPicker('pkCam'); }
 // conversations: search, rename, delete
 // 2026-11-26 Calvin: "chats saved on the side after we are done like the other apps … delete the messages that i dont want to keep"
@@ -398,8 +420,8 @@ function speak(i){ var m = S.msgs[i]; if(!m || !window.speechSynthesis) return; 
 // ── screen ──
 function render(){
   var app = $('app'); if(!app) return;
-  if(S.booting){ app.innerHTML = '<div class="login"><h1>Calvin</h1><p>Opening…</p></div>'; return; }
-  if(!DB.current){ app.innerHTML = '<div class="login"><h1>Calvin</h1><p>Sign in with your WMAMinc username and password.</p>'
+  if(S.booting){ app.innerHTML = '<div class="login"><h1>kalvina</h1><p>Opening…</p></div>'; return; }
+  if(!DB.current){ app.innerHTML = '<div class="login"><h1>kalvina</h1><p style="margin:-6px 0 10px;font-size:13px;letter-spacing:.08em;color:var(--mut)">INTELLIGENCE WITHOUT BOUNDARIES</p><p>Sign in with your WMAMinc username and password.</p>'
     + '<input class="inp" id="lgU" placeholder="Username" autocapitalize="off" autocomplete="username"><input class="inp" id="lgP" type="password" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key===\'Enter\')doLogin()">'
     + (S.loginErr ? '<div class="err">' + esc(S.loginErr) + '</div>' : '') + '<button type="button" class="btn" id="lgBtn" onclick="doLogin()">Sign in</button></div>'; return; }
   var box = $('box'), keep = box ? box.value : '', focused = box && document.activeElement === box;
@@ -407,24 +429,24 @@ function render(){
   var cur = S.threads.filter(function(t){ return t.id === S.thread; })[0];
   var V = S.voice;
   var h = '<div class="top"><button type="button" class="ib menu" aria-label="Conversations" onclick="S.side=true;render()">☰</button>'
-    + '<div class="title"><b>Calvin</b><span>' + esc(S.thread ? ((cur && cur.title) ? clean(cur.title) : 'Conversation') : 'New conversation') + '</span></div>'
+    + '<div class="title"><b>kalvina</b><span>' + esc(S.thread ? ((cur && cur.title) ? clean(cur.title) : 'Conversation') : 'New conversation') + '</span></div>'
     + '<button type="button" class="ib" aria-label="New conversation" title="New conversation" onclick="newChat()">✎</button>'
     + '<button type="button" class="ib" aria-label="Control panel" title="Control panel" onclick="cloneOpen()">🎛️</button></div>';
   if(V){ var st = V.status || 'Connecting…'; h += '<div class="live"><div class="orb' + (/Talking/.test(st) ? ' talk' : /Working/.test(st) ? ' work' : V.muted ? ' mute' : '') + '"></div><div class="ls">' + esc(st) + '</div><div class="lb"><button type="button" class="pill" onclick="toggleMute()">' + (V.muted ? '🎙 Unmute' : '🔇 Mute') + '</button><button type="button" class="pill end" onclick="endVoice()">End</button></div></div>'; }
   var body = S.msgs.map(function(m, i){ return S.gone.m[m.id] ? '' : msgHtml(m, i); }).join('');
   if(S.stream) body += '<div class="msg a"><div class="b" id="streamB"></div></div>';
-  else if(S.waiting) body += '<div class="working"><span class="dots"><i></i><i></i><i></i></span> Calvin\'s work brain is on it…</div>';
+  else if(S.waiting) body += '<div class="working"><span class="dots"><i></i><i></i><i></i></span> kalvina is working on it…</div>';
   if(!S.msgs.length && !S.waiting && !S.stream) body = '<div class="hello"><h1>What are we doing, Calvin?</h1><p>Tap the mic and just talk — walking, driving, wherever. Or type below.<br>Anything: your businesses, your life, research, plans, writing, bills, trainings.</p></div>';
   h += '<div class="list" id="list"><div class="col">' + body + '</div></div>';
   h += '<div class="comp"><div class="col">' + (S.attach.length ? '<div class="thumbs">' + S.attach.map(function(a, k){ return '<div class="thumb' + (a.busy ? ' busy' : '') + '">' + (a.kind === 'image' && a.prev ? '<img src="' + a.prev + '" alt="">' : a.kind === 'video' && a.prev ? '<video src="' + a.prev + '" muted playsinline preload="metadata"></video><span class="vtag">▶</span>' : '<span class="fic">📄</span>') + '<span class="tn">' + esc(a.name) + '</span>' + (a.busy ? '<span class="pc">' + (a.pct != null ? a.pct + '%' : 'Uploading…') + '</span>' : '') + '<button type="button" class="tx" aria-label="Remove ' + esc(a.name) + '" onclick="unattach(' + k + ')">✕</button></div>'; }).join('') + '</div>' : '')
     + (S.amenu ? '<div class="amenu" role="menu"><button type="button" role="menuitem" onclick="pickMedia()"><span>🖼️</span><b>Photos &amp; videos</b><small>From your gallery</small></button><button type="button" role="menuitem" onclick="takePhoto()"><span>📷</span><b>Camera</b><small>Take a photo or video</small></button><button type="button" role="menuitem" onclick="pickFiles()"><span>📄</span><b>Files</b><small>PDF, Excel, Word and more</small></button></div>' : '')
     + (S.err ? '<div class="err">' + esc(S.err) + '</div>' : '')
-    + '<div class="box"><textarea id="box" rows="1" placeholder="Message Calvin…" spellcheck="true" autocapitalize="sentences" oninput="grow(this)" onkeydown="keyDown(event)"></textarea>'
+    + '<div class="box"><textarea id="box" rows="1" placeholder="Message kalvina…" spellcheck="true" autocapitalize="sentences" oninput="grow(this)" onkeydown="keyDown(event)"></textarea>'
     + '<div class="row"><button type="button" class="ib sm plus' + (S.amenu ? ' on' : '') + '" aria-label="Add photos, videos or files" aria-expanded="' + (!!S.amenu) + '" title="Add photos, videos or files" onclick="toggleAttachMenu()">＋</button><button type="button" class="ib sm" aria-label="Photos and videos" title="Photos & videos from your gallery" onclick="pickMedia()">🖼️</button>'
     + '<button type="button" class="ib sm' + (DICT ? ' rec' : '') + '" aria-label="Dictate" title="Speak instead of typing" onclick="toggleDictate()">' + (DICT ? '⏺' : '🎤') + '</button>'
-    + '<select class="brain" aria-label="Brain" title="Which brain answers" onchange="setBrain(this.value)"><option value="auto"' + (S.brain === 'auto' ? ' selected' : '') + '>Auto · fast</option><option value="think"' + (S.brain === 'think' ? ' selected' : '') + '>Think · deep</option>' + BRAINS.map(function(b){ return '<option value="' + b.id + '"' + (S.brain === b.id ? ' selected' : '') + '>' + esc(b.label) + '</option>'; }).join('') + '</select>'
+    
     + '<span style="flex:1"></span>' + (S.sending || S.waiting ? '<button type="button" class="send" aria-label="Stop" title="Stop" onclick="stopAll()">■</button>' : '<button type="button" class="send" aria-label="Send" onclick="send()">↑</button>')
-    + '<button type="button" class="talkb' + (V ? ' on' : '') + '" aria-label="' + (V ? 'End the voice call' : 'Talk live with Calvin') + '" title="Talk live with Calvin" onclick="toggleVoice()">' + (V ? '■' : '<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="3" y="9" width="2.6" height="6" rx="1.3"/><rect x="7.5" y="5" width="2.6" height="14" rx="1.3"/><rect x="12" y="2" width="2.6" height="20" rx="1.3"/><rect x="16.5" y="6" width="2.6" height="12" rx="1.3"/><rect x="21" y="10" width="2.6" height="4" rx="1.3"/></svg>') + '</button></div></div></div></div>';
+    + '<button type="button" class="talkb' + (V ? ' on' : '') + '" aria-label="' + (V ? 'End the voice call' : 'Talk live with kalvina') + '" title="Talk live with kalvina" onclick="toggleVoice()">' + (V ? '■' : '<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="3" y="9" width="2.6" height="6" rx="1.3"/><rect x="7.5" y="5" width="2.6" height="14" rx="1.3"/><rect x="12" y="2" width="2.6" height="20" rx="1.3"/><rect x="16.5" y="6" width="2.6" height="12" rx="1.3"/><rect x="21" y="10" width="2.6" height="4" rx="1.3"/></svg>') + '</button></div></div></div></div>';
   var dock = wide(); app.className = dock ? 'dock' : '';
   if(S.side || dock) h += '<div class="drawer' + (dock ? ' dock' : '') + '"><div class="pane"><div class="dh"><b>Conversations</b><button type="button" class="ib sm" aria-label="Close" onclick="S.side=false;render()">✕</button></div>'
     + '<div class="dl" id="dl0"><input class="inp" id="sq" placeholder="Search your conversations" value="' + esc(S.sq || '') + '" oninput="searchChats(this.value)"><div id="sres"></div><button type="button" class="th" onclick="newChat()">✎ New conversation</button>'
@@ -467,14 +489,14 @@ function gateStart(V, mic){
     if(G.want !== want){ G.want = want; try{ gain.gain.setTargetAtTime(want, ctx.currentTime, want ? 0.005 : 0.03); }catch(e){ gain.gain.value = want; } } }, 20);
   G.track = dest.stream.getAudioTracks()[0]; return G;
 }
-function toggleVoice(){ if(S.voice) endVoice(); else startVoice(); }
+function toggleVoice(){ if(S.voice){ S.callWanted = false; endVoice(); } else startVoice(); }
 async function startVoice(){
   var V = { status:'Connecting…', muted:false, seen:{}, working:false }; S.voice = V; render();
   try{
     if(!navigator.mediaDevices || !window.RTCPeerConnection) throw new Error('this browser can’t do live voice');
     var keyP = takeKey();
-    var mic = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1 } });
-    if(S.voice !== V){ mic.getTracks().forEach(function(t){ t.stop(); }); return; } V.mic = mic;
+    var mic = await getMic();
+    if(S.voice !== V){ releaseMic(); return; } V.mic = mic; S.callWanted = true; keepAwake(true);
     var pc = new RTCPeerConnection(); V.pc = pc; var audio = document.createElement('audio'); audio.autoplay = true; audio.setAttribute('playsinline', ''); V.audio = audio;
     var G = null; try{ G = gateStart(V, mic); }catch(x){} V.gate = G;
     if(G && G.track) pc.addTrack(G.track, mic); else mic.getTracks().forEach(function(t){ pc.addTrack(t, mic); });
@@ -491,8 +513,8 @@ async function startVoice(){
     prepVoice();
   }catch(e){ var msg = String(e && e.message || e); endVoice(); S.err = /Permission|NotAllowed/i.test(msg) ? 'Live voice needs your microphone. Allow the mic and tap 🎙 again.' : 'Live voice didn’t start: ' + msg; render(); }
 }
-function endVoice(){ var v = S.voice; if(!v) return; S.voice = null;
-  try{ if(v.dc) v.dc.close(); }catch(e){} try{ if(v.pc) v.pc.close(); }catch(e){} try{ if(v.mic) v.mic.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} try{ if(v.audio) v.audio.srcObject = null; }catch(e){} try{ if(v.gate){ clearInterval(v.gate.timer); v.gate.ctx.close(); } }catch(e){}
+function endVoice(keepWanted){ var v = S.voice; if(!v) return; S.voice = null; if(!keepWanted) S.callWanted = false;
+  try{ if(v.dc) v.dc.close(); }catch(e){} try{ if(v.pc) v.pc.close(); }catch(e){} try{ if(v.mic){ v.mic = null; releaseMic(); } }catch(e){} try{ if(v.audio) v.audio.srcObject = null; }catch(e){} try{ if(v.gate){ clearInterval(v.gate.timer); v.gate.ctx.close(); } }catch(e){}
   if(v.working){ toast('I’ll finish it and post the answer here.'); startPoll(); } render(); }
 function toggleMute(){ var v = S.voice; if(!v || !v.mic) return; v.muted = !v.muted; v.mic.getTracks().forEach(function(t){ t.enabled = !v.muted; }); vStatus(v.muted ? 'Muted' : 'Live — just talk. Interrupt anytime.'); }
 function vSend(o){ try{ if(S.voice && S.voice.dc && S.voice.dc.readyState === 'open') S.voice.dc.send(JSON.stringify(o)); }catch(e){} }
