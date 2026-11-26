@@ -3929,7 +3929,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.26.3496';
+var BUILD_VERSION = '2026.11.26.3497';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -42355,16 +42355,40 @@ function _i18nCase(orig, es){
   if(/^[A-ZÁÉÍÓÚÑ]/.test(orig.trim())) return es.charAt(0).toUpperCase()+es.slice(1);
   return es;
 }
+// v3497 (Calvin 2026-11-26 "not every word all over the entire site are changing"): anything not on the word list above is sent once to
+// the translator (server function i18n), saved there for everyone and in this browser, so every word on every screen changes.
+// Numbers become {0} {1} … so "18 stuck 4+ days" and "3 stuck 2+ days" share one translation.
+var _i18nAuto = {}; try{ _i18nAuto = JSON.parse(localStorage.getItem('wmam_i18n_es') || '{}') || {}; }catch(e){ _i18nAuto = {}; }
+var _i18nSetVal = (typeof WeakMap!=='undefined') ? new WeakMap() : null;
+var _i18nQueue = {}, _i18nQT = 0, _i18nAsking = false, _i18nFailed = {};
+function _i18nTemplate(t){ var nums = []; var tpl = String(t).replace(/\s+/g, ' ').trim().replace(/\d[\d,.:\/]*/g, function(m){ nums.push(m); return '{' + (nums.length - 1) + '}'; }); return { tpl:tpl, nums:nums }; }
+function _i18nFill(tpl, nums){ return String(tpl).replace(/\{(\d+)\}/g, function(m, i){ return nums[+i] != null ? nums[+i] : m; }); }
+function _i18nSkip(t){ var x = String(t).trim(); return !x || x.length > 2000 || !/[a-zA-Z]{2}/.test(x) || /^[\w.+-]+@[\w-]+\.[\w.]+$/.test(x) || /^https?:\/\//.test(x) || /^[A-Z0-9\-_#]{6,}$/.test(x); }
+function _i18nAutoGet(raw){ if(_i18nSkip(raw)) return null; var t = _i18nTemplate(raw); if(!/[a-zA-Z]{2}/.test(t.tpl.replace(/\{\d+\}/g, ''))) return null;
+  var hit = _i18nAuto[t.tpl]; if(hit != null) return _i18nFill(hit, t.nums);
+  if((_i18nFailed[t.tpl] || 0) < 2) _i18nQueue[t.tpl] = 1; return null; }
+function _i18nFlushSoon(){ clearTimeout(_i18nQT); _i18nQT = setTimeout(_i18nFlush, 250); }
+async function _i18nFlush(){ if(_i18nAsking || WMAM_LANG !== 'es') return; var list = Object.keys(_i18nQueue); if(!list.length) return; _i18nAsking = true; var got = 0;
+  try{ var parts = []; for(var i = 0; i < list.length; i += 60) parts.push(list.slice(i, i + 60)); list.forEach(function(k){ delete _i18nQueue[k]; });
+    await Promise.all(parts.map(async function(part){   // all pieces at the same time
+      var r = await fetch(SUPA_URL + '/functions/v1/i18n', { method:'POST', headers:{ 'Content-Type':'application/json', apikey:SUPA_KEY, Authorization:'Bearer ' + SUPA_KEY }, body:JSON.stringify({ lang:'es', texts:part }) });
+      var d = await r.json().catch(function(){ return {}; }); var map = (d && d.map) || {};
+      part.forEach(function(k){ if(map[k] != null){ _i18nAuto[k] = map[k]; got++; } else _i18nFailed[k] = (_i18nFailed[k] || 0) + 1; });
+      if(got && WMAM_LANG === 'es') wmamApplyLang(); }));
+    try{ localStorage.setItem('wmam_i18n_es', JSON.stringify(_i18nAuto)); }catch(e){ try{ localStorage.removeItem('wmam_i18n_es'); }catch(x){} }
+  }catch(e){} _i18nAsking = false; if(got && WMAM_LANG === 'es') wmamApplyLang(); if(Object.keys(_i18nQueue).length) _i18nFlushSoon(); }
 function _i18nTranslateTextNode(node){
   try{
     var raw=node.nodeValue; if(!raw) return;
     var key=_i18nNorm(raw); if(!key || key.length<1) return;
     if(!/[a-zA-Z]/.test(key)) return; // skip pure numbers/symbols
-    var es=WMAM_ES[key]; if(!es) return;
+    if(_i18nOrigText && _i18nOrigText.has(node)) return;   // already translated
+    var es=WMAM_ES[key], auto=null; if(!es){ auto=_i18nAutoGet(raw); if(auto==null) return; }
     if(_i18nOrigText && !_i18nOrigText.has(node)) _i18nOrigText.set(node, raw);
+    if(auto!=null){ var lead0=(raw.match(/^\s*/)||[''])[0], trail0=(raw.match(/\s*$/)||[''])[0]; node.nodeValue = lead0 + auto + trail0; if(_i18nSetVal) _i18nSetVal.set(node, node.nodeValue); return; }
     // preserve leading/trailing whitespace of the original
     var lead=(raw.match(/^\s*/)||[''])[0], trail=(raw.match(/\s*$/)||[''])[0];
-    node.nodeValue = lead + _i18nCase(raw.trim(), es) + trail;
+    node.nodeValue = lead + _i18nCase(raw.trim(), es) + trail; if(_i18nSetVal) _i18nSetVal.set(node, node.nodeValue);
   }catch(e){}
 }
 function _i18nWalk(root){
@@ -42382,16 +42406,17 @@ function _i18nWalk(root){
     });
     var n, batch=[];
     while((n=walker.nextNode())) batch.push(n);
-    batch.forEach(_i18nTranslateTextNode);
+    batch.forEach(_i18nTranslateTextNode); if(Object.keys(_i18nQueue).length) _i18nFlushSoon();
     // translate common attributes
     var els=root.querySelectorAll?root.querySelectorAll('[placeholder],[title]'):[];
     els.forEach(function(el){
       if(el.closest && el.closest('[data-no-i18n]')) return;
       ['placeholder','title'].forEach(function(attr){
         var v=el.getAttribute(attr); if(!v) return;
-        var es=WMAM_ES[_i18nNorm(v)]; if(!es) return;
-        if(!el.getAttribute('data-en-'+attr)) el.setAttribute('data-en-'+attr, v);
-        el.setAttribute(attr, _i18nCase(v.trim(), es));
+        if(el.getAttribute('data-en-'+attr)) return;
+        var es=WMAM_ES[_i18nNorm(v)], out=es ? _i18nCase(v.trim(), es) : _i18nAutoGet(v); if(out==null) return;
+        el.setAttribute('data-en-'+attr, v);
+        el.setAttribute(attr, out);
       });
     });
   }catch(e){}
@@ -42402,7 +42427,7 @@ function _i18nRevert(){
       var walker=document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
       var n, batch=[];
       while((n=walker.nextNode())) batch.push(n);
-      batch.forEach(function(node){ if(_i18nOrigText.has(node)) node.nodeValue=_i18nOrigText.get(node); });
+      batch.forEach(function(node){ if(_i18nOrigText.has(node)){ node.nodeValue=_i18nOrigText.get(node); _i18nOrigText.delete(node); } });
     }
     document.querySelectorAll('[data-en-placeholder],[data-en-title]').forEach(function(el){
       ['placeholder','title'].forEach(function(attr){ var o=el.getAttribute('data-en-'+attr); if(o!==null){ el.setAttribute(attr,o); el.removeAttribute('data-en-'+attr); } });
@@ -42448,13 +42473,13 @@ if(typeof window!=='undefined' && typeof MutationObserver!=='undefined'){
   var _i18nObs=new MutationObserver(function(muts){
     if(WMAM_LANG!=='es' || _i18nBusy) return;
     var added=false;
-    muts.forEach(function(m){ if(m.addedNodes && m.addedNodes.length) added=true; });
+    muts.forEach(function(m){ if(m.addedNodes && m.addedNodes.length) added=true; if(m.type==='characterData' && _i18nOrigText && m.target && _i18nOrigText.has(m.target) && !(_i18nSetVal && _i18nSetVal.get(m.target) === m.target.nodeValue)){ _i18nOrigText.delete(m.target); added=true; } });
     if(!added) return;
     clearTimeout(_i18nTimer);
     _i18nTimer=setTimeout(function(){ wmamApplyLang(); }, 120);
   });
   document.addEventListener('DOMContentLoaded', function(){
-    try{ _i18nObs.observe(document.body, {childList:true, subtree:true}); }catch(e){}
+    try{ _i18nObs.observe(document.body, {childList:true, subtree:true, characterData:true}); }catch(e){}
     setTimeout(_i18nInitForUser, 400);
   });
   window.wmamToggleLang=wmamToggleLang; window.wmamSetLang=wmamSetLang; window.wmamApplyLang=wmamApplyLang;
@@ -111244,6 +111269,165 @@ async function cxAddPicked(){
 }catch(e){ console.warn('[owner control + cards add-on]', e); } })();
 </script>
 <script>
+// ═════════ HOLIDAY LOOKS — a full-site dress-up (back office + website) that rides on top of a theme ═════════
+// A theme whose spec has look:'christmas' dresses the WHOLE site: evergreen top bar, crimson menu, gold-topped cards,
+// cream snowflake background, string lights + garland under the top bar, gentle falling snow and the family greeting.
+// It only adds a stylesheet + a few decorations; turning the theme off removes every bit of it.
+(function(){ try{
+if(window.wmamLook) return;
+var SNOW = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140' viewBox='0 0 140 140'%3E%3Cg fill='none' stroke='%230B3B2C' stroke-opacity='.07' stroke-width='1.4' stroke-linecap='round'%3E%3Cpath d='M30 14v32M14 30h32M19 19l22 22M41 19L19 41M26 14l4 4 4-4M26 46l4-4 4 4M14 26l4 4-4 4M46 26l-4 4 4 4'/%3E%3Cpath d='M104 84v26M91 97h26M95 88l18 18M113 88l-18 18'/%3E%3Ccircle cx='100' cy='30' r='2'/%3E%3Ccircle cx='34' cy='104' r='2'/%3E%3C/g%3E%3C/svg%3E";
+var GARLAND = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='26' viewBox='0 0 96 26'%3E%3Cpath d='M0 6 Q24 24 48 6 T96 6' fill='none' stroke='%23123F2E' stroke-width='9' stroke-linecap='round'/%3E%3Cpath d='M0 6 Q24 24 48 6 T96 6' fill='none' stroke='%231F6B4A' stroke-width='5' stroke-dasharray='2 3' stroke-linecap='round'/%3E%3Cpath d='M0 4 Q24 21 48 4 T96 4' fill='none' stroke='%232E8B5E' stroke-width='2' stroke-dasharray='1 4' stroke-linecap='round'/%3E%3Ccircle cx='24' cy='15' r='2.6' fill='%23D4AF37'/%3E%3Ccircle cx='72' cy='-3' r='0' /%3E%3C/svg%3E";
+var X = 'html[data-wt3-look="christmas"]';
+function css(){ return [
+  "@font-face{font-family:'WMAM Playfair';src:url(/vendor/fonts/playfair-display-latin-700-normal.woff2) format('woff2');font-weight:700;font-display:swap}",
+  X + ' body{--blue:#0B3B2C;--blue2:#0F4D39;--blue3:#072A1F;--navy:#0B3B2C;--navy2:#2E8B5E;--navy3:#072A1F;--orange:#0B3B2C;--orange2:#0F4D39;--grad-fire:linear-gradient(135deg,#0F4D39 0%,#0B3B2C 100%);--grad-hero:linear-gradient(135deg,#06251B 0%,#0B3B2C 60%,#072A1F 100%);--red:#A3122A;--red2:#C8102E;--xm-ever:#0B3B2C;--xm-ever2:#0F4D39;--xm-crim:#A3122A;--xm-gold:#D4AF37;--xm-gold2:#F1D58A;--xm-ivory:#FBF8F1;--offwhite:#FBF8F1;--cream:#FBF8F1;--sand:#EADFC4;--grey-light:#F4EFE2}',
+  // ── lights + garland strip (shared) ──
+  '.xm-lights{position:relative;height:30px;pointer-events:none;overflow:hidden;background:url("' + GARLAND + '") repeat-x 0 2px / 96px 26px}',
+  '.xm-lights i{position:absolute;top:13px;width:9px;height:13px;border-radius:50% 50% 50% 50%/60% 60% 40% 40%;transform:translateX(-50%);animation:xmTw 2.6s ease-in-out infinite}',
+  '.xm-lights i:before{content:"";position:absolute;left:2px;top:-4px;width:5px;height:5px;border-radius:1px;background:#6b7280}',
+  '.xm-lights i.c0{background:#ff3b3b;color:#ff3b3b}.xm-lights i.c1{background:#ffd34d;color:#ffd34d}.xm-lights i.c2{background:#3be37a;color:#3be37a}.xm-lights i.c3{background:#4fb4ff;color:#4fb4ff}.xm-lights i.c4{background:#ffffff;color:#fff6d6}',
+  '@keyframes xmTw{0%,100%{opacity:1;box-shadow:0 0 8px 2px currentColor}50%{opacity:.45;box-shadow:0 0 2px 0 currentColor}}',
+  '.xm-foil{height:3px;background:linear-gradient(90deg,#9C7A1E,#F1D58A 25%,#D4AF37 50%,#F7E3A6 70%,#9C7A1E)}',
+  // ── falling snow (gentle, behind everything clickable) ──
+  '#xmSnow{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:2147480000}',
+  '#xmSnow i{position:absolute;top:-14px;border-radius:50%;background:#fff;box-shadow:0 0 3px rgba(11,59,44,.25);animation:xmFall linear infinite}',
+  '@keyframes xmFall{to{transform:translate3d(var(--dx,30px),105vh,0)}}',
+  '@media (prefers-reduced-motion:reduce){#xmSnow{display:none}.xm-lights i{animation:none}}',
+  // ═════ BACK OFFICE ═════
+  X + ' #backoffice .bo-main,' + X + ' #backoffice #boBody{background:#FBF8F1 url("' + SNOW + '") !important;background-attachment:fixed !important}',
+  X + ' #backoffice > div:first-child{background:#0B3B2C !important;border-bottom:0 !important;box-shadow:0 4px 14px rgba(7,42,31,.25) !important}',
+  X + ' #backoffice .wt3-top:before{display:none !important}',
+  X + ' #backoffice .bo-topbar-row1{background:linear-gradient(90deg,#072A1F,#0B3B2C 45%,#0F4D39) !important;border-bottom:0 !important}',
+  X + ' #backoffice .bo-topbar-row1 *{border-color:rgba(212,175,55,.45)}',
+  X + ' #backoffice .bo-topbar-row1 .bo-uname,' + X + ' #backoffice .bo-topbar-row1 #boUname{color:#fff !important}',
+  X + ' #backoffice .bo-topbar-row1 .bo-urole,' + X + ' #backoffice #boUserRole{color:#F1D58A !important}',
+  X + ' #backoffice #boAva{box-shadow:0 0 0 2px #D4AF37 !important}',
+  X + ' #backoffice .bo-topbar-row2{background:#A3122A !important;border-top:0 !important;border-bottom:0 !important}',
+  X + ' #backoffice .bo-topbar-row2 > button,' + X + ' #backoffice .bo-topbar-row2 > div > button:first-child,' + X + ' #backoffice .bo-topbar-row2 button{color:#FBE4E8 !important}',
+  X + ' #backoffice .bo-topbar-row2 button.active,' + X + ' #backoffice .bo-topbar-row2 button.on,' + X + ' #backoffice .bo-topbar-row2 button:hover{color:#fff !important;box-shadow:inset 0 -3px 0 #D4AF37 !important}',
+  X + ' #backoffice .bo-main > div:first-child{background:#FFFDF8 !important;border-bottom:1px solid #EADFC4 !important}',
+  X + ' #backoffice .bo-topbar-row1 > div:first-child div[style*="Bebas"]{color:#fff !important}',
+  X + ' #backoffice #sideRole,' + X + ' #backoffice #boDateEl{color:#F1D58A !important}',
+  X + ' #backoffice .bo-topbar-row1 > button{background:rgba(255,255,255,.07) !important;border:1px solid rgba(212,175,55,.55) !important;color:#fff !important}',
+  X + ' #backoffice .bo-topbar-row1 > button *{color:#fff !important}',
+  X + ' #backoffice .bo-topbar-row1 > button#bo-paylink-btn{background:#A3122A !important;border-color:#D4AF37 !important}',
+  X + ' #backoffice .bo-topbar-row2 button.bo-nav-active{background:rgba(255,255,255,.14) !important;color:#fff !important;box-shadow:inset 0 -3px 0 #D4AF37 !important}',
+  X + ' #backoffice [style*="background:#05070f" i],' + X + ' #backoffice [style*="background:#0b0f19" i],' + X + ' #backoffice [style*="background:#0b1220" i],' + X + ' #backoffice [style*="background:#0f172a" i],' + X + ' #backoffice [style*="background:#0a0f1e" i]{background:#062519 !important}',
+  X + ' #backoffice [style*="gradient"][style*="#003594" i],' + X + ' #backoffice [style*="gradient"][style*="#1e40af" i],' + X + ' #backoffice [style*="gradient"][style*="#0d1b45" i],' + X + ' #backoffice [style*="gradient"][style*="#0048bf" i]{background:linear-gradient(120deg,#072A1F,#0F4D39 55%,#145A42) !important;box-shadow:inset 0 0 0 1px rgba(212,175,55,.5)}',
+  X + ' #backoffice [style*="repeating-linear-gradient"]{background:repeating-linear-gradient(120deg,transparent 0 34px,rgba(212,175,55,.06) 34px 36px) !important;box-shadow:none}',
+  X + ' .hero-right div[style*="letter-spacing:6px"]{color:#F1D58A !important}',
+  X + ' #backoffice .bo-card{border:1px solid #EADFC4 !important;border-top:4px solid #D4AF37 !important;box-shadow:0 8px 24px rgba(11,59,44,.08) !important;border-radius:14px !important}',
+  X + ' #backoffice .bo-card-head{border-bottom-color:#EADFC4 !important;background:#FFFDF8}',
+  X + ' #backoffice .bo-card-title,' + X + ' #backoffice .bo-pg-title,' + X + ' #backoffice .bs-val{color:#0B3B2C !important}',
+  X + ' #backoffice table thead th{background:#F4EFE2 !important;color:#0B3B2C !important;border-bottom:2px solid #D4AF37 !important}',
+  X + ' #backoffice .btn-fire{background:linear-gradient(135deg,#0F4D39,#0B3B2C) !important;color:#fff !important;box-shadow:0 4px 14px rgba(11,59,44,.3) !important}',
+  X + ' #backoffice .wmam-page-header,' + X + ' #backoffice .ocx-hero{background:linear-gradient(120deg,#072A1F,#0F4D39 55%,#145A42) !important;color:#fff !important;box-shadow:0 12px 30px rgba(11,59,44,.3),inset 0 0 0 1px rgba(212,175,55,.55) !important}',
+  // the app's hard-coded brand blue/red follow the holiday colors
+  X + ' #backoffice [style*="background:#003594" i],' + X + ' #backoffice [style*="background: #003594" i],' + X + ' #backoffice [style*="background:#0048bf" i],' + X + ' #backoffice [style*="background:#002268" i]{background:#0B3B2C !important;color:#fff}',
+  X + ' #backoffice [style*="linear-gradient(135deg,#003594" i],' + X + ' #backoffice [style*="linear-gradient(135deg, #003594" i],' + X + ' #backoffice [style*="linear-gradient(120deg,#003594" i],' + X + ' #backoffice [style*="linear-gradient(135deg,#002268" i],' + X + ' #backoffice [style*="linear-gradient(135deg,#0a4cc2" i]{background:linear-gradient(135deg,#0F4D39,#0B3B2C) !important}',
+  X + ' #backoffice [style*="color:#003594" i],' + X + ' #backoffice [style*="color: #003594" i],' + X + ' #backoffice [style*="color:#0048bf" i],' + X + ' #backoffice [style*="color:var(--blue)" i]{color:#0B3B2C !important}',
+  X + ' #backoffice [style*="border-color:#003594" i],' + X + ' #backoffice [style*="solid #003594" i],' + X + ' #backoffice [style*="solid var(--blue)" i]{border-color:#0F4D39 !important}',
+  X + ' #backoffice [style*="background:#cc0000" i],' + X + ' #backoffice [style*="background:#c00" i]{background:#A3122A !important}',
+  X + ' #backoffice [style*="color:#cc0000" i]{color:#A3122A !important}',
+  X + ' #backoffice .ocx-tile.on,' + X + ' #backoffice .ocx-pill.on{background:#0B3B2C !important;border-color:#D4AF37 !important}',
+  X + ' #wt3Banner{background:#FFFDF8 !important;color:#0B3B2C !important;text-shadow:none !important;border-bottom:1px solid #EADFC4;font:italic 700 1.05rem "WMAM Playfair",Georgia,serif !important;letter-spacing:.3px !important}',
+  X + ' #wt3Banner button{background:#F4EFE2 !important;color:#0B3B2C !important}',
+  X + ' #wt3Banner .xm-st{color:#D4AF37;font-style:normal}',
+  // ═════ WEBSITE ═════
+  X + ' #acaHire{border-bottom:5px solid #D4AF37 !important;background:radial-gradient(circle at 50% 30%,#17664B,#0B3B2C 60%,#06251B) !important}',
+  X + ' #acaHire .rays{opacity:.35}',
+  X + ' #acaHire .go{background:#A3122A !important;border-color:#D4AF37 !important;box-shadow:0 6px 0 #5E0A18 !important}',
+  X + ' #mainNav{border-bottom:3px solid #0B3B2C !important}',
+  X + ' #mainNav .nav-links button.active,' + X + ' #mainNav .nav-links button:not(.nav-cta):hover{color:#A3122A !important}',
+  X + ' #mainNav .nav-links button.active:after{background:#D4AF37 !important}',
+  X + ' #mainNav .nav-cta{color:#A3122A !important}',
+  X + ' #mainNav .nav-burger span{background:#A3122A !important}',
+  X + ' #navLogoImg{border-radius:50%;box-shadow:0 0 0 2px #D4AF37,0 0 14px rgba(212,175,55,.45)}',
+  X + ' #mainNav .xm-lights{position:absolute;left:0;right:0;top:100%;margin-top:3px}',
+  X + ' .xm-ribbon{background:#A3122A;color:#fff;text-align:center;font:600 13px "Barlow Condensed",Arial,sans-serif;letter-spacing:3px;text-transform:uppercase;padding:9px 12px}',
+  X + ' .xm-ribbon b{color:#F1D58A}',
+  X + ' .hero{background:#FBF8F1 url("' + SNOW + '") !important}',
+  X + ' .hero-left{background:transparent !important}',
+  X + ' .hero-right{background:linear-gradient(135deg,#145A42,#0B3B2C 55%,#072A1F) !important}',
+  X + ' .hero-tag{background:#F4EBD3 !important;border-color:#D4AF37 !important;color:#A3122A !important}',
+  X + ' .hero-tag:before{color:#D4AF37 !important}',
+  X + ' .hero-title .fire{color:#A3122A !important}',
+  X + ' .btn-fire{background:linear-gradient(135deg,#0F4D39,#0B3B2C) !important;box-shadow:0 6px 24px rgba(11,59,44,.35) !important}',
+  X + ' .btn-outline{color:#0B3B2C !important;border-color:#D4AF37 !important}',
+  X + ' .hero-right .btn-outline,' + X + ' .about-band .btn-outline{color:#fff !important}',
+  X + ' .hstat-num{color:#A3122A !important}',
+  X + ' .ticker-wrap{background:#A3122A !important}',
+  X + ' .ticker-item span{color:#F1D58A !important}',
+  X + ' .programs-section{background:#fff !important}',
+  X + ' .sec-eyebrow{color:#A3122A !important}',
+  X + ' .sec-eyebrow:before{background:#D4AF37 !important}',
+  X + ' .prog-card{background:#fff !important;border:1px solid #EADFC4 !important;border-top:4px solid #D4AF37 !important;box-shadow:0 8px 24px rgba(11,59,44,.08) !important}',
+  X + ' .prog-card:before{background:linear-gradient(90deg,#A3122A,#D4AF37) !important}',
+  X + ' .prog-icon{background:linear-gradient(135deg,#0F4D39,#0B3B2C) !important}',
+  X + ' .prog-link{color:#A3122A !important}',
+  X + ' .about-band{background:linear-gradient(135deg,#0F4D39 0%,#0B3B2C 60%,#06251B 100%) !important}',
+  X + ' .val-row{border-color:rgba(212,175,55,.45) !important;background:rgba(212,175,55,.07) !important}',
+  X + ' .quote-section{background:radial-gradient(circle at 50% 0,#145A42,#0B3B2C 60%,#06251B) !important}',
+  X + ' .big-q span{color:#D4AF37 !important}',
+  X + ' .xm-wish{display:block;margin-top:18px;font:italic 700 1.4rem "WMAM Playfair",Georgia,serif;color:#F1D58A;position:relative;z-index:1}',
+  X + ' footer{background:#072A1F !important}',
+  X + ' .page-hero-title,' + X + ' .sec-title,' + X + ' .about-title{color:#0B3B2C}',
+  X + ' .about-band .about-title{color:#fff}',
+  X + ' body > .page [style*="color:#003594" i],' + X + ' body > .page [style*="color: #003594" i]{color:#0B3B2C !important}',
+  X + ' body > .page [style*="background:#003594" i],' + X + ' body > .page [style*="gradient"][style*="#003594" i]{background:linear-gradient(135deg,#0F4D39,#0B3B2C) !important}',
+  X + ' .page-hero{background:#FBF8F1 url("' + SNOW + '") !important}',
+  X + ' #wmamLangFloat{background:#0B3B2C !important}',
+  // phones keep everything centered
+  '@media(max-width:900px){' + X + ' body > .page.active > :first-child{margin-top:30px}}',
+  '@media(max-width:700px){' + X + ' #wt3Banner{font-size:.92rem !important;padding:8px 38px !important}' + X + ' .xm-ribbon{font-size:11px;letter-spacing:2px}' + X + ' .xm-wish{font-size:1.15rem}}'
+].join('\n'); }
+
+function lights(host, cls){
+  if(!host) return; var el = host.querySelector(':scope > .xm-lights'); if(!el){ el = document.createElement('div'); el.className = 'xm-lights' + (cls ? ' ' + cls : ''); el.setAttribute('aria-hidden', 'true'); host.appendChild(el); }
+  var w = Math.max(320, host.getBoundingClientRect().width || innerWidth), n = Math.ceil(w / 48), h = '';
+  // bulbs hang at the low points of the garland swag (every 48px)
+  for(var i = 0; i < n; i++) h += '<i class="c' + (i % 5) + '" style="left:' + (24 + i * 48) + 'px;animation-delay:' + ((i * 0.37) % 2.6).toFixed(2) + 's"></i>';
+  if(el._n !== n){ el.innerHTML = h; el._n = n; }
+}
+function snow(on){
+  var s = document.getElementById('xmSnow');
+  if(!on){ if(s) s.remove(); return; }
+  if(s) return; s = document.createElement('div'); s.id = 'xmSnow'; s.setAttribute('aria-hidden', 'true');
+  var n = innerWidth < 700 ? 22 : 40, h = '';
+  for(var i = 0; i < n; i++){ var sz = (2 + Math.random() * 4).toFixed(1), dur = (9 + Math.random() * 10).toFixed(1);
+    h += '<i style="left:' + (Math.random() * 100).toFixed(2) + '%;width:' + sz + 'px;height:' + sz + 'px;opacity:' + (.45 + Math.random() * .45).toFixed(2) + ';--dx:' + Math.round(Math.random() * 80 - 40) + 'px;animation-duration:' + dur + 's;animation-delay:-' + (Math.random() * dur).toFixed(1) + 's"></i>'; }
+  s.innerHTML = h; document.body.appendChild(s);
+}
+var cur = '', _tick = 0;
+function decorate(){
+  if(cur !== 'christmas') return;
+  var top = document.querySelector('#backoffice > div:first-child');
+  if(top){ var f = top.querySelector(':scope > .xm-foil'); if(!f){ f = document.createElement('div'); f.className = 'xm-foil'; top.appendChild(f); } lights(top); }
+  var nav = document.getElementById('mainNav'); if(nav) lights(nav);
+  var bn = document.getElementById('wt3Banner'); if(bn && !bn._xm){ var sp = bn.querySelector('span'); if(sp){ sp.innerHTML = '<span class="xm-st">✦</span> ' + sp.innerHTML + ' <span class="xm-st">✦</span>'; } bn._xm = 1; }
+  document.querySelectorAll('.quote-section').forEach(function(q){ if(!q.querySelector('.xm-wish')){ var w = document.createElement('span'); w.className = 'xm-wish'; w.textContent = 'Merry Christmas & a prosperous New Year'; var sm = q.querySelector('small, .q-attr'); if(sm) q.insertBefore(w, sm); else q.appendChild(w); } });
+  snow(true);
+}
+function undecorate(){
+  document.querySelectorAll('.xm-lights,.xm-foil,.xm-wish,.xm-ribbon').forEach(function(e){ e.remove(); });
+  var bn = document.getElementById('wt3Banner'); if(bn && bn._xm){ bn.querySelectorAll('.xm-st').forEach(function(e){ e.remove(); }); bn._xm = 0; }
+  snow(false);
+}
+window.wmamLook = function(name){
+  name = name === 'christmas' ? 'christmas' : '';
+  if(name === cur){ if(name) decorate(); return; }
+  cur = name; var root = document.documentElement;
+  if(!name){ root.removeAttribute('data-wt3-look'); var st = document.getElementById('xmLookCss'); if(st) st.remove(); undecorate(); clearInterval(_tick); _tick = 0; return; }
+  var st2 = document.getElementById('xmLookCss'); if(!st2){ st2 = document.createElement('style'); st2.id = 'xmLookCss'; document.head.appendChild(st2); } st2.textContent = css();
+  root.setAttribute('data-wt3-look', name); decorate();
+  // keep the decorations in place as screens change (back office / website)
+  clearInterval(_tick); _tick = setInterval(decorate, 1500);
+  addEventListener('resize', function(){ if(cur) decorate(); });
+};
+window.wmamLookName = function(){ return cur; };
+}catch(e){ console.warn('[look]', e); } })();
+</script>
+<script>
 // ═══ 🎨 THEME STUDIO v3 — COMPANY THEMES THAT REALLY WORK (Calvin 2026-10-20) ═══
 // One clean engine replaces the old theme screens (they never saved to the cloud, so nothing ever stuck).
 // • Themes: ready-made (company, holidays, seasons, sports colors) + your own built in the builder.
@@ -111295,7 +111479,7 @@ var PRESETS = [
   T('labor', 'Labor Day', 'holiday', '#1e40af', '#ea580c', { banner:'🛠️ Happy Labor Day — thank you, team!' }),
   T('halloween', 'Halloween', 'holiday', '#ea580c', '#111827', { nav:'dark', pattern:{ type:'diamonds', strength:2 }, effect:'leaves', banner:'🎃 Happy Halloween!', when:['10-24', '10-31'] }),
   T('thanks', 'Thanksgiving', 'holiday', '#9a3412', '#d97706', { pattern:{ type:'leaves', strength:2 }, effect:'leaves', banner:'🦃 Happy Thanksgiving — grateful for every one of you!', page:'#fff7ed' }),
-  T('christmas', 'Christmas', 'holiday', '#166534', '#b91c1c', { pattern:{ type:'snow', strength:2 }, effect:'snow', banner:'🎄 Merry Christmas from WMAMinc!', when:['12-01', '12-26'] }),
+  T('christmas', 'Christmas', 'holiday', '#0B3B2C', '#A3122A', { page:'#FBF8F1', pattern:{ type:'snow', strength:2 }, effect:'none', look:'christmas', banner:'Merry Christmas from the WMAMinc family', when:['12-01', '12-26'] }),
   T('spring', 'Spring', 'season', '#16a34a', '#f472b6', { cards:'soft', pattern:{ type:'dots', strength:1 }, page:'#f0fdf4' }),
   T('summer', 'Summer', 'season', '#0284c7', '#f59e0b', { pattern:{ type:'waves', strength:1 }, page:'#f0f9ff' }),
   T('fall', 'Fall', 'season', '#b45309', '#7c2d12', { pattern:{ type:'leaves', strength:1 }, page:'#fffbeb' }),
@@ -111440,11 +111624,13 @@ function setVars(spec){
   Object.keys(V).forEach(function(k){ b.style.setProperty(k, V[k]); });
   b.setAttribute('data-wt3', '1'); b.setAttribute('data-wt3-nav', spec.nav || 'brand'); b.setAttribute('data-wt3-cards', spec.cards || 'bold');
   var st = document.getElementById('wt3Css'); if(!st){ st = document.createElement('style'); st.id = 'wt3Css'; document.head.appendChild(st); } st.textContent = cssText();
+  try{ if(window.wmamLook) wmamLook(spec.look || ''); }catch(e){}
 }
 function clearVars(){
   var b = document.body; if(!b) return; VARS.forEach(function(k){ b.style.removeProperty(k); });
   b.removeAttribute('data-wt3'); b.removeAttribute('data-wt3-nav'); b.removeAttribute('data-wt3-cards');
   var bn = document.getElementById('wt3Banner'); if(bn) bn.remove();
+  try{ if(window.wmamLook) wmamLook(''); }catch(e){}
 }
 function clearLegacy(){
   try{ if(typeof teClearApplied === 'function') teClearApplied(); }catch(e){}
@@ -111504,6 +111690,7 @@ if(typeof applyPersonalTheme === 'function'){
       var res = u ? resolve(u) : null;
       if(res){ applyTheme(res.theme); return; }
       if(W.applied || (document.body && document.body.hasAttribute('data-wt3'))){ clearVars(); W.applied = ''; }
+      else if(window.wmamLook && !/#look-christmas/.test(location.hash)) wmamLook('');
     }catch(e){ console.warn('[themes] apply', e); }
     return oAP.apply(this, arguments);
   };
@@ -111525,6 +111712,20 @@ var _rt = 0;
 function refresh(){ clearTimeout(_rt); _rt = setTimeout(async function(){ await load(); try{ applyPersonalTheme(); }catch(e){} if(document.getElementById('wt3Studio')) studio(); }, 400); }
 window.wt3Refresh = refresh;
 var _st = setInterval(function(){ if(started){ clearInterval(_st); return; } start(); }, 1500);
+// visitors (not logged in): the public website wears a holiday LOOK only when the owner turned that theme on for everyone today.
+// Plain color themes never change the public website.
+async function visitorLook(){
+  try{
+    if(/#look-christmas/.test(location.hash)){ wmamLook('christmas'); return; }   // preview link for the owner
+    if(typeof supaClient === 'undefined' || (typeof DB !== 'undefined' && DB.current)) return;
+    var r = await supaClient.from('wmam_theme_rules3').select('theme_key,target_type,starts_on,ends_on,repeat_yearly,active').eq('target_type', 'everyone').eq('active', true);
+    if(r.error || (typeof DB !== 'undefined' && DB.current)) return;
+    var d = ctToday(), hit = null;
+    (r.data || []).forEach(function(x){ if(hit || !dateOK(x, d)) return; var t = themeByKey(x.theme_key); if(t && t.spec && t.spec.look) hit = t; });
+    if(hit) wmamLook(hit.spec.look);
+  }catch(e){}
+}
+setTimeout(visitorLook, 2500); addEventListener('hashchange', function(){ if(/#look-christmas/.test(location.hash)) wmamLook('christmas'); });
 
 // ═════════════════ THEME STUDIO (owner) — lives in Owner Control → Look & Feel ═════════════════
 var S = { cat:'all', sel:null, edit:null, tab:'gallery' };
