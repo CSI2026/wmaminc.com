@@ -3929,7 +3929,7 @@ var OWNER_ID = 1; // Calvin Williams — permanently locked
 //  she needs a hard refresh (or a clean reload via the button in
 //  Owner Control).
 // ════════════════════════════════════════════════════════════════════════
-var BUILD_VERSION = '2026.11.26.3499';
+var BUILD_VERSION = '2026.11.26.3500';
 if(typeof window !== 'undefined') window.BUILD_VERSION = BUILD_VERSION;
 
 // Stale-version detection. If Owner clicks "Push Reload to Everyone",
@@ -108088,9 +108088,10 @@ function hostPanel(){ css(); var p = document.getElementById('zHostPanel'), vm =
     + sw('allow_share', '🖥 Everyone can share screen', 'Off = only hosts share', st.allow_share !== false)
     + sw('presenter', '🎤 Presenter mode', 'Only hosts talk, show video and share', !!st.presenter) + '</div>'; }
   h += '<div class="zh-sec" id="zhPeople"></div>';
-  if(full){ h += '<div class="zh-sec"><div class="zh-t">📊 Quick poll</div><input id="zhQ" maxlength="300" placeholder="Question"><textarea id="zhO" rows="3" placeholder="Choices, one per line (2 to 6)"></textarea>'
-      + '<button class="zh-b" id="zhPoll">Start poll</button><div style="font-size:.66rem;color:rgba(255,255,255,.45);margin-top:4px">It shows up in the chat for everyone to vote.</div></div>'
-      + '<div class="zh-sec"><div class="zh-t">🧾 Attendance</div><button class="zh-b" id="zhAtt">Show who came</button><div id="zhAttList" style="margin-top:8px"></div></div>'
+  var newScreen = !!document.querySelector('#jitsiContainer .wcx');
+  if(full && !newScreen){ h += '<div class="zh-sec"><div class="zh-t">📊 Quick poll</div><input id="zhQ" maxlength="300" placeholder="Question"><textarea id="zhO" rows="3" placeholder="Choices, one per line (2 to 6)"></textarea>'
+      + '<button class="zh-b" id="zhPoll">Start poll</button><div style="font-size:.66rem;color:rgba(255,255,255,.45);margin-top:4px">It shows up in the chat for everyone to vote.</div></div>'; }
+  if(full){ h += '<div class="zh-sec"><div class="zh-t">🧾 Attendance</div><button class="zh-b" id="zhAtt">Show who came</button><div id="zhAttList" style="margin-top:8px"></div></div>'
       + '<div class="zh-sec"><button class="zh-b red" id="zhEnd" style="width:100%;padding:10px">⏹ End the call for everyone</button></div>'; }
   h += '</div>';
   p.innerHTML = h;
@@ -108099,7 +108100,7 @@ function hostPanel(){ css(); var p = document.getElementById('zHostPanel'), vm =
   p.querySelector('#zhAskAll').onclick = function(){ send({ t:'ask-unmute' }); toast('Asked everyone to unmute.'); };
   Array.prototype.forEach.call(p.querySelectorAll('.zh-sw'), function(b){ b.onclick = function(){ var k = b.getAttribute('data-k'), cur = k === 'allow_unmute' || k === 'allow_share' ? (st[k] !== false) : !!st[k]; setState(k, !cur); }; });
   people();
-  if(full){ p.querySelector('#zhPoll').onclick = startPoll; p.querySelector('#zhAtt').onclick = attendance; p.querySelector('#zhEnd').onclick = function(){ if(confirm('End the call for everyone?')) endForAll(); }; }
+  if(full){ if(p.querySelector('#zhPoll')) p.querySelector('#zhPoll').onclick = startPoll; p.querySelector('#zhAtt').onclick = attendance; p.querySelector('#zhEnd').onclick = function(){ if(confirm('End the call for everyone?')) endForAll(); }; }
 }
 function people(){ var box = document.getElementById('zhPeople'); if(!box) return; var f = frame(), ps = {}; try{ ps = f ? f.participants() : {}; }catch(e){}
   var full = Z.serverHost;
@@ -108138,11 +108139,25 @@ async function person(a, sid, q){ var f = frame(); if(!f || !q) return; var ag =
     send({ t:'remove' }, sid); if(ownerPowers()) try{ f.updateParticipant(sid, { eject:true }); }catch(e){}
     toast('Removed ' + (q.user_name || '') + '.'); }
   setTimeout(people, 600); }
-async function startPoll(){ var q = (document.getElementById('zhQ').value || '').trim(), o = (document.getElementById('zhO').value || '').split(/\r?\n/).map(function(x){ return x.trim(); }).filter(Boolean);
-  if(!q || o.length < 2 || o.length > 6){ alert('Type a question and 2 to 6 choices, one per line.'); return; }
+// 2026-11-26 v3500: one poll engine for both call screens. Choices can be one per line OR split by commas.
+async function createPoll(q, o){ q = String(q || '').trim(); o = (o || []).map(function(x){ return String(x || '').trim(); }).filter(Boolean);
+  if(!q) throw new Error('Type the question.'); if(o.length < 2) throw new Error('Add at least 2 choices.'); if(o.length > 6) throw new Error('Use 6 choices or fewer.');
+  if(!Z.room) throw new Error('The call is still connecting. Try again in a few seconds.');
   var r = await rpc('wmam_call_poll_create', { p_room:Z.room, p_session:Z.session, p_question:q, p_options:o });
-  if(r && r.error){ alert('Could not start the poll: ' + (r.error.message || r.error)); return; }
-  document.getElementById('zhQ').value = ''; document.getElementById('zhO').value = ''; send({ t:'poll' }); chatReload();
+  if(r && r.error) throw new Error(r.error.message || String(r.error));
+  send({ t:'poll' }); chatReload(); return r && r.data; }
+window.wmamCallPoll = {
+  start:createPoll,
+  list:function(){ return Z.polls || {}; },
+  isHost:function(){ return !!Z.serverHost; },
+  myId:function(){ var u = me(); return u ? +u.id : null; },
+  vote:function(id, i){ return rpc('wmam_call_poll_vote', { p_poll:id, p_choice:i }).then(function(r){ if(r && r.error) throw new Error(r.error.message || String(r.error)); loadPoll(id); }); },
+  close:function(id){ return rpc('wmam_call_poll_close', { p_poll:id }).then(function(){ loadPoll(id); }); }
+};
+async function startPoll(){ var q = (document.getElementById('zhQ').value || '').trim(), raw = (document.getElementById('zhO').value || ''), o = raw.split(/\r?\n/).map(function(x){ return x.trim(); }).filter(Boolean);
+  if(o.length < 2) o = raw.split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+  try{ await createPoll(q, o); }catch(e){ alert(e.message || e); return; }
+  document.getElementById('zhQ').value = ''; document.getElementById('zhO').value = '';
   toast('📊 Poll started. It is in the chat.');
   var c = document.getElementById('mtgChatPanel'); if(c && c.style.display === 'none'){ Z.hostOpen = false; hostPanel(); if(typeof _mtgToggleChat === 'function') _mtgToggleChat(); bar(); } }
 async function attendance(){ var box = document.getElementById('zhAttList'); if(!box) return; box.innerHTML = '<div style="font-size:.78rem;color:rgba(255,255,255,.5)">Loading…</div>';
@@ -108197,7 +108212,7 @@ window._mtgChatRender = _mtgChatRender = function(){ var box = document.getEleme
   box.scrollTop = box.scrollHeight; };
 function loadPoll(id){ var c = sb(); if(!c || !id) return;
   Promise.all([ c.from('wmam_call_polls').select('id,question,options,closed,created_by').eq('id', id).maybeSingle(), c.from('wmam_call_poll_votes').select('agent_id,choice').eq('poll_id', id) ]).then(function(rs){
-    var p = rs[0] && rs[0].data; if(!p) return; Z.polls[id] = { q:p.question, o:p.options || [], closed:p.closed, votes:(rs[1] && rs[1].data) || [] }; _mtgChatRender(); }, function(){}); }
+    var p = rs[0] && rs[0].data; if(!p) return; Z.polls[id] = { id:id, q:p.question, o:p.options || [], closed:p.closed, votes:(rs[1] && rs[1].data) || [] }; _mtgChatRender(); try{ if(window._wcxPollPaint) window._wcxPollPaint(); }catch(e){} }, function(){}); }
 function pollCard(id){ var p = Z.polls[id]; if(!p) return '<div class="zc-poll">📊 Loading poll…</div>'; var u = me(), total = p.votes.length, mine = null;
   p.votes.forEach(function(v){ if(u && +v.agent_id === +u.id) mine = v.choice; });
   var h = '<div class="zc-poll"><div style="font-weight:700;margin-bottom:2px">📊 ' + esc(p.q) + '</div><div style="font-size:.66rem;color:rgba(255,255,255,.6)">' + total + ' vote' + (total === 1 ? '' : 's') + (p.closed ? ' · closed' : mine == null ? ' · tap to vote' : ' · tap to change') + '</div>';
@@ -126783,12 +126798,22 @@ var css = ''
  + '.wcx-ed{position:absolute;inset:0;z-index:9;background:rgba(3,8,22,.7);display:grid;place-items:center;padding:16px}'
  + '.wcx-ed>div{background:#fff;color:#0B1B3F;border-radius:16px;padding:18px;width:min(520px,100%);display:flex;flex-direction:column;gap:10px;text-align:center}'
  + '.wcx-ed textarea{width:100%;min-height:86px;border:1px solid #C7D2E6;border-radius:10px;padding:10px;font:500 15px Barlow,Arial,sans-serif;box-sizing:border-box}'
+ + '.wcx-ed input{width:100%;height:44px;border:1px solid #C7D2E6;border-radius:10px;padding:0 12px;font:500 15px Barlow,Arial,sans-serif;box-sizing:border-box}.wcx-pos{display:flex;flex-direction:column;gap:8px}'
+ + '.wcx-ed .wcx-padd{background:none;border:1px dashed #9FB0D0;color:#003594;height:38px}.wcx-ed .row{flex-wrap:wrap}'
+ + '.wcx-poll{position:absolute;top:12px;right:12px;z-index:6;width:min(340px,calc(100% - 24px));background:rgba(6,16,38,.94);border:1px solid rgba(227,174,74,.55);border-radius:16px;padding:12px;color:#fff;box-shadow:0 12px 34px rgba(0,0,0,.45);font:500 14px Barlow,Arial,sans-serif;text-align:left;max-height:calc(100% - 24px);overflow:auto}'
+ + '.wcx-poll .hd{display:flex;align-items:center;justify-content:space-between;width:100%;text-align:left}.wcx-poll .hd b{font:800 11px Inter,Arial,sans-serif;letter-spacing:.14em;color:var(--gold)}.wcx-poll .hd button{background:none;border:0;color:#C9D5EE;font-size:16px;cursor:pointer;width:32px;height:32px}'
+ + '.wcx-poll .q{font:700 16px Inter,Arial,sans-serif;margin:2px 0 10px}'
+ + '.wcx-poll .op{position:relative;display:flex;align-items:center;gap:8px;width:100%;min-height:44px;margin-bottom:6px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font:600 14px Inter,Arial,sans-serif;padding:0 12px;cursor:pointer;overflow:hidden;text-align:left}'
+ + '.wcx-poll .op i{position:absolute;left:0;top:0;bottom:0;background:rgba(10,76,194,.55);transition:width .4s}.wcx-poll .op span,.wcx-poll .op em{position:relative}.wcx-poll .op span{flex:1}.wcx-poll .op em{font-style:normal;color:#C9D5EE}'
+ + '.wcx-poll .op.mine{border-color:var(--gold)}.wcx-poll .op.mine i{background:rgba(227,174,74,.45)}.wcx-poll .op:disabled{cursor:default}'
+ + '.wcx-poll .ft{font-size:12px;color:#9FB0D0;margin-top:2px}.wcx-poll .cl{margin-top:8px;height:36px;padding:0 14px;border-radius:10px;border:1px solid rgba(255,255,255,.3);background:none;color:#fff;font:700 13px Inter,Arial,sans-serif;cursor:pointer}'
+ + '@media(max-width:700px){.wcx-poll{left:50%;right:auto;transform:translateX(-50%);top:8px}}'
  + '.wcx-ed .row{display:flex;gap:8px;justify-content:center}.wcx-ed button{height:42px;padding:0 16px;border-radius:10px;border:0;font:700 14px Inter,Arial,sans-serif;cursor:pointer}'
  + '#videoCallModal.vc-min .wcx-aud,#videoCallModal.vc-min .wcx-dock,#videoCallModal.vc-min .wcx-tw,#videoCallModal.vc-min .wcx-pip{display:none!important}#videoCallModal.vc-min .wcx-stage{padding:6px}'
  + '@media(prefers-reduced-motion:reduce){.wcx-tw span{animation:none;padding-left:0}}'
  + '@media(max-width:700px){.wcx-stage{padding:8px 8px 0}.wcx-tiles{grid-template-columns:1fr!important;grid-auto-rows:minmax(0,1fr)}.wcx-pip{width:96px;right:14px;bottom:56px}'
  +   '.wcx-tw{height:34px}.wcx-tw b{font-size:16px;padding:0 10px}.wcx-tw span{font-size:13px}.wcx-aud{padding:8px 10px;gap:6px 8px;justify-content:center;flex-wrap:wrap}.wcx-aud .t{width:100%;text-align:center}.wcx-faces{flex:none;justify-content:center;max-width:100%}.wcx-face{width:30px;height:30px}'
- +   '.wcx-dock{gap:6px;padding:8px 6px calc(8px + env(safe-area-inset-bottom,0px))}.wcx-dock button{min-width:0;flex:1 1 0;height:54px;font-size:11px;padding:0 4px}.wcx-dock .sep,.wcx-dock .hl,.wcx-dock .dsk{display:none}}';
+ +   '.wcx-dock{gap:6px;padding:8px 6px calc(8px + env(safe-area-inset-bottom,0px))}.wcx-dock button{min-width:0;flex:0 0 calc(25% - 6px);height:54px;font-size:11px;padding:0 4px}.wcx-dock .sep,.wcx-dock .hl,.wcx-dock .dsk{display:none}}';
 function addCss(){ if(document.getElementById('wcxCss')) return; var st = document.createElement('style'); st.id = 'wcxCss'; st.textContent = css; (document.head || document.documentElement).appendChild(st); }
 
 function agents(){ return (typeof DB !== 'undefined' && DB.agents) || []; }
@@ -126821,7 +126846,7 @@ window.wmamCallUI = function(container, o){
     + '<figure class="wcx-pip" id="wcxPip" aria-label="Your camera"></figure><div class="wcx-tw" id="wcxTw" hidden><b>THIS WEEK</b><div><span id="wcxTwText"></span></div></div></div>'
     + '<div class="wcx-aud"><span class="t" id="wcxCount"></span><div class="wcx-faces" id="wcxFaces"></div><span class="t" id="wcxHands"></span></div>'
     + '<div class="wcx-dock" id="wcxDock" role="toolbar" aria-label="Call controls"></div><div id="wcxAudio" hidden></div></div>';
-  var $ = function(id){ return document.getElementById(id); };
+  var $ = function(id){ return container.querySelector('#' + id) || document.getElementById(id); };   // this call's own screen first (never an old one)
   var V = { speaker:null, hands:{}, myHand:false, tiles:{}, audio:{}, rec:false, joined:false, hostNow:H };
   function ps(){ try{ return f.participants() || {}; }catch(e){ return {}; } }
   function videoEl(track, mirror){ var v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = true; v.setAttribute('playsinline', ''); v.srcObject = new MediaStream([track]); if(mirror) v.style.transform = 'scaleX(-1)'; var pr = v.play && v.play(); if(pr && pr.catch) pr.catch(function(){}); return v; }
@@ -126893,7 +126918,7 @@ window.wmamCallUI = function(container, o){
     var h = btn('wcxMic', mic ? '🎙' : '🔇', mic ? 'Mute' : 'Unmute', mic ? '' : 'off') + btn('wcxCam', cam ? '📷' : '🚫', cam ? 'Camera off' : 'Camera on', cam ? '' : 'off')
       + (hs ? '' : btn('wcxHand', '✋', V.myHand ? 'Lower hand' : 'Raise hand', V.myHand ? 'up' : '')) + chatBtn()
       + (window.innerWidth > 700 ? btn('wcxShare', '🖥', sharing ? 'Stop sharing' : 'Share screen', (sharing ? 'up ' : '') + 'dsk') : '');
-    if(hs) h += '<span class="sep" aria-hidden="true"></span><span class="hl">HOST</span>' + btn('wcxMuteAll', '🔇', 'Mute all', 'hb') + btn('wcxTools', '🛡', 'Host tools', 'hb')
+    if(hs) h += '<span class="sep" aria-hidden="true"></span><span class="hl">HOST</span>' + btn('wcxMuteAll', '🔇', 'Mute all', 'hb') + btn('wcxTools', '🛡', 'Host tools', 'hb') + btn('wcxPollB', '📊', 'Poll', 'hb')
       + (typeof f.startRecording === 'function' ? btn('wcxRec', '⏺', V.rec ? 'Stop recording' : 'Record', 'hb' + (V.rec ? ' rec' : '')) : '')
       + (isCalvin() ? btn('wcxTw2', '✏️', 'THIS WEEK', 'hb') : '');
     if(h === lastDock) return; lastDock = h; d.innerHTML = h; }
@@ -126910,18 +126935,64 @@ window.wmamCallUI = function(container, o){
       else if(b.id === 'wcxTools'){ var hb = document.getElementById('zHostBtn'); if(hb) hb.click(); else toast('Host tools are loading…'); }
       else if(b.id === 'wcxRec'){ if(V.rec) f.stopRecording(); else f.startRecording(); }
       else if(b.id === 'wcxTw2') editTW();
+      else if(b.id === 'wcxPollB') editPoll();
     }catch(err){ toast('That didn’t work: ' + (err && err.message || err)); } });
   // THIS WEEK (only inside the call)
-  var TW = { text:'', on:false };
-  function paintTW(){ var w = $('wcxTw'), s = $('wcxTwText'); if(!w || !s) return; var t = String(TW.text || '').trim(); w.hidden = !(TW.on !== false && t);
+  var TW = { text:'', on:true }, AUTO = '';
+  // what the banner shows: what Calvin typed; if nothing is typed, the contest that is running right now (ACA Fast Start) — so it is never blank by accident
+  function twText(){ var t = String(TW.text || '').trim(); if(t) return TW.on === false ? '' : t; return TW.off ? '' : AUTO; }
+  function paintTW(){ var w = $('wcxTw'), s = $('wcxTwText'); if(!w || !s) return; var t = twText(); w.hidden = !t;
     var line = esc(t) + '&nbsp;&nbsp;&nbsp;·&nbsp;&nbsp;&nbsp;'; s.innerHTML = line + line; }
-  function loadTW(){ try{ supaClient.from('app_settings').select('value').eq('key', 'call_this_week').maybeSingle().then(function(r){ var v = r && r.data && r.data.value; if(typeof v === 'string'){ try{ v = JSON.parse(v); }catch(e){ v = { text:v }; } } if(v){ TW = v; paintTW(); } }); }catch(e){} }
-  function editTW(){ var box = document.createElement('div'); box.className = 'wcx-ed'; box.innerHTML = '<div><b style="font:400 24px Bebas Neue,Impact,sans-serif;letter-spacing:.06em;color:#003594">THIS WEEK BANNER</b><span style="font-size:13px;color:#5B6782">Shows across the bottom of the call for everyone. Leave it empty to hide it.</span><textarea id="wcxTwIn" maxlength="300"></textarea><div class="row"><button type="button" id="wcxTwCancel" style="background:#EEF2FA;color:#003594">Cancel</button><button type="button" id="wcxTwSave" style="background:#16A34A;color:#fff">Show it</button></div></div>';
-    container.querySelector('.wcx').appendChild(box); var ta = $('wcxTwIn'); ta.value = TW.text || ''; ta.focus();
-    $('wcxTwCancel').onclick = function(){ box.remove(); };
-    $('wcxTwSave').onclick = function(){ var v = { text:String(ta.value || '').trim().slice(0, 300), on:true, at:new Date().toISOString() }; TW = v; paintTW(); box.remove();
-      try{ saveAppSettingToSupabase('call_this_week', v).then(function(r){ if(r && r.ok === false) toast('Not saved: ' + (r.error || 'try again')); }); }catch(e){}
-      try{ f.sendAppMessage({ wcxTW:1, v:v }, '*'); }catch(e){} toast('THIS WEEK is showing for everyone.'); }; }
+  function loadAuto(){ try{ supaClient.rpc('wmam_call_banner_auto').then(function(r){ var d = r && !r.error && r.data;
+      if(d && d.on && d.kind === 'aca_faststart'){ var end = new Date(String(d.end) + 'T12:00:00').toLocaleDateString('en-US', { weekday:'short', month:'short', day:'numeric' });
+        AUTO = 'ACA FAST START BONUS · First ' + (d.goal || 40) + ' qualified ACA sales wins $' + Math.round((d.prize_cents || 15000) / 100) + ' · Ends ' + end + ' at midnight'; }
+      else AUTO = ''; paintTW(); }, function(){}); }catch(e){} }
+  function loadTW(){ loadAuto(); try{ supaClient.from('app_settings').select('value').eq('key', 'call_this_week').maybeSingle().then(function(r){ var v = r && r.data && r.data.value; if(typeof v === 'string'){ try{ v = JSON.parse(v); }catch(e){ v = { text:v }; } } if(v){ TW = v; paintTW(); } }); }catch(e){} }
+  function editTW(){ var old = container.querySelector('.wcx-ed'); if(old) old.remove();   // only one editor at a time
+    var box = document.createElement('div'); box.className = 'wcx-ed'; box.innerHTML = '<div><b style="font:400 24px Bebas Neue,Impact,sans-serif;letter-spacing:.06em;color:#003594">THIS WEEK BANNER</b><span style="font-size:13px;color:#5B6782">Shows across the bottom of the call for everyone.' + (AUTO ? ' Leave it empty to show the ACA Fast Start banner.' : '') + '</span><textarea maxlength="300" data-k="in"></textarea>'
+      + '<div class="row"><button type="button" data-k="cancel" style="background:#EEF2FA;color:#003594">Cancel</button><button type="button" data-k="hide" style="background:#FDECEC;color:#B42318">Hide banner</button><button type="button" data-k="save" style="background:#16A34A;color:#fff">Show it</button></div><span data-k="msg" style="font-size:13px;color:#B42318"></span></div>';
+    container.querySelector('.wcx').appendChild(box); var q = function(k){ return box.querySelector('[data-k="' + k + '"]'); }; var ta = q('in'); ta.value = TW.text || ''; ta.focus();
+    function put(v, said){ TW = v; paintTW(); box.remove(); toast(said);
+      try{ f.sendAppMessage({ wcxTW:1, v:v }, '*'); }catch(e){}
+      try{ Promise.resolve(saveAppSettingToSupabase('call_this_week', v)).then(function(r){ if(r && r.ok === false) toast('Not saved: ' + (r.error || 'try again')); }, function(e){ toast('Not saved: ' + (e && e.message || 'try again')); }); }catch(e){ toast('Not saved: ' + e.message); } }
+    box.addEventListener('click', function(e){ var b = e.target.closest('button'); if(!b) return; e.stopPropagation(); var k = b.getAttribute('data-k');
+      if(k === 'cancel') box.remove();
+      else if(k === 'hide') put({ text:'', on:false, off:true, at:new Date().toISOString() }, 'The banner is hidden.');
+      else if(k === 'save'){ var t = String(ta.value || '').trim().slice(0, 300); if(!t && !AUTO){ q('msg').textContent = 'Type what the banner should say.'; return; }
+        put({ text:t, on:true, at:new Date().toISOString() }, 'THIS WEEK is showing for everyone.'); } }); }
+  // ── POLLS on the call: hosts start one from the 📊 Poll button; everyone votes right on the call screen ──
+  var PH = {};   // polls I closed the card for
+  function editPoll(){ var P = window.wmamCallPoll; if(!P){ toast('Polls are still loading…'); return; }
+    var old = container.querySelector('.wcx-ed'); if(old) old.remove();
+    var box = document.createElement('div'); box.className = 'wcx-ed'; var opt = function(n){ return '<input class="wcx-po" maxlength="80" placeholder="Choice ' + n + '">'; };
+    box.innerHTML = '<div><b style="font:400 24px Bebas Neue,Impact,sans-serif;letter-spacing:.06em;color:#003594">📊 START A POLL</b><span style="font-size:13px;color:#5B6782">Everyone on the call sees it and votes right on their screen.</span>'
+      + '<input data-k="q" class="wcx-pq" maxlength="300" placeholder="Your question"><div data-k="opts" class="wcx-pos">' + opt(1) + opt(2) + '</div>'
+      + '<button type="button" data-k="add" class="wcx-padd">+ Add a choice</button>'
+      + '<div class="row"><button type="button" data-k="cancel" style="background:#EEF2FA;color:#003594">Cancel</button><button type="button" data-k="go" style="background:#16A34A;color:#fff">Start poll</button></div><span data-k="msg" style="font-size:13px;color:#B42318"></span></div>';
+    container.querySelector('.wcx').appendChild(box); var q = function(k){ return box.querySelector('[data-k="' + k + '"]'); }; q('q').focus(); box.addEventListener('input', function(){ q('msg').textContent = ''; });
+    box.addEventListener('click', async function(e){ var b = e.target.closest('button'); if(!b) return; e.stopPropagation(); var k = b.getAttribute('data-k');
+      if(k === 'cancel') box.remove();
+      else if(k === 'add'){ var os = q('opts'); if(os.children.length >= 6){ q('msg').textContent = '6 choices is the most.'; return; } os.insertAdjacentHTML('beforeend', opt(os.children.length + 1)); os.lastChild.focus(); if(os.children.length >= 6) b.hidden = true; }
+      else if(k === 'go'){ var qs = q('q').value, os2 = Array.prototype.map.call(box.querySelectorAll('.wcx-po'), function(i){ return i.value; });
+        b.disabled = true; b.textContent = 'Starting…'; q('msg').textContent = '';
+        try{ await P.start(qs, os2); box.remove(); PH = {}; toast('📊 Poll started — everyone can vote now.'); }
+        catch(err){ b.disabled = false; b.textContent = 'Start poll'; q('msg').textContent = err.message || String(err); } } }); }
+  function pollPaint(){ var st = container.querySelector('.wcx-stage'); if(!st) return; var P = window.wmamCallPoll; var all = P ? P.list() : {};
+    var ids = Object.keys(all).map(Number).filter(function(id){ return !PH[id]; }).sort(function(a, b){ return b - a; }), id = ids[0], card = $('wcxPoll');
+    if(!id){ if(card) card.remove(); return; }
+    var p = all[id], me = P.myId(), total = p.votes.length, mine = null; p.votes.forEach(function(v){ if(+v.agent_id === me) mine = +v.choice; });
+    var h = '<div class="hd"><b>📊 POLL' + (p.closed ? ' · FINAL' : '') + '</b><button type="button" data-x="' + id + '" title="Hide">✕</button></div><div class="q">' + esc(p.q) + '</div>';
+    p.o.forEach(function(o, i){ var n = p.votes.filter(function(v){ return +v.choice === i; }).length, pct = total ? Math.round(n * 100 / total) : 0;
+      h += '<button type="button" class="op' + (mine === i ? ' mine' : '') + '" data-v="' + id + ':' + i + '"' + (p.closed ? ' disabled' : '') + '><i style="width:' + pct + '%"></i><span>' + (mine === i ? '✔ ' : '') + esc(o) + '</span><em>' + pct + '%</em></button>'; });
+    h += '<div class="ft">' + total + ' vote' + (total === 1 ? '' : 's') + (p.closed ? ' · poll closed' : mine == null ? ' · tap a choice to vote' : ' · tap to change your vote') + '</div>';
+    if(P.isHost() && !p.closed) h += '<button type="button" class="cl" data-c="' + id + '">Close poll</button>';
+    if(!card){ card = document.createElement('div'); card.id = 'wcxPoll'; card.className = 'wcx-poll'; st.appendChild(card);
+      card.addEventListener('click', function(e){ var b = e.target.closest('button'); if(!b) return; e.stopPropagation();
+        if(b.dataset.x){ PH[+b.dataset.x] = 1; pollPaint(); }
+        else if(b.dataset.v){ var a = b.dataset.v.split(':'); P.vote(+a[0], +a[1]).catch(function(err){ toast(err.message || 'Vote not saved'); }); }
+        else if(b.dataset.c){ b.disabled = true; P.close(+b.dataset.c); } }); }
+    card.innerHTML = h; }
+  window._wcxPollPaint = pollPaint;
   // events
   var rq = null; function soon(){ if(rq) return; rq = setTimeout(function(){ rq = null; try{ render(); }catch(e){ console.warn('[call screen]', e); } }, 60); }
   ['participant-joined', 'participant-updated', 'participant-left', 'track-started', 'track-stopped', 'participant-counts-updated'].forEach(function(ev){ try{ f.on(ev, soon); }catch(e){} });
