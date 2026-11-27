@@ -61,7 +61,7 @@ button{font-family:inherit}
 .comp{padding:8px 12px calc(10px + env(safe-area-inset-bottom));background:var(--bg)}.box{background:#fff;border:1px solid #dedad4;border-radius:22px;padding:10px 10px 8px 14px;box-shadow:0 2px 10px rgba(0,0,0,.04)}
 .box textarea{display:block;width:100%;border:0;outline:0;resize:none;font-size:16px;line-height:1.45;max-height:160px;background:transparent;color:var(--ink);font-family:inherit;padding:2px 0}
 .row{display:flex;align-items:center;gap:6px;margin-top:6px}
-.send{width:38px;height:38px;border-radius:50%;border:0;background:var(--ink);color:#fff;font-size:18px;font-weight:700;cursor:pointer}.send:disabled{opacity:.35}
+.send{width:38px;height:38px;border-radius:50%;border:0;background:var(--ink);color:#fff;font-size:18px;font-weight:700;cursor:pointer}.send:disabled{opacity:.35}.send.stop{background:transparent;color:var(--ink);border:2px solid var(--ink);margin-right:8px}
 .talkb{width:50px;height:50px;border-radius:50%;border:0;background:var(--blue);color:#fff;font-size:22px;cursor:pointer;box-shadow:0 4px 14px rgba(0,53,148,.35)}.talkb.on{background:var(--red);box-shadow:0 4px 14px rgba(204,0,0,.35)}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}.chip{background:#eef2ff;border-radius:999px;padding:4px 10px;font-size:13px}.chip button{border:0;background:none;cursor:pointer}
 .err{background:#fee2e2;color:#7f1d1d;border-radius:10px;padding:8px 10px;margin-bottom:6px;font-size:13px}
@@ -170,7 +170,7 @@ async function loadMsgs(){
   var lids = []; S.msgs.forEach(function(m){ var x = String(m.content || '').match(/^🔐 \[login #(\d+)/); if(x) lids.push(Number(x[1])); });
   if(lids.length){ var lw = await supaClient.from('wmam_ai_login_waits').select('id,status,site,need').in('id', lids); ((lw && lw.data) || []).forEach(function(x){ S.lw[x.id] = x; }); }
   var last = S.msgs[S.msgs.length - 1];
-  S.waiting = !!(last && last.role === 'user');
+  S.waiting = !!(last && last.role === 'user') && !(S.stoppedAt && Date.now() - S.stoppedAt < 180000);   // v3520: after Stop she is not 'working' just because your message is last
   if(!S.waiting){ var q = await supaClient.from('wmam_ai_tasks').select('id').eq('thread_id', S.thread).in('status', ['queued', 'running']).limit(1); if(q && q.data && q.data.length) S.waiting = true; }
   if(S.waiting) startPoll(); else stopPoll();
 }
@@ -178,7 +178,7 @@ async function loadFiles(ids){
   var r = await supaClient.from('wmam_ai_files').select('id,path,name,mime').in('id', ids);
   for(var f of ((r && r.data) || [])){ var u = await supaClient.storage.from('ai-files').createSignedUrl(f.path, 6 * 3600); S.files[f.id] = { name:f.name, mime:f.mime || '', url:u && u.data && u.data.signedUrl }; }
 }
-function startPoll(){ if(S.poll) return; var n = 0; S.poll = setInterval(async function(){ n++; if(n > 400){ stopPoll(); return; } if(S.stream) return; var before = S.msgs.length + ':' + S.waiting; await loadMsgs(); if(before !== S.msgs.length + ':' + S.waiting) render(); }, 2500); }
+function startPoll(){ if(S.poll) return; var n = 0; S.poll = setInterval(async function(){ n++; if(n > 48 && n % 4){ return; } if(S.stream) return; var before = S.msgs.length + ':' + S.waiting; await loadMsgs(); if(before !== S.msgs.length + ':' + S.waiting) render(); }, 2500); }
 function stopPoll(){ clearInterval(S.poll); S.poll = null; }
 async function openThread(id){ S.thread = id; S.side = false; S.msgs = []; render(); await loadMsgs(); render(); }
 function newChat(){ S.thread = null; S.msgs = []; S.side = false; S.waiting = false; stopPoll(); render(); focusBox(); }
@@ -213,12 +213,15 @@ async function chat(text, opts){
         else if(d.type === 'status'){ S.stream.status = d.text; paintStream(); }
         else if(d.type === 'job'){ jobs = true; }
         else if(d.type === 'error'){ throw new Error(d.error); } } }
-  }catch(e){ if(e.name !== 'AbortError') S.err = 'Not sent: ' + (e.message || e); }
+  }catch(e){ if(e.name !== 'AbortError') S.err = 'Not sent: ' + (e.message || e); else { S.stoppedAt = Date.now(); S.kept = (S.stream && S.stream.text) ? { thread:S.thread, text:S.stream.text + '\n\n■ Stopped' } : null; } }
   S.abort = null; S.stream = null; S.sending = false;
+  if(S.stoppedAt && Date.now() - S.stoppedAt < 2000) await new Promise(function(r){ setTimeout(r, 1200); });   // give the server a moment to save the stopped answer
   if(jobs) nudge(); await loadMsgs(); await loadThreads(); if(jobs){ S.waiting = true; startPoll(); } render();
+  if(S.queue && S.queue.length){ var nx = S.queue.shift(); send(nx); }
 }
 async function send(textIn){
-  if(S.sending) return; var box = $('box'); var text = String(textIn != null ? textIn : (box ? box.value : '')).trim();
+  var box = $('box');
+  if(S.sending){ var qt = String(textIn != null ? textIn : (box ? box.value : '')).trim(); if(!qt) return; S.queue = (S.queue || []).concat([qt]); if(box && textIn == null){ box.value = ''; grow(box); } toast('Sending right after this answer'); render(); return; } var text = String(textIn != null ? textIn : (box ? box.value : '')).trim();
   if(S.attach.some(function(a){ return a.busy; })){ S.err = 'Still uploading your file…'; render(); return; }
   var files = S.attach.filter(function(a){ return a.fileId; });
   if(!text && files.length) text = 'Please look at this.';
@@ -230,7 +233,8 @@ async function send(textIn){
 }
 function regen(){ var u = S.msgs.filter(function(m){ return m.role === 'user'; }).slice(-1)[0]; if(!u || S.sending) return; chat(u.content, { regenerate:true }); }
 function editMsg(i){ var m = S.msgs[i]; if(!m) return; var b = $('box'); if(!b) return; b.value = clean(m.content).replace(/\n?\[file #\d+[^\]]*\]/g, '').trim(); grow(b); b.focus(); toast('Edit it and send'); }
-function stopAll(){ if(S.abort){ try{ S.abort.abort(); }catch(e){} return; } stopJob(); }
+// v3520 (Calvin 2026-11-27 "the stop button's not working"): Stop ends the answer being written (the server stops too) AND every job in this chat
+function stopAll(){ if(S.abort){ try{ S.abort.abort(); }catch(e){} } stopJob(); }
 // v3496 (Calvin 2026-11-26 "she constantly asked for permission to my mic … if my phone dims she stops"):
 // one microphone for the whole visit (calls and typing-by-voice share it, kept 2 minutes after you finish so the phone does not ask
 // again right away), the screen stays awake while she listens or works, and a call cut off by the phone locking reconnects by itself.
@@ -288,10 +292,10 @@ function deleteChat(id){ S.gone.t[id] = 1; if(S.thread === id) newChat(); else r
 function deleteMsg(i){ var m = S.msgs[i]; if(!m || !(m.id > 0)) return; var id = m.id; S.gone.m[id] = 1; render();
   undoBar('Message deleted', function(){ delete S.gone.m[id]; render(); }, async function(){ var r = await supaClient.rpc('wmam_ai_message_delete', { p_id:id }); delete S.gone.m[id];
     if(r.error){ toast(r.error.message); } else { S.msgs = S.msgs.filter(function(x){ return x.id !== id; }); } render(); }); }
-async function stopJob(){ try{ var q = await supaClient.from('wmam_ai_tasks').select('id').eq('thread_id', S.thread).in('status', ['queued', 'running']); var ids = ((q && q.data) || []).map(function(x){ return x.id; });
-  for(var i of ids) await supaClient.rpc('wmam_ai_cancel', { p_task:i }).catch(function(){}); }catch(e){} toast('Stopping…'); }
+async function stopJob(){ if(!S.thread){ return; } try{ var q = await supaClient.from('wmam_ai_tasks').select('id').eq('thread_id', S.thread).in('status', ['queued', 'running', 'needs_approval']); var ids = ((q && q.data) || []).map(function(x){ return x.id; }); var n = 0;
+  for(var i of ids){ var r = await supaClient.rpc('wmam_ai_task_stop', { p_task:i }); if(!r.error) n++; } if(n || S.abort === null){ toast('■ Stopped'); } }catch(e){ toast('Could not stop: ' + (e.message || e)); } S.waiting = false; stopPoll(); setTimeout(function(){ loadMsgs().then(render); }, 1500); render(); }
 async function decide(apId, yes){ var r = await supaClient.rpc('wmam_ai_decide', { p_approval:apId, p_approve:!!yes }); if(r.error){ S.err = r.error.message; } else { S.appr[apId] = yes ? 'approved' : 'rejected'; nudge(); startPoll(); } render(); }
-async function idea(sid, yes){ try{ await supaClient.rpc('wmam_ai_suggestion_decide', { p_id:sid, p_yes:!!yes }); S.sugg[sid] = yes ? 'accepted' : 'declined'; }catch(e){} render(); }
+async function idea(sid, yes){ var r = await supaClient.rpc('wmam_ai_suggestion_decide', { p_suggestion:sid, p_accept:!!yes, p_note:null }); if(r.error){ S.err = r.error.message; } else { S.sugg[sid] = yes ? 'accepted' : 'declined'; if(yes){ nudge(); S.waiting = true; startPoll(); } } render(); }
 async function loginSend(wid){
   var g = function(k){ var el = $(k + wid); return el ? el.value : ''; };
   var L = S.lw[wid] || {}, rem = $('lgRem' + wid);
@@ -427,14 +431,16 @@ function render(){
   var box = $('box'), keep = box ? box.value : '', focused = box && document.activeElement === box;
   var sqF = document.activeElement && document.activeElement.id === 'sq', sqPos = sqF ? document.activeElement.selectionStart : 0, lsT = $('dl0') ? $('dl0').scrollTop : 0;
   var cur = S.threads.filter(function(t){ return t.id === S.thread; })[0];
-  var V = S.voice;
+  var V = S.voice; var ol = $('list'), wasNear = !ol || (ol.scrollHeight - ol.scrollTop - ol.clientHeight < 220), oldTop = ol ? ol.scrollTop : 0, oldCount = S._shown || 0; S._shown = S.msgs.length + (S.stream ? 1 : 0);
   var h = '<div class="top"><button type="button" class="ib menu" aria-label="Conversations" onclick="S.side=true;render()">☰</button>'
     + '<div class="title"><b>kalvina</b><span>' + esc(S.thread ? ((cur && cur.title) ? clean(cur.title) : 'Conversation') : 'New conversation') + '</span></div>'
     + '<button type="button" class="ib" aria-label="New conversation" title="New conversation" onclick="newChat()">✎</button>'
     + '<button type="button" class="ib" aria-label="Control panel" title="Control panel" onclick="cloneOpen()">🎛️</button></div>';
   if(V){ var st = V.status || 'Connecting…'; h += '<div class="live"><div class="orb' + (/Talking/.test(st) ? ' talk' : /Working/.test(st) ? ' work' : V.muted ? ' mute' : '') + '"></div><div class="ls">' + esc(st) + '</div><div class="lb"><button type="button" class="pill" onclick="toggleMute()">' + (V.muted ? '🎙 Unmute' : '🔇 Mute') + '</button><button type="button" class="pill end" onclick="endVoice()">End</button></div></div>'; }
   var body = S.msgs.map(function(m, i){ return S.gone.m[m.id] ? '' : msgHtml(m, i); }).join('');
+  if(S.kept && S.kept.thread === S.thread && !S.msgs.some(function(m){ return m.role === 'assistant' && /■ Stopped\s*$/.test(String(m.content || '')); })) body += '<div class="msg a"><div class="b">' + mdCards(S.kept.text) + '</div></div>';
   if(S.stream) body += '<div class="msg a"><div class="b" id="streamB"></div></div>';
+  if(S.queue && S.queue.length) body += S.queue.map(function(q){ return '<div class="msg u"><div><div class="b" style="opacity:.6">' + esc(q) + '</div><div class="acts"><span style="font-size:12px;color:var(--mut)">⏳ sends right after this answer</span></div></div></div>'; }).join('');
   else if(S.waiting) body += '<div class="working"><span class="dots"><i></i><i></i><i></i></span> kalvina is working on it…</div>';
   if(!S.msgs.length && !S.waiting && !S.stream) body = '<div class="hello"><h1>What are we doing, Calvin?</h1><p>Tap the mic and just talk — walking, driving, wherever. Or type below.<br>Anything: your businesses, your life, research, plans, writing, bills, trainings.</p></div>';
   h += '<div class="list" id="list"><div class="col">' + body + '</div></div>';
@@ -445,7 +451,7 @@ function render(){
     + '<div class="row"><button type="button" class="ib sm plus' + (S.amenu ? ' on' : '') + '" aria-label="Add photos, videos or files" aria-expanded="' + (!!S.amenu) + '" title="Add photos, videos or files" onclick="toggleAttachMenu()">＋</button><button type="button" class="ib sm" aria-label="Photos and videos" title="Photos & videos from your gallery" onclick="pickMedia()">🖼️</button>'
     + '<button type="button" class="ib sm' + (DICT ? ' rec' : '') + '" aria-label="Dictate" title="Speak instead of typing" onclick="toggleDictate()">' + (DICT ? '⏺' : '🎤') + '</button>'
     
-    + '<span style="flex:1"></span>' + (S.sending || S.waiting ? '<button type="button" class="send" aria-label="Stop" title="Stop" onclick="stopAll()">■</button>' : '<button type="button" class="send" aria-label="Send" onclick="send()">↑</button>')
+    + '<span style="flex:1"></span>' + (S.sending || S.waiting ? '<button type="button" class="send stop" aria-label="Stop" title="Stop" onclick="stopAll()">■</button>' : '') + '<button type="button" class="send" aria-label="Send" title="Send" onclick="send()">↑</button>'
     + '<button type="button" class="talkb' + (V ? ' on' : '') + '" aria-label="' + (V ? 'End the voice call' : 'Talk live with kalvina') + '" title="Talk live with kalvina" onclick="toggleVoice()">' + (V ? '■' : '<svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="3" y="9" width="2.6" height="6" rx="1.3"/><rect x="7.5" y="5" width="2.6" height="14" rx="1.3"/><rect x="12" y="2" width="2.6" height="20" rx="1.3"/><rect x="16.5" y="6" width="2.6" height="12" rx="1.3"/><rect x="21" y="10" width="2.6" height="4" rx="1.3"/></svg>') + '</button></div></div></div></div>';
   var dock = wide(); app.className = dock ? 'dock' : '';
   if(S.side || dock) h += '<div class="drawer' + (dock ? ' dock' : '') + '"><div class="pane"><div class="dh"><b>Conversations</b><button type="button" class="ib sm" aria-label="Close" onclick="S.side=false;render()">✕</button></div>'
@@ -458,7 +464,7 @@ function render(){
   app.querySelectorAll('.a .b pre').forEach(function(pre){ if(pre.querySelector('.cpy')) return; var bt = document.createElement('button'); bt.type = 'button'; bt.className = 'cpy'; bt.textContent = 'Copy'; bt.onclick = function(){ try{ navigator.clipboard.writeText(pre.innerText.replace(/Copy$/, '')); toast('Copied'); }catch(e){} }; pre.appendChild(bt); });
   var nb = $('box'); if(nb){ nb.value = keep; grow(nb); if(focused){ nb.focus(); } }
   S.err = S.err && /^Not sent/.test(S.err) ? S.err : '';
-  var l = $('list'); if(l) l.scrollTop = l.scrollHeight;
+  var l = $('list'); if(l){ if(wasNear || S._shown > oldCount) l.scrollTop = l.scrollHeight; else l.scrollTop = oldTop; }
 }
 function grow(b){ b.style.height = 'auto'; b.style.height = Math.min(160, b.scrollHeight) + 'px'; }
 function keyDown(ev){ if(ev.key === 'Enter' && !ev.shiftKey && !/Mobi|Android|iPhone/i.test(navigator.userAgent)){ ev.preventDefault(); send(); } }
